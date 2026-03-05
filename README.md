@@ -1,14 +1,16 @@
-# Hail Decoder
+# Genohype
 
-Pure Rust decoder for Hail table format with support for cloud storage, Parquet conversion, and database exports.
+A fast, memory-efficient toolkit for genomic data processing. Read Hail tables and VCF files, export to Parquet/ClickHouse/BigQuery, generate Manhattan plots, and run distributed jobs on GCP.
 
 ## Features
 
-- **Zero Java/Hail dependencies**: Single static binary, no JVM required
-- **Local/Cloud Storage**: Read from local disk or cloud storage (GCS, S3)
-- **Memory efficient**: Process tables of any size with minimal memory
-- **Multiple outputs**: Export to Parquet, VCF, ClickHouse, BigQuery
-- **VCF support**: Query and export VCF files with tabix index support
+- **Zero Java dependencies**: Single static binary, no JVM or Hail installation required
+- **Multiple input formats**: Hail tables (.ht), VCF files (.vcf.bgz with tabix)
+- **Cloud-native**: Read from local disk, GCS, S3, or HTTP URLs
+- **Multiple outputs**: Export to Parquet, VCF, ClickHouse, BigQuery, or Hail format
+- **Visualization**: Generate Manhattan plots and locus plots from GWAS results
+- **Distributed processing**: Run parallel jobs across GCP VM pools
+- **Memory efficient**: Stream datasets of any size with minimal memory
 
 ## Installation
 
@@ -41,32 +43,49 @@ genohype info "gs://gcp-public-data--gnomad/release/4.1/ht/exomes/gnomad.exomes.
 
 ## Commands
 
-### info
+### Data Exploration
 
-Show table metadata without scanning data (fast).
+| Command | Description |
+|---------|-------------|
+| `info` | Show table metadata without scanning data (fast) |
+| `summary` | Full scan to calculate row counts and field statistics |
+| `query` | Stream rows with optional filtering |
 
-```bash
-# Hail table
-genohype info data/variants.ht
+### Export
 
-# VCF file
-genohype info data/variants.vcf.bgz
+| Command | Description |
+|---------|-------------|
+| `export parquet` | Convert to Parquet format |
+| `export vcf` | Export to VCF format |
+| `export hail` | Export to Hail table format (useful for subsetting) |
+| `export clickhouse` | Export to ClickHouse database |
+| `export bigquery` | Export to BigQuery |
 
-# Cloud table
-genohype info "gs://bucket/path/to/table.ht"
-```
+### Visualization
 
-### summary
+| Command | Description |
+|---------|-------------|
+| `manhattan` | Generate Manhattan plots from GWAS results |
+| `manhattan-batch` | Batch process multiple phenotypes |
+| `loci` | Generate LocusZoom-style locus plots |
 
-Full scan to calculate row counts and field statistics.
+### Schema
 
-```bash
-genohype summary data/analysis-meta.ht
-```
+| Command | Description |
+|---------|-------------|
+| `schema generate` | Generate JSON schema from table |
+| `schema validate` | Validate table data against JSON schema |
 
-### query
+### Distributed Processing
 
-Stream rows with optional filtering.
+| Command | Description |
+|---------|-------------|
+| `pool create` | Create a distributed worker pool on GCP |
+| `pool submit` | Submit a job to the worker pool |
+| `pool destroy` | Destroy a worker pool |
+| `pool list` | List instances in a pool |
+
+## Querying
 
 ```bash
 # Basic query with limit
@@ -81,9 +100,6 @@ genohype query data/table.ht --where ancestry=EUR --where trait_type=binary --li
 # Nested field filters
 genohype query data/table.ht --where "locus.contig=chr1" --where "locus.position>=55039447"
 
-# JSON output
-genohype query data/table.ht --limit 5 --json
-
 # Genomic interval filtering
 genohype query data/table.ht --interval "chr10:121500000-121600000" --limit 10
 
@@ -95,11 +111,14 @@ genohype query data/table.ht \
 
 # Intervals from file (BED, JSON, or text format)
 genohype query data/table.ht --intervals-file regions.bed --limit 10
+
+# JSON output
+genohype query data/table.ht --limit 5 --json
 ```
 
-### export parquet
+## Export Examples
 
-Convert to Parquet format with optional filtering.
+### Parquet
 
 ```bash
 # Basic export
@@ -115,26 +134,14 @@ genohype export parquet data/table.ht output.parquet --interval "chr10:121500000
 duckdb -c "SELECT * FROM 'output.parquet' LIMIT 5"
 ```
 
-### export hail
-
-Export to Hail table format (useful for subsetting).
-
-```bash
-genohype export hail data/table.ht /tmp/subset.ht --interval "chr10:121500000-121600000"
-```
-
-### export vcf
-
-Export to VCF format.
+### VCF
 
 ```bash
 # Export with bgzip compression
 genohype export vcf data/variants.vcf.bgz output.vcf.gz --interval "chrX:31097677-31098000" --bgzip
 ```
 
-### export clickhouse
-
-Export to ClickHouse database (requires `--features clickhouse`).
+### ClickHouse
 
 ```bash
 genohype export clickhouse \
@@ -142,14 +149,9 @@ genohype export clickhouse \
   "http://user:pass@localhost:8123" \
   target_table \
   --intervals-file regions.bed
-
-# Query in ClickHouse
-curl -s "http://user:pass@localhost:8123" --data "SELECT * FROM target_table LIMIT 10 FORMAT Pretty"
 ```
 
-### export bigquery
-
-Export to BigQuery (requires `--features bigquery`).
+### BigQuery
 
 ```bash
 genohype export bigquery \
@@ -157,60 +159,6 @@ genohype export bigquery \
   project:dataset.table \
   --bucket staging-bucket \
   --intervals-file regions.bed
-
-# Query in BigQuery
-bq query --use_legacy_sql=false "SELECT * FROM dataset.table LIMIT 10"
-```
-
-### schema generate
-
-Generate JSON schema from table.
-
-```bash
-# Print to stdout
-genohype schema generate data/table.ht
-
-# Save to file
-genohype schema generate data/table.ht schema.json
-```
-
-### schema validate
-
-Validate table data against JSON schema.
-
-```bash
-# Validate first N rows
-genohype schema validate data/table.ht schema.json --limit 100
-
-# Validate random sample (faster for large tables)
-genohype schema validate data/table.ht schema.json --sample 1000
-
-# Stop on first error
-genohype schema validate data/table.ht schema.json --fail-fast
-```
-
-## Feature Flags
-
-| Feature | Description | Default |
-|---------|-------------|---------|
-| `gcp` | Google Cloud Storage support | Yes |
-| `validation` | `schema validate` and `schema generate` commands | Yes |
-| `aws` | Amazon S3 support | No |
-| `http` | HTTP/HTTPS URL support | No |
-| `clickhouse` | `export clickhouse` command | No |
-| `bigquery` | `export bigquery` command (requires gcp) | No |
-| `server` | `hail-server` HTTP binary | No |
-| `full` | All features | No |
-
-```bash
-# Add S3 support
-cargo build --release --features aws
-
-# Full cloud support (GCS + S3 + HTTP)
-cargo build --release --features gcp,aws,http
-
-# Everything
-cargo build --release --features full
 ```
 
 ## VCF Support
@@ -230,6 +178,27 @@ genohype schema generate data/variants.vcf.bgz
 # Validate VCF with sampling
 genohype schema validate data/variants.vcf.bgz schema.json --sample 10000
 ```
+
+## Distributed Processing (GCP)
+
+Run parallel exports across multiple GCP VMs:
+
+```bash
+# 1. Build Linux worker binary
+make worker
+
+# 2. Create a pool of spot VMs
+genohype pool create my-pool --workers 4 --spot
+
+# 3. Submit a distributed job
+genohype pool submit my-pool -- \
+    export parquet gs://bucket/input.ht gs://bucket/output/ --shard-count 100
+
+# 4. Clean up
+genohype pool destroy my-pool
+```
+
+Requires `gcloud` CLI configured with appropriate project/credentials.
 
 ## Interval File Formats
 
@@ -255,9 +224,29 @@ chr2:178525989-178830802
 ]
 ```
 
-## Demo
+## Feature Flags
 
-See `examples/demo.sh` for a comprehensive walkthrough of all features.
+| Feature | Description | Default |
+|---------|-------------|---------|
+| `gcp` | Google Cloud Storage support | Yes |
+| `validation` | `schema validate` and `schema generate` commands | Yes |
+| `aws` | Amazon S3 support | No |
+| `http` | HTTP/HTTPS URL support | No |
+| `clickhouse` | `export clickhouse` command | No |
+| `bigquery` | `export bigquery` command (requires gcp) | No |
+| `server` | `genohype-server` HTTP binary | No |
+| `full` | All features | No |
+
+```bash
+# Add S3 support
+cargo build --release --features aws
+
+# Full cloud support (GCS + S3 + HTTP)
+cargo build --release --features gcp,aws,http
+
+# Everything
+cargo build --release --features full
+```
 
 ## Testing
 
@@ -270,7 +259,7 @@ cargo test --features full  # test all features
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                         HAIL-DECODER DATA FLOW                              │
+│                           GENOHYPE DATA FLOW                                │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
 │  INPUT SOURCES                  CORE ENGINE                 OUTPUT TARGETS  │

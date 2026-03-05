@@ -1,6 +1,6 @@
-# Hail Decoder
+# Genohype
 
-Pure Rust decoder for Hail table format with support for cloud storage, Parquet conversion, and database exports.
+Fast, memory-efficient toolkit for genomic data processing. Read Hail tables and VCF files, export to Parquet/ClickHouse/BigQuery, generate Manhattan plots, and run distributed jobs on GCP.
 
 ## Build
 
@@ -15,7 +15,7 @@ cargo build --no-default-features
 cargo build --features full
 
 # Build the HTTP server
-cargo build --bin hail-server --features server
+cargo build --bin genohype-server --features server
 ```
 
 ## Feature Flags
@@ -28,7 +28,7 @@ cargo build --bin hail-server --features server
 | `http` | HTTP/HTTPS URL support | No |
 | `clickhouse` | `export clickhouse` command | No |
 | `bigquery` | `export bigquery` command (requires gcp) | No |
-| `server` | `hail-server` HTTP binary | No |
+| `server` | `genohype-server` HTTP binary | No |
 | `benchmark` | `--benchmark` flag for parquet export (CPU/mem/IO metrics) | No |
 | `full` | All features | No |
 
@@ -55,9 +55,9 @@ brew install zig
 cargo install cargo-zigbuild
 rustup target add x86_64-unknown-linux-gnu
 
-# Build Linux binary
-cargo linux --release
-# Output: target/x86_64-unknown-linux-gnu/release/genohype
+# Build Linux worker binary
+make worker
+# Output: target/release/genohype-worker
 ```
 
 ## Commands
@@ -83,8 +83,8 @@ cargo linux --release
 Run parallel exports across multiple GCP VMs:
 
 ```bash
-# 1. Build Linux binary
-cargo linux --release
+# 1. Build Linux worker binary
+make worker
 
 # 2. Create a pool of spot VMs
 genohype pool create my-pool --workers 4 --spot

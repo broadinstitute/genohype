@@ -1,4 +1,4 @@
-# Hail Decoder Build Targets
+# Genohype Build Targets
 
 # Default features for worker binary
 WORKER_FEATURES ?= clickhouse
