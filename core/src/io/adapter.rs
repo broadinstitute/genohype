@@ -77,6 +77,18 @@ pub fn get_gcs_client(bucket: &str) -> Result<Arc<dyn ObjectStore>> {
         builder = builder.with_service_account_path(key_path);
     }
 
+    // Configure retry with exponential backoff for 429/5xx errors
+    let retry_config = object_store::RetryConfig {
+        max_retries: 10,
+        retry_timeout: std::time::Duration::from_secs(180),
+        backoff: object_store::BackoffConfig {
+            init_backoff: std::time::Duration::from_millis(500),
+            max_backoff: std::time::Duration::from_secs(30),
+            base: 2.0,
+        },
+    };
+    builder = builder.with_retry(retry_config);
+
     let client: Arc<dyn ObjectStore> = Arc::new(
         builder
             .build()

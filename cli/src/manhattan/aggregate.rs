@@ -1628,7 +1628,18 @@ pub fn extract_sig_positions(parquet_path: &str) -> Result<Vec<SigPosition>> {
     use genohype_core::io::is_cloud_path;
 
     let batches = if is_cloud_path(parquet_path) {
-        read_cloud_parquet_file(parquet_path)?
+        // For cloud paths, handle 404 (file not found) gracefully -
+        // phenotypes with no significant hits won't have this file
+        match read_cloud_parquet_file(parquet_path) {
+            Ok(b) => b,
+            Err(e) => {
+                let err_str = e.to_string();
+                if err_str.contains("404") || err_str.contains("not found") || err_str.contains("NotFound") {
+                    return Ok(vec![]);
+                }
+                return Err(e);
+            }
+        }
     } else {
         if !std::path::Path::new(parquet_path).exists() {
             return Ok(vec![]);

@@ -1856,10 +1856,27 @@ async fn complete_work(
             details: format!("Failed partitions {:?}: {} (wasted {:.1}s)", req.partitions, error, wasted_duration_ms as f64 / 1000.0),
         });
 
-        // Remove from processing and add to failed (for non-batch jobs)
+        // Remove from processing and retry or mark as failed (for non-batch jobs)
         for &part_id in &req.partitions {
             data.processing_partitions.remove(&part_id);
-            data.failed_partitions.insert(part_id);
+
+            // Use same retry logic as timeouts
+            let retries = data.retry_counts.entry(part_id).or_insert(0);
+            *retries += 1;
+
+            if *retries > 3 {
+                println!(
+                    "Partition {} exceeded max retries ({}), marking as permanently failed",
+                    part_id, retries
+                );
+                data.failed_partitions.insert(part_id);
+            } else {
+                println!(
+                    "Re-queuing partition {} for retry ({}/3)",
+                    part_id, retries
+                );
+                data.pending_partitions.push_front(part_id);
+            }
         }
 
         // For batch jobs, handle retry logic based on task type
