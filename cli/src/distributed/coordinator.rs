@@ -1448,6 +1448,8 @@ fn get_manhattan_work(
             // Build ManhattanAggregateSpec
             let aggregate_spec = ManhattanAggregateSpec {
                 output_path: manhattan.original_spec.output_path.clone(),
+                phenotype_id: manhattan.original_spec.phenotype.clone(),
+                ancestry: manhattan.original_spec.ancestry.clone(),
                 exome_results: manhattan.original_spec.exome.clone(),
                 genome_results: manhattan.original_spec.genome.clone(),
                 gene_burden: manhattan.original_spec.gene_burden.clone(),
@@ -1682,6 +1684,8 @@ fn complete_batch_work(
                     let original = &state.original_spec;
                     let aggregate_spec = ManhattanAggregateSpec {
                         output_path: original.output_path.clone(),
+                        phenotype_id: original.phenotype.clone(),
+                        ancestry: original.ancestry.clone(),
                         exome_results: original.exome.clone(),
                         genome_results: original.genome.clone(),
                         gene_burden: original.gene_burden.clone(),
@@ -2379,6 +2383,8 @@ async fn submit_job(
                 let id = spec.output_path.clone();
                 let aggregate_spec = ManhattanAggregateSpec {
                     output_path: spec.output_path.clone(),
+                    phenotype_id: spec.phenotype.clone(),
+                    ancestry: spec.ancestry.clone(),
                     exome_results: spec.exome.clone(),
                     genome_results: spec.genome.clone(),
                     gene_burden: spec.gene_burden.clone(),

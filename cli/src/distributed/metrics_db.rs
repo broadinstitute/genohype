@@ -143,7 +143,7 @@ impl MetricsDb {
                     total_items: row.get::<_, i64>(5)? as usize,
                     active_partition: row.get::<_, Option<i64>>(6)?.map(|v| v as usize),
                     partitions_completed: row.get::<_, i64>(7)? as usize,
-                    // Extended metrics (not persisted: cpu_per_core, disk_read/write_bytes_sec)
+                    // Extended metrics (not persisted: cpu_per_core, disk_read/write_bytes_sec, core_tasks)
                     cpu_per_core: None,
                     disk_read_bytes_sec: None,
                     disk_write_bytes_sec: None,
@@ -151,6 +151,7 @@ impl MetricsDb {
                     disk_total_bytes: row.get::<_, Option<i64>>(9)?.map(|v| v as u64),
                     network_rx_bytes_sec: row.get(10)?,
                     network_tx_bytes_sec: row.get(11)?,
+                    core_tasks: None, // Not persisted - real-time only
                 })
             })?
             .collect::<SqliteResult<Vec<_>>>()?;
@@ -190,7 +191,7 @@ impl MetricsDb {
                     total_items: row.get::<_, i64>(5)? as usize,
                     active_partition: row.get::<_, Option<i64>>(6)?.map(|v| v as usize),
                     partitions_completed: row.get::<_, i64>(7)? as usize,
-                    // Extended metrics (not persisted: cpu_per_core, disk_read/write_bytes_sec)
+                    // Extended metrics (not persisted: cpu_per_core, disk_read/write_bytes_sec, core_tasks)
                     cpu_per_core: None,
                     disk_read_bytes_sec: None,
                     disk_write_bytes_sec: None,
@@ -198,6 +199,7 @@ impl MetricsDb {
                     disk_total_bytes: row.get::<_, Option<i64>>(9)?.map(|v| v as u64),
                     network_rx_bytes_sec: row.get(10)?,
                     network_tx_bytes_sec: row.get(11)?,
+                    core_tasks: None, // Not persisted - real-time only
                 })
             })?
             .collect::<SqliteResult<Vec<_>>>()?;

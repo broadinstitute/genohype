@@ -93,6 +93,65 @@ pub struct StatusResponse {
     pub is_complete: bool,
 }
 
+/// Describes what work a specific CPU core/thread is currently executing.
+///
+/// This provides rich context for dashboard visualization, supporting any job type
+/// and nested parallelism (e.g., phenotype → locus plots).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoreTaskInfo {
+    /// Type of work unit (e.g., "partition", "phenotype", "locus_plot", "aggregation")
+    pub task_type: String,
+
+    /// Primary identifier for the work unit (partition number, phenotype ID, etc.)
+    pub task_id: String,
+
+    /// Optional human-readable label for dashboard display
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+
+    /// Optional parent context (e.g., which phenotype a locus plot belongs to)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<Box<CoreTaskInfo>>,
+}
+
+impl CoreTaskInfo {
+    /// Create a simple partition task.
+    pub fn partition(partition_id: usize) -> Self {
+        Self {
+            task_type: "partition".to_string(),
+            task_id: partition_id.to_string(),
+            label: None,
+            parent: None,
+        }
+    }
+
+    /// Create a phenotype task.
+    pub fn phenotype(phenotype_id: impl Into<String>, label: Option<String>) -> Self {
+        Self {
+            task_type: "phenotype".to_string(),
+            task_id: phenotype_id.into(),
+            label,
+            parent: None,
+        }
+    }
+
+    /// Create a task with a parent context (for nested parallelism).
+    pub fn with_parent(mut self, parent: CoreTaskInfo) -> Self {
+        self.parent = Some(Box::new(parent));
+        self
+    }
+
+    /// Create a custom task type.
+    pub fn custom(task_type: impl Into<String>, task_id: impl Into<String>) -> Self {
+        Self {
+            task_type: task_type.into(),
+            task_id: task_id.into(),
+            label: None,
+            parent: None,
+        }
+    }
+}
+
 /// A point-in-time telemetry snapshot from a worker.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TelemetrySnapshot {
@@ -136,6 +195,10 @@ pub struct TelemetrySnapshot {
     /// Network transmit rate in bytes per second
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_tx_bytes_sec: Option<f64>,
+
+    /// Map of CPU core index (Rayon thread ID) to currently executing task info
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub core_tasks: Option<std::collections::HashMap<usize, CoreTaskInfo>>,
 }
 
 /// Heartbeat request from worker to coordinator.

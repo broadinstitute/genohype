@@ -7,8 +7,9 @@
 //! metrics to the coordinator for the dashboard UI.
 
 use crate::distributed::message::{
-    CompleteRequest, HeartbeatRequest, JobSpec, ManhattanAggregateSpec, ManhattanScanSpec,
-    ManhattanSource, ManhattanSpec, TelemetrySnapshot, WorkRequest, WorkResponse,
+    CompleteRequest, CoreTaskInfo, HeartbeatRequest, JobSpec, ManhattanAggregateSpec,
+    ManhattanScanSpec, ManhattanSource, ManhattanSpec, TelemetrySnapshot, WorkRequest,
+    WorkResponse,
 };
 use genohype_core::io::{is_cloud_path, StreamingCloudWriter};
 use genohype_core::parquet::{build_record_batch, ParquetWriter};
@@ -51,9 +52,54 @@ pub struct TelemetryState {
     partitions_completed: AtomicUsize,
     /// Signal to stop the telemetry loop
     stop: AtomicBool,
+    /// Map of Rayon thread ID to currently executing task info
+    core_tasks: std::sync::Mutex<std::collections::HashMap<usize, CoreTaskInfo>>,
 }
 
 const NO_ACTIVE_PARTITION: usize = usize::MAX;
+
+/// RAII guard to safely register and unregister a task for a Rayon thread.
+///
+/// When created, this guard registers the current Rayon thread's ID with the task
+/// it is executing. When dropped (either normally or due to panic/error), it automatically
+/// removes the registration, ensuring the core_tasks map stays accurate.
+struct CoreTaskGuard<'a> {
+    ts: &'a Arc<TelemetryState>,
+    thread_id: Option<usize>,
+}
+
+impl<'a> CoreTaskGuard<'a> {
+    /// Create a new guard that registers the current Rayon thread as executing the given task.
+    fn new(ts: &'a Arc<TelemetryState>, task_info: CoreTaskInfo) -> Self {
+        let thread_id = rayon::current_thread_index();
+        if let Some(tid) = thread_id {
+            if let Ok(mut map) = ts.core_tasks.lock() {
+                map.insert(tid, task_info);
+            }
+        }
+        Self { ts, thread_id }
+    }
+
+    /// Create a guard for a partition-based task.
+    fn partition(ts: &'a Arc<TelemetryState>, partition_id: usize) -> Self {
+        Self::new(ts, CoreTaskInfo::partition(partition_id))
+    }
+
+    /// Create a guard for a phenotype-based task.
+    fn phenotype(ts: &'a Arc<TelemetryState>, phenotype_id: impl Into<String>, label: Option<String>) -> Self {
+        Self::new(ts, CoreTaskInfo::phenotype(phenotype_id, label))
+    }
+}
+
+impl<'a> Drop for CoreTaskGuard<'a> {
+    fn drop(&mut self) {
+        if let Some(tid) = self.thread_id {
+            if let Ok(mut map) = self.ts.core_tasks.lock() {
+                map.remove(&tid);
+            }
+        }
+    }
+}
 
 /// Run the worker loop.
 ///
@@ -84,6 +130,7 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
         active_partition: AtomicUsize::new(NO_ACTIVE_PARTITION),
         partitions_completed: AtomicUsize::new(0),
         stop: AtomicBool::new(false),
+        core_tasks: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
 
     // Spawn background telemetry heartbeat loop
@@ -439,6 +486,16 @@ fn spawn_telemetry_loop(
                 (Some(rx_sec), Some(tx_sec), Some(current_rx), Some(current_tx))
             };
 
+            // Collect the core tasks map (Rayon thread ID -> partition ID)
+            let core_tasks = {
+                let map = state.core_tasks.lock().unwrap();
+                if map.is_empty() {
+                    None
+                } else {
+                    Some(map.clone())
+                }
+            };
+
             let snapshot = TelemetrySnapshot {
                 timestamp_ms,
                 cpu_percent: cpu,
@@ -460,6 +517,7 @@ fn spawn_telemetry_loop(
                 disk_total_bytes: disk_total,
                 network_rx_bytes_sec: net_rx_sec,
                 network_tx_bytes_sec: net_tx_sec,
+                core_tasks,
             };
 
             let req = HeartbeatRequest {
@@ -566,7 +624,16 @@ pub fn dispatch_job(
             // - Top level: parallel phenotypes
             // - Inner level: parallel locus plots (within process_manhattan_aggregate)
             let results: Vec<Result<(usize, serde_json::Value)>> = specs.par_iter()
-                .map(|spec| process_manhattan_aggregate(spec))
+                .map(|spec| {
+                    // Track the phenotype being processed on this Rayon thread
+                    let phenotype_id = spec.phenotype_id.clone()
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let label = spec.ancestry.clone();
+                    let _core_guard = telemetry.as_ref()
+                        .map(|ts| CoreTaskGuard::phenotype(ts, &phenotype_id, label));
+
+                    process_manhattan_aggregate(spec)
+                })
                 .collect();
 
             // Sum rows and collect summaries
@@ -697,6 +764,9 @@ fn process_clickhouse_export(
     let results: Vec<Result<usize>> = partitions
         .par_iter()
         .map(|&partition_id| {
+            // Track the active partition for this Rayon thread (RAII guard)
+            let _core_guard = telemetry.as_ref().map(|ts| CoreTaskGuard::partition(ts, partition_id));
+
             // Acquire semaphore permit - blocks if too many partitions in flight
             let _permit = semaphore.acquire();
 
@@ -982,6 +1052,9 @@ fn process_parquet_export(
     let results: Vec<Result<usize>> = partitions
         .par_iter()
         .map(|&partition_id| {
+            // Track the active partition for this Rayon thread (RAII guard)
+            let _core_guard = telemetry.as_ref().map(|ts| CoreTaskGuard::partition(ts, partition_id));
+
             // Each thread opens its own QueryEngine (they share underlying caches)
             let engine = QueryEngine::open_path(&input_path)?;
             let row_type = engine.row_type().clone();
@@ -1115,6 +1188,9 @@ fn process_json_export(
     let results: Vec<Result<usize>> = partitions
         .par_iter()
         .map(|&partition_id| {
+            // Track the active partition for this Rayon thread (RAII guard)
+            let _core_guard = telemetry.as_ref().map(|ts| CoreTaskGuard::partition(ts, partition_id));
+
             let engine = QueryEngine::open_path(&input_path)?;
 
             let output_file = if output_is_cloud {
@@ -1213,6 +1289,9 @@ fn process_summary(
         .fold(
             || (0usize, StatsAccumulator::new()),
             |(mut rows, mut acc), &partition_id| {
+                // Track the active partition for this Rayon thread (RAII guard)
+                let _core_guard = telemetry.as_ref().map(|ts| CoreTaskGuard::partition(ts, partition_id));
+
                 match QueryEngine::open_path(&input_path) {
                     Ok(engine) => {
                         match engine.scan_partition_iter(partition_id, &[]) {
@@ -1323,6 +1402,9 @@ fn process_manhattan_scan(
     let results: Vec<Result<usize>> = partitions
         .par_iter()
         .map(|&partition_id| {
+            // Track the active partition for this Rayon thread (RAII guard)
+            let _core_guard = telemetry.as_ref().map(|ts| CoreTaskGuard::partition(ts, partition_id));
+
             let engine = QueryEngine::open_path(&table_path_clone)?;
             let iter = engine.scan_partition_iter(partition_id, &[])?;
 
@@ -1451,6 +1533,9 @@ fn process_manhattan_scan_v2(
     let results: Vec<Result<usize>> = partitions
         .par_iter()
         .map(|&partition_id| {
+            // Track the active partition for this Rayon thread (RAII guard)
+            let _core_guard = telemetry.as_ref().map(|ts| CoreTaskGuard::partition(ts, partition_id));
+
             let engine = QueryEngine::open_path(table_path)?;
             let iter = engine.scan_partition_iter(partition_id, &[])?;
 

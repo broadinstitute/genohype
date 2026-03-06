@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 pub use genohype_pool::distributed::{
-    CompleteRequest, CompleteResponse, HeartbeatRequest, HeartbeatResponse,
+    CompleteRequest, CompleteResponse, CoreTaskInfo, HeartbeatRequest, HeartbeatResponse,
     StatusResponse, TelemetrySnapshot, WorkRequest, WorkResponse,
 };
 
@@ -384,6 +384,13 @@ pub struct ManhattanScanSpec {
 pub struct ManhattanAggregateSpec {
     /// Output directory (contains partial PNGs/parquets from scan phase)
     pub output_path: String,
+
+    /// Phenotype identifier (for telemetry and tracking)
+    #[serde(default)]
+    pub phenotype_id: Option<String>,
+    /// Ancestry group (for telemetry and tracking)
+    #[serde(default)]
+    pub ancestry: Option<String>,
 
     // Input tables for targeted reads (locus plots)
     /// Path to Exome results Hail table
