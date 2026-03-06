@@ -89,6 +89,11 @@ impl<'a> CoreTaskGuard<'a> {
     fn phenotype(ts: &'a Arc<TelemetryState>, phenotype_id: impl Into<String>, label: Option<String>) -> Self {
         Self::new(ts, CoreTaskInfo::phenotype(phenotype_id, label))
     }
+
+    /// Create a guard for a custom task type.
+    fn custom(ts: &'a Arc<TelemetryState>, task_type: impl Into<String>, task_id: impl Into<String>) -> Self {
+        Self::new(ts, CoreTaskInfo::custom(task_type, task_id))
+    }
 }
 
 impl<'a> Drop for CoreTaskGuard<'a> {
@@ -729,8 +734,8 @@ fn process_stress(
     println!("Processing {} stress partitions...", partitions.len());
 
     let results: Vec<Result<usize>> = partitions.par_iter().map(|&partition_id| {
-        // Tag this thread for the dashboard's per-core task view
-        let _core_guard = telemetry.as_ref().map(|ts| CoreTaskGuard::partition(ts, partition_id));
+        // Tag this thread for the dashboard's per-core task view (stress task type)
+        let _core_guard = telemetry.as_ref().map(|ts| CoreTaskGuard::custom(ts, "stress", partition_id.to_string()));
 
         // 1. Memory Load: allocate and hold a large vector.
         let mut mem_hog: Vec<u64> = Vec::new();
