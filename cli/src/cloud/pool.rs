@@ -1618,6 +1618,9 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         let (total_partitions, engine) = if matches!(job_spec, crate::distributed::message::JobSpec::IngestManhattan { .. }) {
             println!("Ingestion job: phenotypes will be discovered by coordinator");
             (0, None)  // Coordinator will set this after discovering phenotypes
+        } else if let crate::distributed::message::JobSpec::Stress(ref spec) = job_spec {
+            println!("Stress job: queuing {} synthetic partitions", spec.partitions);
+            (spec.partitions, None)
         } else {
             // Calculate total partitions by reading metadata locally
             println!("Reading metadata from {}...", input_path.bright_white());
@@ -2495,6 +2498,11 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             return Self::parse_ingest_command(&command[1..]);
         }
 
+        // Handle 'stress' command
+        if cmd == "stress" {
+            return Self::parse_stress_command(&command[1..]);
+        }
+
         // Expect: export <type> <input> <output> [args...]
         if cmd != "export" {
             return Err(HailError::Io(std::io::Error::new(
@@ -3268,6 +3276,101 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         Ok((output_dir, JobSpec::Loci(spec), Vec::new(), Vec::new()))
     }
 
+    /// Parse a `stress` command into a StressSpec job.
+    fn parse_stress_command(
+        args: &[String],
+    ) -> Result<(String, crate::distributed::message::JobSpec, Vec<String>, Vec<String>)> {
+        use crate::distributed::message::{JobSpec, StressSpec};
+
+        let mut partitions = 100;
+        let mut cpu_secs = 0.0;
+        let mut memory_mb = 0;
+        let mut read_path = None;
+        let mut write_dir = None;
+        let mut generate_read_data = false;
+        let mut read_data_size_mb = 32;
+
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--partitions" => {
+                    if i + 1 < args.len() {
+                        partitions = args[i + 1].parse().unwrap_or(100);
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                "--cpu-secs" => {
+                    if i + 1 < args.len() {
+                        cpu_secs = args[i + 1].parse().unwrap_or(0.0);
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                "--memory-mb" => {
+                    if i + 1 < args.len() {
+                        memory_mb = args[i + 1].parse().unwrap_or(0);
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                "--read-path" => {
+                    if i + 1 < args.len() {
+                        read_path = Some(args[i + 1].clone());
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                "--write-dir" => {
+                    if i + 1 < args.len() {
+                        write_dir = Some(args[i + 1].clone());
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                "--generate-read-data" => {
+                    generate_read_data = true;
+                    i += 1;
+                }
+                "--read-data-size-mb" => {
+                    if i + 1 < args.len() {
+                        read_data_size_mb = args[i + 1].parse().unwrap_or(32);
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                _ => i += 1,
+            }
+        }
+
+        // Validate: --generate-read-data requires --write-dir
+        if generate_read_data && write_dir.is_none() {
+            return Err(HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--generate-read-data requires --write-dir to be set",
+            )));
+        }
+
+        let spec = StressSpec {
+            partitions,
+            cpu_secs,
+            memory_mb,
+            read_path,
+            write_dir,
+            generate_read_data,
+            read_data_size_mb,
+        };
+
+        // Use a dummy input path and empty filters since stress tests don't read Hail tables
+        Ok(("stress_synthetic".to_string(), JobSpec::Stress(spec), Vec::new(), Vec::new()))
+    }
+
     /// Parse an `ingest` command into an IngestManhattan job.
     ///
     /// Supports: ingest manhattan --input-dir <path> --clickhouse-url <url> [--database <db>]
@@ -3495,7 +3598,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                 println!("    {}", "(no active task)".dimmed());
             }
 
-            if let Some(ref latest) = w.latest {
+            if let Some(ref latest) = w.telemetry {
                 let cpu = latest.cpu_percent.unwrap_or(0.0);
                 let mem_gb = latest
                     .memory_used_bytes

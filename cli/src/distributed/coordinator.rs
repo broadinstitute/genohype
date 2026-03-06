@@ -2915,7 +2915,7 @@ async fn get_dashboard_workers(
             worker_id: id.clone(),
             status: w.status.as_str().to_string(),
             last_seen_secs: now.duration_since(w.last_seen).as_secs_f64(),
-            latest: w.metrics_history.back().cloned(),
+            telemetry: w.metrics_history.back().cloned(),
             total_items: w.total_rows,
             partitions_completed: w.partitions_completed,
             current_task: w.current_task.clone(),

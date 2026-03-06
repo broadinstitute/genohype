@@ -93,6 +93,33 @@ pub enum JobSpec {
         clickhouse_url: String,
         database: String,
     },
+    /// Synthetic workload for testing cluster telemetry and autoscaling
+    Stress(StressSpec),
+}
+
+/// Parameters for a synthetic stress test workload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StressSpec {
+    /// Total number of tasks to queue
+    pub partitions: usize,
+    /// Seconds of pure CPU math to spin per partition
+    pub cpu_secs: f64,
+    /// Megabytes of RAM to allocate and hold per partition
+    pub memory_mb: usize,
+    /// A file to stream into memory to generate Network RX
+    pub read_path: Option<String>,
+    /// A directory to pump random bytes into to generate Network TX
+    pub write_dir: Option<String>,
+    /// Generate temporary read data (writes to write_dir first, then reads back)
+    #[serde(default)]
+    pub generate_read_data: bool,
+    /// Size in MB of generated read data per partition (default: 32)
+    #[serde(default = "default_read_data_size_mb")]
+    pub read_data_size_mb: usize,
+}
+
+fn default_read_data_size_mb() -> usize {
+    32
 }
 
 /// Progress stats for batch Manhattan jobs (multi-phenotype mode).
@@ -477,6 +504,7 @@ impl JobSpec {
             JobSpec::ExportClickhouse { .. } => "export clickhouse",
             JobSpec::IngestManhattan { .. } => "ingest manhattan",
             JobSpec::IngestManhattanTask { .. } => "ingest manhattan task",
+            JobSpec::Stress(_) => "synthetic stress test",
         }
     }
 
@@ -496,6 +524,7 @@ impl JobSpec {
             JobSpec::ExportClickhouse { table_name, .. } => Some(table_name),
             JobSpec::IngestManhattan { input_dir, .. } => Some(input_dir),
             JobSpec::IngestManhattanTask { base_path, .. } => Some(base_path),
+            JobSpec::Stress(spec) => spec.write_dir.as_deref(),
         }
     }
 }
@@ -635,7 +664,7 @@ pub struct DashboardWorker {
     /// Seconds since last heartbeat
     pub last_seen_secs: f64,
     /// Latest telemetry snapshot
-    pub latest: Option<TelemetrySnapshot>,
+    pub telemetry: Option<TelemetrySnapshot>,
     /// Total items reported by this worker
     pub total_items: usize,
     /// Total partitions completed by this worker
