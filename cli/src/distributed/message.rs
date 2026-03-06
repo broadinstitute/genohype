@@ -539,6 +539,9 @@ pub struct DashboardSummary {
     pub progress_percent: f64,
     /// Total partitions in the job
     pub total_partitions: usize,
+    /// Number of partitions assigned per work request
+    #[serde(default)]
+    pub batch_size: usize,
     /// Partitions completed
     pub completed_partitions: usize,
     /// Partitions currently processing

@@ -2766,6 +2766,7 @@ async fn get_dashboard_summary(
     axum::Json(DashboardSummary {
         progress_percent,
         total_partitions: total,
+        batch_size: data.config.batch_size,
         completed_partitions: completed,
         processing_partitions: processing,
         pending_partitions: pending,

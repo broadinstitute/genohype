@@ -65,6 +65,8 @@ export interface DashboardSummary {
   progress_percent: number;
   /** Total partitions in the job */
   total_partitions: number;
+  /** Number of partitions assigned per work request */
+  batch_size?: number;
   /** Partitions completed */
   completed_partitions: number;
   /** Partitions currently processing */

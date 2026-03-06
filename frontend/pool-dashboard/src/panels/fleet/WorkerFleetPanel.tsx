@@ -114,7 +114,7 @@ const StatusBadge: React.FC<{ status: string }> = ({ status }) => {
 };
 
 /**
- * Per-core CPU visualization grid with task tooltips.
+ * Per-core CPU visualization grid with task labels.
  */
 const CoresGrid: React.FC<{
   cpuPerCore: number[];
@@ -127,36 +127,86 @@ const CoresGrid: React.FC<{
     return 'var(--cyan)';
   };
 
-  const getTooltip = (coreIdx: number): string => {
+  const getTaskColor = (taskType: string): string => {
+    switch (taskType) {
+      case 'partition':
+        return 'var(--cyan)';
+      case 'phenotype':
+        return 'var(--green)';
+      case 'locus_plot':
+        return 'var(--magenta, #d19afc)';
+      case 'aggregation':
+        return 'var(--yellow)';
+      default:
+        return 'var(--text-dim)';
+    }
+  };
+
+  const getTaskLabel = (coreIdx: number): { short: string; full: string } | null => {
     const taskInfo = coreTasks?.[coreIdx];
-    if (!taskInfo) return 'Idle';
+    if (!taskInfo) return null;
 
-    let tooltip = `${taskInfo.task_type}: ${taskInfo.label || taskInfo.task_id}`;
-
-    // Include parent context if available (e.g., phenotype for locus plots)
-    if (taskInfo.parent) {
-      tooltip += ` (${taskInfo.parent.task_type}: ${taskInfo.parent.label || taskInfo.parent.task_id})`;
+    // Build short label for display
+    let short: string;
+    if (taskInfo.task_type === 'partition') {
+      short = `P${taskInfo.task_id}`;
+    } else if (taskInfo.label) {
+      // Truncate long labels
+      short = taskInfo.label.length > 12 ? taskInfo.label.slice(0, 10) + '…' : taskInfo.label;
+    } else {
+      short = taskInfo.task_id.length > 8 ? taskInfo.task_id.slice(0, 6) + '…' : taskInfo.task_id;
     }
 
-    return tooltip;
+    // Build full tooltip
+    let full = `${taskInfo.task_type}: ${taskInfo.label || taskInfo.task_id}`;
+    if (taskInfo.parent) {
+      full += ` (${taskInfo.parent.task_type}: ${taskInfo.parent.label || taskInfo.parent.task_id})`;
+    }
+
+    return { short, full };
   };
 
   return (
     <div className="cores-grid" style={{ marginBottom: '12px' }}>
-      {cpuPerCore.map((pct, idx) => (
-        <div key={idx} className="core-item" title={getTooltip(idx)}>
-          <span className="core-label">C{idx}</span>
-          <div className="core-bar-outer">
-            <div
-              className="core-bar"
-              style={{
-                width: `${Math.min(pct, 100)}%`,
-                backgroundColor: getCpuColor(pct),
-              }}
-            />
+      {cpuPerCore.map((pct, idx) => {
+        const task = getTaskLabel(idx);
+        const taskInfo = coreTasks?.[idx];
+        return (
+          <div
+            key={idx}
+            className="core-item"
+            title={task?.full || 'Idle'}
+            style={{ marginBottom: '4px' }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+              <span className="core-label">C{idx}</span>
+              <div className="core-bar-outer" style={{ flex: 1 }}>
+                <div
+                  className="core-bar"
+                  style={{
+                    width: `${Math.min(pct, 100)}%`,
+                    backgroundColor: getCpuColor(pct),
+                  }}
+                />
+              </div>
+            </div>
+            {task && (
+              <div
+                style={{
+                  fontSize: '8px',
+                  color: getTaskColor(taskInfo?.task_type || ''),
+                  marginLeft: '20px',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {task.short}
+              </div>
+            )}
           </div>
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 };

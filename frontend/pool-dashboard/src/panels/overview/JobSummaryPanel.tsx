@@ -67,7 +67,7 @@ export const JobSummaryPanel: React.FC = () => {
             {formatPath(summary.input_path)}
           </span>
         </div>
-        <div style={{ display: 'flex', gap: '16px', fontSize: '11px' }}>
+        <div style={{ display: 'flex', gap: '16px', fontSize: '11px', flexWrap: 'wrap' }}>
           <span>
             <span style={{ color: 'var(--text-dim)' }}>Status: </span>
             <span
@@ -86,6 +86,12 @@ export const JobSummaryPanel: React.FC = () => {
             <span style={{ color: 'var(--text-dim)' }}>Elapsed: </span>
             {formatDuration(summary.elapsed_secs)}
           </span>
+          {summary.batch_size && summary.batch_size > 0 && (
+            <span>
+              <span style={{ color: 'var(--text-dim)' }}>Batch: </span>
+              {summary.batch_size}
+            </span>
+          )}
         </div>
       </div>
 
