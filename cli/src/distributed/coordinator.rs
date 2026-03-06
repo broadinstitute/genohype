@@ -1894,7 +1894,35 @@ async fn complete_work(
                                 phenotype_id, MAX_AGGREGATE_RETRIES
                             );
                             batch.failed_count += 1;
-                            batch.aggregate_specs.remove(&phenotype_id);
+
+                            // Write error.json to the output path before removing the spec
+                            if let Some(spec) = batch.aggregate_specs.remove(&phenotype_id) {
+                                let err_path = format!("{}/error.json", spec.output_path.trim_end_matches('/'));
+                                let timestamp_ms = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as u64)
+                                    .unwrap_or(0);
+                                let err_json = serde_json::json!({
+                                    "phenotype": phenotype_id,
+                                    "status": "MANHATTAN_FAILED",
+                                    "error": format!("Exceeded max aggregate retries ({})", MAX_AGGREGATE_RETRIES),
+                                    "timestamp_ms": timestamp_ms
+                                });
+
+                                // Write error.json in a background thread to avoid blocking
+                                std::thread::spawn(move || {
+                                    if genohype_core::io::is_cloud_path(&err_path) {
+                                        use genohype_core::io::CloudWriter;
+                                        use std::io::Write;
+                                        if let Ok(mut writer) = CloudWriter::new(&err_path) {
+                                            let _ = writer.write_all(err_json.to_string().as_bytes());
+                                            let _ = writer.finish();
+                                        }
+                                    } else {
+                                        let _ = std::fs::write(&err_path, err_json.to_string());
+                                    }
+                                });
+                            }
                         } else if let Some(spec) = batch.aggregate_specs.get(&phenotype_id).cloned() {
                             println!(
                                 "Re-queuing phenotype {} for aggregate retry ({}/{})",
