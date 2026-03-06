@@ -1,0 +1,1 @@
+export { PhenotypeBatchPanel } from './PhenotypeBatchPanel';

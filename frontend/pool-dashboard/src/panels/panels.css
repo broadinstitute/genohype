@@ -1,0 +1,441 @@
+/**
+ * Shared panel styling for pool-dashboard components.
+ *
+ * Extracted from cli/static/dashboard.html to maintain the
+ * dark mode "btop" aesthetic across all Dockview panels.
+ */
+
+/* ============================================================================
+ * CSS Variables
+ * ============================================================================ */
+:root {
+  --bg: #0d1117;
+  --surface: #161b22;
+  --surface-hover: #1c2128;
+  --border: #30363d;
+  --text: #e6edf3;
+  --text-dim: #7d8590;
+  --accent: #58a6ff;
+  --cyan: #39c5cf;
+  --green: #3fb950;
+  --red: #f85149;
+  --yellow: #d29922;
+  --orange: #db6d28;
+  --purple: #a371f7;
+  --magenta: #db61a2;
+}
+
+/* ============================================================================
+ * Base Panel Container
+ * ============================================================================ */
+.panel-container {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 12px;
+  height: 100%;
+  overflow-y: auto;
+  color: var(--text);
+  font-family: 'JetBrains Mono', 'Fira Code', 'SF Mono', Consolas, monospace;
+  font-size: 12px;
+}
+
+.panel-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--cyan);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 8px;
+}
+
+/* ============================================================================
+ * Worker Cards
+ * ============================================================================ */
+.workers-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
+  gap: 10px;
+}
+
+.worker-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+  transition: border-color 0.3s;
+}
+
+.worker-card.active {
+  border-color: var(--green);
+}
+
+.worker-card.idle {
+  border-color: var(--yellow);
+}
+
+.worker-card.dead {
+  border-color: var(--red);
+}
+
+.worker-card.draining {
+  border-color: var(--orange);
+}
+
+.worker-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 10px;
+  background: rgba(255, 255, 255, 0.02);
+  border-bottom: 1px solid var(--border);
+}
+
+.worker-content {
+  padding: 10px;
+}
+
+/* ============================================================================
+ * Per-Core CPU Visualization
+ * ============================================================================ */
+.cores-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(50px, 1fr));
+  gap: 4px;
+}
+
+.core-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  position: relative;
+}
+
+.core-label {
+  font-size: 9px;
+  color: var(--text-dim);
+}
+
+.core-bar-outer {
+  height: 6px;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.core-bar {
+  height: 100%;
+  border-radius: 2px;
+  transition: width 0.3s ease;
+}
+
+/* Core task tooltip on hover */
+.core-item[title]:hover::after {
+  content: attr(title);
+  position: absolute;
+  bottom: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #000;
+  padding: 4px 8px;
+  border-radius: 4px;
+  white-space: nowrap;
+  z-index: 10;
+  font-size: 10px;
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+
+/* ============================================================================
+ * Stats Grid
+ * ============================================================================ */
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(80px, 1fr));
+  gap: 8px;
+}
+
+.stat-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.stat-label {
+  font-size: 10px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+
+.stat-value {
+  font-size: 14px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.stat-value.cyan {
+  color: var(--cyan);
+}
+
+.stat-value.green {
+  color: var(--green);
+}
+
+.stat-value.red {
+  color: var(--red);
+}
+
+.stat-value.yellow {
+  color: var(--yellow);
+}
+
+/* ============================================================================
+ * Progress Bar
+ * ============================================================================ */
+.progress-bar-outer {
+  width: 100%;
+  height: 20px;
+  background: var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+  position: relative;
+}
+
+.progress-bar-inner {
+  height: 100%;
+  background: linear-gradient(90deg, var(--cyan), var(--accent));
+  transition: width 0.5s ease;
+}
+
+.progress-bar-failed {
+  height: 100%;
+  background: var(--red);
+  position: absolute;
+  top: 0;
+  transition: width 0.5s ease, left 0.5s ease;
+}
+
+.progress-label {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 600;
+  color: white;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+}
+
+/* ============================================================================
+ * Log Lists
+ * ============================================================================ */
+.log-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.log-item {
+  padding: 4px 8px;
+  border-left: 2px solid transparent;
+  background: rgba(255, 255, 255, 0.02);
+  border-radius: 0 2px 2px 0;
+}
+
+.log-item.info {
+  border-left-color: var(--cyan);
+}
+
+.log-item.success {
+  border-left-color: var(--green);
+}
+
+.log-item.warning {
+  border-left-color: var(--yellow);
+}
+
+.log-item.error {
+  border-left-color: var(--red);
+}
+
+.log-timestamp {
+  color: var(--text-dim);
+  margin-right: 8px;
+}
+
+.log-type {
+  color: var(--accent);
+  font-weight: 600;
+  margin-right: 8px;
+}
+
+.log-details {
+  color: var(--text);
+}
+
+/* ============================================================================
+ * Bottleneck Badge
+ * ============================================================================ */
+.bottleneck-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.bottleneck-badge.cpu {
+  background: rgba(248, 81, 73, 0.2);
+  color: var(--red);
+}
+
+.bottleneck-badge.memory {
+  background: rgba(163, 113, 247, 0.2);
+  color: var(--purple);
+}
+
+.bottleneck-badge.network {
+  background: rgba(219, 97, 162, 0.2);
+  color: var(--magenta);
+}
+
+.bottleneck-badge.io {
+  background: rgba(210, 153, 34, 0.2);
+  color: var(--yellow);
+}
+
+.bottleneck-badge.idle {
+  background: rgba(125, 133, 144, 0.2);
+  color: var(--text-dim);
+}
+
+/* ============================================================================
+ * Data Table (for phenotype batch)
+ * ============================================================================ */
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+}
+
+.data-table thead tr {
+  border-bottom: 1px solid var(--border);
+  color: var(--text-dim);
+}
+
+.data-table th,
+.data-table td {
+  padding: 8px;
+}
+
+.data-table tbody tr {
+  border-bottom: 1px solid var(--border);
+}
+
+.data-table tbody tr:hover {
+  background: var(--surface-hover);
+}
+
+/* Stage badges */
+.stage-badge {
+  display: inline-block;
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.stage-badge.queued {
+  background: rgba(125, 133, 144, 0.2);
+  color: var(--text-dim);
+}
+
+.stage-badge.scanning {
+  background: rgba(57, 197, 207, 0.2);
+  color: var(--cyan);
+}
+
+.stage-badge.aggregating {
+  background: rgba(219, 109, 40, 0.2);
+  color: var(--orange);
+}
+
+.stage-badge.completed {
+  background: rgba(63, 185, 80, 0.2);
+  color: var(--green);
+}
+
+.stage-badge.failed {
+  background: rgba(248, 81, 73, 0.2);
+  color: var(--red);
+}
+
+/* ============================================================================
+ * Buttons
+ * ============================================================================ */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 6px 12px;
+  border: none;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s, opacity 0.2s;
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-danger {
+  background: var(--red);
+  color: #fff;
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: #da4a41;
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: #fff;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: #4a96e8;
+}
+
+/* ============================================================================
+ * Chart Container
+ * ============================================================================ */
+.chart-container {
+  flex: 1;
+  min-height: 150px;
+  position: relative;
+}
+
+/* ============================================================================
+ * Empty State
+ * ============================================================================ */
+.empty-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--text-dim);
+  font-style: italic;
+}
