@@ -1853,6 +1853,52 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             println!("{}", "Waiting for workers to connect...".dimmed());
             std::thread::sleep(std::time::Duration::from_secs(3));
 
+            // For ClickHouse export jobs, create the target table before submitting
+            // Workers will INSERT into this table, so it must exist first
+            #[cfg(feature = "clickhouse")]
+            if let crate::distributed::message::JobSpec::ExportClickhouse {
+                ref clickhouse_url,
+                ref table_name,
+            } = job_spec
+            {
+                use crate::export::clickhouse::{generate_create_table, ClickHouseClient};
+                use genohype_core::query::QueryEngine;
+
+                println!(
+                    "{} Creating ClickHouse table '{}'...",
+                    "Setup:".cyan(),
+                    table_name.bright_white()
+                );
+
+                // Read schema from the input Hail table
+                let engine = QueryEngine::open_path(&input_path)?;
+                let row_type = engine.row_type();
+                let key_fields = engine.key_fields();
+
+                // Generate CREATE TABLE IF NOT EXISTS DDL
+                let ddl = generate_create_table(table_name, row_type, key_fields).map_err(|e| {
+                    HailError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Failed to generate ClickHouse DDL: {}", e),
+                    ))
+                })?;
+
+                // Execute DDL on ClickHouse
+                let client = ClickHouseClient::new(clickhouse_url);
+                client.execute(&ddl).map_err(|e| {
+                    HailError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Failed to create ClickHouse table: {}", e),
+                    ))
+                })?;
+
+                println!(
+                    "  {} Table '{}' ready",
+                    "OK".green(),
+                    table_name
+                );
+            }
+
             // Submit job via API
             println!("{}", "Submitting job via API...".dimmed());
             if !self.submit_job_via_api(
