@@ -609,6 +609,9 @@ pub struct JobConfigRequest {
     /// Interval filters
     #[serde(default)]
     pub intervals: Vec<String>,
+    /// Hint for memory required per partition in MB (overrides default heuristics)
+    #[serde(default)]
+    pub memory_weight_mb: Option<u64>,
 }
 
 /// Response to a job submission request.

@@ -51,6 +51,8 @@ pub struct CoordinatorConfig {
     pub filters: Vec<String>,
     /// Interval filters
     pub intervals: Vec<String>,
+    /// Hint for memory required per partition in MB
+    pub memory_weight_mb: Option<u64>,
 }
 
 impl Default for CoordinatorConfig {
@@ -65,6 +67,7 @@ impl Default for CoordinatorConfig {
             stuck_timeout_secs: 600, // 10 minutes for stuck job detection
             filters: Vec::new(),
             intervals: Vec::new(),
+            memory_weight_mb: None,
         }
     }
 }
@@ -430,6 +433,7 @@ pub async fn run_coordinator(
             stuck_timeout_secs: 600, // Default 10 minutes
             filters: Vec::new(),
             intervals: Vec::new(),
+            memory_weight_mb: None,
         },
         total_rows: 0,
         scan_cpu_secs: 0.0,
@@ -917,6 +921,7 @@ fn determine_batch_size(
     default_size: usize,
     hardware: Option<&crate::distributed::message::HardwareSpec>,
     job_spec: &Option<JobSpec>,
+    memory_weight_mb: Option<u64>,
 ) -> usize {
     if let Some(hw) = hardware {
         // Different jobs have different memory characteristics.
@@ -934,9 +939,17 @@ fn determine_batch_size(
 
         let core_based = (hw.num_cores as f64 * core_multiplier).ceil() as usize;
 
-        // Rough heuristic to prevent OOM: limit concurrent partitions based on memory
-        // e.g. Assume each concurrent partition needs 500MB of RAM
-        let max_by_memory = (hw.total_memory_mb / 500).max(1) as usize;
+        // Phase 3: Use job-specific memory weight if provided, otherwise infer from job type
+        let mem_per_partition_mb = memory_weight_mb.unwrap_or_else(|| match job_spec {
+            Some(JobSpec::ManhattanScan(_))
+            | Some(JobSpec::ManhattanBatch { .. })
+            | Some(JobSpec::Manhattan { .. }) => 1024, // 1GB per partition for Manhattan
+            Some(JobSpec::ExportParquet { .. }) | Some(JobSpec::ExportJson { .. }) => 256, // 256MB
+            Some(JobSpec::Summary) => 64, // 64MB, very light
+            _ => 500,
+        });
+
+        let max_by_memory = (hw.total_memory_mb / mem_per_partition_mb).max(1) as usize;
 
         // We want at least the default_size (so we don't regress if someone manually specified a good default),
         // but if memory dictates a lower cap, we respect it unless the default size itself exceeds memory.
@@ -1033,7 +1046,7 @@ fn get_batch_work(
         .get(worker_id)
         .and_then(|w| w.hardware.as_ref());
 
-    let max_batch_size = determine_batch_size(data.config.batch_size, worker_hw, &data.config.job_spec);
+    let max_batch_size = determine_batch_size(data.config.batch_size, worker_hw, &data.config.job_spec, data.config.memory_weight_mb);
     let partition_batch_size = data.worker_registry.get(worker_id)
         .and_then(|w| w.current_batch_size)
         .unwrap_or_else(|| (max_batch_size / 10).max(2).min(max_batch_size));
@@ -1289,7 +1302,7 @@ async fn get_work(
             .get(&req.worker_id)
             .and_then(|w| w.hardware.as_ref());
 
-        let max_batch_size = determine_batch_size(data.config.batch_size, worker_hw, &data.config.job_spec);
+        let max_batch_size = determine_batch_size(data.config.batch_size, worker_hw, &data.config.job_spec, data.config.memory_weight_mb);
         let batch_size = data.worker_registry.get(&req.worker_id)
             .and_then(|w| w.current_batch_size)
             .unwrap_or_else(|| (max_batch_size / 10).max(2).min(max_batch_size));
@@ -1383,7 +1396,7 @@ fn get_manhattan_work(
         .get(worker_id)
         .and_then(|w| w.hardware.as_ref());
 
-    let max_batch_size = determine_batch_size(data.config.batch_size, worker_hw, &data.config.job_spec);
+    let max_batch_size = determine_batch_size(data.config.batch_size, worker_hw, &data.config.job_spec, data.config.memory_weight_mb);
     let batch_size = data.worker_registry.get(worker_id)
         .and_then(|w| w.current_batch_size)
         .unwrap_or_else(|| (max_batch_size / 10).max(2).min(max_batch_size));
@@ -1916,6 +1929,7 @@ async fn complete_work(
     // Extract config values before borrowing worker_registry mutably
     let config_batch_size = data.config.batch_size;
     let job_spec_ref = data.config.job_spec.clone();
+    let memory_weight_mb = data.config.memory_weight_mb;
 
     // Clear the current_task from the worker and capture it for duration tracking
     // Also extract hardware info for AIMD calculation
@@ -1927,7 +1941,7 @@ async fn complete_work(
 
     // AIMD Batch Size Adjustment
     if let Some(w) = data.worker_registry.get_mut(&req.worker_id) {
-        let max_batch = determine_batch_size(config_batch_size, worker_hardware.as_ref(), &job_spec_ref);
+        let max_batch = determine_batch_size(config_batch_size, worker_hardware.as_ref(), &job_spec_ref, memory_weight_mb);
         // Start conservative if we don't have a baseline yet
         let current_batch = w.current_batch_size.unwrap_or((max_batch / 10).max(2).min(max_batch));
 
@@ -2309,11 +2323,35 @@ async fn handle_heartbeat(
     let mut data = state.lock().unwrap();
     touch_worker(&mut data, &req.worker_id, None);
 
+    // Extract config value before mutable borrow of worker_registry
+    let default_batch_size = data.config.batch_size;
+
     if let Some(w) = data.worker_registry.get_mut(&req.worker_id) {
         // Revive if previously suspected dead
         if w.status == WorkerStatus::SuspectedDead {
             w.status = WorkerStatus::Active;
         }
+
+        // Phase 3: Memory-based batch reduction heuristic
+        // If memory usage exceeds 85%, aggressively slash batch size to prevent OOM
+        if let (Some(used), Some(total)) = (req.telemetry.memory_used_bytes, req.telemetry.memory_total_bytes) {
+            if total > 0 {
+                let mem_usage_pct = (used as f64 / total as f64) * 100.0;
+                if mem_usage_pct > 85.0 {
+                    // Aggressively slash batch size to prevent OOM
+                    let current_batch = w.current_batch_size.unwrap_or(default_batch_size);
+                    let new_batch = (current_batch / 2).max(1);
+                    if new_batch < current_batch {
+                        println!(
+                            "Worker {} memory usage at {:.1}%. Reducing batch size from {} to {}",
+                            req.worker_id, mem_usage_pct, current_batch, new_batch
+                        );
+                        w.current_batch_size = Some(new_batch);
+                    }
+                }
+            }
+        }
+
         // Store telemetry snapshot in memory (for quick access to latest)
         w.metrics_history.push_back(req.telemetry.clone());
         if w.metrics_history.len() > MAX_METRICS_HISTORY {
@@ -2442,6 +2480,7 @@ async fn submit_job(
     data.config.total_partitions = req.total_partitions;
     data.config.filters = req.filters.clone();
     data.config.intervals = req.intervals.clone();
+    data.config.memory_weight_mb = req.memory_weight_mb;
     if let Some(batch_size) = req.batch_size {
         data.config.batch_size = batch_size;
     }

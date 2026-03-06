@@ -212,6 +212,17 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             _ => Some(50),
         });
 
+        // Phase 3: Job-type memory weight hints (MB per partition)
+        let memory_weight_mb = match job_spec {
+            crate::distributed::message::JobSpec::Manhattan { .. }
+            | crate::distributed::message::JobSpec::ManhattanBatch { .. }
+            | crate::distributed::message::JobSpec::ManhattanScan(_) => Some(1024), // 1GB per partition
+            crate::distributed::message::JobSpec::ExportParquet { .. }
+            | crate::distributed::message::JobSpec::ExportJson { .. } => Some(256), // 256MB
+            crate::distributed::message::JobSpec::Summary => Some(64), // 64MB, very light
+            _ => None,
+        };
+
         let request = JobConfigRequest {
             input_path: input_path.to_string(),
             job_spec: job_spec.clone(),
@@ -220,6 +231,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             force,
             filters: filters.to_vec(),
             intervals: intervals.to_vec(),
+            memory_weight_mb,
         };
 
         let json_payload = serde_json::to_string(&request)
