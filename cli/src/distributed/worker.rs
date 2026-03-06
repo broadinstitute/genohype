@@ -707,7 +707,131 @@ pub fn dispatch_job(
                 )))
             }
         }
+        JobSpec::Stress(spec) => {
+            let rows = process_stress(partitions, spec, telemetry)?;
+            Ok((rows, None, cached_engine))
+        }
     }
+}
+
+/// Process a synthetic stress test workload.
+///
+/// Simulates CPU, Memory, and Network I/O loads concurrently based on the `StressSpec` parameters.
+fn process_stress(
+    partitions: &[usize],
+    spec: &crate::distributed::message::StressSpec,
+    telemetry: Option<Arc<TelemetryState>>,
+) -> Result<usize> {
+    use rayon::prelude::*;
+    use std::time::Instant;
+    use std::io::{Read, Write};
+
+    println!("Processing {} stress partitions...", partitions.len());
+
+    let results: Vec<Result<usize>> = partitions.par_iter().map(|&partition_id| {
+        // Tag this thread for the dashboard's per-core task view
+        let _core_guard = telemetry.as_ref().map(|ts| CoreTaskGuard::partition(ts, partition_id));
+
+        // 1. Memory Load: allocate and hold a large vector.
+        let mut mem_hog: Vec<u64> = Vec::new();
+        if spec.memory_mb > 0 {
+            let elements = (spec.memory_mb * 1024 * 1024) / 8;
+            mem_hog.resize(elements, 0u64);
+            // Force the OS to actually allocate the physical pages by writing to them.
+            for i in 0..elements {
+                mem_hog[i] = i as u64;
+            }
+        }
+
+        // 2. CPU Load: spin doing heavy math operations.
+        if spec.cpu_secs > 0.0 {
+            let start = Instant::now();
+            let mut dummy: f64 = 1.0;
+            while start.elapsed().as_secs_f64() < spec.cpu_secs {
+                // Inner tight loop to avoid excessive clock reads
+                for _ in 0..10_000 {
+                    dummy = dummy.sin().cos().exp();
+                }
+            }
+            // Prevent the compiler from optimizing away the math loop
+            std::hint::black_box(dummy);
+        }
+
+        // 3. Generate read data if requested (write temp file, then read it back)
+        let generated_read_path = if spec.generate_read_data {
+            if let Some(write_dir) = &spec.write_dir {
+                let temp_path = format!("{}/stress_read_{}.bin", write_dir.trim_end_matches('/'), partition_id);
+
+                // Write the temporary file
+                if let Ok(mut writer) = StreamingCloudWriter::new(&temp_path) {
+                    let chunk_size = 8 * 1024 * 1024; // 8MB chunks
+                    let total_bytes = spec.read_data_size_mb * 1024 * 1024;
+                    let buf = vec![0xBB; chunk_size];
+                    let mut written = 0;
+
+                    while written < total_bytes {
+                        let to_write = std::cmp::min(chunk_size, total_bytes - written);
+                        let _ = writer.write(&buf[..to_write]);
+                        written += to_write;
+                    }
+                    let _ = writer.finish();
+                }
+
+                Some(temp_path)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // 4. Network RX Load: stream data from a remote path and discard it.
+        // Use generated path if available, otherwise use explicit read_path
+        let read_source = generated_read_path.as_ref().or(spec.read_path.as_ref());
+        if let Some(read_path) = read_source {
+            if let Ok(mut reader) = genohype_core::io::get_reader(read_path) {
+                let mut buf = vec![0u8; 8 * 1024 * 1024]; // 8MB read buffer
+                while let Ok(n) = reader.read(&mut buf) {
+                    if n == 0 { break; }
+                }
+            }
+        }
+
+        // 5. Network TX Load: stream random bytes to a remote path (separate from generated read data).
+        if let Some(write_dir) = &spec.write_dir {
+            // Only write stress output files if not in generate-read-data-only mode
+            // or if we want both TX and generated read data
+            if !spec.generate_read_data {
+                let out_path = format!("{}/stress_{}.bin", write_dir.trim_end_matches('/'), partition_id);
+                if let Ok(mut writer) = StreamingCloudWriter::new(&out_path) {
+                    let buf = vec![0xAA; 8 * 1024 * 1024]; // 8MB block
+                    // Write 4 chunks to simulate a 32MB file per partition
+                    for _ in 0..4 {
+                        let _ = writer.write(&buf);
+                    }
+                    let _ = writer.finish();
+                }
+            }
+        }
+
+        // Keep the memory allocated until the end of the task
+        std::hint::black_box(&mem_hog);
+
+        // Bump the simulated rows counter to give the dashboard some throughput data
+        let rows_simulated = 10_000;
+        if let Some(ref t) = telemetry {
+            t.total_rows.fetch_add(rows_simulated, Ordering::Relaxed);
+        }
+
+        Ok(rows_simulated)
+    }).collect();
+
+    let mut total_rows = 0;
+    for res in results {
+        total_rows += res?;
+    }
+
+    Ok(total_rows)
 }
 
 /// Process partitions and export to ClickHouse.

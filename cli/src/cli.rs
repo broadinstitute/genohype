@@ -96,6 +96,9 @@ pub enum Commands {
         #[command(subcommand)]
         command: IngestCommands,
     },
+
+    /// Synthetic workload for testing cluster telemetry
+    Stress(StressArgs),
 }
 
 #[derive(Subcommand)]
@@ -719,6 +722,39 @@ pub struct LocusArgs {
     /// Max Y-axis value (-log10 p)
     #[arg(long, default_value = "30.0")]
     pub y_max: f64,
+}
+
+/// Arguments for synthetic stress test workload.
+#[derive(Args, Debug)]
+pub struct StressArgs {
+    /// Total number of tasks to queue
+    #[arg(long, default_value = "100")]
+    pub partitions: usize,
+
+    /// Seconds of pure CPU math to spin per partition
+    #[arg(long, default_value = "0.0")]
+    pub cpu_secs: f64,
+
+    /// Megabytes of RAM to allocate and hold per partition
+    #[arg(long, default_value = "0")]
+    pub memory_mb: usize,
+
+    /// A file to stream into memory to generate Network RX (e.g. gs://bucket/file.json)
+    #[arg(long)]
+    pub read_path: Option<String>,
+
+    /// A directory to pump random bytes into to generate Network TX
+    #[arg(long)]
+    pub write_dir: Option<String>,
+
+    /// Generate temporary read data (writes to write_dir first, then reads back).
+    /// Requires --write-dir to be set.
+    #[arg(long)]
+    pub generate_read_data: bool,
+
+    /// Size in MB of generated read data per partition (default: 32)
+    #[arg(long, default_value = "32")]
+    pub read_data_size_mb: usize,
 }
 
 /// Subcommands for managing cluster configurations (legacy).

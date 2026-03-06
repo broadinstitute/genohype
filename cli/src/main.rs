@@ -27,7 +27,7 @@ mod genomic;
 pub use genohype_core::{HailError, Result};
 
 use clap::Parser;
-use cli::{Cli, ClickHouseCommands, ClusterCommands, Commands, EnvCommands, ExportCommands, ExportParquetArgs, ExportJsonArgs, ExportVcfArgs, ExportHailArgs, HasCommonExportArgs, LociArgs, LocusArgs, ManhattanArgs, ManhattanBatchArgs, PoolCommands, QueryArgs, ServiceCommands};
+use cli::{Cli, ClickHouseCommands, ClusterCommands, Commands, EnvCommands, ExportCommands, ExportParquetArgs, ExportJsonArgs, ExportVcfArgs, ExportHailArgs, HasCommonExportArgs, LociArgs, LocusArgs, ManhattanArgs, ManhattanBatchArgs, PoolCommands, QueryArgs, ServiceCommands, StressArgs};
 #[cfg(feature = "validation")]
 use cli::{SchemaSubcommands, ValidateArgs};
 #[cfg(feature = "clickhouse")]
@@ -122,6 +122,12 @@ fn main() -> Result<()> {
         Commands::Service { command } => run_service_command(command)?,
         #[cfg(feature = "clickhouse")]
         Commands::Ingest { command } => run_ingest_command(command)?,
+        Commands::Stress(args) => {
+            use owo_colors::OwoColorize;
+            println!("{} The stress command is designed to be run via a worker pool:", "Note:".cyan());
+            println!("  genohype pool submit <pool_name> -- stress --partitions {} --cpu-secs {} --memory-mb {}",
+                args.partitions, args.cpu_secs, args.memory_mb);
+        }
     }
 
     Ok(())
