@@ -4,6 +4,8 @@ import path from 'path'
 
 export default defineConfig({
   plugins: [react()],
+  // Base path for production - dashboard is served at /dashboard
+  base: '/dashboard/',
   server: {
     port: parseInt(process.env.PORT || '5174'),
     proxy: {
