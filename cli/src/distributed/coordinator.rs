@@ -21,7 +21,10 @@ use crate::distributed::metrics_db::MetricsDb;
 use crate::manhattan::config::PlotType;
 use crate::Result;
 use axum::body::Body;
-use tower_http::services::{ServeDir, ServeFile};
+use axum::http::{header, StatusCode};
+use axum::response::{IntoResponse, Response};
+use rust_embed::Embed;
+use mime_guess;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -617,43 +620,6 @@ pub async fn run_coordinator(
         }
     });
 
-    // Determine static files directory for the SPA dashboard
-    // Try multiple paths to support various deployment scenarios:
-    // 1. Relative to current working directory (development: `cargo run` from cli/)
-    // 2. Relative to the binary location (production deployment)
-    let static_dir = {
-        let cwd_path = std::path::PathBuf::from("static/dist");
-        if cwd_path.exists() {
-            cwd_path
-        } else {
-            // Try relative to binary location
-            let exe_path = std::env::current_exe().ok();
-            let exe_dir_path = exe_path
-                .as_ref()
-                .and_then(|p| p.parent())
-                .map(|p| p.join("../static/dist"));
-            if let Some(ref path) = exe_dir_path {
-                if path.exists() {
-                    path.clone()
-                } else {
-                    // Fallback: use CWD path and let ServeDir handle the error
-                    println!(
-                        "Warning: Static dashboard files not found at {:?} or {:?}",
-                        cwd_path, path
-                    );
-                    println!("Run `make dashboard` to build the pool-dashboard SPA");
-                    cwd_path
-                }
-            } else {
-                cwd_path
-            }
-        }
-    };
-
-    // Build the static file service with fallback to index.html for SPA routing
-    let serve_dir = ServeDir::new(&static_dir)
-        .not_found_service(ServeFile::new(static_dir.join("index.html")));
-
     let app = Router::new()
         .route("/work", post(get_work))
         .route("/complete", post(complete_work))
@@ -674,8 +640,9 @@ pub async fn run_coordinator(
         .route("/api/failures", get(get_failures))
         .route("/api/workers/:worker_id/logs", get(get_worker_logs))
         .with_state(state)
-        // Serve the SPA dashboard from /dashboard (nested under /dashboard path)
-        .nest_service("/dashboard", serve_dir);
+        // Serve embedded SPA dashboard
+        .route("/dashboard", get(serve_dashboard_index))
+        .route("/dashboard/*path", get(serve_dashboard_asset));
 
     println!("Dashboard available at http://0.0.0.0:{}/dashboard", port);
 
@@ -2322,8 +2289,8 @@ async fn submit_job(
         });
     }
 
-    // ManhattanBatch, Manhattan, and IngestManhattan jobs don't require input_path (they use per-spec paths)
-    let needs_input_path = !is_batch_job && !is_ingest_job && !matches!(&req.job_spec, JobSpec::Manhattan { .. });
+    // ManhattanBatch, Manhattan, IngestManhattan, and Stress jobs don't require input_path (they use per-spec paths)
+    let needs_input_path = !is_batch_job && !is_ingest_job && !matches!(&req.job_spec, JobSpec::Manhattan { .. }) && !matches!(&req.job_spec, JobSpec::Stress(_));
     if req.input_path.is_empty() && needs_input_path {
         return axum::Json(JobConfigResponse {
             acknowledged: false,
@@ -3054,8 +3021,58 @@ async fn get_worker_logs(
     axum::Json(logs)
 }
 
-// Note: Dashboard is now served as a SPA from static/dist via ServeDir.
-// The old embedded HTML handlers have been removed in favor of the React app.
+// ============================================================================
+// Embedded Dashboard SPA
+// ============================================================================
+
+/// Embedded static files for the pool-dashboard SPA.
+/// Files are included at compile time from cli/static/dist.
+#[derive(Embed)]
+#[folder = "static/dist"]
+struct DashboardAssets;
+
+/// Handler for serving embedded dashboard assets.
+/// Serves files from the embedded SPA, falling back to index.html for SPA routing.
+async fn serve_dashboard_asset(
+    axum::extract::Path(path): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    serve_embedded_file(&path)
+}
+
+/// Handler for the dashboard root - serves index.html.
+async fn serve_dashboard_index() -> impl IntoResponse {
+    serve_embedded_file("index.html")
+}
+
+/// Serve an embedded file by path, with SPA fallback to index.html.
+fn serve_embedded_file(path: &str) -> Response {
+    // Try to get the requested file
+    let file = DashboardAssets::get(path).or_else(|| {
+        // For SPA routing: if the path doesn't exist, serve index.html
+        // (unless it looks like a file request with an extension)
+        if !path.contains('.') {
+            DashboardAssets::get("index.html")
+        } else {
+            None
+        }
+    });
+
+    match file {
+        Some(content) => {
+            // Determine content type from file extension
+            let mime = mime_guess::from_path(path).first_or_octet_stream();
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, mime.as_ref())
+                .body(Body::from(content.data.into_owned()))
+                .unwrap()
+        }
+        None => Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from("Not found"))
+            .unwrap(),
+    }
+}
 
 /// Handler for GET /api/binary - serve the genohype binary.
 ///
