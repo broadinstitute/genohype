@@ -248,6 +248,8 @@ struct WorkerState {
     latest_log_tail: Option<Vec<String>>,
     /// Hardware specifications reported by worker
     hardware: Option<crate::distributed::message::HardwareSpec>,
+    /// Dynamically adjusted batch size for this worker (AIMD algorithm)
+    current_batch_size: Option<usize>,
 }
 
 /// Internal state of the coordinator.
@@ -832,6 +834,7 @@ fn touch_worker(
             current_task: None,
             latest_log_tail: None,
             hardware: None,
+            current_batch_size: None,
         });
     worker.last_seen = Instant::now();
     if hardware.is_some() {
@@ -1029,8 +1032,11 @@ fn get_batch_work(
         .worker_registry
         .get(worker_id)
         .and_then(|w| w.hardware.as_ref());
-    let partition_batch_size =
-        determine_batch_size(data.config.batch_size, worker_hw, &data.config.job_spec);
+
+    let max_batch_size = determine_batch_size(data.config.batch_size, worker_hw, &data.config.job_spec);
+    let partition_batch_size = data.worker_registry.get(worker_id)
+        .and_then(|w| w.current_batch_size)
+        .unwrap_or_else(|| (max_batch_size / 10).max(2).min(max_batch_size));
 
     // Step 1: Activate phenotypes to fill the active pool
     activate_next_phenotypes(batch);
@@ -1146,15 +1152,24 @@ fn get_batch_work(
             },
         );
 
-        // Update worker status
-        if let Some(w) = data.worker_registry.get_mut(worker_id) {
-            w.status = WorkerStatus::Active;
-        }
-
         let source_name = match source {
             ManhattanSource::Exome => "exome",
             ManhattanSource::Genome => "genome",
         };
+
+        // Update worker status and track task info for AIMD duration tracking
+        if let Some(w) = data.worker_registry.get_mut(worker_id) {
+            w.status = WorkerStatus::Active;
+            w.current_task = Some(ActiveTaskInfo {
+                task_id: task_id.clone(),
+                phenotype_id: Some(phenotype_id.clone()),
+                phase: "scan".to_string(),
+                source: Some(source_name.to_string()),
+                partitions: partitions.clone(),
+                started_at_ms: CoordinatorData::now_ms(),
+            });
+        }
+
         println!(
             "Assigned {} partitions {:?} to worker {} for phenotype {} [task={}]",
             source_name, partitions, worker_id, phenotype_id, &task_id[..8]
@@ -1273,8 +1288,11 @@ async fn get_work(
             .worker_registry
             .get(&req.worker_id)
             .and_then(|w| w.hardware.as_ref());
-        let batch_size =
-            determine_batch_size(data.config.batch_size, worker_hw, &data.config.job_spec);
+
+        let max_batch_size = determine_batch_size(data.config.batch_size, worker_hw, &data.config.job_spec);
+        let batch_size = data.worker_registry.get(&req.worker_id)
+            .and_then(|w| w.current_batch_size)
+            .unwrap_or_else(|| (max_batch_size / 10).max(2).min(max_batch_size));
 
         while partitions.len() < batch_size {
             if let Some(next_id) = data.pending_partitions.pop_front() {
@@ -1291,20 +1309,6 @@ async fn get_work(
                 .insert(p, (req.worker_id.clone(), now));
         }
 
-        // Update worker status
-        if let Some(w) = data.worker_registry.get_mut(&req.worker_id) {
-            w.status = WorkerStatus::Active;
-        }
-
-        println!(
-            "Assigned partitions {:?} to worker {} ({} pending, {} processing, {} complete)",
-            partitions,
-            req.worker_id,
-            data.pending_partitions.len(),
-            data.processing_partitions.len(),
-            data.completed_partitions.len()
-        );
-
         // Get job_spec, or return Wait if not configured (shouldn't happen since we check idle)
         let job_spec = match data.config.job_spec.clone() {
             Some(spec) => spec,
@@ -1319,6 +1323,28 @@ async fn get_work(
 
         // Generate unique task ID for tracking
         let task_id = Uuid::new_v4().to_string();
+
+        // Update worker status and assign task info for AIMD duration tracking
+        if let Some(w) = data.worker_registry.get_mut(&req.worker_id) {
+            w.status = WorkerStatus::Active;
+            w.current_task = Some(ActiveTaskInfo {
+                task_id: task_id.clone(),
+                phenotype_id: None,
+                phase: "export".to_string(),
+                source: None,
+                partitions: partitions.clone(),
+                started_at_ms: CoordinatorData::now_ms(),
+            });
+        }
+
+        println!(
+            "Assigned partitions {:?} to worker {} ({} pending, {} processing, {} complete)",
+            partitions,
+            req.worker_id,
+            data.pending_partitions.len(),
+            data.processing_partitions.len(),
+            data.completed_partitions.len()
+        );
 
         axum::Json(WorkResponse::Task {
             task_id,
@@ -1356,7 +1382,11 @@ fn get_manhattan_work(
         .worker_registry
         .get(worker_id)
         .and_then(|w| w.hardware.as_ref());
-    let batch_size = determine_batch_size(data.config.batch_size, worker_hw, &data.config.job_spec);
+
+    let max_batch_size = determine_batch_size(data.config.batch_size, worker_hw, &data.config.job_spec);
+    let batch_size = data.worker_registry.get(worker_id)
+        .and_then(|w| w.current_batch_size)
+        .unwrap_or_else(|| (max_batch_size / 10).max(2).min(max_batch_size));
 
     // Generate unique task ID for tracking
     let task_id = Uuid::new_v4().to_string();
@@ -1421,25 +1451,14 @@ fn get_manhattan_work(
                     }
                 };
 
-            // Update worker status
-            if let Some(w) = data.worker_registry.get_mut(worker_id) {
-                w.status = WorkerStatus::Active;
-            }
-
             let source_name = match source {
                 ManhattanSource::Exome => "exome",
                 ManhattanSource::Genome => "genome",
             };
-            println!(
-                "Assigned {} partitions {:?} to worker {} (scan phase)",
-                source_name, partitions, worker_id
-            );
 
-            // Build ManhattanScanSpec with identity metadata
-            // For single mode, extract phenotype from output path if not set
+            // Build identity metadata for dashboard task mapping
             let phenotype = manhattan.original_spec.phenotype.clone()
                 .unwrap_or_else(|| {
-                    // Extract last segment of output path as phenotype ID
                     manhattan.original_spec.output_path
                         .trim_end_matches('/')
                         .rsplit('/')
@@ -1447,6 +1466,26 @@ fn get_manhattan_work(
                         .unwrap_or("unknown")
                         .to_string()
                 });
+
+            // Update worker status and task info for AIMD duration tracking
+            if let Some(w) = data.worker_registry.get_mut(worker_id) {
+                w.status = WorkerStatus::Active;
+                w.current_task = Some(ActiveTaskInfo {
+                    task_id: task_id.clone(),
+                    phenotype_id: Some(phenotype.clone()),
+                    phase: "scan".to_string(),
+                    source: Some(source_name.to_string()),
+                    partitions: partitions.clone(),
+                    started_at_ms: CoordinatorData::now_ms(),
+                });
+            }
+
+            println!(
+                "Assigned {} partitions {:?} to worker {} (scan phase)",
+                source_name, partitions, worker_id
+            );
+
+            // Build ManhattanScanSpec with identity metadata
             let ancestry = manhattan.original_spec.ancestry.clone()
                 .unwrap_or_else(|| "unknown".to_string());
 
@@ -1874,9 +1913,48 @@ async fn complete_work(
     let mut data = state.lock().unwrap();
     let now_ms = CoordinatorData::now_ms();
 
-    // Clear the current_task from the worker
+    // Extract config values before borrowing worker_registry mutably
+    let config_batch_size = data.config.batch_size;
+    let job_spec_ref = data.config.job_spec.clone();
+
+    // Clear the current_task from the worker and capture it for duration tracking
+    // Also extract hardware info for AIMD calculation
+    let (completed_task, worker_hardware) = if let Some(w) = data.worker_registry.get_mut(&req.worker_id) {
+        (w.current_task.take(), w.hardware.clone())
+    } else {
+        (None, None)
+    };
+
+    // AIMD Batch Size Adjustment
     if let Some(w) = data.worker_registry.get_mut(&req.worker_id) {
-        w.current_task = None;
+        let max_batch = determine_batch_size(config_batch_size, worker_hardware.as_ref(), &job_spec_ref);
+        // Start conservative if we don't have a baseline yet
+        let current_batch = w.current_batch_size.unwrap_or((max_batch / 10).max(2).min(max_batch));
+
+        if req.error.is_some() {
+            // Multiplicative Decrease: halve the batch size on failure/timeout
+            w.current_batch_size = Some((current_batch / 2).max(1));
+        } else if let Some(task) = &completed_task {
+            let duration_secs = (now_ms.saturating_sub(task.started_at_ms)) as f64 / 1000.0;
+            let num_partitions = req.partitions.len() as f64;
+
+            if num_partitions > 0.0 && duration_secs > 0.0 {
+                let time_per_partition = duration_secs / num_partitions;
+                // Target an ideal turnaround of 60 seconds
+                let target_batch = (60.0 / time_per_partition).round() as usize;
+                let clamped_target = target_batch.clamp(1, max_batch);
+
+                let next_batch = if clamped_target > current_batch {
+                    // Additive Increase / Slow Start: grow safely up to the optimal target
+                    let growth = (current_batch / 4).max(2);
+                    (current_batch + growth).min(clamped_target)
+                } else {
+                    // Multiplicative Decrease (soft): instantly drop to the optimal target if taking too long
+                    clamped_target
+                };
+                w.current_batch_size = Some(next_batch);
+            }
+        }
     }
 
     // Check if this is a failure report
