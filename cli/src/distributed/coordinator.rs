@@ -2318,13 +2318,16 @@ fn check_worker_liveness(state: &SharedState) {
 /// Handler for POST /heartbeat - worker sends telemetry.
 async fn handle_heartbeat(
     axum::extract::State(state): axum::extract::State<SharedState>,
-    axum::Json(req): axum::Json<HeartbeatRequest>,
+    axum::Json(mut req): axum::Json<HeartbeatRequest>,
 ) -> axum::Json<HeartbeatResponse> {
     let mut data = state.lock().unwrap();
     touch_worker(&mut data, &req.worker_id, None);
 
     // Extract config value before mutable borrow of worker_registry
     let default_batch_size = data.config.batch_size;
+
+    // Track if we need to log an event (collected outside the mutable borrow)
+    let mut batch_reduction_event: Option<(String, usize, f64)> = None;
 
     if let Some(w) = data.worker_registry.get_mut(&req.worker_id) {
         // Revive if previously suspected dead
@@ -2346,17 +2349,35 @@ async fn handle_heartbeat(
                             "Worker {} memory usage at {:.1}%. Reducing batch size from {} to {}",
                             req.worker_id, mem_usage_pct, current_batch, new_batch
                         );
+
+                        // Collect event info to log after releasing worker borrow
+                        batch_reduction_event = Some((req.worker_id.clone(), new_batch, mem_usage_pct));
+
                         w.current_batch_size = Some(new_batch);
                     }
                 }
             }
         }
 
+        // Inject the current batch size into telemetry before persistence
+        req.telemetry.current_batch_size = w.current_batch_size;
+
         // Store telemetry snapshot in memory (for quick access to latest)
         w.metrics_history.push_back(req.telemetry.clone());
         if w.metrics_history.len() > MAX_METRICS_HISTORY {
             w.metrics_history.pop_front();
         }
+    }
+
+    // Log batch reduction event for the UI (outside the worker borrow)
+    if let Some((worker_id, new_batch, mem_pct)) = batch_reduction_event {
+        data.log_event(JobEvent {
+            timestamp_ms: CoordinatorData::now_ms(),
+            event_type: "warning".to_string(),
+            worker_id: Some(worker_id),
+            phenotype_id: None,
+            details: format!("Reduced batch size to {} (Memory at {:.1}%)", new_batch, mem_pct),
+        });
     }
 
     // Persist to SQLite (fire-and-forget, don't block on DB errors)
@@ -2983,6 +3004,8 @@ async fn get_dashboard_bottlenecks(
     let mut total_mem_pct = 0.0_f64;
     let mut total_rx = 0.0_f64;
     let mut total_tx = 0.0_f64;
+    let mut total_batch_size = 0usize;
+    let mut mem_constrained_workers = 0usize;
 
     for worker in data.worker_registry.values() {
         if worker.status == WorkerStatus::Active {
@@ -2994,11 +3017,16 @@ async fn get_dashboard_bottlenecks(
                     (telemetry.memory_used_bytes, telemetry.memory_total_bytes)
                 {
                     if total > 0 {
-                        total_mem_pct += (used as f64 / total as f64) * 100.0;
+                        let pct = (used as f64 / total as f64) * 100.0;
+                        total_mem_pct += pct;
+                        if pct > 85.0 {
+                            mem_constrained_workers += 1;
+                        }
                     }
                 }
                 total_rx += telemetry.network_rx_bytes_sec.unwrap_or(0.0);
                 total_tx += telemetry.network_tx_bytes_sec.unwrap_or(0.0);
+                total_batch_size += worker.current_batch_size.unwrap_or(data.config.batch_size);
             }
         }
     }
@@ -3018,53 +3046,54 @@ async fn get_dashboard_bottlenecks(
     let avg_mem = (total_mem_pct / active_count as f64) as f32;
     let avg_rx_mb = (total_rx / active_count as f64) / 1_048_576.0;
     let avg_tx_mb = (total_tx / active_count as f64) / 1_048_576.0;
+    let avg_batch = total_batch_size / active_count;
 
     let (bottleneck, description) = if avg_cpu > 85.0 {
         (
             "CPU".to_string(),
             format!(
-                "CPU Bound ({:.1}% utilization) - Scanning phase or heavy decoding.",
-                avg_cpu
+                "CPU Bound ({:.1}% utilization) - Scanning phase or heavy decoding. (Avg batch: {})",
+                avg_cpu, avg_batch
             ),
         )
-    } else if avg_mem > 85.0 {
+    } else if mem_constrained_workers > 0 || avg_mem > 85.0 {
         (
             "Memory".to_string(),
             format!(
-                "Memory Bound ({:.1}% utilization) - Aggregation phase or high partition count.",
-                avg_mem
+                "Memory Bound ({:.1}% utilization) - {} workers throttled to prevent OOM. (Avg batch: {})",
+                avg_mem, mem_constrained_workers.max(1), avg_batch
             ),
         )
     } else if avg_rx_mb > 800.0 {
         (
             "Network RX".to_string(),
             format!(
-                "Network Downlink Bound ({:.1} MB/s) - Saturated VM network fetching from GCS.",
-                avg_rx_mb
+                "Network Downlink Bound ({:.1} MB/s) - Saturated VM network fetching from GCS. (Avg batch: {})",
+                avg_rx_mb, avg_batch
             ),
         )
     } else if avg_tx_mb > 500.0 {
         (
             "Network TX".to_string(),
             format!(
-                "Network Uplink Bound ({:.1} MB/s) - Saturated VM network writing to GCS.",
-                avg_tx_mb
+                "Network Uplink Bound ({:.1} MB/s) - Saturated VM network writing to GCS. (Avg batch: {})",
+                avg_tx_mb, avg_batch
             ),
         )
     } else if avg_cpu < 30.0 {
         (
             "I/O Wait".to_string(),
             format!(
-                "Low Utilization ({:.1}% CPU). Likely waiting on external I/O or single-threaded aggregation.",
-                avg_cpu
+                "Low Utilization ({:.1}% CPU). Likely waiting on external I/O or single-threaded aggregation. (Avg batch: {})",
+                avg_cpu, avg_batch
             ),
         )
     } else {
         (
             "Mixed".to_string(),
             format!(
-                "Healthy distribution. CPU: {:.1}%, Mem: {:.1}%",
-                avg_cpu, avg_mem
+                "Healthy distribution. CPU: {:.1}%, Mem: {:.1}% (Avg batch: {})",
+                avg_cpu, avg_mem, avg_batch
             ),
         )
     };
@@ -3092,6 +3121,7 @@ async fn get_dashboard_workers(
         .map(|(id, w)| DashboardWorker {
             worker_id: id.clone(),
             status: w.status.as_str().to_string(),
+            current_batch_size: w.current_batch_size,
             last_seen_secs: now.duration_since(w.last_seen).as_secs_f64(),
             telemetry: w.metrics_history.back().cloned(),
             total_items: w.total_rows,

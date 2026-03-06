@@ -211,6 +211,10 @@ pub struct TelemetrySnapshot {
     /// Map of CPU core index (Rayon thread ID) to currently executing task info
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub core_tasks: Option<std::collections::HashMap<usize, CoreTaskInfo>>,
+
+    /// The current dynamically adjusted batch size for this worker
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_batch_size: Option<usize>,
 }
 
 /// Heartbeat request from worker to coordinator.
@@ -271,6 +275,9 @@ pub struct DashboardWorker {
     pub worker_id: String,
     /// Worker status
     pub status: String,
+    /// Current dynamically adjusted batch size
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_batch_size: Option<usize>,
     /// Current telemetry
     #[serde(skip_serializing_if = "Option::is_none")]
     pub telemetry: Option<TelemetrySnapshot>,

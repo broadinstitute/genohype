@@ -55,6 +55,8 @@ export interface TelemetrySnapshot {
   network_tx_bytes_sec?: number;
   /** Map of CPU core index (Rayon thread ID) to currently executing task info */
   core_tasks?: Record<number, CoreTaskInfo>;
+  /** Current dynamically adjusted batch size */
+  current_batch_size?: number;
 }
 
 /**
@@ -101,6 +103,8 @@ export interface DashboardWorker {
   worker_id: string;
   /** Worker status */
   status: string;
+  /** Current dynamically adjusted batch size */
+  current_batch_size?: number;
   /** Current telemetry */
   telemetry?: TelemetrySnapshot;
   /** Time since last heartbeat in seconds */

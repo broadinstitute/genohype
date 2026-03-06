@@ -667,6 +667,9 @@ pub struct DashboardWorker {
     pub worker_id: String,
     /// Current status
     pub status: String,
+    /// Current dynamically adjusted batch size
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_batch_size: Option<usize>,
     /// Seconds since last heartbeat
     pub last_seen_secs: f64,
     /// Latest telemetry snapshot

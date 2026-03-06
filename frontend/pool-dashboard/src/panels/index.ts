@@ -17,6 +17,7 @@ export {
   CpuChartPanel,
   MemoryChartPanel,
   NetworkChartPanel,
+  BatchSizeChartPanel,
 } from './metrics';
 
 // Log panels

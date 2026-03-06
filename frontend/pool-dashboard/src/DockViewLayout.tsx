@@ -13,6 +13,7 @@ import {
   CpuChartPanel,
   MemoryChartPanel,
   NetworkChartPanel,
+  BatchSizeChartPanel,
   EventLogPanel,
   FailuresPanel,
   PhenotypeBatchPanel,
@@ -27,6 +28,7 @@ const components: Record<string, React.FC> = {
   cpuChart: CpuChartPanel,
   memoryChart: MemoryChartPanel,
   networkChart: NetworkChartPanel,
+  batchSizeChart: BatchSizeChartPanel,
   eventLog: EventLogPanel,
   failures: FailuresPanel,
   phenotypeBatch: PhenotypeBatchPanel,
@@ -119,6 +121,13 @@ export const applyPerformanceLayout = (api: DockviewApi) => {
   });
 
   api.addPanel({
+    id: 'batch_size_chart',
+    component: 'batchSizeChart',
+    title: 'Batch Size',
+    position: { direction: 'right', referencePanel: memory.id },
+  });
+
+  const throughput = api.addPanel({
     id: 'throughput_chart',
     component: 'throughputChart',
     title: 'Throughput',
@@ -129,7 +138,7 @@ export const applyPerformanceLayout = (api: DockviewApi) => {
     id: 'network_chart',
     component: 'networkChart',
     title: 'Network',
-    position: { direction: 'below', referencePanel: memory.id },
+    position: { direction: 'right', referencePanel: throughput.id },
   });
 };
 

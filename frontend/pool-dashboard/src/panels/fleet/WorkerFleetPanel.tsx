@@ -37,7 +37,12 @@ const WorkerCard: React.FC<{ worker: DashboardWorker }> = ({ worker }) => {
   return (
     <div className={`worker-card ${worker.status}`}>
       <div className="worker-header">
-        <span style={{ fontWeight: 600, color: 'var(--cyan)' }}>{worker.worker_id}</span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <span style={{ fontWeight: 600, color: 'var(--cyan)' }}>{worker.worker_id}</span>
+          {t?.memory_used_bytes && t?.memory_total_bytes && (t.memory_used_bytes / t.memory_total_bytes) > 0.85 && (
+            <span style={{ fontSize: '9px', fontWeight: 600, color: 'var(--bg)', background: 'var(--red)', padding: '1px 4px', borderRadius: '3px' }}>MEM BOUND</span>
+          )}
+        </div>
         <StatusBadge status={worker.status} />
       </div>
 
@@ -65,7 +70,7 @@ const WorkerCard: React.FC<{ worker: DashboardWorker }> = ({ worker }) => {
             )}
 
             {/* Resource Stats */}
-            <WorkerStats telemetry={t} partitionsCompleted={t.partitions_completed} />
+            <WorkerStats telemetry={t} partitionsCompleted={t.partitions_completed} currentBatch={worker.current_batch_size} />
           </>
         ) : (
           <div className="empty-state" style={{ height: 'auto' }}>
@@ -217,7 +222,8 @@ const CoresGrid: React.FC<{
 const WorkerStats: React.FC<{
   telemetry: TelemetrySnapshot;
   partitionsCompleted: number;
-}> = ({ telemetry, partitionsCompleted }) => {
+  currentBatch?: number;
+}> = ({ telemetry, partitionsCompleted, currentBatch }) => {
   const formatBytes = (bytes: number | undefined): string => {
     if (bytes === undefined) return '--';
     if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
@@ -236,10 +242,9 @@ const WorkerStats: React.FC<{
 
   const memUsed = telemetry.memory_used_bytes;
   const memTotal = telemetry.memory_total_bytes;
-  const memPct =
-    memUsed !== undefined && memTotal !== undefined && memTotal > 0
-      ? ((memUsed / memTotal) * 100).toFixed(0)
-      : '--';
+  const memRatio = memUsed !== undefined && memTotal !== undefined && memTotal > 0 ? (memUsed / memTotal) : 0;
+  const memPct = memRatio > 0 ? (memRatio * 100).toFixed(0) : '--';
+  const memColor = memRatio > 0.85 ? 'var(--red)' : memRatio > 0.75 ? 'var(--yellow)' : 'inherit';
 
   return (
     <div
@@ -253,9 +258,15 @@ const WorkerStats: React.FC<{
       {/* Memory */}
       <div>
         <span style={{ color: 'var(--text-dim)' }}>RAM: </span>
-        <span>
+        <span style={{ color: memColor }}>
           {formatBytes(memUsed)} / {formatBytes(memTotal)} ({memPct}%)
         </span>
+      </div>
+
+      {/* Batch Size */}
+      <div>
+        <span style={{ color: 'var(--text-dim)' }}>Batch Size: </span>
+        <span style={{ color: 'var(--cyan)' }}>{currentBatch ?? '--'}</span>
       </div>
 
       {/* Partitions Done */}
