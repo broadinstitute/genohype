@@ -115,6 +115,26 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
         config.worker_id, config.coordinator_url
     );
 
+    let hardware = {
+        use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
+        let mut sys = System::new_with_specifics(
+            RefreshKind::new()
+                .with_cpu(CpuRefreshKind::new())
+                .with_memory(MemoryRefreshKind::new().with_ram()),
+        );
+        sys.refresh_cpu_list(CpuRefreshKind::new());
+        sys.refresh_memory();
+        crate::distributed::message::HardwareSpec {
+            num_cores: sys.cpus().len(),
+            total_memory_mb: sys.total_memory() / (1024 * 1024),
+        }
+    };
+
+    println!(
+        "Hardware detected: {} cores, {} MB RAM",
+        hardware.num_cores, hardware.total_memory_mb
+    );
+
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
         .timeout(Duration::from_secs(300)) // 5 minute request timeout
@@ -151,7 +171,7 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
 
     loop {
         // Request work from coordinator
-        let work_response = match request_work(&client, &work_url, &config.worker_id).await {
+        let work_response = match request_work(&client, &work_url, &config.worker_id, &hardware).await {
             Ok(resp) => resp,
             Err(e) => {
                 eprintln!(
@@ -310,9 +330,11 @@ async fn request_work(
     client: &reqwest::Client,
     url: &str,
     worker_id: &str,
+    hardware: &crate::distributed::message::HardwareSpec,
 ) -> Result<WorkResponse> {
     let request = WorkRequest {
         worker_id: worker_id.to_string(),
+        hardware: Some(hardware.clone()),
     };
 
     let response = client

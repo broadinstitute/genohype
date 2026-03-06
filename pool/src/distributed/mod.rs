@@ -10,8 +10,8 @@ pub mod worker;
 // Re-export message types
 pub use message::{
     CompleteRequest, CompleteResponse, CoreTaskInfo, DashboardBottleneck, DashboardMetrics,
-    DashboardSummary, DashboardWorker, HeartbeatRequest, HeartbeatResponse, StatusResponse,
-    TelemetrySnapshot, WorkRequest, WorkResponse,
+    DashboardSummary, DashboardWorker, HardwareSpec, HeartbeatRequest, HeartbeatResponse,
+    StatusResponse, TelemetrySnapshot, WorkRequest, WorkResponse,
 };
 
 // Re-export coordinator and worker

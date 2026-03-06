@@ -153,6 +153,7 @@ async fn request_work(
 ) -> Result<WorkResponse, anyhow::Error> {
     let request = WorkRequest {
         worker_id: worker_id.to_string(),
+        hardware: None,
     };
 
     let response = client.post(url).json(&request).send().await?;

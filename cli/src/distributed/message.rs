@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 pub use genohype_pool::distributed::{
-    CompleteRequest, CompleteResponse, CoreTaskInfo, HeartbeatRequest, HeartbeatResponse,
-    StatusResponse, TelemetrySnapshot, WorkRequest, WorkResponse,
+    CompleteRequest, CompleteResponse, CoreTaskInfo, HardwareSpec, HeartbeatRequest,
+    HeartbeatResponse, StatusResponse, TelemetrySnapshot, WorkRequest, WorkResponse,
 };
 
 /// Table initialization strategy for ingestion.

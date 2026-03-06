@@ -7,11 +7,23 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Hardware capabilities of the worker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HardwareSpec {
+    /// Number of logical CPU cores
+    pub num_cores: usize,
+    /// Total system memory in megabytes
+    pub total_memory_mb: u64,
+}
+
 /// Request from a worker asking for work.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkRequest {
     /// Unique identifier for this worker
     pub worker_id: String,
+    /// Worker hardware specification
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware: Option<HardwareSpec>,
 }
 
 /// Response from coordinator with work assignment.

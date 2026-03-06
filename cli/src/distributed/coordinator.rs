@@ -246,6 +246,8 @@ struct WorkerState {
     current_task: Option<ActiveTaskInfo>,
     /// Latest log tail received via heartbeat
     latest_log_tail: Option<Vec<String>>,
+    /// Hardware specifications reported by worker
+    hardware: Option<crate::distributed::message::HardwareSpec>,
 }
 
 /// Internal state of the coordinator.
@@ -813,7 +815,11 @@ fn check_timeouts(state: &SharedState, timeout_secs: u64) {
 }
 
 /// Ensure a worker exists in the registry and update last_seen.
-fn touch_worker(data: &mut CoordinatorData, worker_id: &str) {
+fn touch_worker(
+    data: &mut CoordinatorData,
+    worker_id: &str,
+    hardware: Option<crate::distributed::message::HardwareSpec>,
+) {
     let worker = data
         .worker_registry
         .entry(worker_id.to_string())
@@ -825,8 +831,12 @@ fn touch_worker(data: &mut CoordinatorData, worker_id: &str) {
             partitions_completed: 0,
             current_task: None,
             latest_log_tail: None,
+            hardware: None,
         });
     worker.last_seen = Instant::now();
+    if hardware.is_some() {
+        worker.hardware = hardware;
+    }
 }
 
 /// Activate phenotypes from the pending queue up to the active limit.
@@ -896,6 +906,42 @@ fn activate_next_phenotypes(batch: &mut BatchState) {
         };
 
         batch.active_phenotypes.insert(phenotype_id, pipeline_state);
+    }
+}
+
+/// Determine the optimal batch size for a worker based on its hardware and the job type.
+fn determine_batch_size(
+    default_size: usize,
+    hardware: Option<&crate::distributed::message::HardwareSpec>,
+    job_spec: &Option<JobSpec>,
+) -> usize {
+    if let Some(hw) = hardware {
+        // Different jobs have different memory characteristics.
+        // - Parquet/JSON: streaming, low memory, scale well
+        // - Manhattan: higher memory footprint per partition (point rendering)
+        // - Summary: very memory efficient, saturates cores easily
+        let core_multiplier = match job_spec {
+            Some(JobSpec::ExportParquet { .. }) | Some(JobSpec::ExportJson { .. }) => 2.0,
+            Some(JobSpec::ManhattanScan(_))
+            | Some(JobSpec::ManhattanBatch { .. })
+            | Some(JobSpec::Manhattan { .. }) => 1.0,
+            Some(JobSpec::Summary) => 3.0,
+            _ => 1.5,
+        };
+
+        let core_based = (hw.num_cores as f64 * core_multiplier).ceil() as usize;
+
+        // Rough heuristic to prevent OOM: limit concurrent partitions based on memory
+        // e.g. Assume each concurrent partition needs 500MB of RAM
+        let max_by_memory = (hw.total_memory_mb / 500).max(1) as usize;
+
+        // We want at least the default_size (so we don't regress if someone manually specified a good default),
+        // but if memory dictates a lower cap, we respect it unless the default size itself exceeds memory.
+        let target = core_based.max(default_size).min(max_by_memory.max(default_size));
+
+        target
+    } else {
+        default_size
     }
 }
 
@@ -979,7 +1025,12 @@ fn get_batch_work(
     worker_id: &str,
 ) -> axum::Json<WorkResponse> {
     let now = Instant::now();
-    let partition_batch_size = data.config.batch_size;
+    let worker_hw = data
+        .worker_registry
+        .get(worker_id)
+        .and_then(|w| w.hardware.as_ref());
+    let partition_batch_size =
+        determine_batch_size(data.config.batch_size, worker_hw, &data.config.job_spec);
 
     // Step 1: Activate phenotypes to fill the active pool
     activate_next_phenotypes(batch);
@@ -1179,7 +1230,7 @@ async fn get_work(
     axum::Json(req): axum::Json<WorkRequest>,
 ) -> axum::Json<WorkResponse> {
     let mut data = state.lock().unwrap();
-    touch_worker(&mut data, &req.worker_id);
+    touch_worker(&mut data, &req.worker_id, req.hardware.clone());
 
     // If coordinator is idle (no job configured), tell workers to wait
     if data.idle {
@@ -1218,7 +1269,12 @@ async fn get_work(
     if let Some(part_id) = data.pending_partitions.pop_front() {
         // Collect batch of partitions
         let mut partitions = vec![part_id];
-        let batch_size = data.config.batch_size;
+        let worker_hw = data
+            .worker_registry
+            .get(&req.worker_id)
+            .and_then(|w| w.hardware.as_ref());
+        let batch_size =
+            determine_batch_size(data.config.batch_size, worker_hw, &data.config.job_spec);
 
         while partitions.len() < batch_size {
             if let Some(next_id) = data.pending_partitions.pop_front() {
@@ -1296,7 +1352,11 @@ fn get_manhattan_work(
     worker_id: &str,
 ) -> axum::Json<WorkResponse> {
     let now = Instant::now();
-    let batch_size = data.config.batch_size;
+    let worker_hw = data
+        .worker_registry
+        .get(worker_id)
+        .and_then(|w| w.hardware.as_ref());
+    let batch_size = determine_batch_size(data.config.batch_size, worker_hw, &data.config.job_spec);
 
     // Generate unique task ID for tracking
     let task_id = Uuid::new_v4().to_string();
@@ -2055,7 +2115,7 @@ async fn complete_work(
     }
 
     // Update per-worker stats
-    touch_worker(&mut data, &req.worker_id);
+    touch_worker(&mut data, &req.worker_id, None);
     if let Some(w) = data.worker_registry.get_mut(&req.worker_id) {
         w.total_rows += req.items_processed;
         w.partitions_completed += req.partitions.len();
@@ -2169,7 +2229,7 @@ async fn handle_heartbeat(
     axum::Json(req): axum::Json<HeartbeatRequest>,
 ) -> axum::Json<HeartbeatResponse> {
     let mut data = state.lock().unwrap();
-    touch_worker(&mut data, &req.worker_id);
+    touch_worker(&mut data, &req.worker_id, None);
 
     if let Some(w) = data.worker_registry.get_mut(&req.worker_id) {
         // Revive if previously suspected dead
