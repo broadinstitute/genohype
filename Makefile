@@ -3,7 +3,16 @@
 # Default features for worker binary
 WORKER_FEATURES ?= clickhouse
 
-.PHONY: all release worker clean
+.PHONY: all release worker clean dashboard
+
+# Build dashboard SPA and copy to cli/static/dist for embedding
+dashboard:
+	@echo "Building pool-dashboard SPA..."
+	@cd frontend/pool-dashboard && npm run build
+	@echo "Copying dist to cli/static/dist..."
+	@rm -rf cli/static/dist
+	@cp -r frontend/pool-dashboard/dist cli/static/dist
+	@echo "Dashboard built and installed to cli/static/dist"
 
 # Build both macOS CLI and Linux worker
 all: release worker

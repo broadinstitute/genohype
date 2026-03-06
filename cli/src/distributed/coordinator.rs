@@ -21,6 +21,7 @@ use crate::distributed::metrics_db::MetricsDb;
 use crate::manhattan::config::PlotType;
 use crate::Result;
 use axum::body::Body;
+use tower_http::services::{ServeDir, ServeFile};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -616,13 +617,49 @@ pub async fn run_coordinator(
         }
     });
 
+    // Determine static files directory for the SPA dashboard
+    // Try multiple paths to support various deployment scenarios:
+    // 1. Relative to current working directory (development: `cargo run` from cli/)
+    // 2. Relative to the binary location (production deployment)
+    let static_dir = {
+        let cwd_path = std::path::PathBuf::from("static/dist");
+        if cwd_path.exists() {
+            cwd_path
+        } else {
+            // Try relative to binary location
+            let exe_path = std::env::current_exe().ok();
+            let exe_dir_path = exe_path
+                .as_ref()
+                .and_then(|p| p.parent())
+                .map(|p| p.join("../static/dist"));
+            if let Some(ref path) = exe_dir_path {
+                if path.exists() {
+                    path.clone()
+                } else {
+                    // Fallback: use CWD path and let ServeDir handle the error
+                    println!(
+                        "Warning: Static dashboard files not found at {:?} or {:?}",
+                        cwd_path, path
+                    );
+                    println!("Run `make dashboard` to build the pool-dashboard SPA");
+                    cwd_path
+                }
+            } else {
+                cwd_path
+            }
+        }
+    };
+
+    // Build the static file service with fallback to index.html for SPA routing
+    let serve_dir = ServeDir::new(&static_dir)
+        .not_found_service(ServeFile::new(static_dir.join("index.html")));
+
     let app = Router::new()
         .route("/work", post(get_work))
         .route("/complete", post(complete_work))
         .route("/status", get(get_status))
         .route("/heartbeat", post(handle_heartbeat))
-        .route("/dashboard", get(serve_dashboard))
-        .route("/dashboard/phenotypes", get(serve_phenotypes_page))
+        // API routes
         .route("/api/dashboard/summary", get(get_dashboard_summary))
         .route("/api/dashboard/bottlenecks", get(get_dashboard_bottlenecks))
         .route("/api/dashboard/workers", get(get_dashboard_workers))
@@ -636,7 +673,9 @@ pub async fn run_coordinator(
         .route("/api/events", get(get_events))
         .route("/api/failures", get(get_failures))
         .route("/api/workers/:worker_id/logs", get(get_worker_logs))
-        .with_state(state);
+        .with_state(state)
+        // Serve the SPA dashboard from /dashboard (nested under /dashboard path)
+        .nest_service("/dashboard", serve_dir);
 
     println!("Dashboard available at http://0.0.0.0:{}/dashboard", port);
 
@@ -3015,15 +3054,8 @@ async fn get_worker_logs(
     axum::Json(logs)
 }
 
-/// Handler for GET /dashboard - serve the embedded dashboard HTML.
-async fn serve_dashboard() -> axum::response::Html<&'static str> {
-    axum::response::Html(include_str!("../../static/dashboard.html"))
-}
-
-/// Handler for GET /dashboard/phenotypes - serve the phenotypes list page.
-async fn serve_phenotypes_page() -> axum::response::Html<&'static str> {
-    axum::response::Html(include_str!("../../static/phenotypes.html"))
-}
+// Note: Dashboard is now served as a SPA from static/dist via ServeDir.
+// The old embedded HTML handlers have been removed in favor of the React app.
 
 /// Handler for GET /api/binary - serve the genohype binary.
 ///
