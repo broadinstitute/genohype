@@ -397,7 +397,38 @@ pub fn run_aggregation(spec: &ManhattanAggregateSpec) -> Result<(usize, serde_js
         combined_sig_count, exome_sig_count, genome_sig_count
     );
 
-    // Step 5: Write manifest.json
+    // Step 5: Calculate storage sizes
+    println!("  Calculating storage sizes...");
+    let input_ht_size_bytes = {
+        let mut total: u64 = 0;
+        if let Some(ref path) = spec.exome_results {
+            if let Some(size) = get_gcs_dir_size(path) {
+                total += size;
+            }
+        }
+        if let Some(ref path) = spec.genome_results {
+            if let Some(size) = get_gcs_dir_size(path) {
+                total += size;
+            }
+        }
+        if let Some(ref path) = spec.gene_burden {
+            if let Some(size) = get_gcs_dir_size(path) {
+                total += size;
+            }
+        }
+        if total > 0 { Some(total) } else { None }
+    };
+
+    let output_dir_size_bytes = get_gcs_dir_size(output_base);
+
+    if let Some(input_size) = input_ht_size_bytes {
+        println!("    Input HT size: {:.2} GB", input_size as f64 / 1e9);
+    }
+    if let Some(output_size) = output_dir_size_bytes {
+        println!("    Output dir size: {:.2} GB", output_size as f64 / 1e9);
+    }
+
+    // Step 6: Write manifest.json
     println!("  Writing manifest.json...");
     let aggregate_duration = start.elapsed().as_secs_f64();
 
@@ -465,6 +496,8 @@ pub fn run_aggregation(spec: &ManhattanAggregateSpec) -> Result<(usize, serde_js
             scan_duration_sec: scan_duration,
             aggregate_duration_sec: aggregate_duration,
             total_loci: loci.len(),
+            input_ht_size_bytes,
+            output_dir_size_bytes,
         },
     };
 
@@ -2176,4 +2209,61 @@ fn write_loci_parquet(
     }
 
     Ok(())
+}
+
+// =============================================================================
+// GCS Size Calculation
+// =============================================================================
+
+/// Get the total size of a GCS directory in bytes using gsutil du.
+/// Returns None for local paths or if the command fails.
+pub fn get_gcs_dir_size(path: &str) -> Option<u64> {
+    if !is_cloud_path(path) {
+        // For local paths, use std::fs to calculate directory size
+        return get_local_dir_size(path);
+    }
+
+    let output = std::process::Command::new("gsutil")
+        .args(["du", "-s", path])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Output format: "12345  gs://bucket/path"
+    stdout.lines().next()?.split_whitespace().next()?.parse().ok()
+}
+
+/// Get the total size of a local directory in bytes.
+fn get_local_dir_size(path: &str) -> Option<u64> {
+    use std::path::Path;
+
+    let path = Path::new(path);
+    if !path.exists() {
+        return None;
+    }
+
+    fn dir_size(path: &std::path::Path) -> u64 {
+        let mut size = 0;
+        if path.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    let entry_path = entry.path();
+                    if entry_path.is_dir() {
+                        size += dir_size(&entry_path);
+                    } else if let Ok(metadata) = entry.metadata() {
+                        size += metadata.len();
+                    }
+                }
+            }
+        } else if let Ok(metadata) = std::fs::metadata(path) {
+            size = metadata.len();
+        }
+        size
+    }
+
+    Some(dir_size(path))
 }

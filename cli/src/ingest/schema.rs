@@ -23,6 +23,7 @@ pub fn get_manhattan_schemas() -> Vec<(&'static str, &'static str)> {
             include_str!("sql/gene_associations.sql"),
         ),
         ("qq_points", include_str!("sql/qq_points.sql")),
+        ("pipeline_status", include_str!("sql/pipeline_status.sql")),
     ]
 }
 
@@ -41,7 +42,7 @@ mod tests {
     #[test]
     fn test_get_manhattan_schemas() {
         let schemas = get_manhattan_schemas();
-        assert_eq!(schemas.len(), 6);
+        assert_eq!(schemas.len(), 7);
 
         // Check all expected tables are present
         let table_names: Vec<_> = schemas.iter().map(|(name, _)| *name).collect();
@@ -51,6 +52,7 @@ mod tests {
         assert!(table_names.contains(&"phenotype_plots"));
         assert!(table_names.contains(&"gene_associations"));
         assert!(table_names.contains(&"qq_points"));
+        assert!(table_names.contains(&"pipeline_status"));
     }
 
     #[test]

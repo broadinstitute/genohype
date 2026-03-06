@@ -336,6 +336,25 @@ pub struct ManifestStats {
     pub aggregate_duration_sec: f64,
     /// Total number of loci generated
     pub total_loci: usize,
+    /// Total size of input Hail Tables in bytes (exome + genome + gene_burden)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_ht_size_bytes: Option<u64>,
+    /// Total size of derived output directory in bytes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_dir_size_bytes: Option<u64>,
+}
+
+/// Error manifest for tracking pipeline failures.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorManifest {
+    /// Phenotype identifier
+    pub phenotype: String,
+    /// Pipeline status (e.g., "MANHATTAN_FAILED", "INGEST_FAILED")
+    pub status: String,
+    /// Error message describing the failure
+    pub error: String,
+    /// Unix timestamp in milliseconds when the error occurred
+    pub timestamp_ms: u64,
 }
 
 // =============================================================================

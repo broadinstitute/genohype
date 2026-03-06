@@ -112,6 +112,58 @@ pub struct PhenotypePlotRow {
     pub gcs_uri: String,
 }
 
+/// Pipeline status values for tracking in ClickHouse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineStatus {
+    ManhattanFailed,
+    Ingesting,
+    IngestFailed,
+    Ingested,
+}
+
+impl PipelineStatus {
+    fn as_str(&self) -> &'static str {
+        match self {
+            PipelineStatus::ManhattanFailed => "MANHATTAN_FAILED",
+            PipelineStatus::Ingesting => "INGESTING",
+            PipelineStatus::IngestFailed => "INGEST_FAILED",
+            PipelineStatus::Ingested => "INGESTED",
+        }
+    }
+}
+
+/// Error manifest JSON structure for failed pipeline runs.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ErrorManifest {
+    pub phenotype: String,
+    pub status: String,
+    pub error: String,
+    #[serde(default)]
+    pub timestamp_ms: Option<u64>,
+}
+
+/// Extended manifest JSON structure with stats.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ManifestWithStats {
+    /// Basic manifest fields
+    #[serde(flatten)]
+    pub manifest: Manifest,
+    /// Pipeline stats including storage sizes
+    #[serde(default)]
+    pub stats: Option<ManifestStatsInfo>,
+}
+
+/// Stats information from the manifest.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ManifestStatsInfo {
+    #[serde(default)]
+    pub total_loci: Option<usize>,
+    #[serde(default)]
+    pub input_ht_size_bytes: Option<u64>,
+    #[serde(default)]
+    pub output_dir_size_bytes: Option<u64>,
+}
+
 /// Run the ingestion task for a single phenotype.
 ///
 /// # Arguments
@@ -139,9 +191,55 @@ pub fn run_ingest_task(
     let base = base_path.trim_end_matches('/');
     let mut total_rows = 0;
 
-    // 1. Read manifest.json
+    // 0. Check for error.json first (indicates Manhattan pipeline failure)
+    let error_path = format!("{}/error.json", base);
+    if file_exists(&error_path)? {
+        let error_manifest = read_error_manifest(&error_path)?;
+        println!(
+            "  Found error.json: {} - {}",
+            error_manifest.status, error_manifest.error
+        );
+
+        // Log the failure status to ClickHouse
+        let _ = log_pipeline_status(
+            &client,
+            phenotype_id,
+            ancestry,
+            PipelineStatus::ManhattanFailed,
+            0,
+            0,
+            0,
+            0,
+            Some(&error_manifest.error),
+        );
+
+        // Return early - nothing to ingest
+        return Ok(0);
+    }
+
+    // 1. Read manifest.json with stats
     let manifest_path = format!("{}/manifest.json", base);
-    let manifest = read_manifest(&manifest_path)?;
+    let manifest_with_stats = read_manifest_with_stats(&manifest_path)?;
+    let manifest = manifest_with_stats.manifest;
+    let stats = manifest_with_stats.stats.unwrap_or_default();
+
+    // Extract storage metrics
+    let original_gcs_bytes = stats.input_ht_size_bytes.unwrap_or(0);
+    let derived_gcs_bytes = stats.output_dir_size_bytes.unwrap_or(0);
+    let loci_count = stats.total_loci.unwrap_or(manifest.loci.len()) as u32;
+
+    // Log INGESTING status
+    let _ = log_pipeline_status(
+        &client,
+        phenotype_id,
+        ancestry,
+        PipelineStatus::Ingesting,
+        loci_count,
+        0,
+        original_gcs_bytes,
+        derived_gcs_bytes,
+        None,
+    );
 
     // 2. Ingest loci
     let loci_rows = ingest_loci(
@@ -158,6 +256,7 @@ pub fn run_ingest_task(
     total_rows += plot_rows;
 
     // 4. Ingest significant variants (exome and genome)
+    let mut significant_variant_count: u32 = 0;
     for seq_type in &["exome", "genome"] {
         let parquet_path = format!("{}/{}_significant.parquet", base, seq_type);
         if file_exists(&parquet_path)? {
@@ -169,6 +268,7 @@ pub fn run_ingest_task(
                 &client,
             )?;
             total_rows += rows;
+            significant_variant_count += rows as u32;
             println!(
                 "  Ingested {} {} significant variants",
                 rows, seq_type
@@ -220,6 +320,19 @@ pub fn run_ingest_task(
         }
     }
 
+    // 8. Log INGESTED status to pipeline_status table
+    let _ = log_pipeline_status(
+        &client,
+        phenotype_id,
+        ancestry,
+        PipelineStatus::Ingested,
+        loci_count,
+        significant_variant_count,
+        original_gcs_bytes,
+        derived_gcs_bytes,
+        None,
+    );
+
     println!(
         "Completed ingestion for {} ({}): {} total rows",
         phenotype_id, ancestry, total_rows
@@ -257,6 +370,66 @@ fn file_exists(path: &str) -> Result<bool> {
     } else {
         Ok(std::path::Path::new(path).exists())
     }
+}
+
+/// Log pipeline status to ClickHouse.
+///
+/// Uses ReplacingMergeTree so the latest status will be kept.
+fn log_pipeline_status(
+    client: &ClickHouseClient,
+    phenotype: &str,
+    ancestry: &str,
+    status: PipelineStatus,
+    loci_count: u32,
+    significant_variants: u32,
+    original_gcs_bytes: u64,
+    derived_gcs_bytes: u64,
+    error_message: Option<&str>,
+) -> Result<()> {
+    // Build the INSERT query
+    // For error_message, we need to handle NULL properly
+    let err_val = match error_message {
+        Some(e) => format!("'{}'", e.replace('\'', "''")),
+        None => "NULL".to_string(),
+    };
+
+    let query = format!(
+        "INSERT INTO pipeline_status (phenotype, ancestry, status, loci_count, significant_variants, original_gcs_bytes, derived_gcs_bytes, error_message, updated_at) VALUES ('{}', '{}', '{}', {}, {}, {}, {}, {}, now())",
+        phenotype.replace('\'', "''"),
+        ancestry.replace('\'', "''"),
+        status.as_str(),
+        loci_count,
+        significant_variants,
+        original_gcs_bytes,
+        derived_gcs_bytes,
+        err_val
+    );
+
+    client.execute(&query).map_err(|e| {
+        crate::HailError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Failed to log pipeline status: {}", e),
+        ))
+    })?;
+    Ok(())
+}
+
+/// Read and parse error.json from a path (local or GCS).
+fn read_error_manifest(path: &str) -> Result<ErrorManifest> {
+    let data = read_file_bytes(path)?;
+    let manifest: ErrorManifest = serde_json::from_slice(&data).map_err(|e| {
+        crate::HailError::InvalidFormat(format!("Failed to parse error.json: {}", e))
+    })?;
+    Ok(manifest)
+}
+
+/// Read manifest with stats.
+fn read_manifest_with_stats(path: &str) -> Result<ManifestWithStats> {
+    let data = read_file_bytes(path)?;
+    let manifest: ManifestWithStats = serde_json::from_slice(&data).map_err(|e| {
+        crate::HailError::InvalidFormat(format!("Failed to parse manifest.json: {}", e))
+    })?;
+    Ok(manifest)
 }
 
 /// List PNG files in a directory (local or cloud).
