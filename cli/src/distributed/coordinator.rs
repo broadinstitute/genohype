@@ -32,6 +32,38 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+/// Backup the database to GCS.
+///
+/// This function checkpoints the WAL to ensure all data is in the main file,
+/// then uploads the database to the specified GCS path.
+async fn backup_db(metrics_db: &MetricsDb, db_path: &str, backup_path: &str) {
+    // Checkpoint the WAL to ensure the main DB file is up-to-date
+    if let Err(e) = metrics_db.checkpoint_for_backup() {
+        eprintln!("Warning: failed to checkpoint DB before backup: {}", e);
+    }
+
+    // Read the database file and upload to GCS
+    if let Ok(db_contents) = std::fs::read(db_path) {
+        use genohype_core::io::CloudWriter;
+        use std::io::Write;
+        if let Ok(mut writer) = CloudWriter::new(backup_path) {
+            if writer.write_all(&db_contents).is_ok() {
+                if writer.finish().is_ok() {
+                    println!("Job history backed up to {}", backup_path);
+                } else {
+                    eprintln!("Warning: failed to finalize backup upload to {}", backup_path);
+                }
+            } else {
+                eprintln!("Warning: failed to write backup data to {}", backup_path);
+            }
+        } else {
+            eprintln!("Warning: failed to create cloud writer for {}", backup_path);
+        }
+    } else {
+        eprintln!("Warning: failed to read database file at {}", db_path);
+    }
+}
+
 /// Configuration for the coordinator.
 #[allow(dead_code)]
 pub struct CoordinatorConfig {
@@ -55,6 +87,10 @@ pub struct CoordinatorConfig {
     pub intervals: Vec<String>,
     /// Hint for memory required per partition in MB
     pub memory_weight_mb: Option<u64>,
+    /// Local path to SQLite database file
+    pub db_path: String,
+    /// GCS path for backup/restore (e.g., "gs://bucket/pool-ops/dev-pool/ops.db")
+    pub backup_path: Option<String>,
 }
 
 impl Default for CoordinatorConfig {
@@ -70,6 +106,8 @@ impl Default for CoordinatorConfig {
             filters: Vec::new(),
             intervals: Vec::new(),
             memory_weight_mb: None,
+            db_path: "/var/lib/genohype/ops.db".to_string(),
+            backup_path: None,
         }
     }
 }
@@ -306,6 +344,8 @@ struct CoordinatorData {
     events: VecDeque<JobEvent>,
     /// Ring buffer of recent failures (max 100)
     failures: VecDeque<FailureRecord>,
+    /// Number of events since last GCS backup (for periodic backup trigger)
+    events_since_backup: usize,
 }
 
 type SharedState = Arc<Mutex<CoordinatorData>>;
@@ -356,6 +396,8 @@ pub async fn start_coordinator(config: CoordinatorConfig) -> Result<()> {
 
     run_coordinator(
         config.port,
+        config.db_path,
+        config.backup_path,
         config.input_path,
         output_path,
         config.total_tasks,
@@ -371,6 +413,8 @@ pub async fn start_coordinator(config: CoordinatorConfig) -> Result<()> {
 /// ExportParquet JobSpec. New code should use the API endpoint with JobSpec directly.
 pub async fn run_coordinator(
     port: u16,
+    db_path: String,
+    backup_path: Option<String>,
     input_path: String,
     output_path: String,
     total_tasks: usize,
@@ -414,14 +458,33 @@ pub async fn run_coordinator(
     println!("  Batch size: {}", batch_size);
     println!("  Timeout: {}s", timeout_secs);
 
+    // Try to restore from backup path if configured
+    if let Some(ref bp) = backup_path {
+        println!("  Checking for database backup at {}", bp);
+        if let Ok(mut reader) = genohype_core::io::get_reader(bp) {
+            let mut data = Vec::new();
+            if std::io::Read::read_to_end(&mut reader, &mut data).is_ok() && !data.is_empty() {
+                if let Some(parent) = std::path::Path::new(&db_path).parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if std::fs::write(&db_path, data).is_ok() {
+                    println!("  Restored ops database from {}", bp);
+                }
+            }
+        }
+    }
+
     // Initialize SQLite database for metrics persistence
-    let metrics_db = MetricsDb::open("/tmp/hail-coordinator-metrics.db").map_err(|e| {
+    let metrics_db = MetricsDb::open(&db_path).map_err(|e| {
         crate::HailError::Io(std::io::Error::new(
             std::io::ErrorKind::Other,
             format!("Failed to open metrics database: {}", e),
         ))
     })?;
-    println!("  Metrics DB: /tmp/hail-coordinator-metrics.db");
+    println!("  Metrics DB: {}", db_path);
+    if let Some(ref bp) = backup_path {
+        println!("  Backup path: {}", bp);
+    }
 
     let state = Arc::new(Mutex::new(CoordinatorData {
         pending_partitions: (0..total_tasks).collect(),
@@ -438,6 +501,8 @@ pub async fn run_coordinator(
             filters: Vec::new(),
             intervals: Vec::new(),
             memory_weight_mb: None,
+            db_path: db_path.clone(),
+            backup_path: backup_path.clone(),
         },
         total_rows: 0,
         scan_cpu_secs: 0.0,
@@ -458,15 +523,24 @@ pub async fn run_coordinator(
         ingestion_state: None,
         events: VecDeque::new(),
         failures: VecDeque::new(),
+        events_since_backup: 0,
     }));
 
     // Start background timeout monitor
     let monitor_state = state.clone();
     tokio::spawn(async move {
+        let mut last_backup_time = Instant::now();
+        let mut last_events_count = 0usize;
+
         loop {
             tokio::time::sleep(Duration::from_secs(30)).await;
             check_timeouts(&monitor_state, timeout_secs);
             check_worker_liveness(&monitor_state);
+
+            // Track events for periodic backup trigger
+            let current_events = { monitor_state.lock().unwrap().events.len() };
+            let events_delta = current_events.saturating_sub(last_events_count);
+            last_events_count = current_events;
 
             // Check for stuck jobs (R3)
             let stuck_timeout = {
@@ -547,6 +621,30 @@ pub async fn run_coordinator(
                 );
             }
 
+            // Periodic / threshold backup fallback
+            // Backup every 1000 events or every 30 minutes
+            let (db_path, backup_path, events_since, metrics_db) = {
+                let mut data = monitor_state.lock().unwrap();
+                data.events_since_backup += events_delta;
+                (
+                    data.config.db_path.clone(),
+                    data.config.backup_path.clone(),
+                    data.events_since_backup,
+                    data.metrics_db.clone(),
+                )
+            };
+
+            if let Some(ref bp) = backup_path {
+                let should_backup = events_since > 1000 || last_backup_time.elapsed().as_secs() > 1800;
+                if should_backup {
+                    backup_db(&metrics_db, &db_path, bp).await;
+                    last_backup_time = Instant::now();
+                    if let Ok(mut data) = monitor_state.lock() {
+                        data.events_since_backup = 0;
+                    }
+                }
+            }
+
             // Check if job is complete
             // For batch/Manhattan: use the phase flag; for standard jobs: check partition counts
             let job_complete = is_batch_complete ||
@@ -622,6 +720,21 @@ pub async fn run_coordinator(
                         } else {
                             println!("Results saved to /tmp/job_result.json");
                         }
+                    }
+                }
+
+                // Perform final backup to GCS before exiting
+                {
+                    let (db_path, backup_path, metrics_db) = {
+                        let data = monitor_state.lock().unwrap();
+                        (
+                            data.config.db_path.clone(),
+                            data.config.backup_path.clone(),
+                            data.metrics_db.clone(),
+                        )
+                    };
+                    if let Some(bp) = backup_path {
+                        backup_db(&metrics_db, &db_path, &bp).await;
                     }
                 }
 
@@ -3532,21 +3645,23 @@ async fn serve_binary() -> impl axum::response::IntoResponse {
 /// This endpoint reads the SQLite metrics database and uploads it to a GCS path.
 /// Used by `pool destroy --metrics-bucket` to save metrics before deleting VMs.
 async fn export_metrics(
+    axum::extract::State(state): axum::extract::State<SharedState>,
     axum::Json(req): axum::Json<ExportMetricsRequest>,
 ) -> axum::Json<ExportMetricsResponse> {
     use genohype_core::io::CloudWriter;
     use std::io::Write;
 
-    const METRICS_DB_PATH: &str = "/tmp/hail-coordinator-metrics.db";
+    // Get db_path from config
+    let db_path = { state.lock().unwrap().config.db_path.clone() };
 
     // Read the metrics database file
-    let db_contents = match std::fs::read(METRICS_DB_PATH) {
+    let db_contents = match std::fs::read(&db_path) {
         Ok(contents) => contents,
         Err(e) => {
             return axum::Json(ExportMetricsResponse {
                 success: false,
                 path: None,
-                error: Some(format!("Failed to read metrics database: {}", e)),
+                error: Some(format!("Failed to read metrics database at {}: {}", db_path, e)),
             });
         }
     };

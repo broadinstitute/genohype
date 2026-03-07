@@ -16,6 +16,13 @@ impl MetricsDb {
     pub fn open<P: AsRef<Path>>(path: P) -> SqliteResult<Self> {
         let conn = Connection::open(path)?;
 
+        // Enable high-concurrency WAL mode for non-blocking reads/writes
+        // This allows workers to write telemetry while dashboard reads metrics
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;"
+        )?;
+
         // Create tables if they don't exist
         conn.execute_batch(
             r#"
@@ -251,6 +258,18 @@ impl MetricsDb {
         let conn = self.conn.lock().unwrap();
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM telemetry", [], |row| row.get(0))?;
         Ok(count as usize)
+    }
+
+    /// Force a WAL checkpoint to ensure all data is written to the main DB file
+    /// before performing a backup to GCS.
+    ///
+    /// This flushes the Write-Ahead Log (WAL) into the main database file and
+    /// truncates the WAL, ensuring the single .db file contains the complete
+    /// current state. Call this before uploading ops.db to GCS.
+    pub fn checkpoint_for_backup(&self) -> SqliteResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok(())
     }
 }
 

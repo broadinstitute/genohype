@@ -1914,6 +1914,7 @@ fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> Resul
                 subnet: resolved_subnet,
                 with_coordinator: resolved_with_coordinator,
                 wireguard,
+                pool_db_path: profile.as_ref().and_then(|p| p.pool_db_path.clone()),
             };
 
             manager.create(&pool_config, wait, skip_build)?;
@@ -2028,6 +2029,7 @@ fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> Resul
                     subnet: p.subnet.clone(),
                     project: p.project.clone(),
                     with_coordinator: p.with_coordinator,
+                    pool_db_path: p.pool_db_path.clone(),
                 }
             });
             manager.submit(
@@ -2070,6 +2072,7 @@ fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> Resul
                 subnet: pool_config.subnet.clone(),
                 project: pool_config.project.clone(),
                 with_coordinator: pool_config.with_coordinator,
+                pool_db_path: pool_config.pool_db_path.clone(),
             };
 
             manager.scale(&name, workers, &zone, binary, skip_build, &scaling_config)?;
@@ -2124,6 +2127,8 @@ fn run_service_command(command: ServiceCommands) -> Result<()> {
     match command {
         ServiceCommands::StartCoordinator {
             port,
+            db_path,
+            backup_path,
             input,
             output,
             total_partitions,
@@ -2134,6 +2139,8 @@ fn run_service_command(command: ServiceCommands) -> Result<()> {
             // Job can be submitted later via POST /api/job
             rt.block_on(coordinator::run_coordinator(
                 port,
+                db_path,
+                backup_path,
                 input.unwrap_or_default(),
                 output.unwrap_or_default(),
                 total_partitions.unwrap_or(0),

@@ -112,6 +112,8 @@ pub struct PoolProfile {
     pub with_coordinator: Option<bool>,
     /// WireGuard configuration for coordinator
     pub wireguard: Option<WireGuardConfig>,
+    /// GCS path for SQLite database backup/restore (e.g., "gs://bucket/pool-ops/dev-pool/ops.db")
+    pub pool_db_path: Option<String>,
 }
 
 /// A named ClickHouse instance profile.
@@ -393,6 +395,7 @@ impl Config {
                 project: self.defaults.project.clone(),
                 with_coordinator,
                 wireguard: profile.wireguard.clone(),
+                pool_db_path: profile.pool_db_path.clone(),
             }
         })
     }
@@ -483,6 +486,8 @@ pub struct ResolvedPoolConfig {
     pub with_coordinator: bool,
     /// WireGuard configuration
     pub wireguard: Option<WireGuardConfig>,
+    /// GCS path for SQLite database backup/restore
+    pub pool_db_path: Option<String>,
 }
 
 /// Status of a cluster deployment.

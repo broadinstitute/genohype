@@ -52,6 +52,8 @@ pub struct PoolConfig {
     pub with_coordinator: bool,
     /// WireGuard configuration for coordinator (optional)
     pub wireguard: Option<WireGuardConfig>,
+    /// GCS path for SQLite database backup/restore (e.g., "gs://bucket/pool-ops/dev-pool/ops.db")
+    pub pool_db_path: Option<String>,
 }
 
 /// Information about a cloud instance.
@@ -132,6 +134,8 @@ pub struct ScalingConfig {
     pub project: Option<String>,
     /// Whether the pool has a coordinator
     pub with_coordinator: bool,
+    /// GCS path for SQLite database backup/restore
+    pub pool_db_path: Option<String>,
 }
 
 /// Abstract interface for cloud infrastructure operations.

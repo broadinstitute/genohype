@@ -27,6 +27,10 @@ apt-get install -y -qq libssl-dev ca-certificates
 # Create directory for the binary
 mkdir -p /usr/local/bin
 
+# Create directory for the active SQLite database
+mkdir -p /var/lib/genohype
+chmod 777 /var/lib/genohype
+
 # Create a marker file to indicate VM is ready
 touch /tmp/genohype-ready
 
@@ -112,6 +116,10 @@ fi
 
 # Create directory for the binary
 mkdir -p /usr/local/bin
+
+# Create directory for the active SQLite database
+mkdir -p /var/lib/genohype
+chmod 777 /var/lib/genohype
 
 # Create a marker file to indicate VM is ready
 touch /tmp/genohype-ready

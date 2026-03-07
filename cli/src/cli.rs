@@ -1130,6 +1130,14 @@ pub enum ServiceCommands {
         #[arg(long, default_value = "3000")]
         port: u16,
 
+        /// Local path where the active SQLite database will run
+        #[arg(long, default_value = "/var/lib/genohype/ops.db")]
+        db_path: String,
+
+        /// GCS path to backup the database to (and restore from on startup)
+        #[arg(long)]
+        backup_path: Option<String>,
+
         /// Path to input Hail table (optional, can be set later via POST /api/job)
         #[arg(long)]
         input: Option<String>,

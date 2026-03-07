@@ -88,14 +88,14 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
 
         // If with_coordinator, deploy binary and start coordinator in idle mode
         if config.with_coordinator {
-            self.start_idle_coordinator(&config.name, &config.zone, skip_build)?;
+            self.start_idle_coordinator(&config.name, &config.zone, skip_build, config.pool_db_path.as_deref())?;
         }
 
         Ok(())
     }
 
     /// Deploy binary and start coordinator in idle mode.
-    fn start_idle_coordinator(&self, pool_name: &str, zone: &str, _skip_build: bool) -> Result<()> {
+    fn start_idle_coordinator(&self, pool_name: &str, zone: &str, _skip_build: bool, pool_db_path: Option<&str>) -> Result<()> {
         // Get coordinator instance
         let instances = self.provider.list_instances(pool_name)?;
         let coordinator = instances
@@ -128,11 +128,15 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             coordinator.name.cyan()
         );
 
-        let coord_cmd = format!(
+        let mut coord_cmd = String::from(
             "nohup /usr/local/bin/genohype service start-coordinator \
              --port 3000 \
-             > /tmp/coordinator.log 2>&1 & echo $! > /tmp/coordinator.pid"
+             --db-path /var/lib/genohype/ops.db"
         );
+        if let Some(backup) = pool_db_path {
+            coord_cmd.push_str(&format!(" --backup-path {}", backup));
+        }
+        coord_cmd.push_str(" > /tmp/coordinator.log 2>&1 & echo $! > /tmp/coordinator.pid");
 
         let status = self
             .provider
@@ -1039,6 +1043,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         let coord_cmd =
             "nohup /usr/local/bin/genohype service start-coordinator \
              --port 3000 \
+             --db-path /var/lib/genohype/ops.db \
              > /tmp/coordinator.log 2>&1 & echo $! > /tmp/coordinator.pid";
         let status = self
             .provider
@@ -1192,6 +1197,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             force,
             batch_size,
             memory_weight_mb,
+            config,
             command,
         );
 
@@ -1223,6 +1229,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         force: bool,
         batch_size: Option<usize>,
         memory_weight_mb: Option<u64>,
+        config: Option<&crate::cloud::ScalingConfig>,
         command: &[String],
     ) -> Result<()> {
         // 1. Locate the Linux binary (will check if needed after seeing coordinator status)
@@ -1339,13 +1346,18 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                     "{}",
                     "Starting coordinator service to serve binary...".dimmed()
                 );
-                let coord_cmd =
+                let mut coord_cmd = String::from(
                     "nohup /usr/local/bin/genohype service start-coordinator \
                      --port 3000 \
-                     > /tmp/coordinator.log 2>&1 & echo $! > /tmp/coordinator.pid";
+                     --db-path /var/lib/genohype/ops.db"
+                );
+                if let Some(backup) = config.and_then(|c| c.pool_db_path.as_deref()) {
+                    coord_cmd.push_str(&format!(" --backup-path {}", backup));
+                }
+                coord_cmd.push_str(" > /tmp/coordinator.log 2>&1 & echo $! > /tmp/coordinator.pid");
                 let status = self
                     .provider
-                    .get_ssh_command(&coord.name, zone, coord_cmd)
+                    .get_ssh_command(&coord.name, zone, &coord_cmd)
                     .status()
                     .map_err(HailError::Io)?;
 
@@ -1398,6 +1410,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                 force,
                 batch_size,
                 memory_weight_mb,
+                config,
             );
         }
 
@@ -1631,6 +1644,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         force: bool,
         batch_size: Option<usize>,
         memory_weight_mb: Option<u64>,
+        config: Option<&crate::cloud::ScalingConfig>,
     ) -> Result<()> {
         use genohype_core::query::QueryEngine;
 
@@ -1968,14 +1982,19 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             std::thread::sleep(std::time::Duration::from_millis(500));
 
             // Start coordinator service in idle mode (accepts jobs via API)
-            let coord_cmd =
+            let mut coord_cmd = String::from(
                 "nohup /usr/local/bin/genohype service start-coordinator \
                  --port 3000 \
-                 > /tmp/coordinator.log 2>&1 & echo $! > /tmp/coordinator.pid";
+                 --db-path /var/lib/genohype/ops.db"
+            );
+            if let Some(backup) = config.and_then(|c| c.pool_db_path.as_deref()) {
+                coord_cmd.push_str(&format!(" --backup-path {}", backup));
+            }
+            coord_cmd.push_str(" > /tmp/coordinator.log 2>&1 & echo $! > /tmp/coordinator.pid");
 
             let status = self
                 .provider
-                .get_ssh_command(&coordinator.name, zone, coord_cmd)
+                .get_ssh_command(&coordinator.name, zone, &coord_cmd)
                 .status()
                 .map_err(HailError::Io)?;
 
