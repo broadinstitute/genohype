@@ -58,6 +58,9 @@ export const WorkspaceToolbar: React.FC = () => {
       <button onClick={() => handlePresetChange('debug')} style={getButtonStyle('debug')}>
         Debug
       </button>
+      <button onClick={() => handlePresetChange('fleet')} style={getButtonStyle('fleet')}>
+        Fleet
+      </button>
     </div>
   );
 };

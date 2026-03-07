@@ -42,25 +42,45 @@ async fn backup_db(metrics_db: &MetricsDb, db_path: &str, backup_path: &str) {
         eprintln!("Warning: failed to checkpoint DB before backup: {}", e);
     }
 
-    // Read the database file and upload to GCS
-    if let Ok(db_contents) = std::fs::read(db_path) {
+    // Read the database file and upload to GCS in a blocking task
+    let db_path = db_path.to_string();
+    let backup_path = backup_path.to_string();
+    let backup_path_display = backup_path.clone();
+    let result = tokio::task::spawn_blocking(move || {
         use genohype_core::io::CloudWriter;
         use std::io::Write;
-        if let Ok(mut writer) = CloudWriter::new(backup_path) {
-            if writer.write_all(&db_contents).is_ok() {
-                if writer.finish().is_ok() {
-                    println!("Job history backed up to {}", backup_path);
-                } else {
-                    eprintln!("Warning: failed to finalize backup upload to {}", backup_path);
-                }
-            } else {
-                eprintln!("Warning: failed to write backup data to {}", backup_path);
+
+        let db_contents = match std::fs::read(&db_path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Warning: failed to read database file at {}: {}", db_path, e);
+                return false;
             }
-        } else {
-            eprintln!("Warning: failed to create cloud writer for {}", backup_path);
+        };
+
+        let mut writer = match CloudWriter::new(&backup_path) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("Warning: failed to create cloud writer for {}: {}", backup_path, e);
+                return false;
+            }
+        };
+
+        if let Err(e) = writer.write_all(&db_contents) {
+            eprintln!("Warning: failed to write backup data to {}: {}", backup_path, e);
+            return false;
         }
-    } else {
-        eprintln!("Warning: failed to read database file at {}", db_path);
+
+        if let Err(e) = writer.finish() {
+            eprintln!("Warning: failed to finalize backup upload to {}: {}", backup_path, e);
+            return false;
+        }
+
+        true
+    }).await;
+
+    if result.unwrap_or(false) {
+        println!("Job history backed up to {}", backup_path_display);
     }
 }
 
@@ -461,16 +481,24 @@ pub async fn run_coordinator(
     // Try to restore from backup path if configured
     if let Some(ref bp) = backup_path {
         println!("  Checking for database backup at {}", bp);
-        if let Ok(mut reader) = genohype_core::io::get_reader(bp) {
-            let mut data = Vec::new();
-            if std::io::Read::read_to_end(&mut reader, &mut data).is_ok() && !data.is_empty() {
-                if let Some(parent) = std::path::Path::new(&db_path).parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                if std::fs::write(&db_path, data).is_ok() {
-                    println!("  Restored ops database from {}", bp);
+        let bp_clone = bp.clone();
+        let db_path_clone = db_path.clone();
+        let restore_result = tokio::task::spawn_blocking(move || {
+            if let Ok(mut reader) = genohype_core::io::get_reader(&bp_clone) {
+                let mut data = Vec::new();
+                if std::io::Read::read_to_end(&mut reader, &mut data).is_ok() && !data.is_empty() {
+                    if let Some(parent) = std::path::Path::new(&db_path_clone).parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if std::fs::write(&db_path_clone, data).is_ok() {
+                        return true;
+                    }
                 }
             }
+            false
+        }).await;
+        if restore_result.unwrap_or(false) {
+            println!("  Restored ops database from {}", bp);
         }
     }
 
@@ -635,7 +663,7 @@ pub async fn run_coordinator(
             };
 
             if let Some(ref bp) = backup_path {
-                let should_backup = events_since > 1000 || last_backup_time.elapsed().as_secs() > 1800;
+                let should_backup = events_since > 1000 || last_backup_time.elapsed().as_secs() > 60;
                 if should_backup {
                     backup_db(&metrics_db, &db_path, bp).await;
                     last_backup_time = Instant::now();
@@ -3273,6 +3301,8 @@ async fn get_dashboard_summary(
         scan_cpu_secs: data.scan_cpu_secs,
         aggregate_cpu_secs: data.aggregate_cpu_secs,
         wasted_cpu_secs: data.wasted_cpu_secs,
+        db_path: Some(data.config.db_path.clone()),
+        backup_path: data.config.backup_path.clone(),
     })
 }
 

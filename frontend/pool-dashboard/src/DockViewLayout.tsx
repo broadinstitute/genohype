@@ -94,56 +94,66 @@ export const applyOverviewLayout = (api: DockviewApi, isBatchJob: boolean) => {
 
 /**
  * Applies the Performance layout preset:
- * 3x2 grid of metric panels:
- * - Row 1: Cluster Efficiency (left), CPU (right)
- * - Row 2: Batch Size (left), Network (right)
- * - Row 3: Throughput (left), Memory (right)
+ * 2-column layout:
+ * - Column 1: Job Summary/Cluster Efficiency (tabbed) → Batch Size → Throughput
+ * - Column 2: CPU → Memory → Network
  */
 export const applyPerformanceLayout = (api: DockviewApi) => {
   clearPanels(api);
 
-  // Row 1: Cluster Efficiency | CPU
-  const efficiency = api.addPanel({
+  // Column 1: Job Summary (root)
+  const jobSummary = api.addPanel({
+    id: 'job_summary',
+    component: 'jobSummary',
+    title: 'Job Summary',
+  });
+
+  // Column 1: Cluster Efficiency (tabbed with Job Summary)
+  api.addPanel({
     id: 'cluster_efficiency',
     component: 'clusterEfficiency',
     title: 'Cluster Efficiency',
+    position: { direction: 'within', referencePanel: jobSummary.id },
   });
 
-  api.addPanel({
+  // Column 2: CPU (right of Job Summary, creates 2-column split)
+  const cpuChart = api.addPanel({
     id: 'cpu_chart',
     component: 'cpuChart',
     title: 'CPU',
-    position: { direction: 'right', referencePanel: efficiency.id },
+    position: { direction: 'right', referencePanel: jobSummary.id },
   });
 
-  // Row 2: Batch Size | Network
+  // Column 2: Memory (below CPU)
+  const memoryChart = api.addPanel({
+    id: 'memory_chart',
+    component: 'memoryChart',
+    title: 'Memory',
+    position: { direction: 'below', referencePanel: cpuChart.id },
+  });
+
+  // Column 1: Batch Size (below Job Summary/Efficiency tabs)
   const batchSize = api.addPanel({
     id: 'batch_size_chart',
     component: 'batchSizeChart',
     title: 'Batch Size',
-    position: { direction: 'below', referencePanel: efficiency.id },
+    position: { direction: 'below', referencePanel: jobSummary.id },
   });
 
+  // Column 2: Network (below Memory)
   api.addPanel({
     id: 'network_chart',
     component: 'networkChart',
     title: 'Network',
-    position: { direction: 'right', referencePanel: batchSize.id },
+    position: { direction: 'below', referencePanel: memoryChart.id },
   });
 
-  // Row 3: Throughput | Memory
-  const throughput = api.addPanel({
+  // Column 1: Throughput (below Batch Size)
+  api.addPanel({
     id: 'throughput_chart',
     component: 'throughputChart',
     title: 'Throughput',
     position: { direction: 'below', referencePanel: batchSize.id },
-  });
-
-  api.addPanel({
-    id: 'memory_chart',
-    component: 'memoryChart',
-    title: 'Memory',
-    position: { direction: 'right', referencePanel: throughput.id },
   });
 };
 
@@ -177,6 +187,20 @@ export const applyDebugLayout = (api: DockviewApi) => {
 };
 
 /**
+ * Applies the Fleet layout preset:
+ * - Full-screen Worker Fleet panel for detailed worker monitoring
+ */
+export const applyFleetLayout = (api: DockviewApi) => {
+  clearPanels(api);
+
+  api.addPanel({
+    id: 'worker_fleet',
+    component: 'workerFleet',
+    title: 'Worker Fleet',
+  });
+};
+
+/**
  * Main Dockview layout component.
  * Registers all Phase 3 panels and reacts to layoutPresetAtom changes
  * to apply the corresponding workspace layout.
@@ -200,6 +224,9 @@ export const DockViewLayout: React.FC = () => {
         break;
       case 'debug':
         applyDebugLayout(api);
+        break;
+      case 'fleet':
+        applyFleetLayout(api);
         break;
       case 'overview':
       default:

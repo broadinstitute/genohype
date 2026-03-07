@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { useAtomValue } from 'jotai';
 import { workersAtom } from '../../atoms/dashboardAtoms';
 import type { DashboardWorker, TelemetrySnapshot, CoreTaskInfo } from '../../types';
@@ -29,6 +30,239 @@ export const WorkerFleetPanel: React.FC = () => {
 };
 
 /**
+ * Summarizes active tasks by type, showing counts and sample labels.
+ */
+interface TaskTypeSummary {
+  type: string;
+  count: number;
+  labels: string[]; // Sample of unique labels for this type
+}
+
+/**
+ * Extracts task summaries grouped by type from core_tasks.
+ */
+const getTaskTypeSummaries = (
+  coreTasks?: Record<number, CoreTaskInfo>
+): TaskTypeSummary[] => {
+  if (!coreTasks) return [];
+
+  const typeMap = new Map<string, { count: number; labels: Set<string> }>();
+
+  Object.values(coreTasks).forEach((task) => {
+    const existing = typeMap.get(task.task_type);
+    const label = task.label || `#${task.task_id}`;
+
+    if (existing) {
+      existing.count++;
+      existing.labels.add(label); // Collect all unique labels
+    } else {
+      typeMap.set(task.task_type, { count: 1, labels: new Set([label]) });
+    }
+  });
+
+  return Array.from(typeMap.entries())
+    .map(([type, data]) => ({
+      type,
+      count: data.count,
+      labels: Array.from(data.labels),
+    }))
+    .sort((a, b) => b.count - a.count); // Most active types first
+};
+
+/**
+ * Gets human-readable name for task type.
+ */
+const getTaskTypeName = (type: string): string => {
+  switch (type) {
+    case 'partition':
+      return 'Partitions';
+    case 'phenotype':
+      return 'Phenotypes';
+    case 'locus_plot':
+      return 'Locus Plots';
+    case 'aggregation':
+      return 'Aggregation';
+    case 'stress':
+      return 'Stress Test';
+    default:
+      return type.charAt(0).toUpperCase() + type.slice(1);
+  }
+};
+
+/**
+ * Gets the color for a task type.
+ */
+const getTaskTypeColor = (taskType: string): string => {
+  switch (taskType) {
+    case 'partition':
+      return 'var(--cyan)';
+    case 'phenotype':
+      return 'var(--green)';
+    case 'locus_plot':
+      return 'var(--magenta, #d19afc)';
+    case 'aggregation':
+      return 'var(--yellow)';
+    case 'stress':
+      return 'var(--orange)';
+    default:
+      return 'var(--text-dim)';
+  }
+};
+
+/**
+ * Badge component displaying a task type summary with hover popover.
+ */
+const TaskTypeBadge: React.FC<{ summary: TaskTypeSummary }> = ({ summary }) => {
+  const [isHovered, setIsHovered] = useState(false);
+  const color = getTaskTypeColor(summary.type);
+  const typeName = getTaskTypeName(summary.type);
+
+  return (
+    <div
+      style={{ position: 'relative' }}
+      onMouseEnter={() => setIsHovered(true)}
+      onMouseLeave={() => setIsHovered(false)}
+    >
+      {/* Badge */}
+      <div
+        style={{
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '2px',
+          padding: '4px 8px',
+          background: isHovered ? 'rgba(255, 255, 255, 0.06)' : 'rgba(255, 255, 255, 0.03)',
+          borderRadius: '4px',
+          borderLeft: `3px solid ${color}`,
+          minWidth: '80px',
+          cursor: 'pointer',
+          transition: 'background 0.15s ease',
+        }}
+      >
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <span style={{ fontSize: '9px', fontWeight: 600, color: color, textTransform: 'uppercase' }}>
+            {typeName}
+          </span>
+          <span
+            style={{
+              fontSize: '10px',
+              fontWeight: 600,
+              color: 'var(--text)',
+              background: 'rgba(255, 255, 255, 0.1)',
+              padding: '0 4px',
+              borderRadius: '3px',
+            }}
+          >
+            {summary.count}
+          </span>
+        </div>
+        <div
+          style={{
+            fontSize: '8px',
+            color: 'var(--text-dim)',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          {summary.labels.slice(0, 2).join(', ')}
+          {summary.labels.length > 2 && ' …'}
+        </div>
+      </div>
+
+      {/* Hover Popover */}
+      {isHovered && summary.labels.length > 2 && (
+        <div
+          style={{
+            position: 'absolute',
+            top: '100%',
+            left: 0,
+            marginTop: '4px',
+            zIndex: 100,
+            minWidth: '180px',
+            maxWidth: '280px',
+            maxHeight: '200px',
+            overflowY: 'auto',
+            background: 'var(--bg-secondary, #1a1a2e)',
+            border: `1px solid ${color}`,
+            borderRadius: '6px',
+            boxShadow: '0 4px 12px rgba(0, 0, 0, 0.4)',
+            padding: '8px 0',
+          }}
+        >
+          <div
+            style={{
+              padding: '4px 10px 8px',
+              borderBottom: '1px solid rgba(255, 255, 255, 0.1)',
+              marginBottom: '4px',
+            }}
+          >
+            <span style={{ fontSize: '10px', fontWeight: 600, color: color }}>
+              {typeName}
+            </span>
+            <span style={{ fontSize: '9px', color: 'var(--text-dim)', marginLeft: '6px' }}>
+              {summary.count} on {summary.labels.length} unique task{summary.labels.length !== 1 ? 's' : ''}
+            </span>
+          </div>
+          {summary.labels.map((label, idx) => (
+            <div
+              key={idx}
+              style={{
+                padding: '3px 10px',
+                fontSize: '9px',
+                color: 'var(--text)',
+                borderLeft: `2px solid transparent`,
+              }}
+            >
+              {label}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+/**
+ * Displays the current active task summary for a worker.
+ */
+const ActiveTaskSummary: React.FC<{
+  coreTasks?: Record<number, CoreTaskInfo>;
+  status: string;
+}> = ({ coreTasks, status }) => {
+  const taskSummaries = getTaskTypeSummaries(coreTasks);
+  const activeCoreCount = coreTasks ? Object.keys(coreTasks).length : 0;
+
+  if (status !== 'active' || taskSummaries.length === 0) {
+    return null;
+  }
+
+  return (
+    <div style={{ marginBottom: '10px' }}>
+      <div
+        style={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          marginBottom: '6px',
+        }}
+      >
+        <span style={{ fontSize: '9px', color: 'var(--text-dim)', textTransform: 'uppercase' }}>
+          Active Work
+        </span>
+        <span style={{ fontSize: '9px', color: 'var(--cyan)' }}>
+          {activeCoreCount} core{activeCoreCount !== 1 ? 's' : ''} busy
+        </span>
+      </div>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
+        {taskSummaries.map((summary) => (
+          <TaskTypeBadge key={summary.type} summary={summary} />
+        ))}
+      </div>
+    </div>
+  );
+};
+
+/**
  * Individual worker card displaying status, hardware usage, and per-core utilization.
  */
 const WorkerCard: React.FC<{ worker: DashboardWorker }> = ({ worker }) => {
@@ -49,6 +283,9 @@ const WorkerCard: React.FC<{ worker: DashboardWorker }> = ({ worker }) => {
       <div className="worker-content">
         {t ? (
           <>
+            {/* Active Task Summary (new) */}
+            <ActiveTaskSummary coreTasks={t.core_tasks} status={worker.status} />
+
             {/* CPU Overview */}
             <div
               style={{

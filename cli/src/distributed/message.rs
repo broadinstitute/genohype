@@ -845,6 +845,12 @@ pub struct DashboardSummary {
     /// Cumulative CPU-seconds wasted due to failures/preemption
     #[serde(default)]
     pub wasted_cpu_secs: f64,
+    /// Local path to the SQLite database
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub db_path: Option<String>,
+    /// GCS path for backup (if configured)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup_path: Option<String>,
 }
 
 /// Request to submit a new job to an idle coordinator.

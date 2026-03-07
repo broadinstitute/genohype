@@ -45,6 +45,9 @@ use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn main() -> Result<()> {
+    // Suppress gcloud warnings (e.g., the IAP NumPy warning) globally for all child processes
+    std::env::set_var("CLOUDSDK_CORE_DISABLE_WARNINGS", "1");
+
     let cli = Cli::parse();
 
     // Load configuration from file
@@ -2092,7 +2095,8 @@ fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> Resul
             binary,
             skip_build,
         } => {
-            manager.update_binary(&name, &zone, binary, skip_build)?;
+            let pool_db_path = app_config.get_pool(&name).and_then(|p| p.pool_db_path.clone());
+            manager.update_binary(&name, &zone, binary, skip_build, pool_db_path.as_deref())?;
         }
         PoolCommands::Cancel { name, zone } => {
             manager.cancel(&name, &zone)?;

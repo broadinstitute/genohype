@@ -169,6 +169,18 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             pool_name
         );
 
+        // Pre-deploy binary to workers so they're ready when jobs are submitted
+        let workers: Vec<_> = instances.iter().filter(|i| i.name.contains("-worker-")).cloned().collect();
+        if !workers.is_empty() {
+            println!("{}", "Pre-deploying binary to workers...".dimmed());
+            self.pre_deploy_binary_to_workers(coord_ip, &workers, zone)?;
+            println!(
+                "{} Binary pre-deployed to {} worker(s)",
+                "OK".green().bold(),
+                workers.len()
+            );
+        }
+
         Ok(())
     }
 
@@ -937,6 +949,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         zone: &str,
         binary_path: Option<String>,
         skip_build: bool,
+        pool_db_path: Option<&str>,
     ) -> Result<()> {
         // Determine if we should build
         // Note: update_binary doesn't know about job features, defaulting to none.
@@ -1040,14 +1053,18 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             "{}",
             "Starting coordinator service with new binary...".dimmed()
         );
-        let coord_cmd =
+        let mut coord_cmd = String::from(
             "nohup /usr/local/bin/genohype service start-coordinator \
              --port 3000 \
-             --db-path /var/lib/genohype/ops.db \
-             > /tmp/coordinator.log 2>&1 & echo $! > /tmp/coordinator.pid";
+             --db-path /var/lib/genohype/ops.db"
+        );
+        if let Some(backup) = pool_db_path {
+            coord_cmd.push_str(&format!(" --backup-path {}", backup));
+        }
+        coord_cmd.push_str(" > /tmp/coordinator.log 2>&1 & echo $! > /tmp/coordinator.pid");
         let status = self
             .provider
-            .get_ssh_command(&coordinator.name, zone, coord_cmd)
+            .get_ssh_command(&coordinator.name, zone, &coord_cmd)
             .status()
             .map_err(HailError::Io)?;
 
@@ -1152,13 +1169,34 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         // 1. Explicit skip_build -> skip
         // 2. We have a bundled binary -> skip (Release mode)
         // 3. Otherwise -> build (Dev mode)
-        let should_build = if skip_build {
+        let should_build_base = if skip_build {
             false
         } else if self.has_bundled_binary() {
             println!("{}", "Found bundled worker binary, skipping build...".dimmed());
             false
         } else {
             true
+        };
+
+        // Optimize: check if coordinator is already running before building
+        // If coordinator is running and we're not force redeploying or autoscaling,
+        // we can skip the build entirely since binary is already deployed
+        let should_build = if should_build_base && !force_redeploy && !autoscale {
+            // Peek at coordinator status to intelligently skip local build
+            let instances = self.provider.list_instances(name).unwrap_or_default();
+            let coordinator = instances.iter().find(|i| i.name.ends_with("-coordinator"));
+            if let Some(coord) = coordinator {
+                if self.check_coordinator_status(coord, zone) {
+                    println!("{}", "Coordinator already running, skipping build...".dimmed());
+                    false
+                } else {
+                    should_build_base
+                }
+            } else {
+                should_build_base
+            }
+        } else {
+            should_build_base
         };
 
         // Build binary if redeploying (ensures latest code is used) or if needed
@@ -2329,6 +2367,48 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             println!(
                 "   {} {} (from coordinator)",
                 "Deployed to".dimmed(),
+                worker.name.cyan()
+            );
+            Ok(())
+        })
+    }
+
+    /// Pre-deploy binary from coordinator to workers without starting worker processes.
+    /// Used during pool creation to prime workers with the binary.
+    fn pre_deploy_binary_to_workers(
+        &self,
+        coordinator_ip: &str,
+        workers: &[Instance],
+        zone: &str,
+    ) -> Result<()> {
+        workers.par_iter().try_for_each(|worker| {
+            // Download binary from coordinator and install it, but don't start worker process
+            let curl_cmd = format!(
+                "curl -sL --retry 3 --retry-delay 2 http://{}:3000/api/binary -o /tmp/genohype && \
+                 chmod +x /tmp/genohype && \
+                 sudo mv /tmp/genohype /usr/local/bin/genohype",
+                coordinator_ip
+            );
+
+            let status = self
+                .provider
+                .get_ssh_command(&worker.name, zone, &curl_cmd)
+                .status()
+                .map_err(HailError::Io)?;
+
+            if !status.success() {
+                return Err(HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!(
+                        "Failed to pre-deploy binary to {}",
+                        worker.name
+                    ),
+                )));
+            }
+
+            println!(
+                "   {} {}",
+                "Binary deployed to".dimmed(),
                 worker.name.cyan()
             );
             Ok(())

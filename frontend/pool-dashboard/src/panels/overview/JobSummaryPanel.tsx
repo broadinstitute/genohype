@@ -67,6 +67,14 @@ export const JobSummaryPanel: React.FC = () => {
             {formatPath(summary.input_path)}
           </span>
         </div>
+        {summary.backup_path && (
+          <div style={{ marginBottom: '4px' }}>
+            <span style={{ color: 'var(--text-dim)' }}>Backup: </span>
+            <span style={{ wordBreak: 'break-all', color: 'var(--green)' }} title={summary.backup_path}>
+              {formatPath(summary.backup_path)}
+            </span>
+          </div>
+        )}
         <div style={{ display: 'flex', gap: '16px', fontSize: '11px', flexWrap: 'wrap' }}>
           <span>
             <span style={{ color: 'var(--text-dim)' }}>Status: </span>

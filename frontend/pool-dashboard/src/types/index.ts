@@ -93,6 +93,10 @@ export interface DashboardSummary {
   job_spec?: unknown;
   /** Whether the coordinator is idle */
   idle: boolean;
+  /** Local path to the SQLite database */
+  db_path?: string;
+  /** GCS path for backup (if configured) */
+  backup_path?: string;
 }
 
 /**
