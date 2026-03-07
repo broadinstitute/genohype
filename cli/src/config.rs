@@ -23,6 +23,7 @@ pub struct Config {
     pub defaults: Defaults,
 
     /// Export command defaults
+    #[allow(dead_code)]
     #[serde(default)]
     pub export: ExportDefaults,
 
@@ -59,6 +60,7 @@ pub struct Defaults {
 }
 
 /// Export command defaults.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize, Default, Clone)]
 pub struct ExportDefaults {
     /// BigQuery export settings
@@ -70,6 +72,7 @@ pub struct ExportDefaults {
 }
 
 /// BigQuery export defaults.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize, Default, Clone)]
 pub struct BigQueryDefaults {
     /// GCS bucket for staging parquet files
@@ -79,6 +82,7 @@ pub struct BigQueryDefaults {
 }
 
 /// ClickHouse export defaults.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize, Default, Clone)]
 pub struct ClickHouseDefaults {
     /// ClickHouse HTTP URL
@@ -236,6 +240,7 @@ impl Config {
     /// 3. `./genohype.toml`
     ///
     /// Returns default config if no file is found.
+    #[allow(dead_code)]
     pub fn load() -> Self {
         Self::load_from_path(None)
     }
@@ -335,6 +340,7 @@ impl Config {
     }
 
     /// Get the list of paths to search for config files.
+    #[allow(dead_code)]
     fn config_search_paths() -> Vec<PathBuf> {
         let mut paths = Vec::new();
 
@@ -452,6 +458,7 @@ pub struct ResolvedClickHouseConfig {
 }
 
 /// A fully resolved pool configuration with all defaults applied.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ResolvedPoolConfig {
     /// Pool name
@@ -604,6 +611,7 @@ impl HailEnv {
     /// Get the ClickHouse URL.
     /// If clickhouse is already a URL, return it directly.
     /// Otherwise, this returns None and caller should resolve instance name to IP.
+    #[allow(dead_code)]
     pub fn clickhouse_url(&self) -> Option<&str> {
         if self.clickhouse_is_url() {
             Some(&self.clickhouse)
@@ -613,6 +621,7 @@ impl HailEnv {
     }
 
     /// Get the ClickHouse instance name (if not a URL).
+    #[allow(dead_code)]
     pub fn clickhouse_instance(&self) -> Option<&str> {
         if self.clickhouse_is_url() {
             None

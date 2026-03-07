@@ -1,0 +1,11 @@
+
+cli/**/*.rs
+core/**/*.rs
+pool/**/*.rs
+
+*.py
+*.sh
+
+Makefile
+
+frontend/pool-dashboard/src/**/*.{tsx,ts,css}

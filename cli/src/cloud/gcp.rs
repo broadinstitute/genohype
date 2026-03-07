@@ -29,6 +29,7 @@ impl GcpClient {
     }
 
     /// Create a new GCP client with a specific project.
+    #[allow(dead_code)]
     pub fn with_project(project: String) -> Self {
         Self {
             project: Some(project),
@@ -81,6 +82,7 @@ impl GcpClient {
     }
 
     /// Get the default zone from gcloud config.
+    #[allow(dead_code)]
     pub fn get_default_zone(&self) -> Result<String> {
         let output = Command::new("gcloud")
             .args(["config", "get-value", "compute/zone"])
@@ -97,6 +99,7 @@ impl GcpClient {
     }
 
     /// Wait for an instance to be in RUNNING state.
+    #[allow(dead_code)]
     pub fn wait_for_instance(&self, instance: &str, zone: &str, timeout_secs: u64) -> Result<()> {
         let start = std::time::Instant::now();
         let timeout = std::time::Duration::from_secs(timeout_secs);
@@ -133,6 +136,7 @@ impl GcpClient {
     }
 
     /// Wait for the startup script to complete (marker file exists).
+    #[allow(dead_code)]
     pub fn wait_for_startup_complete(
         &self,
         instance: &str,

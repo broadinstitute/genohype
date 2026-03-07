@@ -7,7 +7,7 @@
 use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, RefreshKind, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// Input table metadata for the benchmark report
@@ -26,9 +26,10 @@ pub struct InputMetadata {
 }
 
 // Re-export progress types from core
-pub use genohype_core::progress::{FieldSizeStats, RowSizeStats};
+pub use genohype_core::progress::RowSizeStats;
 
 /// A single snapshot of system metrics
+#[allow(dead_code)]
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct MetricsSample {
     /// Timestamp (seconds since start)
@@ -653,50 +654,3 @@ impl MetricsCollector {
     }
 }
 
-/// Get total disk I/O bytes (read, write) from /proc/diskstats on Linux
-#[cfg(target_os = "linux")]
-fn get_disk_io_bytes() -> (u64, u64) {
-    use std::fs::File;
-    use std::io::{BufRead, BufReader};
-
-    let mut total_read = 0u64;
-    let mut total_write = 0u64;
-
-    if let Ok(file) = File::open("/proc/diskstats") {
-        let reader = BufReader::new(file);
-        for line in reader.lines().flatten() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            // diskstats format: major minor name rd_ios rd_merges rd_sectors rd_ticks
-            //                   wr_ios wr_merges wr_sectors wr_ticks ...
-            // We want rd_sectors (index 5) and wr_sectors (index 9)
-            if parts.len() >= 10 {
-                // Skip partitions (only count whole disks like sda, nvme0n1)
-                let name = parts[2];
-                if name.chars().last().map(|c| c.is_ascii_digit()).unwrap_or(false)
-                    && !name.starts_with("nvme")
-                {
-                    continue; // Skip partitions like sda1, sdb2
-                }
-                if name.contains("loop") || name.contains("ram") {
-                    continue; // Skip loop and ram devices
-                }
-
-                if let (Ok(rd_sectors), Ok(wr_sectors)) =
-                    (parts[5].parse::<u64>(), parts[9].parse::<u64>())
-                {
-                    // Sectors are typically 512 bytes
-                    total_read += rd_sectors * 512;
-                    total_write += wr_sectors * 512;
-                }
-            }
-        }
-    }
-
-    (total_read, total_write)
-}
-
-/// Fallback for non-Linux systems
-#[cfg(not(target_os = "linux"))]
-fn get_disk_io_bytes() -> (u64, u64) {
-    (0, 0)
-}

@@ -221,6 +221,7 @@ impl Default for BackgroundStyle {
 
 impl BackgroundStyle {
     /// Parse from string (CLI argument).
+    #[allow(dead_code)]
     pub fn from_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "transparent" => BackgroundStyle::Transparent,
@@ -280,6 +281,7 @@ impl Default for ManhattanConfig {
 
 impl ManhattanConfig {
     /// Load configuration from a TOML file.
+    #[allow(dead_code)]
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path).map_err(HailError::Io)?;
         toml::from_str(&content).map_err(|e| HailError::Config(e.to_string()))

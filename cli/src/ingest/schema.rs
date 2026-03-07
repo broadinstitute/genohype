@@ -27,14 +27,6 @@ pub fn get_manhattan_schemas() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
-/// Returns just the table names for Manhattan ingestion.
-pub fn get_manhattan_table_names() -> Vec<&'static str> {
-    get_manhattan_schemas()
-        .into_iter()
-        .map(|(name, _)| name)
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

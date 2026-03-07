@@ -35,6 +35,7 @@ pub struct BufferedVariant {
 }
 
 /// A genomic region of interest for locus plot generation.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct LocusRegion {
     pub contig: String,
@@ -345,6 +346,7 @@ pub struct ManifestStats {
 }
 
 /// Error manifest for tracking pipeline failures.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorManifest {
     /// Phenotype identifier

@@ -24,6 +24,7 @@ use std::time::Instant;
 ///
 /// This handler deserializes the generic JSON payload into a JobSpec and
 /// delegates to the existing job dispatch logic.
+#[allow(dead_code)]
 pub struct CliTaskHandler {
     /// Input path for the Hail table
     pub input_path: String,
@@ -33,6 +34,7 @@ pub struct CliTaskHandler {
     pub intervals: Vec<String>,
 }
 
+#[allow(dead_code)]
 impl CliTaskHandler {
     /// Create a new CLI task handler.
     pub fn new(input_path: String, filters: Vec<String>, intervals: Vec<String>) -> Self {
@@ -100,6 +102,7 @@ impl TaskHandler for CliTaskHandler {
 /// This is a minimal implementation that demonstrates the abstraction.
 /// In a full implementation, this would wrap the existing CoordinatorData
 /// with all its batch/pipeline state machines.
+#[allow(dead_code)]
 pub struct SimpleWorkQueue {
     /// Partitions waiting to be assigned
     pub pending: VecDeque<usize>,
@@ -117,6 +120,7 @@ pub struct SimpleWorkQueue {
     pub filters: Vec<String>,
 }
 
+#[allow(dead_code)]
 impl SimpleWorkQueue {
     /// Create a new work queue with the given number of partitions.
     pub fn new(total_partitions: usize, input_path: String) -> Self {
@@ -141,11 +145,13 @@ impl SimpleWorkQueue {
 ///
 /// This demonstrates the abstraction pattern. In later sessions, this will
 /// be extended to wrap the full CoordinatorData with batch/pipeline support.
+#[allow(dead_code)]
 pub struct CliCoordinatorPlugin {
     /// Work queue state
     state: Arc<Mutex<SimpleWorkQueue>>,
 }
 
+#[allow(dead_code)]
 impl CliCoordinatorPlugin {
     /// Create a new coordinator plugin with the given work queue.
     pub fn new(state: Arc<Mutex<SimpleWorkQueue>>) -> Self {

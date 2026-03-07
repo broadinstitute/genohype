@@ -242,17 +242,6 @@ impl ClickHouseClient {
         Ok(())
     }
 
-    /// Check if a table exists
-    ///
-    /// # Arguments
-    ///
-    /// * `table_name` - Table name to check
-    pub fn table_exists(&self, table_name: &str) -> Result<bool> {
-        let query = format!("EXISTS TABLE `{}`", table_name);
-        let result = self.execute(&query)?;
-        Ok(result.trim() == "1")
-    }
-
     /// Get the row count of a table
     ///
     /// # Arguments

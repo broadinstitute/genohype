@@ -959,48 +959,6 @@ fn read_cloud_parquet_file(path: &str) -> Result<Vec<RecordBatch>> {
     Ok(batches)
 }
 
-/// Sort record batches by pvalue column.
-fn sort_batches_by_pvalue(batches: &[RecordBatch]) -> Result<Vec<RecordBatch>> {
-    use arrow::compute::concat_batches;
-    use arrow::compute::sort_to_indices;
-    use arrow::compute::take;
-
-    if batches.is_empty() {
-        return Ok(vec![]);
-    }
-
-    let schema = batches[0].schema();
-
-    // Concatenate all batches
-    let combined = concat_batches(&schema, batches)?;
-
-    // Get pvalue column index
-    let pvalue_idx = schema
-        .fields()
-        .iter()
-        .position(|f| f.name() == "pvalue")
-        .ok_or_else(|| crate::HailError::InvalidFormat("Missing pvalue column".into()))?;
-
-    let pvalue_col = combined.column(pvalue_idx);
-
-    // Sort indices by pvalue (ascending)
-    let sort_options = arrow::compute::SortOptions {
-        descending: false,
-        nulls_first: false,
-    };
-    let indices = sort_to_indices(pvalue_col, Some(sort_options), None)?;
-
-    // Apply sort to all columns
-    let sorted_columns: Vec<Arc<dyn Array>> = combined
-        .columns()
-        .iter()
-        .map(|col| take(col.as_ref(), &indices, None).map(Arc::from))
-        .collect::<std::result::Result<_, _>>()?;
-
-    let sorted_batch = RecordBatch::try_new(schema, sorted_columns)?;
-    Ok(vec![sorted_batch])
-}
-
 /// Write record batches to a parquet file.
 fn write_parquet_batches(
     path: &str,
@@ -1059,62 +1017,6 @@ fn write_cloud_parquet_batches(
     let cloud_writer = writer.into_inner()?;
     cloud_writer.finish()?;
     Ok(())
-}
-
-/// Extract top hit from sorted batches.
-fn extract_top_hit(batches: &[RecordBatch]) -> Option<ManifestTopHit> {
-    if batches.is_empty() {
-        return None;
-    }
-
-    let batch = &batches[0];
-    if batch.num_rows() == 0 {
-        return None;
-    }
-
-    // Get columns by name
-    let schema = batch.schema();
-    let get_string = |name: &str| -> Option<String> {
-        let idx = schema.fields().iter().position(|f| f.name() == name)?;
-        let col = batch.column(idx);
-        let arr = col.as_any().downcast_ref::<StringArray>()?;
-        if arr.is_null(0) {
-            None
-        } else {
-            Some(arr.value(0).to_string())
-        }
-    };
-
-    let get_f64 = |name: &str| -> Option<f64> {
-        let idx = schema.fields().iter().position(|f| f.name() == name)?;
-        let col = batch.column(idx);
-        let arr = col.as_any().downcast_ref::<Float64Array>()?;
-        if arr.is_null(0) {
-            None
-        } else {
-            Some(arr.value(0))
-        }
-    };
-
-    let contig = get_string("contig")?;
-    let position = {
-        let idx = schema.fields().iter().position(|f| f.name() == "position")?;
-        let col = batch.column(idx);
-        let arr = col
-            .as_any()
-            .downcast_ref::<arrow::array::Int32Array>()?;
-        arr.value(0)
-    };
-    let ref_allele = get_string("ref")?;
-    let alt_allele = get_string("alt")?;
-    let pvalue = get_f64("pvalue")?;
-
-    Some(ManifestTopHit {
-        id: format!("{}:{}:{}:{}", contig, position, ref_allele, alt_allele),
-        pvalue,
-        gene: None,
-        consequence: None,
-    })
 }
 
 /// Clean up intermediate partition files.
@@ -1721,69 +1623,6 @@ pub fn extract_sig_positions(parquet_path: &str) -> Result<Vec<SigPosition>> {
     }
 
     Ok(positions)
-}
-
-/// Compute locus regions by expanding significant positions and merging overlapping.
-fn compute_locus_regions(
-    positions: &[SigPosition],
-    window: i32,
-) -> Vec<(String, i32, i32)> {
-    // Group positions by chromosome
-    let mut by_chrom: HashMap<String, Vec<(i32, f64)>> = HashMap::new();
-    for pos in positions {
-        by_chrom
-            .entry(pos.contig.clone())
-            .or_default()
-            .push((pos.position, pos.pvalue));
-    }
-
-    let mut regions = Vec::new();
-
-    for (contig, mut chrom_positions) in by_chrom {
-        // Sort by position
-        chrom_positions.sort_by_key(|(pos, _)| *pos);
-
-        // Expand and merge
-        let mut current_start: Option<i32> = None;
-        let mut current_end: Option<i32> = None;
-
-        for (pos, _pvalue) in chrom_positions {
-            let expanded_start = (pos - window).max(1);
-            let expanded_end = pos + window;
-
-            match (current_start, current_end) {
-                (Some(_start), Some(end)) if expanded_start <= end => {
-                    // Overlapping - extend current region
-                    current_end = Some(expanded_end.max(end));
-                }
-                (Some(start), Some(end)) => {
-                    // Non-overlapping - emit current and start new
-                    regions.push((contig.clone(), start, end));
-                    current_start = Some(expanded_start);
-                    current_end = Some(expanded_end);
-                }
-                _ => {
-                    // First region
-                    current_start = Some(expanded_start);
-                    current_end = Some(expanded_end);
-                }
-            }
-        }
-
-        // Emit final region
-        if let (Some(start), Some(end)) = (current_start, current_end) {
-            regions.push((contig, start, end));
-        }
-    }
-
-    // Sort by chromosome and position
-    regions.sort_by(|a, b| {
-        let chr_a = parse_chrom_order(&a.0);
-        let chr_b = parse_chrom_order(&b.0);
-        chr_a.cmp(&chr_b).then(a.1.cmp(&b.1))
-    });
-
-    regions
 }
 
 /// Compute locus regions including gene bounds using Greedy P-value Clumping.

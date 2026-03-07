@@ -33,6 +33,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 /// Configuration for the coordinator.
+#[allow(dead_code)]
 pub struct CoordinatorConfig {
     /// Port to listen on
     pub port: u16,
@@ -112,6 +113,7 @@ enum ManhattanPhase {
 }
 
 /// Tracks what a specific task_id corresponds to in batch mode.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 enum ActiveTask {
     /// A scan task for a specific phenotype and partition
@@ -342,6 +344,7 @@ impl CoordinatorData {
 /// Start the coordinator server using a config struct.
 ///
 /// This function blocks until the job is complete or the server is interrupted.
+#[allow(dead_code)]
 pub async fn start_coordinator(config: CoordinatorConfig) -> Result<()> {
     // Extract output_path from job_spec for backward compatibility
     let output_path = config
@@ -2099,9 +2102,18 @@ async fn complete_work(
     // Extract task IDs and partition indices from request
     let task_ids = &req.tasks;
     let task_id = task_ids.first().cloned().unwrap_or_default();
+    // Extract partition indices from task IDs. Task IDs may be:
+    // - Raw numbers: "0", "1", "2" (legacy format)
+    // - Prefixed: "stress_0", "partition_1", etc. (new TaskDescriptor format)
     let partitions: Vec<usize> = task_ids
         .iter()
-        .filter_map(|t| t.parse::<usize>().ok())
+        .filter_map(|t| {
+            // First try direct parse (legacy format)
+            t.parse::<usize>().ok().or_else(|| {
+                // Try extracting number after underscore (e.g., "stress_0" -> 0)
+                t.rsplit('_').next().and_then(|s| s.parse::<usize>().ok())
+            })
+        })
         .collect();
 
     // AIMD Batch Size Adjustment
@@ -2700,7 +2712,7 @@ async fn submit_job(
     data.idle = false;
 
     // Handle ManhattanBatch jobs (batch scheduling mode)
-    if let JobSpec::ManhattanBatch { specs: ref specs, mode } = req.job_spec {
+    if let JobSpec::ManhattanBatch { ref specs, mode } = req.job_spec {
         let total_phenotypes = specs.len();
 
         // Clear standard partition tracking - batch mode uses its own

@@ -91,6 +91,7 @@ impl MetricsDb {
     }
 
     /// Open an in-memory database (useful for testing or when persistence isn't needed).
+    #[allow(dead_code)]
     pub fn in_memory() -> SqliteResult<Self> {
         Self::open(":memory:")
     }
@@ -176,6 +177,7 @@ impl MetricsDb {
     }
 
     /// Get recent snapshots for a worker (last N entries).
+    #[allow(dead_code)]
     pub fn get_worker_snapshots_recent(
         &self,
         worker_id: &str,
@@ -244,6 +246,7 @@ impl MetricsDb {
     }
 
     /// Get total count of snapshots.
+    #[allow(dead_code)]
     pub fn count(&self) -> SqliteResult<usize> {
         let conn = self.conn.lock().unwrap();
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM telemetry", [], |row| row.get(0))?;

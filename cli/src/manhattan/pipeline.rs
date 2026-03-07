@@ -49,6 +49,7 @@ pub struct PipelineConfig {
     pub locus_threshold: f64,
     pub locus_window: i32,
     pub locus_plots: bool,
+    #[allow(dead_code)]
     pub min_variants_per_locus: usize,
 
     // Output
@@ -1192,8 +1193,8 @@ fn enrich_variants_with_annotations(
 // =============================================================================
 
 use genohype_core::io::{is_cloud_path, StreamingCloudWriter};
-use crate::manhattan::data::{extract_plot_data, PlotPoint};
-use std::io::{BufWriter, Write};
+use crate::manhattan::data::PlotPoint;
+use std::io::Write;
 
 /// Result of a distributed scan containing extracted plot points.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -1207,124 +1208,6 @@ pub struct DistributedScanResult {
 /// Run a distributed scan for a specific set of partitions.
 ///
 /// This function is designed to be called by workers in a distributed pool.
-/// Instead of rendering a full Manhattan plot, it extracts raw PlotPoint data
-/// and writes it to an intermediate file for later aggregation.
-///
-/// # Arguments
-/// * `config` - Pipeline configuration (determines which tables to scan)
-/// * `partitions` - List of partition indices to process
-/// * `output_file` - Path to write the intermediate JSON output
-///
-/// # Returns
-/// Number of rows processed.
-pub fn run_distributed_scan(
-    config: &PipelineConfig,
-    partitions: &[usize],
-    output_file: &str,
-) -> Result<usize> {
-    let y_field = &config.y_field;
-    let mut all_points: Vec<PlotPoint> = Vec::new();
-    let mut total_rows: usize = 0;
-
-    // Scan exome table partitions
-    if let Some(exome_path) = &config.exome {
-        let (points, rows) = scan_table_partitions(exome_path, partitions, y_field)?;
-        all_points.extend(points);
-        total_rows += rows;
-    }
-
-    // Scan genome table partitions
-    if let Some(genome_path) = &config.genome {
-        let (points, rows) = scan_table_partitions(genome_path, partitions, y_field)?;
-        all_points.extend(points);
-        total_rows += rows;
-    }
-
-    // Write results to output file
-    let result = DistributedScanResult {
-        points: all_points,
-        rows_processed: total_rows,
-    };
-
-    write_scan_result(&result, output_file)?;
-
-    Ok(total_rows)
-}
-
-/// Scan specific partitions from a table and extract PlotPoints.
-fn scan_table_partitions(
-    table_path: &str,
-    partitions: &[usize],
-    y_field: &str,
-) -> Result<(Vec<PlotPoint>, usize)> {
-    use rayon::prelude::*;
-
-    let table_path = table_path.to_string();
-    let y_field = y_field.to_string();
-
-    // Process partitions in parallel
-    let results: Vec<Result<(Vec<PlotPoint>, usize)>> = partitions
-        .par_iter()
-        .map(|&partition_id| {
-            let engine = QueryEngine::open_path(&table_path)?;
-            let iter = engine.scan_partition_iter(partition_id, &[])?;
-
-            let mut points = Vec::new();
-            let mut rows = 0;
-
-            for row_result in iter {
-                let row = row_result?;
-                rows += 1;
-
-                if let Some(point) = extract_plot_data(&row, &y_field) {
-                    points.push(point);
-                }
-            }
-
-            Ok((points, rows))
-        })
-        .collect();
-
-    // Aggregate results
-    let mut all_points = Vec::new();
-    let mut total_rows = 0;
-
-    for result in results {
-        let (points, rows) = result?;
-        all_points.extend(points);
-        total_rows += rows;
-    }
-
-    Ok((all_points, total_rows))
-}
-
-/// Write scan result to a JSON file (supports cloud and local paths).
-fn write_scan_result(result: &DistributedScanResult, output_path: &str) -> Result<()> {
-    let json_data = serde_json::to_vec(result).map_err(|e| {
-        crate::HailError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Failed to serialize scan result: {}", e),
-        ))
-    })?;
-
-    if is_cloud_path(output_path) {
-        let mut writer = StreamingCloudWriter::new(output_path)?;
-        writer.write_all(&json_data)?;
-        writer.finish()?;
-    } else {
-        // Ensure parent directory exists
-        if let Some(parent) = std::path::Path::new(output_path).parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let file = std::fs::File::create(output_path)?;
-        let mut writer = BufWriter::new(file);
-        writer.write_all(&json_data)?;
-        writer.flush()?;
-    }
-
-    Ok(())
-}
-
 // =============================================================================
 // Shard Aggregation (--from-shards mode)
 // =============================================================================

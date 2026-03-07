@@ -129,6 +129,7 @@ echo "=== Coordinator VM initialized ==="
 /// Generate a startup script with custom commands appended.
 ///
 /// Useful for adding project-specific setup steps.
+#[allow(dead_code)]
 pub fn generate_startup_script_with_extras(extra_commands: &str) -> String {
     let mut script = generate_startup_script();
     // Remove the final echo and add custom commands before it

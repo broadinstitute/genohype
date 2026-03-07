@@ -6,11 +6,13 @@ use genohype_core::query::QueryEngine;
 use crate::Result;
 
 /// Annotates significant hits by looking up their keys in an annotation table.
+#[allow(dead_code)]
 pub struct Annotator {
     engine: Option<QueryEngine>,
     fields: Vec<String>,
 }
 
+#[allow(dead_code)]
 impl Annotator {
     /// Create an annotator. If `path` is `None`, annotation is a no-op.
     pub fn new(path: Option<String>, fields: Vec<String>) -> Result<Self> {
@@ -54,6 +56,7 @@ impl Annotator {
 }
 
 /// Convert an `EncodedValue` to a `serde_json::Value` for the sidecar.
+#[allow(dead_code)]
 fn encoded_value_to_json(val: &EncodedValue) -> serde_json::Value {
     match val {
         EncodedValue::Null => serde_json::Value::Null,

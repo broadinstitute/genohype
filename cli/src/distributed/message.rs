@@ -310,6 +310,7 @@ pub struct LociSpec {
 }
 
 /// A locus region to generate a plot for.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocusRegion {
     pub contig: String,
@@ -324,6 +325,7 @@ pub struct LocusRegion {
 }
 
 /// Worker-level locus generation job (assigned subset of regions).
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LociWorkerSpec {
     /// Path to Manhattan output directory

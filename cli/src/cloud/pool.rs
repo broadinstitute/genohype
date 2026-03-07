@@ -1672,7 +1672,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         }
 
         // For Manhattan jobs, compute the layout and partition counts for all tables
-        if let crate::distributed::message::JobSpec::Manhattan { spec: ref mut spec, .. } = job_spec {
+        if let crate::distributed::message::JobSpec::Manhattan { ref mut spec, .. } = job_spec {
             use crate::manhattan::layout::{ChromosomeLayout, YScale};
             use crate::manhattan::reference::get_contig_lengths;
 
@@ -1705,7 +1705,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         }
 
         // For ManhattanBatch jobs, compute layout and partition counts for all unique tables
-        if let crate::distributed::message::JobSpec::ManhattanBatch { specs: ref mut specs, .. } = job_spec {
+        if let crate::distributed::message::JobSpec::ManhattanBatch { ref mut specs, .. } = job_spec {
             use crate::manhattan::layout::{ChromosomeLayout, YScale};
             use crate::manhattan::reference::get_contig_lengths;
             use std::collections::HashMap;
@@ -3363,7 +3363,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
-                "--partitions" => {
+                "--partitions" | "--tasks" => {
                     if i + 1 < args.len() {
                         partitions = args[i + 1].parse().unwrap_or(100);
                         i += 2;
@@ -3447,8 +3447,6 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
     fn parse_ingest_command(
         args: &[String],
     ) -> Result<(String, crate::distributed::message::JobSpec, Vec<String>, Vec<String>)> {
-        use crate::distributed::message::JobSpec;
-
         if args.is_empty() {
             return Err(HailError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,

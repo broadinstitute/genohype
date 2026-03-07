@@ -20,11 +20,11 @@ use arrow::datatypes::{DataType, Field, Schema};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use serde::Deserialize;
 use std::sync::Arc;
 
 /// Manifest JSON structure from Manhattan pipeline output.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct Manifest {
     /// Timestamp when the manifest was generated
@@ -38,6 +38,7 @@ pub struct Manifest {
     pub loci: Vec<LocusDefinition>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct ManifestThresholds {
     pub significance: Option<f64>,
@@ -76,6 +77,7 @@ pub struct LocusRegion {
     pub end: i32,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct VariantCounts {
     #[serde(default)]
@@ -84,35 +86,8 @@ pub struct VariantCounts {
     pub path: Option<String>,
 }
 
-/// Row for the `loci` ClickHouse table.
-#[derive(Debug, Clone, Serialize)]
-pub struct LociRow {
-    pub phenotype: String,
-    pub ancestry: String,
-    pub locus_id: String,
-    pub contig: String,
-    pub start: i32,
-    pub stop: i32,
-    pub xstart: i64,
-    pub xstop: i64,
-    pub source: String,
-    pub lead_variant: String,
-    pub lead_pvalue: f64,
-    pub exome_count: u32,
-    pub genome_count: u32,
-    pub plot_gcs_uri: String,
-}
-
-/// Row for the `phenotype_plots` ClickHouse table.
-#[derive(Debug, Clone, Serialize)]
-pub struct PhenotypePlotRow {
-    pub phenotype: String,
-    pub ancestry: String,
-    pub plot_type: String,
-    pub gcs_uri: String,
-}
-
 /// Pipeline status values for tracking in ClickHouse.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PipelineStatus {
     ManhattanFailed,
@@ -133,6 +108,7 @@ impl PipelineStatus {
 }
 
 /// Error manifest JSON structure for failed pipeline runs.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct ErrorManifest {
     pub phenotype: String,
@@ -339,15 +315,6 @@ pub fn run_ingest_task(
     );
 
     Ok(total_rows)
-}
-
-/// Read and parse manifest.json from a path (local or GCS).
-fn read_manifest(path: &str) -> Result<Manifest> {
-    let data = read_file_bytes(path)?;
-    let manifest: Manifest = serde_json::from_slice(&data).map_err(|e| {
-        crate::HailError::InvalidFormat(format!("Failed to parse manifest.json: {}", e))
-    })?;
-    Ok(manifest)
 }
 
 /// Read entire file contents as bytes.

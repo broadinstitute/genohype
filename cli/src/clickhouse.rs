@@ -3,7 +3,7 @@
 //! Provides commands for creating, listing, and destroying ClickHouse
 //! instances on GCP. Similar to pool management but for database VMs.
 
-use crate::config::{Config, ResolvedClickHouseConfig};
+use crate::config::Config;
 use crate::Result;
 use owo_colors::OwoColorize;
 use std::process::Command;

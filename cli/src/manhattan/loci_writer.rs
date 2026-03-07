@@ -132,6 +132,7 @@ impl<W: Write + Send> LocusDefinitionWriter<W> {
     }
 
     /// Get the number of rows written so far.
+    #[allow(dead_code)]
     pub fn rows_written(&self) -> usize {
         self.total_rows + self.buffer.len()
     }
@@ -319,6 +320,7 @@ impl<W: Write + Send> LocusVariantWriter<W> {
     }
 
     /// Get the number of rows written so far.
+    #[allow(dead_code)]
     pub fn rows_written(&self) -> usize {
         self.total_rows + self.buffer.len()
     }

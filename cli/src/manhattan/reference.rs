@@ -46,6 +46,7 @@ fn get_grch38_autosomes_and_x() -> Vec<(String, u32)> {
 }
 
 /// Build a lookup map from the ordered contig list, including "chr"-prefixed aliases.
+#[allow(dead_code)]
 pub fn contig_length_map(contigs: &[(String, u32)]) -> HashMap<String, u32> {
     let mut m = HashMap::new();
     for (name, len) in contigs {

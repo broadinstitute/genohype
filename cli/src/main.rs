@@ -27,14 +27,14 @@ mod genomic;
 pub use genohype_core::{HailError, Result};
 
 use clap::Parser;
-use cli::{Cli, ClickHouseCommands, ClusterCommands, Commands, EnvCommands, ExportCommands, ExportParquetArgs, ExportJsonArgs, ExportVcfArgs, ExportHailArgs, HasCommonExportArgs, LociArgs, LocusArgs, ManhattanArgs, ManhattanBatchArgs, PoolCommands, QueryArgs, ServiceCommands, StressArgs};
+use cli::{Cli, ClickHouseCommands, ClusterCommands, Commands, EnvCommands, ExportCommands, ExportParquetArgs, ExportJsonArgs, ExportVcfArgs, ExportHailArgs, HasCommonExportArgs, LociArgs, LocusArgs, ManhattanArgs, ManhattanBatchArgs, PoolCommands, QueryArgs, ServiceCommands};
 #[cfg(feature = "validation")]
 use cli::{SchemaSubcommands, ValidateArgs};
 #[cfg(feature = "clickhouse")]
 use cli::{ExportClickhouseArgs, IngestCommands};
 use genohype_core::codec::EncodedValue;
 use genohype_core::io::{get_file_size, join_path};
-use genohype_core::query::{IntervalList, KeyRange, KeyValue, QueryEngine};
+use genohype_core::query::{IntervalList, KeyRange, QueryEngine};
 use genohype_core::summary::{format_schema_clean, StatsAccumulator};
 use std::sync::Arc;
 #[cfg(feature = "validation")]
@@ -464,7 +464,7 @@ fn parse_equality(s: &str) -> Option<(String, String)> {
 }
 
 // Filter parsing moved to genohype_core::query::filter
-use genohype_core::query::filter::{parse_key_value, parse_where_condition};
+use genohype_core::query::filter::parse_where_condition;
 
 fn build_key_from_filters(
     filters: &[(String, String)],
@@ -2442,7 +2442,7 @@ fn run_manhattan(args: ManhattanArgs) -> Result<()> {
     // 3. Init components
     let layout = ChromosomeLayout::new(&contigs, args.width, 4);
     let mut renderer = ManhattanRenderer::new(args.width, args.height);
-    let mut annotator = Annotator::new(args.annotate, args.annotate_fields)?;
+    let _annotator = Annotator::new(args.annotate, args.annotate_fields)?;
 
     // Use log-log scale: linear 0-10, then log 10+
     // Max of 300 handles extremely significant hits (p ~ 10^-300)

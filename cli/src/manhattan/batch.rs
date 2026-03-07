@@ -99,12 +99,6 @@ impl BatchSummary {
     }
 }
 
-/// Wrapper struct for assets JSON that may contain an "assets" field
-#[derive(Debug, Deserialize)]
-struct AssetsWrapper {
-    assets: Vec<AssetEntry>,
-}
-
 /// Load assets.json, filter, and group into phenotypes.
 ///
 /// Supports two JSON formats:

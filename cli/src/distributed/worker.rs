@@ -8,7 +8,7 @@
 
 use crate::distributed::message::{
     CompleteRequest, CoreTaskInfo, HeartbeatRequest, JobSpec, ManhattanAggregateSpec,
-    ManhattanScanSpec, ManhattanSource, ManhattanSpec, TaskDescriptor, TaskType,
+    ManhattanScanSpec, ManhattanSource, TaskType,
     TelemetrySnapshot, WorkRequest, WorkResponse,
 };
 use genohype_core::io::{is_cloud_path, StreamingCloudWriter};
@@ -498,7 +498,7 @@ fn spawn_telemetry_loop(
             };
 
             // Collect network metrics
-            let (net_rx_sec, net_tx_sec, net_rx_total, net_tx_total) = {
+            let (net_rx_sec, net_tx_sec, _net_rx_total, _net_tx_total) = {
                 let mut n = networks.lock().unwrap();
                 n.refresh();
                 let (current_rx, current_tx) = n
@@ -1002,7 +1002,6 @@ fn process_clickhouse_export(
             // Receive and upload chunks until channel closes
             for batch_res in rx {
                 let batch = batch_res?;
-                let batch_len = batch.len();
 
                 let uploaded = upload_chunk_to_clickhouse(
                     &client,
@@ -1509,130 +1508,6 @@ fn process_summary(
     Ok((total_rows, stats, None))
 }
 
-/// Process partitions for a Manhattan plot job.
-///
-/// Renders plot points directly to a PNG image for this batch of partitions.
-/// The coordinator will composite all partial PNGs into the final image.
-fn process_manhattan_scan(
-    _cached_engine: Option<(String, QueryEngine)>,
-    partitions: &[usize],
-    spec: &ManhattanSpec,
-    telemetry: Option<Arc<TelemetryState>>,
-) -> Result<(usize, Option<(String, QueryEngine)>)> {
-    use genohype_core::io::{is_cloud_path, StreamingCloudWriter};
-    use crate::manhattan::data::{extract_plot_data, PlotPoint};
-    use crate::manhattan::render::ManhattanRenderer;
-    use rayon::prelude::*;
-    use std::io::Write;
-
-    println!(
-        "Processing {} partitions for Manhattan plot...",
-        partitions.len()
-    );
-
-    // Get the pre-computed layout from the spec
-    let layout = spec.layout.as_ref().ok_or_else(|| {
-        crate::HailError::InvalidFormat("Manhattan job missing pre-computed layout".into())
-    })?;
-    let y_scale = spec.y_scale.as_ref().ok_or_else(|| {
-        crate::HailError::InvalidFormat("Manhattan job missing pre-computed y_scale".into())
-    })?;
-
-    // Determine which table to scan
-    let table_path = spec
-        .genome
-        .as_ref()
-        .or(spec.exome.as_ref())
-        .ok_or_else(|| {
-            crate::HailError::InvalidFormat("Manhattan job requires --genome or --exome".into())
-        })?;
-
-    let part_id = partitions.first().copied().unwrap_or(0);
-
-    // Update telemetry with active partition
-    if let Some(ref ts) = telemetry {
-        ts.active_partition.store(part_id, Ordering::Relaxed);
-    }
-
-    let y_field = spec.y_field.clone();
-    let table_path_clone = table_path.clone();
-    let output_base = spec.output_path.trim_end_matches('/').to_string();
-    let width = spec.width;
-    let height = spec.height;
-
-    // Parallel scan+render+encode: each partition produces its own PNG
-    // This parallelizes PNG encoding across all cores
-    let results: Vec<Result<usize>> = partitions
-        .par_iter()
-        .map(|&partition_id| {
-            // Track the active partition for this Rayon thread (RAII guard)
-            let _core_guard = telemetry.as_ref().map(|ts| CoreTaskGuard::partition(ts, partition_id));
-
-            let engine = QueryEngine::open_path(&table_path_clone)?;
-            let iter = engine.scan_partition_iter(partition_id, &[])?;
-
-            // Each thread has its own renderer with transparent background
-            let mut renderer = ManhattanRenderer::new_transparent(width, height);
-            let mut rows = 0usize;
-
-            for row_result in iter {
-                let row = row_result?;
-                rows += 1;
-
-                if let Some(point) = extract_plot_data(&row, &y_field) {
-                    // Normalize contig name (strip "chr" prefix)
-                    let contig_name = if point.contig.starts_with("chr") {
-                        &point.contig[3..]
-                    } else {
-                        &point.contig
-                    };
-
-                    // Map to pixel coordinates and render
-                    if let Some(x) = layout.get_x(contig_name, point.position) {
-                        let y = y_scale.get_y(point.neg_log10_p);
-                        let color = layout.get_color(contig_name);
-                        renderer.render_point(x, y, color, 0.6);
-                    }
-                }
-            }
-
-            // Encode PNG (now parallel - each thread encodes its own)
-            let png_data = renderer.encode_png()?;
-
-            // Write PNG for this partition
-            let output_file = format!("{}/part-{:05}.png", output_base, partition_id);
-            if is_cloud_path(&output_file) {
-                let mut writer = StreamingCloudWriter::new(&output_file)?;
-                writer.write_all(&png_data)?;
-                writer.finish()?;
-            } else {
-                std::fs::write(&output_file, &png_data)?;
-            }
-
-            Ok(rows)
-        })
-        .collect();
-
-    // Aggregate row counts
-    let mut total_rows = 0usize;
-    for result in results {
-        total_rows += result?;
-    }
-
-    // Update telemetry
-    if let Some(ref ts) = telemetry {
-        ts.total_rows.fetch_add(total_rows, Ordering::Relaxed);
-    }
-
-    println!(
-        "  Manhattan partitions {:?} complete: {} rows -> {}/part-*.png",
-        partitions, total_rows, output_base
-    );
-
-    // Don't cache engine since we opened multiple in parallel
-    Ok((total_rows, None))
-}
-
 /// Process partitions for Manhattan scan phase (V2 pipeline).
 ///
 /// This is the Phase 1 worker task. For each partition, it:
@@ -1955,12 +1830,14 @@ fn process_manhattan_aggregate(
 ///
 /// Used to bound memory usage by limiting how many partitions are processed
 /// concurrently, independent of the number of CPU cores available.
+#[cfg(feature = "clickhouse")]
 #[derive(Clone)]
 struct Semaphore {
     inner: Arc<(std::sync::Mutex<usize>, std::sync::Condvar)>,
     max: usize,
 }
 
+#[cfg(feature = "clickhouse")]
 impl Semaphore {
     fn new(max: usize) -> Self {
         Semaphore {
@@ -1980,10 +1857,12 @@ impl Semaphore {
     }
 }
 
+#[cfg(feature = "clickhouse")]
 struct SemaphorePermit {
     sem: Semaphore,
 }
 
+#[cfg(feature = "clickhouse")]
 impl Drop for SemaphorePermit {
     fn drop(&mut self) {
         let (lock, cvar) = &*self.sem.inner;

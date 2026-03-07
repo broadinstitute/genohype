@@ -119,6 +119,7 @@ impl GeneMap {
     }
 
     /// Query genes overlapping a region.
+    #[allow(dead_code)]
     pub fn query(&self, chrom: &str, start: i32, stop: i32) -> Vec<&Gene> {
         self.genes
             .iter()

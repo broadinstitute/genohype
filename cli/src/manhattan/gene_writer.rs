@@ -110,6 +110,7 @@ impl<W: Write + Send> GeneAssociationWriter<W> {
     }
 
     /// Get the number of rows written so far.
+    #[allow(dead_code)]
     pub fn rows_written(&self) -> usize {
         self.total_rows + self.buffer.len()
     }

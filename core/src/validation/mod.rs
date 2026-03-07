@@ -1000,7 +1000,6 @@ impl SchemaGenerator {
                     }
                     obj
                 }
-                _ => json!({}), // Handle other types as needed
             }
         }
 
