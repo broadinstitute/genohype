@@ -728,7 +728,7 @@ pub struct LocusArgs {
 #[derive(Args, Debug)]
 pub struct StressArgs {
     /// Total number of tasks to queue
-    #[arg(long, default_value = "100")]
+    #[arg(long, visible_alias = "tasks", default_value = "100")]
     pub partitions: usize,
 
     /// Seconds of pure CPU math to spin per partition
@@ -982,6 +982,10 @@ pub enum PoolCommands {
         /// Number of partitions per worker batch (higher = more parallelism per worker)
         #[arg(long)]
         batch_size: Option<usize>,
+
+        /// Hint for memory required per partition in MB (overrides default heuristics)
+        #[arg(long)]
+        memory_weight_mb: Option<u64>,
 
         /// The command to run on workers (everything after --)
         #[arg(last = true, required = true)]

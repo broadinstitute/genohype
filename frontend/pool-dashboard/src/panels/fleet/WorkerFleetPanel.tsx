@@ -255,12 +255,23 @@ const WorkerStats: React.FC<{
         fontSize: '10px',
       }}
     >
-      {/* Memory */}
-      <div>
-        <span style={{ color: 'var(--text-dim)' }}>RAM: </span>
-        <span style={{ color: memColor }}>
-          {formatBytes(memUsed)} / {formatBytes(memTotal)} ({memPct}%)
-        </span>
+      {/* Memory Bar */}
+      <div style={{ gridColumn: '1 / -1' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '2px' }}>
+          <span style={{ color: 'var(--text-dim)' }}>RAM</span>
+          <span style={{ color: memColor, fontSize: '9px' }}>
+            {formatBytes(memUsed)} / {formatBytes(memTotal)} ({memPct}%)
+          </span>
+        </div>
+        <div className="core-bar-outer" style={{ height: '8px' }}>
+          <div
+            className="core-bar"
+            style={{
+              width: `${memRatio * 100}%`,
+              backgroundColor: memColor === 'inherit' ? 'var(--cyan)' : memColor,
+            }}
+          />
+        </div>
       </div>
 
       {/* Batch Size */}

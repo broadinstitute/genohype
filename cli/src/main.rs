@@ -1929,6 +1929,7 @@ fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> Resul
             autoscale,
             skip_build,
             batch_size,
+            memory_weight_mb,
             mut command,
         } => {
             // Intercept: Apply cluster config overrides if requested
@@ -2039,6 +2040,7 @@ fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> Resul
                 autoscale,
                 skip_build,
                 batch_size,
+                memory_weight_mb,
                 scaling_config.as_ref(),
                 &command,
             )?;

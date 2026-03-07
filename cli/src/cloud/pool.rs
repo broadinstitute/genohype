@@ -199,6 +199,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         total_partitions: usize,
         force: bool,
         batch_size: Option<usize>,
+        memory_weight_mb: Option<u64>,
         filters: &[String],
         intervals: &[String],
     ) -> Result<bool> {
@@ -213,7 +214,8 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         });
 
         // Phase 3: Job-type memory weight hints (MB per partition)
-        let memory_weight_mb = match job_spec {
+        // Use CLI override if provided, otherwise fall back to job-type heuristics
+        let memory_weight_mb = memory_weight_mb.or_else(|| match job_spec {
             crate::distributed::message::JobSpec::Manhattan { .. }
             | crate::distributed::message::JobSpec::ManhattanBatch { .. }
             | crate::distributed::message::JobSpec::ManhattanScan(_) => Some(1024), // 1GB per partition
@@ -221,7 +223,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             | crate::distributed::message::JobSpec::ExportJson { .. } => Some(256), // 256MB
             crate::distributed::message::JobSpec::Summary => Some(64), // 64MB, very light
             _ => None,
-        };
+        });
 
         let request = JobConfigRequest {
             input_path: input_path.to_string(),
@@ -1118,6 +1120,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         autoscale: bool,
         skip_build: bool,
         batch_size: Option<usize>,
+        memory_weight_mb: Option<u64>,
         config: Option<&crate::cloud::ScalingConfig>,
         command: &[String],
     ) -> Result<()> {
@@ -1178,6 +1181,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             force_redeploy,
             force,
             batch_size,
+            memory_weight_mb,
             command,
         );
 
@@ -1208,6 +1212,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         force_redeploy: bool,
         force: bool,
         batch_size: Option<usize>,
+        memory_weight_mb: Option<u64>,
         command: &[String],
     ) -> Result<()> {
         // 1. Locate the Linux binary (will check if needed after seeing coordinator status)
@@ -1382,6 +1387,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                 auto_stop,
                 force,
                 batch_size,
+                memory_weight_mb,
             );
         }
 
@@ -1614,6 +1620,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         auto_stop: bool,
         force: bool,
         batch_size: Option<usize>,
+        memory_weight_mb: Option<u64>,
     ) -> Result<()> {
         use genohype_core::query::QueryEngine;
 
@@ -1924,6 +1931,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                 total_partitions,
                 force,
                 batch_size,
+                memory_weight_mb,
                 &filters,
                 &intervals,
             )? {
