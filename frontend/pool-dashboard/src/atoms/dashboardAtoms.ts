@@ -53,6 +53,13 @@ export const selectedJobIdAtom = atom<string>('active');
 /** List of historical jobs */
 export const jobsListAtom = atom<JobRecord[]>([]);
 
+/** Shared zoom range for synchronized chart zooming (timestamp bounds) */
+export interface ZoomRange {
+  min: number;
+  max: number;
+}
+export const chartZoomRangeAtom = atom<ZoomRange | null>(null);
+
 // ============================================================================
 // Derived State
 // ============================================================================

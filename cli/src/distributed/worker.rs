@@ -916,13 +916,38 @@ fn process_single_stress_partition(
 ) -> Result<usize> {
     use std::time::Instant;
     use std::io::{Read, Write};
+    use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
     // Tag this thread for the dashboard's per-core task view (stress task type)
     let _core_guard = telemetry.map(|ts| CoreTaskGuard::custom(ts, "stress", partition_id.to_string()));
 
     // 1. Memory Load: allocate and hold a large vector.
+    // Pre-check available memory to avoid allocation failure (which aborts, not panics)
     let mut mem_hog: Vec<u64> = Vec::new();
     if spec.memory_mb > 0 {
+        let required_bytes = spec.memory_mb as u64 * 1024 * 1024;
+
+        // Check available memory before attempting allocation
+        let mut sys = System::new_with_specifics(
+            RefreshKind::new().with_memory(MemoryRefreshKind::new().with_ram())
+        );
+        sys.refresh_memory();
+        let available = sys.available_memory();
+
+        // Require at least 20% headroom to avoid OOM
+        let required_with_headroom = required_bytes + (required_bytes / 5);
+        if available < required_with_headroom {
+            return Err(crate::HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                format!(
+                    "Partition {} skipped: insufficient memory ({} MB available, {} MB required)",
+                    partition_id,
+                    available / (1024 * 1024),
+                    required_with_headroom / (1024 * 1024)
+                ),
+            )));
+        }
+
         let elements = (spec.memory_mb * 1024 * 1024) / 8;
         mem_hog.resize(elements, 0u64);
         // Force the OS to actually allocate the physical pages by writing to them.

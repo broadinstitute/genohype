@@ -1,9 +1,10 @@
-import { useAtomValue, useAtom } from 'jotai';
+import { useAtomValue, useAtom, useSetAtom } from 'jotai';
 import {
   useDashboardPolling,
   summaryAtom,
   isLoadedAtom,
   selectedJobIdAtom,
+  chartZoomRangeAtom,
 } from './atoms/dashboardAtoms';
 import { DockViewLayout } from './DockViewLayout';
 import './App.css';
@@ -20,8 +21,11 @@ function App() {
   const isLoaded = useAtomValue(isLoadedAtom);
   const summary = useAtomValue(summaryAtom);
   const [selectedJobId, setSelectedJobId] = useAtom(selectedJobIdAtom);
+  const zoomRange = useAtomValue(chartZoomRangeAtom);
+  const setZoomRange = useSetAtom(chartZoomRangeAtom);
 
   const isViewingHistory = selectedJobId !== 'active';
+  const isZoomed = zoomRange !== null;
 
   return (
     <div className="app">
@@ -58,6 +62,28 @@ function App() {
                 Return to live dashboard
               </button>
             </div>
+          )}
+          {isZoomed && (
+            <button
+              onClick={() => setZoomRange(null)}
+              style={{
+                background: 'transparent',
+                color: 'var(--text)',
+                border: '1px solid var(--border)',
+                padding: '4px 12px',
+                borderRadius: '4px',
+                cursor: 'pointer',
+                fontSize: '11px',
+                fontWeight: 500,
+                transition: 'all 0.2s',
+              }}
+              onMouseEnter={(e) =>
+                (e.currentTarget.style.background = 'rgba(255,255,255,0.05)')
+              }
+              onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
+            >
+              Reset Zoom
+            </button>
           )}
           {summary?.build_version && (
             <span style={{ fontSize: '11px', color: 'var(--text-dim)' }}>

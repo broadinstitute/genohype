@@ -1,5 +1,5 @@
-import { useMemo, useRef } from 'react';
-import { useAtomValue } from 'jotai';
+import { useMemo, useRef, useEffect } from 'react';
+import { useAtomValue, useSetAtom } from 'jotai';
 import { Line } from 'react-chartjs-2';
 import {
   Chart as ChartJS,
@@ -13,7 +13,7 @@ import {
   Filler,
 } from 'chart.js';
 import zoomPlugin from 'chartjs-plugin-zoom';
-import { metricsAtom } from '../../atoms/dashboardAtoms';
+import { metricsAtom, chartZoomRangeAtom } from '../../atoms/dashboardAtoms';
 import '../panels.css';
 
 // Register Chart.js components
@@ -36,7 +36,24 @@ const CHART_COLORS = ['#39c5cf', '#3fb950', '#db6d28', '#f85149', '#a371f7', '#5
  */
 export const ThroughputChartPanel: React.FC = () => {
   const metrics = useAtomValue(metricsAtom);
+  const zoomRange = useAtomValue(chartZoomRangeAtom);
+  const setZoomRange = useSetAtom(chartZoomRangeAtom);
   const chartRef = useRef<ChartJS<'line'>>(null);
+
+  // Apply shared zoom range when it changes
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+
+    if (zoomRange) {
+      chart.options.scales!.x!.min = zoomRange.min;
+      chart.options.scales!.x!.max = zoomRange.max;
+    } else {
+      chart.options.scales!.x!.min = undefined;
+      chart.options.scales!.x!.max = undefined;
+    }
+    chart.update('none');
+  }, [zoomRange]);
 
   const chartData = useMemo(() => {
     if (!metrics || !metrics.workers || metrics.workers.length === 0) {
@@ -70,69 +87,63 @@ export const ThroughputChartPanel: React.FC = () => {
     return { labels, datasets };
   }, [metrics]);
 
+  const handleZoomComplete = ({ chart }: { chart: ChartJS }) => {
+    const xScale = chart.scales.x;
+    if (xScale) {
+      setZoomRange({ min: xScale.min, max: xScale.max });
+    }
+  };
+
   return (
     <div className="panel-container" style={{ display: 'flex', flexDirection: 'column' }}>
       <h2 className="panel-title">Throughput (Rows/sec)</h2>
-      <div className="chart-container" style={{ position: 'relative' }}>
+      <div className="chart-container">
         {chartData.datasets.length > 0 ? (
-          <>
-            <button
-              onClick={() => chartRef.current?.resetZoom()}
-              style={{
-                position: 'absolute',
-                top: 0,
-                right: 0,
-                fontSize: '10px',
-                padding: '2px 6px',
-                background: 'var(--surface-hover)',
-                border: '1px solid var(--border)',
-                borderRadius: '4px',
-                color: 'var(--text-dim)',
-                cursor: 'pointer',
-                zIndex: 10,
-              }}
-            >
-              Reset Zoom
-            </button>
-            <Line
-              ref={chartRef}
-              data={chartData}
-              options={{
-                responsive: true,
-                maintainAspectRatio: false,
-                animation: { duration: 0 },
-                plugins: {
-                  legend: {
-                    display: true,
-                    position: 'bottom',
-                    labels: {
-                      color: '#7d8590',
-                      font: { size: 10 },
-                      boxWidth: 12,
-                    },
+          <Line
+            ref={chartRef}
+            data={chartData}
+            options={{
+              responsive: true,
+              maintainAspectRatio: false,
+              animation: { duration: 0 },
+              plugins: {
+                legend: {
+                  display: true,
+                  position: 'bottom',
+                  labels: {
+                    color: '#7d8590',
+                    font: { size: 10 },
+                    boxWidth: 12,
+                  },
+                },
+                zoom: {
+                  pan: {
+                    enabled: true,
+                    mode: 'x',
+                    onPanComplete: handleZoomComplete,
                   },
                   zoom: {
-                    pan: { enabled: true, mode: 'x' },
-                    zoom: {
-                      drag: { enabled: true },
-                      mode: 'x',
-                    },
+                    drag: { enabled: true },
+                    mode: 'x',
+                    onZoomComplete: handleZoomComplete,
                   },
                 },
-                scales: {
-                  x: {
-                    ticks: { color: '#7d8590', maxTicksLimit: 8 },
-                    grid: { color: '#21262d' },
-                  },
-                  y: {
-                    ticks: { color: '#7d8590' },
-                    grid: { color: '#21262d' },
-                    beginAtZero: true,
-                  },
+              },
+              scales: {
+                x: {
+                  ticks: { color: '#7d8590', maxTicksLimit: 8 },
+                  grid: { color: '#21262d' },
+                  min: zoomRange?.min,
+                  max: zoomRange?.max,
                 },
-              }}
-            />
-          </>
+                y: {
+                  ticks: { color: '#7d8590' },
+                  grid: { color: '#21262d' },
+                  beginAtZero: true,
+                },
+              },
+            }}
+          />
         ) : (
           <div className="empty-state">Waiting for metrics...</div>
         )}
