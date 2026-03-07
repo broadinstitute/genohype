@@ -579,7 +579,8 @@ pub(crate) async fn cancel_job(
     data.active_tasks.clear();
     data.ingestion_state = None;
     data.idle = true;
-    data.current_job_id = None;
+    // Note: We intentionally keep current_job_id so the dashboard continues
+    // to display the cancelled job's metrics until a new job is submitted.
 
     let reason = req.reason.unwrap_or_else(|| "User request".to_string());
     println!("Job cancelled: {}", reason);

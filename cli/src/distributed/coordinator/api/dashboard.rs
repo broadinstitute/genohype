@@ -295,36 +295,33 @@ pub(crate) async fn get_dashboard_workers(
 }
 
 /// Handler for GET /api/dashboard/metrics - time-series metrics for charts.
+///
+/// Returns metrics scoped to the current job (if any) so that charts display
+/// only the data for the active/most recent job rather than all historical data.
 pub(crate) async fn get_dashboard_metrics(
     axum::extract::State(state): axum::extract::State<SharedState>,
 ) -> axum::Json<DashboardMetrics> {
     let data = state.lock().unwrap();
 
-    // Get all worker IDs from the database (includes historical workers)
-    let worker_ids = match data.metrics_db.get_worker_ids() {
-        Ok(ids) => ids,
-        Err(e) => {
-            eprintln!("Warning: failed to get worker IDs from DB: {}", e);
-            // Fall back to in-memory registry
-            data.worker_registry.keys().cloned().collect()
-        }
-    };
-
-    let workers: Vec<WorkerMetricsSeries> = worker_ids
-        .iter()
-        .map(|id| {
-            // Query all snapshots from DB for this worker
-            let snapshots = data
-                .metrics_db
-                .get_worker_snapshots(id)
-                .unwrap_or_else(|_| Vec::new());
-
-            WorkerMetricsSeries {
-                worker_id: id.clone(),
-                snapshots,
+    // Scope metrics to the current job if one exists
+    let workers = if let Some(ref job_id) = data.current_job_id {
+        match data.metrics_db.get_job_metrics(job_id) {
+            Ok(worker_data) => worker_data
+                .into_iter()
+                .map(|(worker_id, snapshots)| WorkerMetricsSeries {
+                    worker_id,
+                    snapshots,
+                })
+                .collect(),
+            Err(e) => {
+                eprintln!("Warning: failed to fetch job metrics from DB: {}", e);
+                vec![]
             }
-        })
-        .collect();
+        }
+    } else {
+        // No active job - return empty metrics
+        vec![]
+    };
 
     axum::Json(DashboardMetrics { workers })
 }

@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "chart.js": "^4.5.1",
+    "chartjs-plugin-zoom": "^2.0.1",
     "dockview": "^3.0.0",
     "dockview-core": "^3.0.0",
     "jotai": "^2.6.0",

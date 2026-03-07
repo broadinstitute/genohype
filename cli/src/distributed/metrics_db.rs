@@ -631,6 +631,27 @@ impl MetricsDb {
         Ok(statuses)
     }
 
+    /// Delete a job and all its associated data.
+    ///
+    /// Performs a cascading delete across all tables: jobs, events, failures,
+    /// batch_phenotypes, and telemetry. Uses a transaction for atomicity.
+    pub fn delete_job(&self, job_id: &str) -> SqliteResult<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        tx.execute("DELETE FROM jobs WHERE job_id = ?1", params![job_id])?;
+        tx.execute("DELETE FROM events WHERE job_id = ?1", params![job_id])?;
+        tx.execute("DELETE FROM failures WHERE job_id = ?1", params![job_id])?;
+        tx.execute(
+            "DELETE FROM batch_phenotypes WHERE job_id = ?1",
+            params![job_id],
+        )?;
+        tx.execute("DELETE FROM telemetry WHERE job_id = ?1", params![job_id])?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Get metrics for a specific job.
     pub fn get_job_metrics(&self, job_id: &str) -> SqliteResult<Vec<(String, Vec<TelemetrySnapshot>)>> {
         let conn = self.conn.lock().unwrap();

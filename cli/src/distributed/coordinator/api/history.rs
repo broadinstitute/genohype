@@ -205,6 +205,33 @@ pub(crate) async fn get_history_job_failures(
     }
 }
 
+/// Handler for DELETE /api/history/jobs/:job_id - delete a job and all its data.
+///
+/// If the job being deleted is the currently active/displayed job, the context is cleared.
+pub(crate) async fn delete_history_job(
+    axum::extract::State(state): axum::extract::State<SharedState>,
+    axum::extract::Path(job_id): axum::extract::Path<String>,
+) -> axum::response::Response {
+    let mut data = state.lock().unwrap();
+
+    // If deleting the currently active/displayed job, clear the context
+    if data.current_job_id.as_deref() == Some(job_id.as_str()) {
+        data.current_job_id = None;
+    }
+
+    match data.metrics_db.delete_job(&job_id) {
+        Ok(_) => (axum::http::StatusCode::OK, "Job deleted").into_response(),
+        Err(e) => {
+            eprintln!("Warning: failed to delete job {}: {}", job_id, e);
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to delete job: {}", e),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// Handler for GET /api/history/jobs/:job_id/batch - get batch phenotype status.
 pub(crate) async fn get_history_job_batch(
     axum::extract::State(state): axum::extract::State<SharedState>,

@@ -281,6 +281,46 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         false
     }
 
+    /// Fetch data from coordinator API, trying local tunnel first (fast), then SSH (slow).
+    ///
+    /// If you have an IAP tunnel running (`gcloud compute ssh ... -L 3000:localhost:3000`),
+    /// this will use it directly, avoiding the overhead of SSH per-request.
+    fn fetch_coordinator_api(
+        &self,
+        coordinator: &Instance,
+        zone: &str,
+        endpoint: &str,
+        port: u16,
+    ) -> Result<String> {
+        // Fast path: try local tunnel first (sub-second)
+        let local_url = format!("http://localhost:{}{}", port, endpoint);
+        let mut local_cmd = std::process::Command::new("curl");
+        local_cmd.args(["-s", "--connect-timeout", "1", &local_url]);
+        local_cmd.stdout(std::process::Stdio::piped());
+        local_cmd.stderr(std::process::Stdio::null());
+
+        if let Ok(output) = local_cmd.output() {
+            if output.status.success() && !output.stdout.is_empty() {
+                return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+            }
+        }
+
+        // Slow path: SSH through IAP (can take 5-30+ seconds)
+        let remote_curl = format!("curl -s http://localhost:3000{}", endpoint);
+        let mut cmd = self.provider.get_ssh_command(&coordinator.name, zone, &remote_curl);
+        cmd.stdout(std::process::Stdio::piped());
+
+        let output = cmd.output().map_err(HailError::Io)?;
+        if !output.status.success() {
+            return Err(HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to fetch {} from coordinator", endpoint),
+            )));
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
     /// Submit job configuration to an already-running coordinator via its API.
     fn submit_job_via_api(
         &self,
@@ -653,53 +693,41 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
     /// Get status of a distributed job running on the pool.
     pub fn status(&self, name: &str, zone: &str) -> Result<()> {
         let instances = self.provider.list_instances(name)?;
-        let coordinator = instances.iter().find(|i| i.name.ends_with("-coordinator"));
+        let coordinator = instances
+            .iter()
+            .find(|i| i.name.ends_with("-coordinator"))
+            .ok_or_else(|| {
+                HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("No coordinator found for pool '{}'", name),
+                ))
+            })?;
 
-        if let Some(coord) = coordinator {
-            println!("Fetching status from {}...", coord.name);
-            let mut cmd = self.provider.get_ssh_command(
-                &coord.name,
-                zone,
-                "curl -s http://localhost:3000/status",
-            );
-            cmd.stdout(std::process::Stdio::piped());
+        let json_str = self.fetch_coordinator_api(coordinator, zone, "/status", 3000)?;
 
-            if let Ok(output) = cmd.output() {
-                if output.status.success() {
-                    let json_str = String::from_utf8_lossy(&output.stdout);
-                    if let Ok(status) = serde_json::from_str::<
-                        crate::distributed::message::StatusResponse,
-                    >(&json_str)
-                    {
-                        println!();
-                        println!("{}", "Job Status".bold().underline());
-                        println!(
-                            "  Progress:    {}/{} tasks ({:.1}%)",
-                            status.completed_tasks,
-                            status.total_tasks,
-                            if status.total_tasks > 0 {
-                                (status.completed_tasks as f64 / status.total_tasks as f64) * 100.0
-                            } else {
-                                0.0
-                            }
-                        );
-                        println!("  Processing:  {} workers active", status.processing_tasks);
-                        println!("  Pending:     {} tasks", status.pending_tasks);
-                        if status.failed_tasks > 0 {
-                            println!(
-                                "  {} {} tasks",
-                                "Failed:".red(),
-                                status.failed_tasks
-                            );
-                        }
-                        println!("  Rows:        {}", status.total_items);
-                        return Ok(());
-                    }
+        if let Ok(status) =
+            serde_json::from_str::<crate::distributed::message::StatusResponse>(&json_str)
+        {
+            println!();
+            println!("{}", "Job Status".bold().underline());
+            println!(
+                "  Progress:    {}/{} tasks ({:.1}%)",
+                status.completed_tasks,
+                status.total_tasks,
+                if status.total_tasks > 0 {
+                    (status.completed_tasks as f64 / status.total_tasks as f64) * 100.0
+                } else {
+                    0.0
                 }
+            );
+            println!("  Processing:  {} workers active", status.processing_tasks);
+            println!("  Pending:     {} tasks", status.pending_tasks);
+            if status.failed_tasks > 0 {
+                println!("  {} {} tasks", "Failed:".red(), status.failed_tasks);
             }
-            println!("Could not connect to coordinator service. Is the job running?");
+            println!("  Rows:        {}", status.total_items);
         } else {
-            println!("No coordinator found for pool '{}'", name);
+            println!("Could not parse status response. Is the job running?");
         }
         Ok(())
     }
@@ -4133,28 +4161,15 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                 ))
             })?;
 
-        let mut cmd = self.provider.get_ssh_command(
-            &coordinator.name,
-            zone,
-            "curl -s http://localhost:3000/api/dashboard/workers",
-        );
-        cmd.stdout(std::process::Stdio::piped());
+        let json_str =
+            self.fetch_coordinator_api(coordinator, zone, "/api/dashboard/workers", 3000)?;
 
-        let output = cmd.output().map_err(HailError::Io)?;
-        if !output.status.success() {
-            return Err(HailError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Failed to fetch worker data from coordinator",
-            )));
-        }
-
-        let workers: Vec<DashboardWorker> =
-            serde_json::from_slice(&output.stdout).map_err(|e| {
-                HailError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("Failed to parse worker response: {}", e),
-                ))
-            })?;
+        let workers: Vec<DashboardWorker> = serde_json::from_str(&json_str).map_err(|e| {
+            HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Failed to parse worker response: {}", e),
+            ))
+        })?;
 
         println!("{}", "Worker Activity".bold().underline());
         println!();
@@ -4224,22 +4239,10 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             })?;
 
         let fetch_events = |since_ms: u64| -> Result<EventsResponse> {
-            let cmd_str = format!(
-                "curl -s 'http://localhost:3000/api/events?since_ms={}'",
-                since_ms
-            );
-            let mut cmd = self.provider.get_ssh_command(&coordinator.name, zone, &cmd_str);
-            cmd.stdout(std::process::Stdio::piped());
+            let endpoint = format!("/api/events?since_ms={}", since_ms);
+            let json_str = self.fetch_coordinator_api(coordinator, zone, &endpoint, 3000)?;
 
-            let output = cmd.output().map_err(HailError::Io)?;
-            if !output.status.success() {
-                return Err(HailError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Failed to fetch events from coordinator",
-                )));
-            }
-
-            serde_json::from_slice(&output.stdout).map_err(|e| {
+            serde_json::from_str(&json_str).map_err(|e| {
                 HailError::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("Failed to parse events response: {}", e),
@@ -4320,22 +4323,9 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                 ))
             })?;
 
-        let mut cmd = self.provider.get_ssh_command(
-            &coordinator.name,
-            zone,
-            "curl -s http://localhost:3000/api/failures",
-        );
-        cmd.stdout(std::process::Stdio::piped());
+        let json_str = self.fetch_coordinator_api(coordinator, zone, "/api/failures", 3000)?;
 
-        let output = cmd.output().map_err(HailError::Io)?;
-        if !output.status.success() {
-            return Err(HailError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Failed to fetch failures from coordinator",
-            )));
-        }
-
-        let response: FailuresResponse = serde_json::from_slice(&output.stdout).map_err(|e| {
+        let response: FailuresResponse = serde_json::from_str(&json_str).map_err(|e| {
             HailError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("Failed to parse failures response: {}", e),
@@ -4384,22 +4374,10 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                 ))
             })?;
 
-        let cmd_str = format!(
-            "curl -s 'http://localhost:3000/api/workers/{}/logs'",
-            worker_id
-        );
-        let mut cmd = self.provider.get_ssh_command(&coordinator.name, zone, &cmd_str);
-        cmd.stdout(std::process::Stdio::piped());
+        let endpoint = format!("/api/workers/{}/logs", worker_id);
+        let json_str = self.fetch_coordinator_api(coordinator, zone, &endpoint, 3000)?;
 
-        let output = cmd.output().map_err(HailError::Io)?;
-        if !output.status.success() {
-            return Err(HailError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Failed to fetch worker logs from coordinator",
-            )));
-        }
-
-        let logs: Vec<String> = serde_json::from_slice(&output.stdout).map_err(|e| {
+        let logs: Vec<String> = serde_json::from_str(&json_str).map_err(|e| {
             HailError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("Failed to parse logs response: {}", e),

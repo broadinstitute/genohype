@@ -132,7 +132,8 @@ pub(crate) fn check_stuck_job(state: &SharedState, timeout_secs: u64) {
         data.batch_state = None;
         data.active_tasks.clear();
         data.ingestion_state = None;
-        data.current_job_id = None;
+        // Note: We intentionally keep current_job_id so the dashboard continues
+        // to display the failed job's metrics until a new job is submitted.
         data.idle = true;
     }
 }

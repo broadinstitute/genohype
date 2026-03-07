@@ -369,8 +369,21 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
                         continue;
                     }
                     Err(e) => {
+                        let error_msg = format!("Task panicked: {}", e);
                         eprintln!("Task panicked processing tasks {:?}: {}", task_ids, e);
                         cached_engine = None;
+
+                        // Report panic/crash to coordinator so tasks get requeued
+                        let fail_req = CompleteRequest {
+                            worker_id: config.worker_id.clone(),
+                            tasks: task_ids.clone(),
+                            items_processed: 0,
+                            result_json: None,
+                            error: Some(error_msg),
+                        };
+                        if let Err(post_err) = client.post(&complete_url).json(&fail_req).send().await {
+                            eprintln!("Failed to report panic to coordinator: {}", post_err);
+                        }
                         continue;
                     }
                 };

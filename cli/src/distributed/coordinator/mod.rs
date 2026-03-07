@@ -94,7 +94,7 @@ pub async fn run_coordinator(
     batch_size: usize,
     timeout_secs: u64,
 ) -> Result<()> {
-    use axum::{routing::{get, post}, Router};
+    use axum::{routing::{delete, get, post}, Router};
     use tokio::net::TcpListener;
 
     // Determine if starting in idle mode (no job configured yet)
@@ -500,7 +500,8 @@ pub async fn run_coordinator(
                     data.aggregate_cpu_secs = 0.0;
                     data.wasted_cpu_secs = 0.0;
                     data.last_error = None;
-                    data.current_job_id = None;
+                    // Note: We intentionally keep current_job_id so the dashboard continues
+                    // to display the finished job's metrics until a new job is submitted.
                     data.idle = true;
                 }
                 println!("Job complete. Coordinator returning to idle mode, ready for next job.");
@@ -538,6 +539,7 @@ pub async fn run_coordinator(
         .route("/api/history/jobs/:job_id/events", get(api::history::get_history_job_events))
         .route("/api/history/jobs/:job_id/failures", get(api::history::get_history_job_failures))
         .route("/api/history/jobs/:job_id/batch", get(api::history::get_history_job_batch))
+        .route("/api/history/jobs/:job_id", delete(api::history::delete_history_job))
         .with_state(state)
         // Embedded dashboard SPA
         .route("/dashboard", get(ui::serve_dashboard_index))

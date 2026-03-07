@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useMemo, useRef } from 'react';
 import { useAtomValue } from 'jotai';
 import { Line } from 'react-chartjs-2';
 import {
@@ -12,6 +12,7 @@ import {
   Legend,
   Filler,
 } from 'chart.js';
+import zoomPlugin from 'chartjs-plugin-zoom';
 import { metricsAtom } from '../../atoms/dashboardAtoms';
 import '../panels.css';
 
@@ -24,7 +25,8 @@ ChartJS.register(
   Title,
   ChartTooltip,
   Legend,
-  Filler
+  Filler,
+  zoomPlugin
 );
 
 const CHART_COLORS = ['#39c5cf', '#3fb950', '#db6d28', '#f85149', '#a371f7', '#58a6ff'];
@@ -35,6 +37,7 @@ const CHART_COLORS = ['#39c5cf', '#3fb950', '#db6d28', '#f85149', '#a371f7', '#5
  */
 export const NetworkChartPanel: React.FC = () => {
   const metrics = useAtomValue(metricsAtom);
+  const chartRef = useRef<ChartJS<'line'>>(null);
 
   const chartData = useMemo(() => {
     if (!metrics || !metrics.workers || metrics.workers.length === 0) {
@@ -102,38 +105,66 @@ export const NetworkChartPanel: React.FC = () => {
   return (
     <div className="panel-container" style={{ display: 'flex', flexDirection: 'column' }}>
       <h2 className="panel-title">Network Bandwidth (MB/s)</h2>
-      <div className="chart-container">
+      <div className="chart-container" style={{ position: 'relative' }}>
         {chartData.datasets.length > 0 ? (
-          <Line
-            data={chartData}
-            options={{
-              responsive: true,
-              maintainAspectRatio: false,
-              animation: { duration: 0 },
-              plugins: {
-                legend: {
-                  display: true,
-                  position: 'bottom',
-                  labels: {
-                    color: '#7d8590',
-                    font: { size: 10 },
-                    boxWidth: 12,
+          <>
+            <button
+              onClick={() => chartRef.current?.resetZoom()}
+              style={{
+                position: 'absolute',
+                top: 0,
+                right: 0,
+                fontSize: '10px',
+                padding: '2px 6px',
+                background: 'var(--surface-hover)',
+                border: '1px solid var(--border)',
+                borderRadius: '4px',
+                color: 'var(--text-dim)',
+                cursor: 'pointer',
+                zIndex: 10,
+              }}
+            >
+              Reset Zoom
+            </button>
+            <Line
+              ref={chartRef}
+              data={chartData}
+              options={{
+                responsive: true,
+                maintainAspectRatio: false,
+                animation: { duration: 0 },
+                plugins: {
+                  legend: {
+                    display: true,
+                    position: 'bottom',
+                    labels: {
+                      color: '#7d8590',
+                      font: { size: 10 },
+                      boxWidth: 12,
+                    },
+                  },
+                  zoom: {
+                    pan: { enabled: true, mode: 'x' },
+                    zoom: {
+                      drag: { enabled: true },
+                      mode: 'x',
+                    },
                   },
                 },
-              },
-              scales: {
-                x: {
-                  ticks: { color: '#7d8590', maxTicksLimit: 8 },
-                  grid: { color: '#21262d' },
+                scales: {
+                  x: {
+                    ticks: { color: '#7d8590', maxTicksLimit: 8 },
+                    grid: { color: '#21262d' },
+                  },
+                  y: {
+                    ticks: { color: '#7d8590' },
+                    grid: { color: '#21262d' },
+                    beginAtZero: true,
+                  },
                 },
-                y: {
-                  ticks: { color: '#7d8590' },
-                  grid: { color: '#21262d' },
-                  beginAtZero: true,
-                },
-              },
-            }}
-          />
+              }}
+            />
+          </>
         ) : (
           <div className="empty-state">Waiting for metrics...</div>
         )}
