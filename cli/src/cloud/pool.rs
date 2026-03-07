@@ -90,6 +90,24 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             Self::build_linux_binary(&[])?;
         }
 
+        // Stage binary to GCS BEFORE creating VMs (so startup script can download it)
+        let mut config = config.clone();
+        if let Some(ref db_path) = config.pool_db_path {
+            let binary = self.locate_binary(None)?;
+            match self.stage_binary_to_gcs(&binary, db_path) {
+                Ok(gcs_url) => {
+                    config.binary_gcs_url = Some(gcs_url);
+                }
+                Err(e) => {
+                    println!(
+                        "{} GCS staging failed ({}), will deploy via SSH",
+                        "Warning:".yellow(),
+                        e
+                    );
+                }
+            }
+        }
+
         println!(
             "{} pool '{}' with {} workers ({}, {})...",
             "Creating".green(),
@@ -99,7 +117,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             if config.spot { "spot" } else { "on-demand" }
         );
 
-        self.provider.create_pool(config)?;
+        self.provider.create_pool(&config)?;
 
         println!(
             "{} Pool '{}' created successfully.",
@@ -115,21 +133,33 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             self.wait_for_pool_ready(&config.name, &config.zone, 300)?;
             println!("{} All workers are ready.", "OK".green().bold());
         } else {
-            println!(
-                "   Workers will be ready in ~60 seconds (or use --wait)"
-            );
+            println!("   Workers will be ready in ~60 seconds (or use --wait)");
         }
 
-        // If with_coordinator, deploy binary and start coordinator in idle mode
+        // If with_coordinator, start coordinator in idle mode
+        // Binary was already deployed via startup script if GCS staging worked
         if config.with_coordinator {
-            self.start_idle_coordinator(&config.name, &config.zone, skip_build, config.pool_db_path.as_deref())?;
+            self.start_idle_coordinator(
+                &config.name,
+                &config.zone,
+                skip_build,
+                config.pool_db_path.as_deref(),
+                config.binary_gcs_url.is_some(), // skip_binary_deploy if already via startup
+            )?;
         }
 
         Ok(())
     }
 
-    /// Deploy binary and start coordinator in idle mode.
-    fn start_idle_coordinator(&self, pool_name: &str, zone: &str, _skip_build: bool, pool_db_path: Option<&str>) -> Result<()> {
+    /// Start coordinator in idle mode (binary already deployed via startup script or needs deployment).
+    fn start_idle_coordinator(
+        &self,
+        pool_name: &str,
+        zone: &str,
+        _skip_build: bool,
+        pool_db_path: Option<&str>,
+        binary_deployed_via_startup: bool,
+    ) -> Result<()> {
         // Get coordinator instance
         let instances = self.provider.list_instances(pool_name)?;
         let coordinator = instances
@@ -145,17 +175,23 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                 ))
             })?;
 
-        // Locate binary
-        let binary = self.locate_binary(None)?;
-        println!(
-            "{} Deploying binary to coordinator...",
-            "Setup:".cyan()
-        );
+        // Binary deployment: skip if already done via startup script
+        if binary_deployed_via_startup {
+            println!(
+                "{} Binary deployed via startup script (zero SSH)",
+                "OK".green().bold()
+            );
+        } else {
+            // Fallback: deploy via SCP
+            let binary = self.locate_binary(None)?;
+            println!(
+                "{} Deploying binary to coordinator via SCP...",
+                "Setup:".cyan()
+            );
+            self.deploy_binary(&binary, &[coordinator.clone()], zone)?;
+        }
 
-        // Deploy to coordinator only
-        self.deploy_binary(&binary, &[coordinator.clone()], zone)?;
-
-        // Start coordinator in idle mode (no job args)
+        // Start coordinator in idle mode
         println!(
             "{} Starting coordinator in idle mode on {}...",
             "Setup:".cyan(),
@@ -165,7 +201,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         let mut coord_cmd = String::from(
             "nohup /usr/local/bin/genohype service start-coordinator \
              --port 3000 \
-             --db-path /var/lib/genohype/ops.db"
+             --db-path /var/lib/genohype/ops.db",
         );
         if let Some(backup) = pool_db_path {
             coord_cmd.push_str(&format!(" --backup-path {}", backup));
@@ -185,34 +221,40 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             )));
         }
 
-        // Give it a moment to start
         std::thread::sleep(std::time::Duration::from_secs(2));
 
-        // Verify it's running
         let coord_ip = coordinator.ip().unwrap_or("localhost");
-        println!(
-            "{} Coordinator started in idle mode",
-            "OK".green().bold()
-        );
-        println!(
-            "  Dashboard: http://{}:3000/dashboard",
-            coord_ip
-        );
+        println!("{} Coordinator started in idle mode", "OK".green().bold());
+        println!("  Dashboard: http://{}:3000/dashboard", coord_ip);
         println!(
             "  Submit jobs with: genohype pool submit {} -- <command>",
             pool_name
         );
 
-        // Pre-deploy binary to workers so they're ready when jobs are submitted
-        let workers: Vec<_> = instances.iter().filter(|i| i.name.contains("-worker-")).cloned().collect();
+        // Workers: binary already deployed via startup script if GCS staging worked
+        let workers: Vec<_> = instances
+            .iter()
+            .filter(|i| i.name.contains("-worker-"))
+            .cloned()
+            .collect();
+
         if !workers.is_empty() {
-            println!("{}", "Pre-deploying binary to workers...".dimmed());
-            self.pre_deploy_binary_to_workers(coord_ip, &workers, zone)?;
-            println!(
-                "{} Binary pre-deployed to {} worker(s)",
-                "OK".green().bold(),
-                workers.len()
-            );
+            if binary_deployed_via_startup {
+                println!(
+                    "{} {} workers have binary via startup script",
+                    "OK".green().bold(),
+                    workers.len()
+                );
+            } else {
+                // Fallback: workers pull from coordinator
+                println!("{}", "Pre-deploying binary to workers...".dimmed());
+                self.pre_deploy_binary_to_workers(coord_ip, &workers, zone)?;
+                println!(
+                    "{} Binary pre-deployed to {} worker(s)",
+                    "OK".green().bold(),
+                    workers.len()
+                );
+            }
         }
 
         Ok(())
@@ -807,7 +849,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                     machine_type: config.machine_type.clone(),
                     zone: zone.to_string(),
                     tags: vec![tags],
-                    startup_script: super::startup::generate_startup_script(),
+                    startup_script: super::startup::generate_startup_script(None),
                     spot: config.spot,
                     network: config.network.clone(),
                     subnet: config.subnet.clone(),
@@ -1199,6 +1241,265 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             "Done!".green().bold(),
             name.bright_white()
         );
+
+        Ok(())
+    }
+
+    /// Update the binary via HTTP API (zero SSH).
+    ///
+    /// Requires an IAP tunnel to the coordinator on localhost:port.
+    /// Uses /api/update-coordinator and /api/update-fleet endpoints.
+    pub fn update_binary_via_api(
+        &self,
+        binary_path: Option<String>,
+        skip_build: bool,
+        pool_db_path: Option<&str>,
+        port: u16,
+    ) -> Result<()> {
+        // Build if needed
+        let should_build = if skip_build {
+            println!("{}", "Skipping binary build (--skip-build)".dimmed());
+            false
+        } else if self.has_bundled_binary() {
+            println!(
+                "{}",
+                "Found bundled worker binary, skipping build...".dimmed()
+            );
+            false
+        } else {
+            true
+        };
+
+        if should_build {
+            Self::build_linux_binary(&[])?;
+        }
+
+        // Locate binary
+        let binary = self.locate_binary(binary_path)?;
+        println!(
+            "{} {}",
+            "Binary:".cyan(),
+            binary.display().to_string().bright_white()
+        );
+
+        // Stage to GCS
+        let pool_db_path = pool_db_path.ok_or_else(|| {
+            HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "pool_db_path is required for --via-api (set in config or use pool create --pool-db-path)",
+            ))
+        })?;
+
+        let gcs_url = self.stage_binary_to_gcs(&binary, pool_db_path)?;
+
+        let base_url = format!("http://localhost:{}", port);
+        let payload = serde_json::json!({ "gcs_url": gcs_url }).to_string();
+
+        // Helper to call curl
+        let curl_post = |endpoint: &str| -> Result<()> {
+            let output = std::process::Command::new("curl")
+                .args([
+                    "-s",
+                    "-w",
+                    "\n%{http_code}", // Append the HTTP status code to stdout
+                    "-X",
+                    "POST",
+                    "-H",
+                    "Content-Type: application/json",
+                    "-d",
+                    &payload,
+                    &format!("{}{}", base_url, endpoint),
+                ])
+                .output()
+                .map_err(HailError::Io)?;
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+
+            // Parse the output which should be "<body...>\n<http_code>"
+            let mut parts = stdout.rsplitn(2, '\n');
+            let http_code_str = parts.next().unwrap_or("").trim();
+            let body = parts.next().unwrap_or("").trim();
+
+            if let Ok(code) = http_code_str.parse::<u16>() {
+                // HTTP code 0 means no response received (connection failed)
+                if code == 0 {
+                    return Err(HailError::Io(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        format!(
+                            "Failed to connect to coordinator at {}. Is the IAP tunnel running?\n\
+                             Start with: gcloud compute ssh <coordinator> --zone=<zone> --tunnel-through-iap -- -L {}:localhost:3000 -N",
+                            base_url, port
+                        ),
+                    )));
+                }
+                if code >= 400 {
+                    if code == 404 {
+                        return Err(HailError::Io(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!(
+                                "API call to {} returned 404 Not Found.\n\
+                                 The running coordinator might be too old to support API updates.\n\
+                                 Try updating via SSH first (set update_via_api = false in config temporarily).",
+                                endpoint
+                            ),
+                        )));
+                    }
+                    return Err(HailError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("API call to {} failed (HTTP {}): {}", endpoint, code, body),
+                    )));
+                }
+            }
+
+            if !output.status.success() {
+                // Curl failed but we couldn't parse HTTP code - likely a connection issue
+                return Err(HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    format!(
+                        "Failed to connect to coordinator at {}. Is the IAP tunnel running?\n\
+                         Start with: gcloud compute ssh <coordinator> --zone=<zone> --tunnel-through-iap -- -L {}:localhost:3000 -N\n\
+                         curl error: {}",
+                        base_url, port, if stderr.is_empty() { "connection failed" } else { &stderr }
+                    ),
+                )));
+            }
+            Ok(())
+        };
+
+        // Update coordinator
+        println!("{} Updating coordinator via API...", "HTTP:".cyan());
+        curl_post("/api/update-coordinator")?;
+
+        println!(
+            "{} Coordinator restarting with new binary...",
+            "OK".green().bold()
+        );
+
+        // Wait for coordinator to come back up
+        println!("{}", "Waiting for coordinator to restart...".dimmed());
+        let mut retries = 0;
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let status = std::process::Command::new("curl")
+                .args(["-s", "-f", &format!("{}/status", base_url)])
+                .status();
+            match status {
+                Ok(s) if s.success() => break,
+                _ => {
+                    retries += 1;
+                    if retries > 30 {
+                        return Err(HailError::Io(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "Coordinator did not come back up after 30 seconds",
+                        )));
+                    }
+                }
+            }
+        }
+
+        println!("{} Coordinator is back up.", "OK".green().bold());
+
+        // Trigger fleet update immediately - workers will get the signal when they poll
+        println!("{} Triggering worker updates via API...", "HTTP:".cyan());
+        curl_post("/api/update-fleet")?;
+
+        // Wait for workers to re-register and update
+        // Workers poll every ~1s, so we wait for them to show up with recent heartbeats
+        println!(
+            "{}",
+            "Waiting for workers to register and restart...".dimmed()
+        );
+
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(30);
+        let mut last_count = 0;
+        let mut stable_iterations = 0;
+        let mut max_workers_seen = 0;
+        let mut iterations = 0;
+
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            iterations += 1;
+
+            // Check how many workers have recent heartbeats (< 10 seconds old = updated)
+            let output = std::process::Command::new("curl")
+                .args(["-s", &format!("{}/api/dashboard/workers", base_url)])
+                .output()
+                .map_err(HailError::Io)?;
+
+            if let Ok(workers) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                if let Some(arr) = workers.as_array() {
+                    let total_workers = arr.len();
+                    let updated_count = arr
+                        .iter()
+                        .filter(|w| {
+                            w.get("last_seen_secs")
+                                .and_then(|v| v.as_f64())
+                                .map(|s| s < 10.0)
+                                .unwrap_or(false)
+                        })
+                        .count();
+
+                    max_workers_seen = max_workers_seen.max(total_workers);
+
+                    if total_workers > 0 {
+                        if updated_count != last_count {
+                            println!(
+                                "  {} {}/{} workers online",
+                                "Progress:".dimmed(),
+                                updated_count,
+                                total_workers
+                            );
+                        }
+                        last_count = updated_count;
+
+                        // Consider done when all workers are online
+                        if updated_count == total_workers {
+                            stable_iterations += 1;
+                            if stable_iterations >= 2 {
+                                break;
+                            }
+                        } else {
+                            stable_iterations = 0;
+                        }
+                    } else if iterations % 3 == 0 {
+                        // Print waiting message every 6 seconds if no workers seen
+                        print!(".");
+                        use std::io::Write;
+                        std::io::stdout().flush().ok();
+                    }
+                }
+            }
+
+            if start.elapsed() > timeout {
+                println!();
+                if max_workers_seen == 0 {
+                    println!(
+                        "{}",
+                        "No workers registered yet. They may still be updating in background."
+                            .yellow()
+                    );
+                } else {
+                    println!(
+                        "{}",
+                        "Timed out waiting for workers. Some may still be updating.".yellow()
+                    );
+                }
+                break;
+            }
+        }
+
+        println!();
+        if max_workers_seen > 0 {
+            println!(
+                "{} Binary updated on coordinator and {} workers.",
+                "Done!".green().bold(),
+                max_workers_seen
+            );
+        } else {
+            println!("{} Coordinator updated.", "Done!".green().bold());
+        }
 
         Ok(())
     }

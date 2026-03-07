@@ -114,6 +114,10 @@ pub struct PoolProfile {
     pub wireguard: Option<WireGuardConfig>,
     /// GCS path for SQLite database backup/restore (e.g., "gs://bucket/pool-ops/dev-pool/ops.db")
     pub pool_db_path: Option<String>,
+    /// Use HTTP API for binary updates instead of SSH (requires IAP tunnel)
+    pub update_via_api: Option<bool>,
+    /// Port for API updates (default: 3000)
+    pub update_api_port: Option<u16>,
 }
 
 /// A named ClickHouse instance profile.
@@ -396,6 +400,8 @@ impl Config {
                 with_coordinator,
                 wireguard: profile.wireguard.clone(),
                 pool_db_path: profile.pool_db_path.clone(),
+                update_via_api: profile.update_via_api.unwrap_or(false),
+                update_api_port: profile.update_api_port.unwrap_or(3000),
             }
         })
     }
@@ -488,6 +494,10 @@ pub struct ResolvedPoolConfig {
     pub wireguard: Option<WireGuardConfig>,
     /// GCS path for SQLite database backup/restore
     pub pool_db_path: Option<String>,
+    /// Use HTTP API for binary updates instead of SSH
+    pub update_via_api: bool,
+    /// Port for API updates
+    pub update_api_port: u16,
 }
 
 /// Status of a cluster deployment.

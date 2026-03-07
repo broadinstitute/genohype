@@ -1918,6 +1918,7 @@ fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> Resul
                 with_coordinator: resolved_with_coordinator,
                 wireguard,
                 pool_db_path: profile.as_ref().and_then(|p| p.pool_db_path.clone()),
+                binary_gcs_url: None, // Set by create() after staging
             };
 
             manager.create(&pool_config, wait, skip_build)?;
@@ -2094,9 +2095,24 @@ fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> Resul
             zone,
             binary,
             skip_build,
+            via_api,
+            port,
         } => {
-            let pool_db_path = app_config.get_pool(&name).and_then(|p| p.pool_db_path.clone());
-            manager.update_binary(&name, &zone, binary, skip_build, pool_db_path.as_deref())?;
+            let pool_config = app_config.get_pool(&name);
+            let pool_db_path = pool_config.as_ref().and_then(|p| p.pool_db_path.clone());
+            // CLI flag overrides config, config defaults to false
+            let use_api = via_api || pool_config.as_ref().map(|p| p.update_via_api).unwrap_or(false);
+            // CLI port overrides config port
+            let api_port = if via_api {
+                port // CLI explicitly set, use CLI port
+            } else {
+                pool_config.as_ref().map(|p| p.update_api_port).unwrap_or(port)
+            };
+            if use_api {
+                manager.update_binary_via_api(binary, skip_build, pool_db_path.as_deref(), api_port)?;
+            } else {
+                manager.update_binary(&name, &zone, binary, skip_build, pool_db_path.as_deref())?;
+            }
         }
         PoolCommands::Cancel { name, zone } => {
             manager.cancel(&name, &zone)?;

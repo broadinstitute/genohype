@@ -11,9 +11,27 @@ use super::WireGuardConfig;
 /// - libssl-dev (for TLS/HTTPS support)
 /// - ca-certificates (for certificate verification)
 ///
-/// The script is designed to be minimal and fast, avoiding unnecessary packages.
-pub fn generate_startup_script() -> String {
-    r#"#!/bin/bash
+/// If `binary_gcs_url` is provided, the binary is downloaded from GCS during startup.
+/// This eliminates the need for SSH-based binary deployment.
+pub fn generate_startup_script(binary_gcs_url: Option<&str>) -> String {
+    let binary_download = if let Some(gcs_url) = binary_gcs_url {
+        format!(
+            r#"
+# Download binary from GCS (pre-staged)
+echo "Downloading binary from GCS..."
+gsutil cp {} /tmp/genohype
+chmod +x /tmp/genohype
+mv /tmp/genohype /usr/local/bin/genohype
+echo "Binary installed at /usr/local/bin/genohype"
+"#,
+            gcs_url
+        )
+    } else {
+        String::new()
+    };
+
+    format!(
+        r#"#!/bin/bash
 set -e
 
 # Log startup
@@ -30,13 +48,14 @@ mkdir -p /usr/local/bin
 # Create directory for the active SQLite database
 mkdir -p /var/lib/genohype
 chmod 777 /var/lib/genohype
-
+{}
 # Create a marker file to indicate VM is ready
 touch /tmp/genohype-ready
 
 echo "=== Worker VM initialized ==="
-"#
-    .to_string()
+"#,
+        binary_download
+    )
 }
 
 /// Generate the startup script for the coordinator VM with WireGuard VPN.
@@ -45,12 +64,32 @@ echo "=== Worker VM initialized ==="
 /// - All worker dependencies
 /// - WireGuard installation and configuration
 /// - Secret resolution via Google Secret Manager (for `secret:` prefixed values)
+/// - Binary download from GCS (if `binary_gcs_url` is provided)
 ///
 /// # Security
 /// The `secret:` prefix pattern allows storing sensitive values (like private keys)
 /// in Google Secret Manager. The VM uses its service account identity to fetch
 /// secrets at boot time, avoiding exposure in metadata or logs.
-pub fn generate_coordinator_startup_script(wireguard: &WireGuardConfig) -> String {
+pub fn generate_coordinator_startup_script(
+    wireguard: &WireGuardConfig,
+    binary_gcs_url: Option<&str>,
+) -> String {
+    let binary_download = if let Some(gcs_url) = binary_gcs_url {
+        format!(
+            r#"
+# Download binary from GCS (pre-staged)
+echo "Downloading binary from GCS..."
+gsutil cp {} /tmp/genohype
+chmod +x /tmp/genohype
+mv /tmp/genohype /usr/local/bin/genohype
+echo "Binary installed at /usr/local/bin/genohype"
+"#,
+            gcs_url
+        )
+    } else {
+        String::new()
+    };
+
     format!(
         r#"#!/bin/bash
 set -e
@@ -120,6 +159,7 @@ mkdir -p /usr/local/bin
 # Create directory for the active SQLite database
 mkdir -p /var/lib/genohype
 chmod 777 /var/lib/genohype
+{binary_download}
 
 # Create a marker file to indicate VM is ready
 touch /tmp/genohype-ready
@@ -131,6 +171,7 @@ echo "=== Coordinator VM initialized ==="
         client_address = wireguard.client_address,
         endpoint = wireguard.endpoint,
         allowed_ips = wireguard.allowed_ips,
+        binary_download = binary_download,
     )
 }
 
@@ -139,7 +180,7 @@ echo "=== Coordinator VM initialized ==="
 /// Useful for adding project-specific setup steps.
 #[allow(dead_code)]
 pub fn generate_startup_script_with_extras(extra_commands: &str) -> String {
-    let mut script = generate_startup_script();
+    let mut script = generate_startup_script(None);
     // Remove the final echo and add custom commands before it
     script = script.trim_end_matches("echo \"=== Worker VM initialized ===\"\n").to_string();
     script.push_str("\n# Custom setup\n");
@@ -154,13 +195,20 @@ mod tests {
 
     #[test]
     fn test_startup_script_contains_essentials() {
-        let script = generate_startup_script();
+        let script = generate_startup_script(None);
         assert!(script.contains("#!/bin/bash"));
         assert!(script.contains("apt-get"));
         assert!(script.contains("libssl-dev"));
         assert!(script.contains("ca-certificates"));
         assert!(script.contains("/usr/local/bin"));
         assert!(script.contains("genohype-ready"));
+    }
+
+    #[test]
+    fn test_startup_script_with_binary_url() {
+        let script = generate_startup_script(Some("gs://bucket/path/genohype"));
+        assert!(script.contains("gsutil cp gs://bucket/path/genohype"));
+        assert!(script.contains("/usr/local/bin/genohype"));
     }
 
     #[test]
@@ -180,7 +228,7 @@ mod tests {
             client_private_key: "secret:wg-coord-privkey".to_string(),
         };
 
-        let script = generate_coordinator_startup_script(&wg_config);
+        let script = generate_coordinator_startup_script(&wg_config, None);
 
         // Check essential components
         assert!(script.contains("#!/bin/bash"));

@@ -1060,6 +1060,14 @@ pub enum PoolCommands {
         /// Skip automatic Linux binary build (use existing binary)
         #[arg(long)]
         skip_build: bool,
+
+        /// Use HTTP API instead of SSH (requires IAP tunnel to coordinator on localhost:3000)
+        #[arg(long)]
+        via_api: bool,
+
+        /// Port where coordinator is accessible (default: 3000)
+        #[arg(long, default_value = "3000")]
+        port: u16,
     },
 
     /// Cancel a running job on the pool

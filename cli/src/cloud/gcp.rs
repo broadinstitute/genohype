@@ -182,10 +182,11 @@ impl CloudProvider for GcpClient {
     fn create_pool(&self, config: &PoolConfig) -> Result<()> {
         self.check_gcloud_installed()?;
 
-        // Generate startup scripts
-        let worker_script = super::startup::generate_startup_script();
+        // Generate startup scripts (with optional binary download from GCS)
+        let worker_script =
+            super::startup::generate_startup_script(config.binary_gcs_url.as_deref());
         let coordinator_script = config.wireguard.as_ref().map(|wg| {
-            super::startup::generate_coordinator_startup_script(wg)
+            super::startup::generate_coordinator_startup_script(wg, config.binary_gcs_url.as_deref())
         });
 
         // Build list of instances to create: coordinator (optional) + workers
