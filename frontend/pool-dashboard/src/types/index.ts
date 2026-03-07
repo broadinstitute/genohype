@@ -237,3 +237,25 @@ export interface EventsResponse {
 export interface FailuresResponse {
   failures: FailureRecord[];
 }
+
+/**
+ * A record of a submitted job for history tracking.
+ */
+export interface JobRecord {
+  /** Unique identifier for this job */
+  job_id: string;
+  /** Job status: "running", "completed", "cancelled", "failed" */
+  status: string;
+  /** When the job started (milliseconds since epoch) */
+  start_time_ms: number;
+  /** When the job ended (milliseconds since epoch), if finished */
+  end_time_ms?: number;
+  /** Serialized JobSpec for display */
+  job_spec_json?: unknown;
+  /** Input path being processed */
+  input_path: string;
+  /** Total tasks in the job */
+  total_tasks: number;
+  /** Description of the job type */
+  job_type?: string;
+}

@@ -13,7 +13,7 @@ use crate::distributed::message::{
     CompleteResponse, DashboardBatchProgress, DashboardBottleneck, DashboardMetrics,
     DashboardSummary, DashboardWorker, EventsResponse, ExportMetricsRequest, ExportMetricsResponse,
     FailureRecord, FailuresResponse, HeartbeatRequest, HeartbeatResponse, JobConfigRequest,
-    JobConfigResponse, JobEvent, JobResultResponse, JobSpec, ManhattanAggregateSpec,
+    JobConfigResponse, JobEvent, JobRecord, JobResultResponse, JobSpec, ManhattanAggregateSpec,
     ManhattanScanSpec, ManhattanSource, ManhattanSpec, PartitionOp, PhenotypeOp, PhenotypeStatus,
     StatusResponse, TaskDescriptor, TaskType, TelemetrySnapshot, UpdateFleetRequest,
     WorkRequest, WorkResponse, WorkerMetricsSeries,
@@ -377,6 +377,8 @@ struct CoordinatorData {
     update_fleet_url: Option<String>,
     /// Set of workers that have already received the update signal
     updated_workers: HashSet<String>,
+    /// Unique ID for the currently running job (for history tracking)
+    current_job_id: Option<String>,
 }
 
 type SharedState = Arc<Mutex<CoordinatorData>>;
@@ -387,16 +389,30 @@ const MAX_EVENTS: usize = 1000;
 const MAX_FAILURES: usize = 100;
 
 impl CoordinatorData {
-    /// Log an event to the ring buffer
+    /// Log an event to the ring buffer and persist to database.
     fn log_event(&mut self, event: JobEvent) {
+        // Persist to database if we have a current job
+        if let Some(ref job_id) = self.current_job_id {
+            if let Err(e) = self.metrics_db.log_event(job_id, &event) {
+                eprintln!("Warning: failed to persist event to DB: {}", e);
+            }
+        }
+        // Also keep in ring buffer for live dashboard
         self.events.push_back(event);
         if self.events.len() > MAX_EVENTS {
             self.events.pop_front();
         }
     }
 
-    /// Log a failure to the ring buffer
+    /// Log a failure to the ring buffer and persist to database.
     fn log_failure(&mut self, failure: FailureRecord) {
+        // Persist to database if we have a current job
+        if let Some(ref job_id) = self.current_job_id {
+            if let Err(e) = self.metrics_db.log_failure(job_id, &failure) {
+                eprintln!("Warning: failed to persist failure to DB: {}", e);
+            }
+        }
+        // Also keep in ring buffer for live dashboard
         self.failures.push_back(failure);
         if self.failures.len() > MAX_FAILURES {
             self.failures.pop_front();
@@ -602,6 +618,7 @@ pub async fn run_coordinator(
         last_backup_at: None,
         update_fleet_url: None,
         updated_workers: HashSet::new(),
+        current_job_id: None,
     }));
 
     // Start background timeout monitor
@@ -825,6 +842,23 @@ pub async fn run_coordinator(
                 // Reset to idle mode instead of exiting - allows coordinator to accept new jobs
                 {
                     let mut data = monitor_state.lock().unwrap();
+
+                    // Update job status in database before clearing state
+                    if let Some(ref job_id) = data.current_job_id {
+                        let end_time_ms = CoordinatorData::now_ms();
+                        // Build a summary for persistence
+                        let summary = build_dashboard_summary(&data);
+                        let summary_json = serde_json::to_string(&summary).ok();
+                        if let Err(e) = data.metrics_db.update_job_status(
+                            job_id,
+                            "completed",
+                            Some(end_time_ms),
+                            summary_json.as_deref(),
+                        ) {
+                            eprintln!("Warning: failed to update job status in DB: {}", e);
+                        }
+                    }
+
                     data.pending_partitions.clear();
                     data.processing_partitions.clear();
                     data.completed_tasks.clear();
@@ -840,6 +874,7 @@ pub async fn run_coordinator(
                     data.aggregate_cpu_secs = 0.0;
                     data.wasted_cpu_secs = 0.0;
                     data.last_error = None;
+                    data.current_job_id = None;
                     data.idle = true;
                 }
                 println!("Job complete. Coordinator returning to idle mode, ready for next job.");
@@ -868,6 +903,13 @@ pub async fn run_coordinator(
         .route("/api/workers/:worker_id/logs", get(get_worker_logs))
         .route("/api/update-fleet", post(update_fleet))
         .route("/api/update-coordinator", post(update_coordinator))
+        // History endpoints
+        .route("/api/history/jobs", get(get_history_jobs))
+        .route("/api/history/jobs/:job_id/summary", get(get_history_job_summary))
+        .route("/api/history/jobs/:job_id/metrics", get(get_history_job_metrics))
+        .route("/api/history/jobs/:job_id/events", get(get_history_job_events))
+        .route("/api/history/jobs/:job_id/failures", get(get_history_job_failures))
+        .route("/api/history/jobs/:job_id/batch", get(get_history_job_batch))
         .with_state(state)
         // Serve embedded SPA dashboard
         .route("/dashboard", get(serve_dashboard_index))
@@ -924,6 +966,14 @@ fn check_stuck_job(state: &SharedState, timeout_secs: u64) {
             elapsed.as_secs()
         );
 
+        // Update job status in database
+        if let Some(ref job_id) = data.current_job_id {
+            let end_time_ms = CoordinatorData::now_ms();
+            if let Err(e) = data.metrics_db.update_job_status(job_id, "failed", Some(end_time_ms), None) {
+                eprintln!("Warning: failed to update job status in DB: {}", e);
+            }
+        }
+
         // Reset state
         data.pending_partitions.clear();
         data.processing_partitions.clear();
@@ -931,6 +981,7 @@ fn check_stuck_job(state: &SharedState, timeout_secs: u64) {
         data.batch_state = None;
         data.active_tasks.clear();
         data.ingestion_state = None;
+        data.current_job_id = None;
         data.idle = true;
     }
 }
@@ -2791,7 +2842,8 @@ async fn handle_heartbeat(
     }
 
     // Persist to SQLite (fire-and-forget, don't block on DB errors)
-    if let Err(e) = data.metrics_db.insert_snapshot(&req.worker_id, &req.telemetry) {
+    let job_id = data.current_job_id.clone();
+    if let Err(e) = data.metrics_db.insert_snapshot_with_job_id(&req.worker_id, &req.telemetry, job_id.as_deref()) {
         eprintln!("Warning: failed to persist metrics to DB: {}", e);
     }
 
@@ -2936,9 +2988,30 @@ async fn submit_job(
     // Only clear if this is a fresh start and we want to purge stale workers
     // data.worker_registry.clear();
 
-    // Clear metrics database for new job
-    if let Err(e) = data.metrics_db.clear() {
-        eprintln!("Warning: failed to clear metrics DB: {}", e);
+    // Don't clear metrics database - preserve historical telemetry across jobs
+    // This allows restore from GCS backup to accumulate data over time
+
+    // Clear in-memory event/failure buffers for the new job (historical data is in DB)
+    data.events.clear();
+    data.failures.clear();
+
+    // Generate a unique job ID and persist to database
+    let job_id = Uuid::new_v4().to_string();
+    data.current_job_id = Some(job_id.clone());
+
+    let job_record = JobRecord {
+        job_id: job_id.clone(),
+        status: "running".to_string(),
+        start_time_ms: CoordinatorData::now_ms(),
+        end_time_ms: None,
+        job_spec_json: serde_json::to_value(&req.job_spec).ok(),
+        input_path: req.input_path.clone(),
+        total_tasks: req.total_tasks,
+        job_type: Some(req.job_spec.description().to_string()),
+    };
+
+    if let Err(e) = data.metrics_db.insert_job(&job_record) {
+        eprintln!("Warning: failed to persist job to DB: {}", e);
     }
 
     // Mark as no longer idle
@@ -3208,6 +3281,14 @@ async fn cancel_job(
         });
     }
 
+    // Update job status in database
+    if let Some(ref job_id) = data.current_job_id {
+        let end_time_ms = CoordinatorData::now_ms();
+        if let Err(e) = data.metrics_db.update_job_status(job_id, "cancelled", Some(end_time_ms), None) {
+            eprintln!("Warning: failed to update job status in DB: {}", e);
+        }
+    }
+
     // Reset job state
     data.pending_partitions.clear();
     data.processing_partitions.clear();
@@ -3216,6 +3297,7 @@ async fn cancel_job(
     data.active_tasks.clear();
     data.ingestion_state = None;
     data.idle = true;
+    data.current_job_id = None;
 
     let reason = req.reason.unwrap_or_else(|| "User request".to_string());
     println!("Job cancelled: {}", reason);
@@ -3268,11 +3350,8 @@ async fn get_job_result(
 }
 
 /// Handler for GET /api/dashboard/summary - overall job summary.
-async fn get_dashboard_summary(
-    axum::extract::State(state): axum::extract::State<SharedState>,
-) -> axum::Json<DashboardSummary> {
-    let data = state.lock().unwrap();
-
+/// Build a DashboardSummary from coordinator data (used for persistence and API).
+fn build_dashboard_summary(data: &CoordinatorData) -> DashboardSummary {
     let elapsed = data.job_start_time.elapsed().as_secs_f64();
     let failed = data.failed_partitions.len();
 
@@ -3281,15 +3360,8 @@ async fn get_dashboard_summary(
         // For batch jobs, track phenotype-level progress
         let total = batch.total_phenotypes;
         let completed = batch.completed_count;
-
-        // Count active phenotypes (currently being scanned)
         let active_count = batch.active_phenotypes.len();
-
-        // Count phenotypes ready to aggregate
         let ready_count = batch.ready_to_aggregate.len();
-
-        // Pending = queued + active + ready (not yet fully complete)
-        // Processing = active phenotypes being scanned
         let pending = batch.pending_queue.len();
         let processing = active_count + ready_count;
 
@@ -3300,13 +3372,11 @@ async fn get_dashboard_summary(
 
         (completed, processing, pending, total, is_complete)
     } else if let Some(ref m) = data.manhattan_state {
-        // Check if this is a single Manhattan pipeline job
         let total_parts = m.exome_total_tasks + m.genome_total_tasks;
         let completed_parts = m.exome_completed.len() + m.genome_completed.len();
         let processing_parts = m.exome_processing.len() + m.genome_processing.len();
         let pending_parts = m.exome_pending.len() + m.genome_pending.len();
 
-        // Add aggregate phase (+1 task)
         let total = total_parts + 1;
         let completed = completed_parts + if m.aggregate_complete { 1 } else { 0 };
         let processing = processing_parts + if m.aggregate_dispatched && !m.aggregate_complete { 1 } else { 0 };
@@ -3332,7 +3402,6 @@ async fn get_dashboard_summary(
         0.0
     };
 
-    // Compute cluster-wide items/sec from worker telemetry
     let cluster_items_per_sec: f64 = data
         .worker_registry
         .values()
@@ -3341,7 +3410,6 @@ async fn get_dashboard_summary(
         .map(|s| s.items_per_sec)
         .sum();
 
-    // ETA based on partition completion rate
     let eta_secs = if completed > 0 && !is_complete {
         let remaining = total - completed - failed;
         let secs_per_partition = elapsed / completed as f64;
@@ -3350,9 +3418,7 @@ async fn get_dashboard_summary(
         None
     };
 
-    // Compute batch progress if in batch mode
     let batch_progress = if let Some(ref batch) = data.batch_state {
-        // Count phenotypes in each aggregation state
         let in_aggregate = batch
             .phenotype_statuses
             .values()
@@ -3371,7 +3437,7 @@ async fn get_dashboard_summary(
         None
     };
 
-    axum::Json(DashboardSummary {
+    DashboardSummary {
         progress_percent,
         total_tasks: total,
         batch_size: data.config.batch_size,
@@ -3396,7 +3462,14 @@ async fn get_dashboard_summary(
         db_path: Some(data.config.db_path.clone()),
         backup_path: data.config.backup_path.clone(),
         last_backup_at: data.last_backup_at,
-    })
+    }
+}
+
+async fn get_dashboard_summary(
+    axum::extract::State(state): axum::extract::State<SharedState>,
+) -> axum::Json<DashboardSummary> {
+    let data = state.lock().unwrap();
+    axum::Json(build_dashboard_summary(&data))
 }
 
 /// Handler for GET /api/dashboard/bottlenecks - analyze cluster bottlenecks.
@@ -3928,4 +4001,210 @@ async fn update_coordinator(
         axum::http::StatusCode::OK,
         "Coordinator update initiated, restarting...".to_string(),
     )
+}
+
+// ============================================================================
+// History API Endpoints
+// ============================================================================
+
+/// Handler for GET /api/history/jobs - list all historical jobs.
+async fn get_history_jobs(
+    axum::extract::State(state): axum::extract::State<SharedState>,
+) -> axum::Json<Vec<JobRecord>> {
+    let data = state.lock().unwrap();
+    match data.metrics_db.get_jobs() {
+        Ok(jobs) => axum::Json(jobs),
+        Err(e) => {
+            eprintln!("Warning: failed to fetch jobs from DB: {}", e);
+            axum::Json(vec![])
+        }
+    }
+}
+
+/// Handler for GET /api/history/jobs/:job_id/summary - get job summary.
+///
+/// If job_id matches current_job_id, returns live data. Otherwise returns persisted summary.
+async fn get_history_job_summary(
+    axum::extract::State(state): axum::extract::State<SharedState>,
+    axum::extract::Path(job_id): axum::extract::Path<String>,
+) -> axum::response::Response {
+    let data = state.lock().unwrap();
+
+    // If requesting the current active job, return live data
+    if let Some(ref current_id) = data.current_job_id {
+        if current_id == &job_id {
+            let summary = build_dashboard_summary(&data);
+            return axum::Json(summary).into_response();
+        }
+    }
+
+    // Otherwise, fetch from database
+    match data.metrics_db.get_job_summary(&job_id) {
+        Ok(Some(json_str)) => {
+            if let Ok(summary) = serde_json::from_str::<DashboardSummary>(&json_str) {
+                return axum::Json(summary).into_response();
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("Warning: failed to fetch job summary from DB: {}", e);
+        }
+    }
+
+    // If no persisted summary, try to construct a minimal one from the job record
+    match data.metrics_db.get_job(&job_id) {
+        Ok(Some(job)) => {
+            let summary = DashboardSummary {
+                progress_percent: if job.status == "completed" { 100.0 } else { 0.0 },
+                total_tasks: job.total_tasks,
+                batch_size: 1,
+                completed_tasks: if job.status == "completed" { job.total_tasks } else { 0 },
+                processing_tasks: 0,
+                pending_tasks: if job.status == "completed" { 0 } else { job.total_tasks },
+                failed_tasks: if job.status == "failed" { job.total_tasks } else { 0 },
+                total_items: 0,
+                cluster_items_per_sec: 0.0,
+                elapsed_secs: job.end_time_ms.map(|e| (e - job.start_time_ms) as f64 / 1000.0).unwrap_or(0.0),
+                eta_secs: None,
+                is_complete: job.status == "completed",
+                input_path: job.input_path,
+                job_spec: job.job_spec_json.and_then(|v| serde_json::from_value(v).ok()),
+                idle: true,
+                last_error: if job.status == "failed" { Some("Job failed".to_string()) } else { None },
+                batch_progress: None,
+                build_version: None,
+                scan_cpu_secs: 0.0,
+                aggregate_cpu_secs: 0.0,
+                wasted_cpu_secs: 0.0,
+                db_path: None,
+                backup_path: None,
+                last_backup_at: None,
+            };
+            axum::Json(summary).into_response()
+        }
+        _ => {
+            (axum::http::StatusCode::NOT_FOUND, "Job not found").into_response()
+        }
+    }
+}
+
+/// Handler for GET /api/history/jobs/:job_id/metrics - get job metrics.
+async fn get_history_job_metrics(
+    axum::extract::State(state): axum::extract::State<SharedState>,
+    axum::extract::Path(job_id): axum::extract::Path<String>,
+) -> axum::Json<DashboardMetrics> {
+    let data = state.lock().unwrap();
+
+    // If requesting the current active job, return live data
+    if let Some(ref current_id) = data.current_job_id {
+        if current_id == &job_id {
+            let workers: Vec<WorkerMetricsSeries> = data
+                .worker_registry
+                .iter()
+                .map(|(id, state)| WorkerMetricsSeries {
+                    worker_id: id.clone(),
+                    snapshots: state.metrics_history.iter().cloned().collect(),
+                })
+                .collect();
+            return axum::Json(DashboardMetrics { workers });
+        }
+    }
+
+    // Fetch from database
+    match data.metrics_db.get_job_metrics(&job_id) {
+        Ok(worker_data) => {
+            let workers = worker_data
+                .into_iter()
+                .map(|(worker_id, snapshots)| WorkerMetricsSeries { worker_id, snapshots })
+                .collect();
+            axum::Json(DashboardMetrics { workers })
+        }
+        Err(e) => {
+            eprintln!("Warning: failed to fetch job metrics from DB: {}", e);
+            axum::Json(DashboardMetrics { workers: vec![] })
+        }
+    }
+}
+
+/// Handler for GET /api/history/jobs/:job_id/events - get job events.
+async fn get_history_job_events(
+    axum::extract::State(state): axum::extract::State<SharedState>,
+    axum::extract::Path(job_id): axum::extract::Path<String>,
+) -> axum::Json<EventsResponse> {
+    let data = state.lock().unwrap();
+
+    // If requesting the current active job, return live data
+    if let Some(ref current_id) = data.current_job_id {
+        if current_id == &job_id {
+            return axum::Json(EventsResponse {
+                events: data.events.iter().cloned().collect(),
+            });
+        }
+    }
+
+    // Fetch from database
+    match data.metrics_db.get_job_events(&job_id) {
+        Ok(events) => axum::Json(EventsResponse { events }),
+        Err(e) => {
+            eprintln!("Warning: failed to fetch job events from DB: {}", e);
+            axum::Json(EventsResponse { events: vec![] })
+        }
+    }
+}
+
+/// Handler for GET /api/history/jobs/:job_id/failures - get job failures.
+async fn get_history_job_failures(
+    axum::extract::State(state): axum::extract::State<SharedState>,
+    axum::extract::Path(job_id): axum::extract::Path<String>,
+) -> axum::Json<FailuresResponse> {
+    let data = state.lock().unwrap();
+
+    // If requesting the current active job, return live data
+    if let Some(ref current_id) = data.current_job_id {
+        if current_id == &job_id {
+            return axum::Json(FailuresResponse {
+                failures: data.failures.iter().cloned().collect(),
+            });
+        }
+    }
+
+    // Fetch from database
+    match data.metrics_db.get_job_failures(&job_id) {
+        Ok(failures) => axum::Json(FailuresResponse { failures }),
+        Err(e) => {
+            eprintln!("Warning: failed to fetch job failures from DB: {}", e);
+            axum::Json(FailuresResponse { failures: vec![] })
+        }
+    }
+}
+
+/// Handler for GET /api/history/jobs/:job_id/batch - get batch phenotype status.
+async fn get_history_job_batch(
+    axum::extract::State(state): axum::extract::State<SharedState>,
+    axum::extract::Path(job_id): axum::extract::Path<String>,
+) -> axum::Json<BatchStatusResponse> {
+    let data = state.lock().unwrap();
+
+    // If requesting the current active job, return live data
+    if let Some(ref current_id) = data.current_job_id {
+        if current_id == &job_id {
+            if let Some(ref batch) = data.batch_state {
+                let phenotypes: Vec<PhenotypeStatus> = batch
+                    .phenotype_statuses
+                    .values()
+                    .cloned()
+                    .collect();
+                return axum::Json(BatchStatusResponse { phenotypes });
+            }
+        }
+    }
+
+    // Fetch from database
+    match data.metrics_db.get_job_batch_phenotypes(&job_id) {
+        Ok(phenotypes) => axum::Json(BatchStatusResponse { phenotypes }),
+        Err(e) => {
+            eprintln!("Warning: failed to fetch batch phenotypes from DB: {}", e);
+            axum::Json(BatchStatusResponse { phenotypes: vec![] })
+        }
+    }
 }

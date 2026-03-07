@@ -9,6 +9,7 @@ import type {
   BatchStatusResponse,
   JobEvent,
   FailureRecord,
+  JobRecord,
 } from '../types';
 
 // ============================================================================
@@ -45,6 +46,12 @@ export const layoutPresetAtom = atomWithStorage<string>(
   'dashboardLayoutPreset',
   'overview'
 );
+
+/** Which job is currently being viewed ('active' for live job, or a specific job UUID) */
+export const selectedJobIdAtom = atom<string>('active');
+
+/** List of historical jobs */
+export const jobsListAtom = atom<JobRecord[]>([]);
 
 // ============================================================================
 // Derived State
@@ -89,18 +96,32 @@ async function fetchJson<T>(url: string): Promise<T | null> {
  * Action atom that fetches all dashboard endpoints concurrently.
  * Uses Promise.all so failures on optional endpoints (like /batch) don't
  * break updates for other atoms.
+ *
+ * Supports viewing either the "active" live job or a historical job by ID.
  */
-export const fetchDashboardDataAtom = atom(null, async (_get, set) => {
+export const fetchDashboardDataAtom = atom(null, async (get, set) => {
+  const jobId = get(selectedJobIdAtom);
+  const isHistoryView = jobId !== 'active';
+
+  // Determine API base paths based on whether we're viewing history
+  const basePath = isHistoryView ? `/api/history/jobs/${jobId}` : '/api/dashboard';
+  const eventsPath = isHistoryView ? `/api/history/jobs/${jobId}/events` : '/api/events';
+  const failuresPath = isHistoryView ? `/api/history/jobs/${jobId}/failures` : '/api/failures';
+
   // Fetch all endpoints concurrently
-  const [summary, workers, metrics, bottleneck, batch, eventsResp, failuresResp] =
+  const [summary, workers, metrics, bottleneck, batch, eventsResp, failuresResp, jobsList] =
     await Promise.all([
-      fetchJson<DashboardSummary>('/api/dashboard/summary'),
-      fetchJson<DashboardWorker[]>('/api/dashboard/workers'),
-      fetchJson<DashboardMetrics>('/api/dashboard/metrics'),
-      fetchJson<DashboardBottleneck>('/api/dashboard/bottlenecks'),
-      fetchJson<BatchStatusResponse>('/api/dashboard/batch'),
-      fetchJson<{ events: JobEvent[] }>('/api/events'),
-      fetchJson<{ failures: FailureRecord[] }>('/api/failures'),
+      fetchJson<DashboardSummary>(`${basePath}/summary`),
+      // Workers endpoint doesn't exist for history (workers are transient)
+      isHistoryView ? Promise.resolve([] as DashboardWorker[]) : fetchJson<DashboardWorker[]>('/api/dashboard/workers'),
+      fetchJson<DashboardMetrics>(`${basePath}/metrics`),
+      // Bottleneck is a live metric, not available for history
+      isHistoryView ? Promise.resolve(null) : fetchJson<DashboardBottleneck>('/api/dashboard/bottlenecks'),
+      fetchJson<BatchStatusResponse>(`${basePath}/batch`),
+      fetchJson<{ events: JobEvent[] }>(eventsPath),
+      fetchJson<{ failures: FailureRecord[] }>(failuresPath),
+      // Always fetch jobs list for the history panel
+      fetchJson<JobRecord[]>('/api/history/jobs'),
     ]);
 
   // Update atoms with fetched data (only if fetch succeeded)
@@ -111,6 +132,7 @@ export const fetchDashboardDataAtom = atom(null, async (_get, set) => {
   if (batch !== null) set(batchAtom, batch);
   if (eventsResp !== null) set(eventsAtom, eventsResp.events);
   if (failuresResp !== null) set(failuresAtom, failuresResp.failures);
+  if (jobsList !== null) set(jobsListAtom, jobsList);
 });
 
 // ============================================================================

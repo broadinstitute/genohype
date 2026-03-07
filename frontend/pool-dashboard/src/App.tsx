@@ -1,8 +1,9 @@
-import { useAtomValue } from 'jotai';
+import { useAtomValue, useAtom } from 'jotai';
 import {
   useDashboardPolling,
   summaryAtom,
   isLoadedAtom,
+  selectedJobIdAtom,
 } from './atoms/dashboardAtoms';
 import { DockViewLayout } from './DockViewLayout';
 import './App.css';
@@ -18,19 +19,45 @@ function App() {
 
   const isLoaded = useAtomValue(isLoadedAtom);
   const summary = useAtomValue(summaryAtom);
+  const [selectedJobId, setSelectedJobId] = useAtom(selectedJobIdAtom);
+
+  const isViewingHistory = selectedJobId !== 'active';
 
   return (
     <div className="app">
       <header className="app-header">
         <h1>Genohype Pool Dashboard</h1>
         <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+          {isViewingHistory && (
+            <button
+              onClick={() => setSelectedJobId('active')}
+              style={{
+                background: 'var(--orange, #f97316)',
+                color: '#fff',
+                border: 'none',
+                padding: '4px 12px',
+                borderRadius: '4px',
+                cursor: 'pointer',
+                fontSize: '11px',
+                fontWeight: 600,
+              }}
+            >
+              📜 Viewing History — Return to Live
+            </button>
+          )}
           {summary?.build_version && (
             <span style={{ fontSize: '11px', color: 'var(--text-dim)' }}>
               v: {summary.build_version.slice(0, 7)}
             </span>
           )}
           <span className="status-badge">
-            {summary?.is_complete ? 'Complete' : summary?.idle ? 'Idle' : 'Running'}
+            {isViewingHistory
+              ? 'Historical'
+              : summary?.is_complete
+              ? 'Complete'
+              : summary?.idle
+              ? 'Idle'
+              : 'Running'}
           </span>
         </div>
       </header>

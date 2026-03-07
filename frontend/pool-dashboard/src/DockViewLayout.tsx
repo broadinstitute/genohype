@@ -17,6 +17,7 @@ import {
   EventLogPanel,
   FailuresPanel,
   PhenotypeBatchPanel,
+  JobHistoryPanel,
 } from './panels';
 
 // Map React components to string identifiers for Dockview
@@ -32,6 +33,7 @@ const components: Record<string, React.FC> = {
   eventLog: EventLogPanel,
   failures: FailuresPanel,
   phenotypeBatch: PhenotypeBatchPanel,
+  jobHistory: JobHistoryPanel,
 };
 
 /**
@@ -201,6 +203,20 @@ export const applyFleetLayout = (api: DockviewApi) => {
 };
 
 /**
+ * Applies the History layout preset:
+ * - Full-screen Job History panel for browsing past jobs
+ */
+export const applyHistoryLayout = (api: DockviewApi) => {
+  clearPanels(api);
+
+  api.addPanel({
+    id: 'job_history',
+    component: 'jobHistory',
+    title: 'Job History',
+  });
+};
+
+/**
  * Main Dockview layout component.
  * Registers all Phase 3 panels and reacts to layoutPresetAtom changes
  * to apply the corresponding workspace layout.
@@ -227,6 +243,9 @@ export const DockViewLayout: React.FC = () => {
         break;
       case 'fleet':
         applyFleetLayout(api);
+        break;
+      case 'history':
+        applyHistoryLayout(api);
         break;
       case 'overview':
       default:

@@ -1,6 +1,8 @@
 //! SQLite-backed metrics storage for persistent dashboard data.
 
-use crate::distributed::message::TelemetrySnapshot;
+use crate::distributed::message::{
+    FailureRecord, JobEvent, JobRecord, PhenotypeStatus, TelemetrySnapshot,
+};
 use rusqlite::{params, Connection, Result as SqliteResult};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -52,8 +54,68 @@ impl MetricsDb {
 
             CREATE INDEX IF NOT EXISTS idx_telemetry_time
                 ON telemetry(timestamp_ms);
+
+            -- Job history tables
+            CREATE TABLE IF NOT EXISTS jobs (
+                job_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                start_time_ms INTEGER NOT NULL,
+                end_time_ms INTEGER,
+                job_spec_json TEXT,
+                input_path TEXT,
+                total_tasks INTEGER,
+                job_type TEXT,
+                final_summary_json TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL,
+                timestamp_ms INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                worker_id TEXT,
+                phenotype_id TEXT,
+                details TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_events_job_id ON events(job_id);
+
+            CREATE TABLE IF NOT EXISTS failures (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL,
+                timestamp_ms INTEGER NOT NULL,
+                phenotype_id TEXT,
+                tasks TEXT NOT NULL,
+                worker_id TEXT NOT NULL,
+                error TEXT NOT NULL,
+                retry_count INTEGER NOT NULL,
+                wasted_duration_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_failures_job_id ON failures(job_id);
+
+            CREATE TABLE IF NOT EXISTS batch_phenotypes (
+                job_id TEXT NOT NULL,
+                phenotype_id TEXT NOT NULL,
+                status_json TEXT NOT NULL,
+                PRIMARY KEY (job_id, phenotype_id)
+            );
             "#,
         )?;
+
+        // Add job_id column to telemetry if it doesn't exist
+        let has_job_id: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('telemetry') WHERE name = 'job_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0) > 0;
+
+        if !has_job_id {
+            let _ = conn.execute_batch(
+                "ALTER TABLE telemetry ADD COLUMN job_id TEXT;
+                 CREATE INDEX IF NOT EXISTS idx_telemetry_job_id ON telemetry(job_id);",
+            );
+        }
 
         // Add columns if they don't exist (for existing databases)
         // SQLite doesn't support IF NOT EXISTS for ALTER TABLE, so we check first
@@ -105,6 +167,16 @@ impl MetricsDb {
 
     /// Insert a telemetry snapshot for a worker.
     pub fn insert_snapshot(&self, worker_id: &str, snapshot: &TelemetrySnapshot) -> SqliteResult<()> {
+        self.insert_snapshot_with_job_id(worker_id, snapshot, None)
+    }
+
+    /// Insert a telemetry snapshot for a worker, associated with a job.
+    pub fn insert_snapshot_with_job_id(
+        &self,
+        worker_id: &str,
+        snapshot: &TelemetrySnapshot,
+        job_id: Option<&str>,
+    ) -> SqliteResult<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             r#"
@@ -114,8 +186,8 @@ impl MetricsDb {
                 active_partition, partitions_completed,
                 disk_used_bytes, disk_total_bytes,
                 network_rx_bytes_sec, network_tx_bytes_sec,
-                network_rx_total_bytes, network_tx_total_bytes, current_batch_size
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                network_rx_total_bytes, network_tx_total_bytes, current_batch_size, job_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
             "#,
             params![
                 worker_id,
@@ -134,6 +206,7 @@ impl MetricsDb {
                 None::<i64>, // network_rx_total_bytes (no longer in TelemetrySnapshot)
                 None::<i64>, // network_tx_total_bytes (no longer in TelemetrySnapshot)
                 snapshot.current_batch_size.map(|v| v as i64),
+                job_id,
             ],
         )?;
         Ok(())
@@ -270,6 +343,350 @@ impl MetricsDb {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         Ok(())
+    }
+
+    // =========================================================================
+    // Job History CRUD Operations
+    // =========================================================================
+
+    /// Insert a new job record.
+    pub fn insert_job(&self, job: &JobRecord) -> SqliteResult<()> {
+        let conn = self.conn.lock().unwrap();
+        let job_spec_json = job
+            .job_spec_json
+            .as_ref()
+            .map(|v| serde_json::to_string(v).unwrap_or_default());
+        conn.execute(
+            r#"
+            INSERT INTO jobs (job_id, status, start_time_ms, end_time_ms, job_spec_json, input_path, total_tasks, job_type)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "#,
+            params![
+                job.job_id,
+                job.status,
+                job.start_time_ms as i64,
+                job.end_time_ms.map(|v| v as i64),
+                job_spec_json,
+                job.input_path,
+                job.total_tasks as i64,
+                job.job_type,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Update job status and optionally set the end time and final summary.
+    pub fn update_job_status(
+        &self,
+        job_id: &str,
+        status: &str,
+        end_time_ms: Option<u64>,
+        final_summary_json: Option<&str>,
+    ) -> SqliteResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"
+            UPDATE jobs
+            SET status = ?2, end_time_ms = ?3, final_summary_json = ?4
+            WHERE job_id = ?1
+            "#,
+            params![
+                job_id,
+                status,
+                end_time_ms.map(|v| v as i64),
+                final_summary_json,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get all jobs ordered by start time (most recent first).
+    pub fn get_jobs(&self) -> SqliteResult<Vec<JobRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT job_id, status, start_time_ms, end_time_ms, job_spec_json, input_path, total_tasks, job_type
+            FROM jobs
+            ORDER BY start_time_ms DESC
+            "#,
+        )?;
+
+        let jobs = stmt
+            .query_map([], |row| {
+                let job_spec_str: Option<String> = row.get(4)?;
+                let job_spec_json = job_spec_str
+                    .and_then(|s| serde_json::from_str(&s).ok());
+                Ok(JobRecord {
+                    job_id: row.get(0)?,
+                    status: row.get(1)?,
+                    start_time_ms: row.get::<_, i64>(2)? as u64,
+                    end_time_ms: row.get::<_, Option<i64>>(3)?.map(|v| v as u64),
+                    job_spec_json,
+                    input_path: row.get(5)?,
+                    total_tasks: row.get::<_, i64>(6)? as usize,
+                    job_type: row.get(7)?,
+                })
+            })?
+            .collect::<SqliteResult<Vec<_>>>()?;
+
+        Ok(jobs)
+    }
+
+    /// Get a specific job by ID.
+    pub fn get_job(&self, job_id: &str) -> SqliteResult<Option<JobRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT job_id, status, start_time_ms, end_time_ms, job_spec_json, input_path, total_tasks, job_type
+            FROM jobs
+            WHERE job_id = ?1
+            "#,
+        )?;
+
+        let result = stmt.query_row([job_id], |row| {
+            let job_spec_str: Option<String> = row.get(4)?;
+            let job_spec_json = job_spec_str.and_then(|s| serde_json::from_str(&s).ok());
+            Ok(JobRecord {
+                job_id: row.get(0)?,
+                status: row.get(1)?,
+                start_time_ms: row.get::<_, i64>(2)? as u64,
+                end_time_ms: row.get::<_, Option<i64>>(3)?.map(|v| v as u64),
+                job_spec_json,
+                input_path: row.get(5)?,
+                total_tasks: row.get::<_, i64>(6)? as usize,
+                job_type: row.get(7)?,
+            })
+        });
+
+        match result {
+            Ok(job) => Ok(Some(job)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Get the final summary JSON for a job.
+    pub fn get_job_summary(&self, job_id: &str) -> SqliteResult<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let result: Result<Option<String>, _> = conn.query_row(
+            "SELECT final_summary_json FROM jobs WHERE job_id = ?1",
+            [job_id],
+            |row| row.get(0),
+        );
+        match result {
+            Ok(summary) => Ok(summary),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Log an event to the database.
+    pub fn log_event(&self, job_id: &str, event: &JobEvent) -> SqliteResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO events (job_id, timestamp_ms, event_type, worker_id, phenotype_id, details)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "#,
+            params![
+                job_id,
+                event.timestamp_ms as i64,
+                event.event_type,
+                event.worker_id,
+                event.phenotype_id,
+                event.details,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get events for a job.
+    pub fn get_job_events(&self, job_id: &str) -> SqliteResult<Vec<JobEvent>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT timestamp_ms, event_type, worker_id, phenotype_id, details
+            FROM events
+            WHERE job_id = ?1
+            ORDER BY timestamp_ms ASC
+            "#,
+        )?;
+
+        let events = stmt
+            .query_map([job_id], |row| {
+                Ok(JobEvent {
+                    timestamp_ms: row.get::<_, i64>(0)? as u64,
+                    event_type: row.get(1)?,
+                    worker_id: row.get(2)?,
+                    phenotype_id: row.get(3)?,
+                    details: row.get(4)?,
+                })
+            })?
+            .collect::<SqliteResult<Vec<_>>>()?;
+
+        Ok(events)
+    }
+
+    /// Log a failure to the database.
+    pub fn log_failure(&self, job_id: &str, failure: &FailureRecord) -> SqliteResult<()> {
+        let conn = self.conn.lock().unwrap();
+        let tasks_json = serde_json::to_string(&failure.tasks).unwrap_or_default();
+        conn.execute(
+            r#"
+            INSERT INTO failures (job_id, timestamp_ms, phenotype_id, tasks, worker_id, error, retry_count, wasted_duration_ms)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "#,
+            params![
+                job_id,
+                failure.timestamp_ms as i64,
+                failure.phenotype_id,
+                tasks_json,
+                failure.worker_id,
+                failure.error,
+                failure.retry_count as i64,
+                failure.wasted_duration_ms as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get failures for a job.
+    pub fn get_job_failures(&self, job_id: &str) -> SqliteResult<Vec<FailureRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT timestamp_ms, phenotype_id, tasks, worker_id, error, retry_count, wasted_duration_ms
+            FROM failures
+            WHERE job_id = ?1
+            ORDER BY timestamp_ms ASC
+            "#,
+        )?;
+
+        let failures = stmt
+            .query_map([job_id], |row| {
+                let tasks_json: String = row.get(2)?;
+                let tasks: Vec<String> =
+                    serde_json::from_str(&tasks_json).unwrap_or_default();
+                Ok(FailureRecord {
+                    timestamp_ms: row.get::<_, i64>(0)? as u64,
+                    phenotype_id: row.get(1)?,
+                    tasks,
+                    worker_id: row.get(3)?,
+                    error: row.get(4)?,
+                    retry_count: row.get::<_, i64>(5)? as usize,
+                    wasted_duration_ms: row.get::<_, i64>(6)? as u64,
+                })
+            })?
+            .collect::<SqliteResult<Vec<_>>>()?;
+
+        Ok(failures)
+    }
+
+    /// Upsert a batch phenotype status.
+    pub fn upsert_batch_phenotype(
+        &self,
+        job_id: &str,
+        phenotype_id: &str,
+        status: &PhenotypeStatus,
+    ) -> SqliteResult<()> {
+        let conn = self.conn.lock().unwrap();
+        let status_json = serde_json::to_string(status).unwrap_or_default();
+        conn.execute(
+            r#"
+            INSERT OR REPLACE INTO batch_phenotypes (job_id, phenotype_id, status_json)
+            VALUES (?1, ?2, ?3)
+            "#,
+            params![job_id, phenotype_id, status_json],
+        )?;
+        Ok(())
+    }
+
+    /// Get batch phenotype statuses for a job.
+    pub fn get_job_batch_phenotypes(&self, job_id: &str) -> SqliteResult<Vec<PhenotypeStatus>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT status_json FROM batch_phenotypes WHERE job_id = ?1
+            "#,
+        )?;
+
+        let statuses = stmt
+            .query_map([job_id], |row| {
+                let json: String = row.get(0)?;
+                let status: PhenotypeStatus =
+                    serde_json::from_str(&json).unwrap_or_else(|_| PhenotypeStatus {
+                        id: String::new(),
+                        stage: "unknown".to_string(),
+                        partitions_done: 0,
+                        partitions_total: 0,
+                        result: None,
+                        error: None,
+                        duration_secs: None,
+                        cpu_core_secs: None,
+                    });
+                Ok(status)
+            })?
+            .collect::<SqliteResult<Vec<_>>>()?;
+
+        Ok(statuses)
+    }
+
+    /// Get metrics for a specific job.
+    pub fn get_job_metrics(&self, job_id: &str) -> SqliteResult<Vec<(String, Vec<TelemetrySnapshot>)>> {
+        let conn = self.conn.lock().unwrap();
+
+        // First get distinct worker IDs for this job
+        let mut worker_stmt = conn.prepare(
+            "SELECT DISTINCT worker_id FROM telemetry WHERE job_id = ?1 ORDER BY worker_id",
+        )?;
+        let worker_ids: Vec<String> = worker_stmt
+            .query_map([job_id], |row| row.get(0))?
+            .collect::<SqliteResult<Vec<_>>>()?;
+
+        drop(worker_stmt);
+
+        let mut results = Vec::new();
+        for worker_id in worker_ids {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT timestamp_ms, cpu_percent, memory_used_bytes, memory_total_bytes,
+                       rows_per_sec, total_rows, active_partition, partitions_completed,
+                       disk_used_bytes, disk_total_bytes,
+                       network_rx_bytes_sec, network_tx_bytes_sec, current_batch_size
+                FROM telemetry
+                WHERE job_id = ?1 AND worker_id = ?2
+                ORDER BY timestamp_ms ASC
+                "#,
+            )?;
+
+            let snapshots: Vec<TelemetrySnapshot> = stmt
+                .query_map(params![job_id, &worker_id], |row| {
+                    Ok(TelemetrySnapshot {
+                        timestamp_ms: row.get::<_, i64>(0)? as u64,
+                        cpu_percent: row.get(1)?,
+                        memory_used_bytes: row.get::<_, Option<i64>>(2)?.map(|v| v as u64),
+                        memory_total_bytes: row.get::<_, Option<i64>>(3)?.map(|v| v as u64),
+                        items_per_sec: row.get(4)?,
+                        total_items: row.get::<_, i64>(5)? as usize,
+                        active_partition: row.get::<_, Option<i64>>(6)?.map(|v| v as usize),
+                        partitions_completed: row.get::<_, i64>(7)? as usize,
+                        cpu_per_core: None,
+                        disk_read_bytes_sec: None,
+                        disk_write_bytes_sec: None,
+                        disk_used_bytes: row.get::<_, Option<i64>>(8)?.map(|v| v as u64),
+                        disk_total_bytes: row.get::<_, Option<i64>>(9)?.map(|v| v as u64),
+                        network_rx_bytes_sec: row.get(10)?,
+                        network_tx_bytes_sec: row.get(11)?,
+                        core_tasks: None,
+                        current_batch_size: row.get::<_, Option<i64>>(12)?.map(|v| v as usize),
+                    })
+                })?
+                .collect::<SqliteResult<Vec<_>>>()?;
+
+            results.push((worker_id, snapshots));
+        }
+
+        Ok(results)
     }
 }
 

@@ -999,6 +999,30 @@ pub struct ActiveTaskInfo {
     pub started_at_ms: u64,
 }
 
+/// A record of a submitted job for history tracking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobRecord {
+    /// Unique identifier for this job
+    pub job_id: String,
+    /// Job status: "running", "completed", "cancelled", "failed"
+    pub status: String,
+    /// When the job started (milliseconds since epoch)
+    pub start_time_ms: u64,
+    /// When the job ended (milliseconds since epoch), if finished
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_time_ms: Option<u64>,
+    /// Serialized JobSpec for display
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_spec_json: Option<serde_json::Value>,
+    /// Input path being processed
+    pub input_path: String,
+    /// Total tasks in the job
+    pub total_tasks: usize,
+    /// Description of the job type
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_type: Option<String>,
+}
+
 /// A historical event in the cluster.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobEvent {
