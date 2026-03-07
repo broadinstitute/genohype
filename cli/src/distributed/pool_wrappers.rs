@@ -63,12 +63,17 @@ impl TaskHandler for CliTaskHandler {
             .iter()
             .filter_map(|t| {
                 if let Ok(task_type) = serde_json::from_value::<TaskType>(t.payload.clone()) {
-                    if let TaskType::Partition { partition_index, .. } = task_type {
-                        return Some(partition_index);
+                    match task_type {
+                        TaskType::Partition { partition_index, .. } => return Some(partition_index),
+                        TaskType::Stress { iteration } => return Some(iteration),
+                        _ => {}
                     }
                 }
                 // Fallback: try to parse the task ID as a partition index
-                t.id.parse::<usize>().ok()
+                t.id.parse::<usize>().ok().or_else(|| {
+                    // Secondary fallback for IDs like "stress_0"
+                    t.id.rsplit('_').next().and_then(|s| s.parse::<usize>().ok())
+                })
             })
             .collect();
 
