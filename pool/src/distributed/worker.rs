@@ -160,6 +160,7 @@ async fn request_work(
     let request = WorkRequest {
         worker_id: worker_id.to_string(),
         hardware: None,
+        build_version: None, // Pool crate doesn't have GIT_HASH; CLI worker sets this
     };
 
     let response = client.post(url).json(&request).send().await?;

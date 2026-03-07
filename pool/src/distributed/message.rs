@@ -97,6 +97,9 @@ pub struct WorkRequest {
     /// Worker hardware specification
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hardware: Option<HardwareSpec>,
+    /// Git commit hash of the worker binary
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_version: Option<String>,
 }
 
 /// Response from coordinator with work assignment.
@@ -300,6 +303,9 @@ pub struct HeartbeatRequest {
     pub worker_id: String,
     /// Current telemetry snapshot
     pub telemetry: TelemetrySnapshot,
+    /// Git commit hash of the worker binary
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_version: Option<String>,
 }
 
 /// Heartbeat response from coordinator.
@@ -363,6 +369,9 @@ pub struct DashboardWorker {
     /// Time since last heartbeat in seconds
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_heartbeat_secs: Option<f64>,
+    /// Git commit hash of the worker binary
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_version: Option<String>,
 }
 
 /// Dashboard metrics response.

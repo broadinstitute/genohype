@@ -99,6 +99,8 @@ export interface DashboardSummary {
   backup_path?: string;
   /** Timestamp of last successful backup (milliseconds since epoch) */
   last_backup_at?: number;
+  /** Git commit hash of the coordinator binary */
+  build_version?: string;
 }
 
 /**
@@ -115,6 +117,8 @@ export interface DashboardWorker {
   telemetry?: TelemetrySnapshot;
   /** Time since last heartbeat in seconds */
   last_heartbeat_secs?: number;
+  /** Git commit hash of the worker binary */
+  build_version?: string;
 }
 
 /**

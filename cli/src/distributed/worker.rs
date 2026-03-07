@@ -189,41 +189,73 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
                 break;
             }
             WorkResponse::UpdateBinary { gcs_url } => {
-                println!("Received UpdateBinary signal. Updating from {}...", gcs_url);
+                // Use current executable path so we replace exactly what is running
+                let current_exe = std::env::current_exe().unwrap_or_else(|_| {
+                    std::path::PathBuf::from("/usr/local/bin/genohype")
+                });
+                let exe_path = current_exe.to_string_lossy().to_string();
 
+                println!(
+                    "Received UpdateBinary signal. Updating {} from {}...",
+                    exe_path, gcs_url
+                );
+
+                let temp_path = "/tmp/genohype-new";
+
+                // 1. Try gsutil first
                 let status = std::process::Command::new("gsutil")
-                    .args(["cp", &gcs_url, "/tmp/genohype"])
+                    .args(["cp", &gcs_url, temp_path])
                     .status();
 
-                match status {
-                    Ok(s) if s.success() => {}
-                    _ => {
-                        eprintln!("Failed to download new binary from GCS. Retrying next poll.");
+                if !status.map(|s| s.success()).unwrap_or(false) {
+                    println!("gsutil failed, falling back to curl from coordinator...");
+                    // 2. Fallback to pulling from coordinator API
+                    let curl_url = format!("{}/api/binary", config.coordinator_url);
+                    let curl_status = std::process::Command::new("curl")
+                        .args(["-sL", "--retry", "3", &curl_url, "-o", temp_path])
+                        .status();
+
+                    if !curl_status.map(|s| s.success()).unwrap_or(false) {
+                        eprintln!(
+                            "Failed to download binary via both gsutil and curl. Retrying later."
+                        );
                         tokio::time::sleep(Duration::from_millis(config.poll_interval_ms)).await;
                         continue;
                     }
                 }
 
+                // Make executable
                 std::process::Command::new("chmod")
-                    .args(["+x", "/tmp/genohype"])
-                    .status()
-                    .ok();
-                std::process::Command::new("sudo")
-                    .args(["mv", "/tmp/genohype", "/usr/local/bin/genohype"])
+                    .args(["+x", temp_path])
                     .status()
                     .ok();
 
-                println!("Binary updated successfully. Restarting worker process...");
+                // Try standard rename first (works if same filesystem and permissions)
+                if std::fs::rename(temp_path, &exe_path).is_err() {
+                    // Fall back to sudo mv
+                    let mv_status = std::process::Command::new("sudo")
+                        .args(["mv", temp_path, &exe_path])
+                        .status();
+
+                    if !mv_status.map(|s| s.success()).unwrap_or(false) {
+                        eprintln!("Failed to move binary to {}. Retrying later.", exe_path);
+                        tokio::time::sleep(Duration::from_millis(config.poll_interval_ms)).await;
+                        continue;
+                    }
+                }
+
+                println!("Binary updated at {}. Restarting worker...", exe_path);
 
                 use std::os::unix::process::CommandExt;
                 let args: Vec<String> = std::env::args().collect();
-                let err = std::process::Command::new("/usr/local/bin/genohype")
+                let err = std::process::Command::new(&exe_path)
                     .args(&args[1..])
                     .exec();
 
+                // We only reach here if exec fails
                 return Err(crate::HailError::Io(std::io::Error::new(
                     std::io::ErrorKind::Other,
-                    format!("Failed to exec new binary: {}", err),
+                    format!("Failed to exec new binary at {}: {}", exe_path, err),
                 )));
             }
             WorkResponse::Wait => {
@@ -391,6 +423,7 @@ async fn request_work(
     let request = WorkRequest {
         worker_id: worker_id.to_string(),
         hardware: Some(hardware.clone()),
+        build_version: Some(env!("GIT_HASH").to_string()),
     };
 
     let response = client
@@ -605,6 +638,7 @@ fn spawn_telemetry_loop(
             let req = HeartbeatRequest {
                 worker_id: worker_id.clone(),
                 telemetry: snapshot,
+                build_version: Some(env!("GIT_HASH").to_string()),
             };
 
             // Best-effort: don't let heartbeat failures block the worker

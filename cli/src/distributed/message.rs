@@ -949,6 +949,9 @@ pub struct DashboardWorker {
     /// Currently assigned task, if any
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_task: Option<ActiveTaskInfo>,
+    /// Git commit hash of the worker binary
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_version: Option<String>,
 }
 
 /// Time-series metrics data for charts.

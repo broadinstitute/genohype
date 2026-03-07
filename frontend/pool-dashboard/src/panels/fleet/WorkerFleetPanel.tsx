@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useAtomValue } from 'jotai';
-import { workersAtom } from '../../atoms/dashboardAtoms';
+import { workersAtom, summaryAtom } from '../../atoms/dashboardAtoms';
 import type { DashboardWorker, TelemetrySnapshot, CoreTaskInfo } from '../../types';
 import '../panels.css';
 
@@ -11,6 +11,8 @@ import '../panels.css';
  */
 export const WorkerFleetPanel: React.FC = () => {
   const workers = useAtomValue(workersAtom);
+  const summary = useAtomValue(summaryAtom);
+  const coordinatorVersion = summary?.build_version;
 
   return (
     <div className="panel-container">
@@ -21,7 +23,7 @@ export const WorkerFleetPanel: React.FC = () => {
       ) : (
         <div className="workers-grid">
           {workers.map((worker) => (
-            <WorkerCard key={worker.worker_id} worker={worker} />
+            <WorkerCard key={worker.worker_id} worker={worker} coordinatorVersion={coordinatorVersion} />
           ))}
         </div>
       )}
@@ -357,8 +359,10 @@ const ActiveTaskSummary: React.FC<{
 /**
  * Individual worker card displaying status, hardware usage, and per-core utilization.
  */
-const WorkerCard: React.FC<{ worker: DashboardWorker }> = ({ worker }) => {
+const WorkerCard: React.FC<{ worker: DashboardWorker; coordinatorVersion?: string }> = ({ worker, coordinatorVersion }) => {
   const t = worker.telemetry;
+  const workerVersion = worker.build_version;
+  const versionMismatch = workerVersion && coordinatorVersion && workerVersion !== coordinatorVersion;
 
   return (
     <div className={`worker-card ${worker.status}`}>
@@ -369,7 +373,22 @@ const WorkerCard: React.FC<{ worker: DashboardWorker }> = ({ worker }) => {
             <span style={{ fontSize: '9px', fontWeight: 600, color: 'var(--bg)', background: 'var(--red)', padding: '1px 4px', borderRadius: '3px' }}>MEM BOUND</span>
           )}
         </div>
-        <StatusBadge status={worker.status} />
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          {workerVersion && (
+            <span
+              style={{
+                fontSize: '9px',
+                color: versionMismatch ? 'var(--yellow)' : 'var(--text-dim)',
+                fontFamily: 'monospace',
+              }}
+              title={versionMismatch ? `Worker version (${workerVersion.slice(0, 7)}) differs from coordinator (${coordinatorVersion?.slice(0, 7)})` : `Worker version: ${workerVersion}`}
+            >
+              {workerVersion.slice(0, 7)}
+              {versionMismatch && ' ⚠'}
+            </span>
+          )}
+          <StatusBadge status={worker.status} />
+        </div>
       </div>
 
       <div className="worker-content">

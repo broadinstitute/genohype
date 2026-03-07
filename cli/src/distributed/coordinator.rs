@@ -317,6 +317,8 @@ struct WorkerState {
     hardware: Option<crate::distributed::message::HardwareSpec>,
     /// Dynamically adjusted batch size for this worker (AIMD algorithm)
     current_batch_size: Option<usize>,
+    /// Git commit hash of the worker binary
+    build_version: Option<String>,
 }
 
 /// Internal state of the coordinator.
@@ -489,37 +491,61 @@ pub async fn run_coordinator(
 
     // Try to restore from backup path if configured
     if let Some(ref bp) = backup_path {
-        println!("  Checking for database backup at {}", bp);
+        eprintln!("  Checking for database backup at {}", bp);
         let bp_clone = bp.clone();
         let db_path_clone = db_path.clone();
+
         let restore_result = tokio::task::spawn_blocking(move || {
-            match genohype_core::io::get_reader(&bp_clone) {
-                Ok(mut reader) => {
-                    let mut data = Vec::new();
-                    match std::io::Read::read_to_end(&mut reader, &mut data) {
-                        Ok(bytes) => {
-                            if bytes > 0 {
-                                println!("  Downloaded {} bytes from backup", bytes);
-                                if let Some(parent) = std::path::Path::new(&db_path_clone).parent() {
-                                    let _ = std::fs::create_dir_all(parent);
-                                }
-                                match std::fs::write(&db_path_clone, &data) {
-                                    Ok(_) => return true,
-                                    Err(e) => println!("  Failed to write restored DB: {}", e),
-                                }
+            // First, ensure the parent directory exists
+            if let Some(parent) = std::path::Path::new(&db_path_clone).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+
+            // Clean up any existing db files that might corrupt the restored state
+            // If a stale -wal file exists, SQLite will overwrite the restored .db!
+            let _ = std::fs::remove_file(&db_path_clone);
+            let _ = std::fs::remove_file(format!("{}-wal", db_path_clone));
+            let _ = std::fs::remove_file(format!("{}-shm", db_path_clone));
+
+            if bp_clone.starts_with("gs://") {
+                eprintln!("  Running gsutil cp {} {}", bp_clone, db_path_clone);
+                match std::process::Command::new("gsutil")
+                    .args(["cp", &bp_clone, &db_path_clone])
+                    .status()
+                {
+                    Ok(status) if status.success() => {
+                        // Verify file exists and has size
+                        if let Ok(metadata) = std::fs::metadata(&db_path_clone) {
+                            if metadata.len() > 0 {
+                                eprintln!(
+                                    "  Successfully restored DB ({} bytes)",
+                                    metadata.len()
+                                );
+                                return true;
                             } else {
-                                println!("  Backup file is empty");
+                                eprintln!("  Warning: Restored DB file is empty");
                             }
+                        } else {
+                            eprintln!(
+                                "  Warning: gsutil succeeded but file not found at {}",
+                                db_path_clone
+                            );
                         }
-                        Err(e) => println!("  Failed to read backup data: {}", e),
                     }
+                    Ok(status) => eprintln!("  gsutil cp failed with status: {}", status),
+                    Err(e) => eprintln!("  Failed to execute gsutil: {}", e),
                 }
-                Err(e) => println!("  No backup found or error: {}", e),
+            } else {
+                eprintln!("  Warning: Automatic restore only supported for gs:// paths");
             }
             false
-        }).await;
+        })
+        .await;
+
         if restore_result.unwrap_or(false) {
-            println!("  Restored ops database from {}", bp);
+            eprintln!("  Restored ops database from {}", bp);
+        } else {
+            eprintln!("  Starting with fresh database (restore skipped or failed)");
         }
     }
 
@@ -777,7 +803,7 @@ pub async fn run_coordinator(
                     }
                 }
 
-                // Perform final backup to GCS before exiting
+                // Perform final backup to GCS
                 {
                     let (db_path, backup_path, metrics_db) = {
                         let data = monitor_state.lock().unwrap();
@@ -796,9 +822,27 @@ pub async fn run_coordinator(
                     }
                 }
 
-                println!("Coordinator will exit in 10 seconds...");
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                std::process::exit(0);
+                // Reset to idle mode instead of exiting - allows coordinator to accept new jobs
+                {
+                    let mut data = monitor_state.lock().unwrap();
+                    data.pending_partitions.clear();
+                    data.processing_partitions.clear();
+                    data.completed_tasks.clear();
+                    data.failed_partitions.clear();
+                    data.retry_counts.clear();
+                    data.manhattan_state = None;
+                    data.batch_state = None;
+                    data.active_tasks.clear();
+                    data.ingestion_state = None;
+                    data.aggregated_results.clear();
+                    data.total_rows = 0;
+                    data.scan_cpu_secs = 0.0;
+                    data.aggregate_cpu_secs = 0.0;
+                    data.wasted_cpu_secs = 0.0;
+                    data.last_error = None;
+                    data.idle = true;
+                }
+                println!("Job complete. Coordinator returning to idle mode, ready for next job.");
             }
         }
     });
@@ -1002,6 +1046,7 @@ fn touch_worker(
     data: &mut CoordinatorData,
     worker_id: &str,
     hardware: Option<crate::distributed::message::HardwareSpec>,
+    build_version: Option<String>,
 ) {
     let worker = data
         .worker_registry
@@ -1016,10 +1061,14 @@ fn touch_worker(
             latest_log_tail: None,
             hardware: None,
             current_batch_size: None,
+            build_version: None,
         });
     worker.last_seen = Instant::now();
     if hardware.is_some() {
         worker.hardware = hardware;
+    }
+    if build_version.is_some() {
+        worker.build_version = build_version;
     }
 }
 
@@ -1219,12 +1268,12 @@ fn get_ingestion_work(
         return axum::Json(WorkResponse::Wait);
     }
 
-    // All work complete
+    // All work complete - return Wait so worker stays alive for next job
     println!(
         "Ingestion complete: {} succeeded, {} failed",
         ingestion.completed_count, ingestion.failed_count
     );
-    axum::Json(WorkResponse::Exit)
+    axum::Json(WorkResponse::Wait)
 }
 
 fn get_batch_work(
@@ -1487,7 +1536,8 @@ fn get_batch_work(
             "Manhattan batch complete: {} completed, {} failed",
             batch.completed_count, batch.failed_count
         );
-        return axum::Json(WorkResponse::Exit);
+        // Return Wait so worker stays alive for next job
+        return axum::Json(WorkResponse::Wait);
     }
 
     // Step 5: Work in progress, tell worker to wait
@@ -1503,7 +1553,7 @@ async fn get_work(
     axum::Json(req): axum::Json<WorkRequest>,
 ) -> axum::Json<WorkResponse> {
     let mut data = state.lock().unwrap();
-    touch_worker(&mut data, &req.worker_id, req.hardware.clone());
+    touch_worker(&mut data, &req.worker_id, req.hardware.clone(), req.build_version.clone());
 
     // Check for pending binary update
     if let Some(gcs_url) = data.update_fleet_url.clone() {
@@ -1650,12 +1700,12 @@ async fn get_work(
         }
         axum::Json(WorkResponse::Wait)
     } else {
-        // All done
+        // All done - return Wait so worker stays alive for next job
         println!(
             "Worker {} requested work, but all partitions complete",
             req.worker_id
         );
-        axum::Json(WorkResponse::Exit)
+        axum::Json(WorkResponse::Wait)
     }
 }
 
@@ -1730,7 +1780,8 @@ fn get_manhattan_work(
                     if manhattan.mode == crate::distributed::message::ExecutionMode::ScanOnly {
                         println!("Manhattan scan phase complete (ScanOnly mode) - job finished!");
                         manhattan.phase = ManhattanPhase::Complete;
-                        return axum::Json(WorkResponse::Exit);
+                        // Return Wait so worker stays alive for next job
+                        return axum::Json(WorkResponse::Wait);
                     } else {
                         // Transition to Aggregate phase
                         println!("Manhattan scan phase complete, transitioning to Aggregate phase");
@@ -1852,9 +1903,9 @@ fn get_manhattan_work(
             }
 
             if manhattan.aggregate_complete {
-                // All done
+                // All done - return Wait so worker stays alive for next job
                 manhattan.phase = ManhattanPhase::Complete;
-                return axum::Json(WorkResponse::Exit);
+                return axum::Json(WorkResponse::Wait);
             }
 
             // Dispatch aggregate task
@@ -1923,7 +1974,8 @@ fn get_manhattan_work(
         }
 
         ManhattanPhase::Complete => {
-            axum::Json(WorkResponse::Exit)
+            // Return Wait so worker stays alive for next job
+            axum::Json(WorkResponse::Wait)
         }
     }
 }
@@ -2565,7 +2617,7 @@ async fn complete_work(
     }
 
     // Update per-worker stats
-    touch_worker(&mut data, &req.worker_id, None);
+    touch_worker(&mut data, &req.worker_id, None, None);
     if let Some(w) = data.worker_registry.get_mut(&req.worker_id) {
         w.total_rows += req.items_processed;
         w.partitions_completed += task_ids.len();
@@ -2679,7 +2731,7 @@ async fn handle_heartbeat(
     axum::Json(mut req): axum::Json<HeartbeatRequest>,
 ) -> axum::Json<HeartbeatResponse> {
     let mut data = state.lock().unwrap();
-    touch_worker(&mut data, &req.worker_id, None);
+    touch_worker(&mut data, &req.worker_id, None, req.build_version.clone());
 
     // Extract config value before mutable borrow of worker_registry
     let default_batch_size = data.config.batch_size;
@@ -3488,6 +3540,7 @@ async fn get_dashboard_workers(
             total_items: w.total_rows,
             tasks_completed: w.partitions_completed,
             current_task: w.current_task.clone(),
+            build_version: w.build_version.clone(),
         })
         .collect();
 
