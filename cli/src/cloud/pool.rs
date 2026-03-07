@@ -31,6 +31,40 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         Self { provider }
     }
 
+    /// Stage the genohype binary to GCS for fast worker pulls.
+    fn stage_binary_to_gcs(&self, binary: &Path, pool_db_path: &str) -> Result<String> {
+        use genohype_core::io::CloudWriter;
+        use std::io::Write;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // Derive staging path (e.g. gs://bucket/path/ops.db -> gs://bucket/path)
+        let base_dir = if pool_db_path.ends_with(".db") {
+            let parts: Vec<&str> = pool_db_path.split('/').collect();
+            parts[..parts.len().saturating_sub(1)].join("/")
+        } else {
+            pool_db_path.trim_end_matches('/').to_string()
+        };
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let staging_url = format!("{}/bin/genohype-worker-{}", base_dir, timestamp);
+
+        println!(
+            "{} Staging binary to {}...",
+            "Setup:".cyan(),
+            staging_url.dimmed()
+        );
+
+        let binary_data = std::fs::read(binary).map_err(HailError::Io)?;
+        let mut writer = CloudWriter::new(&staging_url)?;
+        writer.write_all(&binary_data).map_err(HailError::Io)?;
+        writer.finish()?;
+
+        Ok(staging_url)
+    }
+
     /// Create a new worker pool.
     ///
     /// Provisions `config.worker_count` VMs in parallel.
@@ -1022,12 +1056,20 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             workers.len().to_string().bright_white()
         );
 
+        // Try to stage binary to GCS for fast updates
+        let pool_db_path = pool_db_path.map(|s| s.to_string());
+        let staging_url = if let Some(ref db_path) = pool_db_path {
+            println!("{}", "Using fast GCS staging for update...".dimmed());
+            self.stage_binary_to_gcs(&binary, db_path).ok()
+        } else {
+            None
+        };
+
         // Always stop any running coordinator before updating (to avoid "Address already in use")
         println!(
             "{}",
             "Stopping any running coordinator service...".dimmed()
         );
-        // Kill by process name and also by port (belt and suspenders)
         let stop_cmd = "pkill -9 -f 'genohype service start-coordinator' 2>/dev/null; \
                         pkill -9 -f 'genohype-worker' 2>/dev/null; \
                         fuser -k 3000/tcp 2>/dev/null; \
@@ -1037,18 +1079,37 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             .get_ssh_command(&coordinator.name, zone, stop_cmd)
             .status();
 
-        // Give processes time to fully terminate and release the port
         std::thread::sleep(std::time::Duration::from_secs(2));
 
-        // Deploy binary to coordinator
-        println!("{}", "Uploading binary to coordinator...".dimmed());
-        self.deploy_binary(&binary, &[coordinator.clone()], zone)?;
-        println!(
-            "{} Binary uploaded to coordinator.",
-            "OK".green().bold()
-        );
+        // Update coordinator binary via GCS (fast) or SCP (fallback)
+        if let Some(ref gcs_url) = staging_url {
+            println!(
+                "{}",
+                "Updating coordinator binary via GCS pull...".dimmed()
+            );
+            let update_coord_cmd = format!(
+                "gsutil cp {} /tmp/genohype && chmod +x /tmp/genohype && sudo mv /tmp/genohype /usr/local/bin/genohype",
+                gcs_url
+            );
+            let status = self
+                .provider
+                .get_ssh_command(&coordinator.name, zone, &update_coord_cmd)
+                .status()
+                .map_err(HailError::Io)?;
+            if !status.success() {
+                return Err(HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Failed to update coordinator binary via GCS",
+                )));
+            }
+        } else {
+            println!("{}", "Uploading binary to coordinator via SCP...".dimmed());
+            self.deploy_binary(&binary, &[coordinator.clone()], zone)?;
+        }
 
-        // Start/restart coordinator service (to serve /api/binary and new dashboard)
+        println!("{} Coordinator binary updated.", "OK".green().bold());
+
+        // Start/restart coordinator service
         println!(
             "{}",
             "Starting coordinator service with new binary...".dimmed()
@@ -1056,9 +1117,9 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         let mut coord_cmd = String::from(
             "nohup /usr/local/bin/genohype service start-coordinator \
              --port 3000 \
-             --db-path /var/lib/genohype/ops.db"
+             --db-path /var/lib/genohype/ops.db",
         );
-        if let Some(backup) = pool_db_path {
+        if let Some(ref backup) = pool_db_path {
             coord_cmd.push_str(&format!(" --backup-path {}", backup));
         }
         coord_cmd.push_str(" > /tmp/coordinator.log 2>&1 & echo $! > /tmp/coordinator.pid");
@@ -1080,7 +1141,6 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
 
         // Verify coordinator is back up
         if !self.check_coordinator_status(&coordinator, zone) {
-            // Try to fetch the log to show what went wrong
             let log_cmd = "tail -50 /tmp/coordinator.log 2>/dev/null || echo '(no log file)'";
             if let Ok(output) = self
                 .provider
@@ -1096,25 +1156,41 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                 "Coordinator failed to start after binary update",
             )));
         }
-        println!(
-            "{} Coordinator restarted with new binary.",
-            "OK".green().bold()
-        );
 
-        // Have workers pull binary from coordinator
-        if workers.is_empty() {
-            println!("{}", "No workers to update.".yellow());
-        } else {
-            println!(
-                "{}",
-                format!("Workers pulling binary from coordinator ({})...", coord_ip).dimmed()
-            );
-            self.propagate_binary_from_coordinator(coord_ip, &workers, zone)?;
-            println!(
-                "{} Binary updated on {} workers.",
-                "OK".green().bold(),
-                workers.len()
-            );
+        // Update workers
+        if !workers.is_empty() {
+            if let Some(ref gcs_url) = staging_url {
+                // Zero-SSH fleet update: call /api/update-fleet
+                println!(
+                    "{} Instructing {} workers to self-update...",
+                    "API:".cyan(),
+                    workers.len()
+                );
+                let req = serde_json::json!({ "gcs_url": gcs_url });
+                let curl_cmd = format!(
+                    "curl -s -X POST -H 'Content-Type: application/json' -d '{}' http://localhost:3000/api/update-fleet",
+                    req.to_string()
+                );
+                let status = self
+                    .provider
+                    .get_ssh_command(&coordinator.name, zone, &curl_cmd)
+                    .status()
+                    .map_err(HailError::Io)?;
+                if !status.success() {
+                    println!("{}", "Warning: Failed to call /api/update-fleet".yellow());
+                }
+            } else {
+                // Fallback: workers pull from coordinator
+                println!(
+                    "{}",
+                    format!(
+                        "Workers pulling binary from coordinator ({})...",
+                        coord_ip
+                    )
+                    .dimmed()
+                );
+                self.propagate_binary_from_coordinator(coord_ip, &workers, zone)?;
+            }
         }
 
         println!();
@@ -1352,8 +1428,16 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                     "Linux binary not found. Build with: cargo linux --release",
                 ))
             })?;
+
+            // Try to stage binary to GCS for fast updates
+            let pool_db_path = config.and_then(|c| c.pool_db_path.as_deref());
+            let staging_url = if let Some(db_path) = pool_db_path {
+                self.stage_binary_to_gcs(binary, db_path).ok()
+            } else {
+                None
+            };
+
             if use_distributed {
-                // Distributed mode: upload to coordinator only, workers pull from coordinator
                 let coord = coordinator.as_ref().unwrap();
                 let coord_ip = coord.ip().ok_or_else(|| {
                     HailError::Io(std::io::Error::new(
@@ -1362,7 +1446,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                     ))
                 })?;
 
-                // Stop any existing coordinator first (to avoid "Address already in use")
+                // Stop any existing coordinator first
                 println!("{}", "Stopping existing coordinator...".dimmed());
                 let stop_cmd = "pkill -f 'genohype service start-coordinator' || true";
                 let _ = self
@@ -1371,28 +1455,43 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                     .status();
                 std::thread::sleep(std::time::Duration::from_secs(1));
 
-                // Deploy binary to coordinator
-                println!("{}", "Deploying binary to coordinator...".dimmed());
-                self.deploy_binary(binary, &[coord.clone()], zone)?;
-                println!(
-                    "{} Binary deployed to coordinator.",
-                    "OK".green().bold()
-                );
+                // Deploy binary to coordinator via GCS (fast) or SCP (fallback)
+                if let Some(ref gcs_url) = staging_url {
+                    println!(
+                        "{}",
+                        "Deploying binary to coordinator via GCS...".dimmed()
+                    );
+                    let update_coord_cmd = format!(
+                        "gsutil cp {} /tmp/genohype && chmod +x /tmp/genohype && sudo mv /tmp/genohype /usr/local/bin/genohype",
+                        gcs_url
+                    );
+                    self.provider
+                        .get_ssh_command(&coord.name, zone, &update_coord_cmd)
+                        .status()
+                        .map_err(HailError::Io)?;
+                } else {
+                    println!(
+                        "{}",
+                        "Deploying binary to coordinator via SCP...".dimmed()
+                    );
+                    self.deploy_binary(binary, &[coord.clone()], zone)?;
+                }
 
-                // Start coordinator service (so /api/binary is available)
+                // Start coordinator service
                 println!(
                     "{}",
-                    "Starting coordinator service to serve binary...".dimmed()
+                    "Starting coordinator service to serve binary/API...".dimmed()
                 );
                 let mut coord_cmd = String::from(
                     "nohup /usr/local/bin/genohype service start-coordinator \
                      --port 3000 \
-                     --db-path /var/lib/genohype/ops.db"
+                     --db-path /var/lib/genohype/ops.db",
                 );
-                if let Some(backup) = config.and_then(|c| c.pool_db_path.as_deref()) {
+                if let Some(backup) = pool_db_path {
                     coord_cmd.push_str(&format!(" --backup-path {}", backup));
                 }
-                coord_cmd.push_str(" > /tmp/coordinator.log 2>&1 & echo $! > /tmp/coordinator.pid");
+                coord_cmd
+                    .push_str(" > /tmp/coordinator.log 2>&1 & echo $! > /tmp/coordinator.pid");
                 let status = self
                     .provider
                     .get_ssh_command(&coord.name, zone, &coord_cmd)
@@ -1402,26 +1501,52 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                 if !status.success() {
                     return Err(HailError::Io(std::io::Error::new(
                         std::io::ErrorKind::Other,
-                        "Failed to start coordinator service for binary serving",
+                        "Failed to start coordinator service",
                     )));
                 }
 
-                // Wait for coordinator to be ready
                 std::thread::sleep(std::time::Duration::from_secs(2));
 
-                // Have workers pull binary from coordinator over GCP internal network
-                println!(
-                    "{}",
-                    "Workers pulling binary from coordinator...".dimmed()
-                );
-                self.propagate_binary_from_coordinator(coord_ip, &workers, zone)?;
-                println!(
-                    "{} Binary propagated to {} workers.",
-                    "OK".green().bold(),
-                    workers.len()
-                );
+                if !self.check_coordinator_status(coord, zone) {
+                    return Err(HailError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "Coordinator failed to start",
+                    )));
+                }
+
+                // Update workers via GCS (zero-SSH) or coordinator pull (fallback)
+                if let Some(ref gcs_url) = staging_url {
+                    println!(
+                        "{} Instructing workers to self-update via GCS...",
+                        "API:".cyan()
+                    );
+                    let req = serde_json::json!({ "gcs_url": gcs_url });
+                    let curl_cmd = format!(
+                        "curl -s -X POST -H 'Content-Type: application/json' -d '{}' http://localhost:3000/api/update-fleet",
+                        req.to_string()
+                    );
+                    let _ = self
+                        .provider
+                        .get_ssh_command(&coord.name, zone, &curl_cmd)
+                        .status();
+                    println!(
+                        "{} Binary update triggered for workers.",
+                        "OK".green().bold()
+                    );
+                } else {
+                    println!(
+                        "{}",
+                        "Workers pulling binary from coordinator...".dimmed()
+                    );
+                    self.propagate_binary_from_coordinator(coord_ip, &workers, zone)?;
+                    println!(
+                        "{} Binary propagated to {} workers.",
+                        "OK".green().bold(),
+                        workers.len()
+                    );
+                }
             } else {
-                // Non-distributed mode: upload to all nodes via SCP
+                // Non-distributed mode
                 let all_nodes: Vec<_> = if let Some(ref c) = coordinator {
                     let mut nodes = workers.clone();
                     nodes.push(c.clone());
@@ -1430,7 +1555,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                     workers.clone()
                 };
 
-                println!("{}", "Deploying binary to nodes...".dimmed());
+                println!("{}", "Deploying binary to nodes via SCP...".dimmed());
                 self.deploy_binary(binary, &all_nodes, zone)?;
                 println!("{} Binary deployed to all nodes.", "OK".green().bold());
             }

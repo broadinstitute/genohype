@@ -73,6 +73,11 @@ export const JobSummaryPanel: React.FC = () => {
             <span style={{ wordBreak: 'break-all', color: 'var(--green)' }} title={summary.backup_path}>
               {formatPath(summary.backup_path)}
             </span>
+            {summary.last_backup_at && (
+              <span style={{ color: 'var(--text-dim)', marginLeft: '8px', fontSize: '10px' }}>
+                (last: {new Date(summary.last_backup_at).toLocaleTimeString()})
+              </span>
+            )}
           </div>
         )}
         <div style={{ display: 'flex', gap: '16px', fontSize: '11px', flexWrap: 'wrap' }}>

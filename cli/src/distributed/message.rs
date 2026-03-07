@@ -8,8 +8,8 @@ use std::collections::HashMap;
 
 pub use genohype_pool::distributed::{
     CompleteRequest, CompleteResponse, CoreTaskInfo, HardwareSpec, HeartbeatRequest,
-    HeartbeatResponse, StatusResponse, TaskDescriptor, TelemetrySnapshot, WorkRequest,
-    WorkResponse,
+    HeartbeatResponse, StatusResponse, TaskDescriptor, TelemetrySnapshot, UpdateFleetRequest,
+    WorkRequest, WorkResponse,
 };
 
 // ============================================================================
@@ -851,6 +851,9 @@ pub struct DashboardSummary {
     /// GCS path for backup (if configured)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backup_path: Option<String>,
+    /// Timestamp of last successful backup (milliseconds since epoch)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_backup_at: Option<u64>,
 }
 
 /// Request to submit a new job to an idle coordinator.

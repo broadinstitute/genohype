@@ -127,6 +127,15 @@ pub enum WorkResponse {
     /// All work is complete - worker should exit
     #[serde(rename = "exit")]
     Exit,
+    /// Update binary and restart
+    #[serde(rename = "update")]
+    UpdateBinary { gcs_url: String },
+}
+
+/// Request to update the fleet binary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateFleetRequest {
+    pub gcs_url: String,
 }
 
 /// Request from a worker reporting completion.

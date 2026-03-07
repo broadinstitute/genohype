@@ -141,6 +141,10 @@ pub async fn run_worker(
                     task_ids, items_processed
                 );
             }
+            WorkResponse::UpdateBinary { gcs_url } => {
+                println!("Received UpdateBinary request: {}", gcs_url);
+                // TODO: Implement binary update logic
+            }
         }
     }
 

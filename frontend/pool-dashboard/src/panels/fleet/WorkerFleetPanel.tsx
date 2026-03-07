@@ -30,12 +30,22 @@ export const WorkerFleetPanel: React.FC = () => {
 };
 
 /**
- * Summarizes active tasks by type, showing counts and sample labels.
+ * Detailed info about a unique task (may be running on multiple cores).
+ */
+interface TaskDetail {
+  task_id: string;
+  label?: string;
+  parent?: CoreTaskInfo;
+  cores: number[]; // Which CPU cores are running this task
+}
+
+/**
+ * Summarizes active tasks by type, with full details per task.
  */
 interface TaskTypeSummary {
   type: string;
-  count: number;
-  labels: string[]; // Sample of unique labels for this type
+  count: number; // Total cores running this type
+  tasks: TaskDetail[]; // Unique tasks with their details
 }
 
 /**
@@ -46,26 +56,42 @@ const getTaskTypeSummaries = (
 ): TaskTypeSummary[] => {
   if (!coreTasks) return [];
 
-  const typeMap = new Map<string, { count: number; labels: Set<string> }>();
+  // Group by task_type, then by task_id within each type
+  const typeMap = new Map<string, Map<string, TaskDetail>>();
 
-  Object.values(coreTasks).forEach((task) => {
-    const existing = typeMap.get(task.task_type);
-    const label = task.label || `#${task.task_id}`;
+  Object.entries(coreTasks).forEach(([coreIdxStr, task]) => {
+    const coreIdx = parseInt(coreIdxStr, 10);
 
+    if (!typeMap.has(task.task_type)) {
+      typeMap.set(task.task_type, new Map());
+    }
+    const tasksForType = typeMap.get(task.task_type)!;
+
+    const existing = tasksForType.get(task.task_id);
     if (existing) {
-      existing.count++;
-      existing.labels.add(label); // Collect all unique labels
+      existing.cores.push(coreIdx);
     } else {
-      typeMap.set(task.task_type, { count: 1, labels: new Set([label]) });
+      tasksForType.set(task.task_id, {
+        task_id: task.task_id,
+        label: task.label,
+        parent: task.parent,
+        cores: [coreIdx],
+      });
     }
   });
 
   return Array.from(typeMap.entries())
-    .map(([type, data]) => ({
-      type,
-      count: data.count,
-      labels: Array.from(data.labels),
-    }))
+    .map(([type, tasksMap]) => {
+      const tasks = Array.from(tasksMap.values()).sort((a, b) =>
+        (a.label || a.task_id).localeCompare(b.label || b.task_id)
+      );
+      const totalCores = tasks.reduce((sum, t) => sum + t.cores.length, 0);
+      return {
+        type,
+        count: totalCores,
+        tasks,
+      };
+    })
     .sort((a, b) => b.count - a.count); // Most active types first
 };
 
@@ -110,12 +136,34 @@ const getTaskTypeColor = (taskType: string): string => {
 };
 
 /**
+ * Formats core indices for display (e.g., "C0, C1, C2" or "C0-C3").
+ */
+const formatCores = (cores: number[]): string => {
+  if (cores.length === 0) return '';
+  if (cores.length === 1) return `C${cores[0]}`;
+  if (cores.length <= 3) return cores.map((c) => `C${c}`).join(', ');
+
+  // Check if consecutive
+  const sorted = [...cores].sort((a, b) => a - b);
+  const isConsecutive = sorted.every((c, i) => i === 0 || c === sorted[i - 1] + 1);
+  if (isConsecutive) {
+    return `C${sorted[0]}-C${sorted[sorted.length - 1]}`;
+  }
+  return `${cores.length} cores`;
+};
+
+/**
  * Badge component displaying a task type summary with hover popover.
  */
 const TaskTypeBadge: React.FC<{ summary: TaskTypeSummary }> = ({ summary }) => {
   const [isHovered, setIsHovered] = useState(false);
   const color = getTaskTypeColor(summary.type);
   const typeName = getTaskTypeName(summary.type);
+
+  // Get preview labels for badge
+  const previewLabels = summary.tasks
+    .slice(0, 2)
+    .map((t) => t.label || `#${t.task_id}`);
 
   return (
     <div
@@ -164,13 +212,13 @@ const TaskTypeBadge: React.FC<{ summary: TaskTypeSummary }> = ({ summary }) => {
             whiteSpace: 'nowrap',
           }}
         >
-          {summary.labels.slice(0, 2).join(', ')}
-          {summary.labels.length > 2 && ' …'}
+          {previewLabels.join(', ')}
+          {summary.tasks.length > 2 && ' …'}
         </div>
       </div>
 
       {/* Hover Popover */}
-      {isHovered && summary.labels.length > 2 && (
+      {isHovered && (
         <div
           style={{
             position: 'absolute',
@@ -178,44 +226,88 @@ const TaskTypeBadge: React.FC<{ summary: TaskTypeSummary }> = ({ summary }) => {
             left: 0,
             marginTop: '4px',
             zIndex: 100,
-            minWidth: '180px',
-            maxWidth: '280px',
-            maxHeight: '200px',
+            minWidth: '240px',
+            maxWidth: '360px',
+            maxHeight: '280px',
             overflowY: 'auto',
             background: 'var(--bg-secondary, #1a1a2e)',
             border: `1px solid ${color}`,
             borderRadius: '6px',
             boxShadow: '0 4px 12px rgba(0, 0, 0, 0.4)',
-            padding: '8px 0',
           }}
         >
+          {/* Header */}
           <div
             style={{
-              padding: '4px 10px 8px',
+              padding: '8px 12px',
               borderBottom: '1px solid rgba(255, 255, 255, 0.1)',
-              marginBottom: '4px',
+              background: 'rgba(255, 255, 255, 0.02)',
             }}
           >
-            <span style={{ fontSize: '10px', fontWeight: 600, color: color }}>
-              {typeName}
-            </span>
-            <span style={{ fontSize: '9px', color: 'var(--text-dim)', marginLeft: '6px' }}>
-              {summary.count} on {summary.labels.length} unique task{summary.labels.length !== 1 ? 's' : ''}
-            </span>
-          </div>
-          {summary.labels.map((label, idx) => (
-            <div
-              key={idx}
-              style={{
-                padding: '3px 10px',
-                fontSize: '9px',
-                color: 'var(--text)',
-                borderLeft: `2px solid transparent`,
-              }}
-            >
-              {label}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <span style={{ fontSize: '11px', fontWeight: 600, color: color }}>
+                {typeName}
+              </span>
+              <span style={{ fontSize: '9px', color: 'var(--text-dim)' }}>
+                {summary.count} core{summary.count !== 1 ? 's' : ''} • {summary.tasks.length} task{summary.tasks.length !== 1 ? 's' : ''}
+              </span>
             </div>
-          ))}
+          </div>
+
+          {/* Task List */}
+          <div style={{ padding: '4px 0' }}>
+            {summary.tasks.map((task, idx) => (
+              <div
+                key={task.task_id}
+                style={{
+                  padding: '6px 12px',
+                  borderBottom: idx < summary.tasks.length - 1 ? '1px solid rgba(255, 255, 255, 0.05)' : 'none',
+                }}
+              >
+                {/* Task Label & ID */}
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '8px' }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: '10px', color: 'var(--text)', fontWeight: 500 }}>
+                      {task.label || `Task ${task.task_id}`}
+                    </div>
+                    {task.label && (
+                      <div style={{ fontSize: '8px', color: 'var(--text-dim)', marginTop: '1px' }}>
+                        ID: {task.task_id}
+                      </div>
+                    )}
+                  </div>
+                  {/* Core badges */}
+                  <div
+                    style={{
+                      fontSize: '8px',
+                      color: color,
+                      background: 'rgba(255, 255, 255, 0.05)',
+                      padding: '2px 5px',
+                      borderRadius: '3px',
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
+                    {formatCores(task.cores)}
+                  </div>
+                </div>
+
+                {/* Parent info */}
+                {task.parent && (
+                  <div
+                    style={{
+                      fontSize: '8px',
+                      color: 'var(--text-dim)',
+                      marginTop: '3px',
+                      paddingLeft: '8px',
+                      borderLeft: '2px solid rgba(255, 255, 255, 0.1)',
+                    }}
+                  >
+                    ↳ {task.parent.task_type}: {task.parent.label || task.parent.task_id}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
         </div>
       )}
     </div>

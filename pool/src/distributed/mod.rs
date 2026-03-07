@@ -11,7 +11,7 @@ pub mod worker;
 pub use message::{
     CompleteRequest, CompleteResponse, CoreTaskInfo, DashboardBottleneck, DashboardMetrics,
     DashboardSummary, DashboardWorker, HardwareSpec, HeartbeatRequest, HeartbeatResponse,
-    StatusResponse, TaskDescriptor, TelemetrySnapshot, WorkRequest, WorkResponse,
+    StatusResponse, TaskDescriptor, TelemetrySnapshot, UpdateFleetRequest, WorkRequest, WorkResponse,
 };
 
 // Re-export coordinator and worker

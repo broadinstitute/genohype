@@ -15,8 +15,8 @@ use crate::distributed::message::{
     FailureRecord, FailuresResponse, HeartbeatRequest, HeartbeatResponse, JobConfigRequest,
     JobConfigResponse, JobEvent, JobResultResponse, JobSpec, ManhattanAggregateSpec,
     ManhattanScanSpec, ManhattanSource, ManhattanSpec, PartitionOp, PhenotypeOp, PhenotypeStatus,
-    StatusResponse, TaskDescriptor, TaskType, TelemetrySnapshot, WorkRequest, WorkResponse,
-    WorkerMetricsSeries,
+    StatusResponse, TaskDescriptor, TaskType, TelemetrySnapshot, UpdateFleetRequest,
+    WorkRequest, WorkResponse, WorkerMetricsSeries,
 };
 use crate::distributed::metrics_db::MetricsDb;
 use crate::manhattan::config::PlotType;
@@ -36,7 +36,8 @@ use uuid::Uuid;
 ///
 /// This function checkpoints the WAL to ensure all data is in the main file,
 /// then uploads the database to the specified GCS path.
-async fn backup_db(metrics_db: &MetricsDb, db_path: &str, backup_path: &str) {
+/// Returns true if backup succeeded.
+async fn backup_db(metrics_db: &MetricsDb, db_path: &str, backup_path: &str) -> bool {
     // Checkpoint the WAL to ensure the main DB file is up-to-date
     if let Err(e) = metrics_db.checkpoint_for_backup() {
         eprintln!("Warning: failed to checkpoint DB before backup: {}", e);
@@ -79,9 +80,11 @@ async fn backup_db(metrics_db: &MetricsDb, db_path: &str, backup_path: &str) {
         true
     }).await;
 
-    if result.unwrap_or(false) {
+    let success = result.unwrap_or(false);
+    if success {
         println!("Job history backed up to {}", backup_path_display);
     }
+    success
 }
 
 /// Configuration for the coordinator.
@@ -366,6 +369,12 @@ struct CoordinatorData {
     failures: VecDeque<FailureRecord>,
     /// Number of events since last GCS backup (for periodic backup trigger)
     events_since_backup: usize,
+    /// Timestamp of last successful backup (milliseconds since epoch)
+    last_backup_at: Option<u64>,
+    /// URL to the new binary for fleet updates
+    update_fleet_url: Option<String>,
+    /// Set of workers that have already received the update signal
+    updated_workers: HashSet<String>,
 }
 
 type SharedState = Arc<Mutex<CoordinatorData>>;
@@ -484,16 +493,28 @@ pub async fn run_coordinator(
         let bp_clone = bp.clone();
         let db_path_clone = db_path.clone();
         let restore_result = tokio::task::spawn_blocking(move || {
-            if let Ok(mut reader) = genohype_core::io::get_reader(&bp_clone) {
-                let mut data = Vec::new();
-                if std::io::Read::read_to_end(&mut reader, &mut data).is_ok() && !data.is_empty() {
-                    if let Some(parent) = std::path::Path::new(&db_path_clone).parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    if std::fs::write(&db_path_clone, data).is_ok() {
-                        return true;
+            match genohype_core::io::get_reader(&bp_clone) {
+                Ok(mut reader) => {
+                    let mut data = Vec::new();
+                    match std::io::Read::read_to_end(&mut reader, &mut data) {
+                        Ok(bytes) => {
+                            if bytes > 0 {
+                                println!("  Downloaded {} bytes from backup", bytes);
+                                if let Some(parent) = std::path::Path::new(&db_path_clone).parent() {
+                                    let _ = std::fs::create_dir_all(parent);
+                                }
+                                match std::fs::write(&db_path_clone, &data) {
+                                    Ok(_) => return true,
+                                    Err(e) => println!("  Failed to write restored DB: {}", e),
+                                }
+                            } else {
+                                println!("  Backup file is empty");
+                            }
+                        }
+                        Err(e) => println!("  Failed to read backup data: {}", e),
                     }
                 }
+                Err(e) => println!("  No backup found or error: {}", e),
             }
             false
         }).await;
@@ -552,6 +573,9 @@ pub async fn run_coordinator(
         events: VecDeque::new(),
         failures: VecDeque::new(),
         events_since_backup: 0,
+        last_backup_at: None,
+        update_fleet_url: None,
+        updated_workers: HashSet::new(),
     }));
 
     // Start background timeout monitor
@@ -665,10 +689,12 @@ pub async fn run_coordinator(
             if let Some(ref bp) = backup_path {
                 let should_backup = events_since > 1000 || last_backup_time.elapsed().as_secs() > 60;
                 if should_backup {
-                    backup_db(&metrics_db, &db_path, bp).await;
-                    last_backup_time = Instant::now();
-                    if let Ok(mut data) = monitor_state.lock() {
-                        data.events_since_backup = 0;
+                    if backup_db(&metrics_db, &db_path, bp).await {
+                        last_backup_time = Instant::now();
+                        if let Ok(mut data) = monitor_state.lock() {
+                            data.events_since_backup = 0;
+                            data.last_backup_at = Some(CoordinatorData::now_ms());
+                        }
                     }
                 }
             }
@@ -762,7 +788,11 @@ pub async fn run_coordinator(
                         )
                     };
                     if let Some(bp) = backup_path {
-                        backup_db(&metrics_db, &db_path, &bp).await;
+                        if backup_db(&metrics_db, &db_path, &bp).await {
+                            if let Ok(mut data) = monitor_state.lock() {
+                                data.last_backup_at = Some(CoordinatorData::now_ms());
+                            }
+                        }
                     }
                 }
 
@@ -792,6 +822,8 @@ pub async fn run_coordinator(
         .route("/api/events", get(get_events))
         .route("/api/failures", get(get_failures))
         .route("/api/workers/:worker_id/logs", get(get_worker_logs))
+        .route("/api/update-fleet", post(update_fleet))
+        .route("/api/update-coordinator", post(update_coordinator))
         .with_state(state)
         // Serve embedded SPA dashboard
         .route("/dashboard", get(serve_dashboard_index))
@@ -1472,6 +1504,14 @@ async fn get_work(
 ) -> axum::Json<WorkResponse> {
     let mut data = state.lock().unwrap();
     touch_worker(&mut data, &req.worker_id, req.hardware.clone());
+
+    // Check for pending binary update
+    if let Some(gcs_url) = data.update_fleet_url.clone() {
+        if !data.updated_workers.contains(&req.worker_id) {
+            data.updated_workers.insert(req.worker_id.clone());
+            return axum::Json(WorkResponse::UpdateBinary { gcs_url });
+        }
+    }
 
     // If coordinator is idle (no job configured), tell workers to wait
     if data.idle {
@@ -3303,6 +3343,7 @@ async fn get_dashboard_summary(
         wasted_cpu_secs: data.wasted_cpu_secs,
         db_path: Some(data.config.db_path.clone()),
         backup_path: data.config.backup_path.clone(),
+        last_backup_at: data.last_backup_at,
     })
 }
 
@@ -3749,4 +3790,89 @@ async fn export_metrics(
             error: Some(format!("Failed to upload metrics: {}", e)),
         }),
     }
+}
+
+/// Handler for POST /api/update-fleet - trigger workers to self-update.
+async fn update_fleet(
+    axum::extract::State(state): axum::extract::State<SharedState>,
+    axum::Json(req): axum::Json<UpdateFleetRequest>,
+) -> impl axum::response::IntoResponse {
+    let mut data = state.lock().unwrap();
+    data.update_fleet_url = Some(req.gcs_url);
+    data.updated_workers.clear();
+    (axum::http::StatusCode::OK, "Fleet update initiated")
+}
+
+/// Handler for POST /api/update-coordinator - coordinator self-updates.
+///
+/// Downloads the new binary from GCS and exec()s itself to restart seamlessly.
+async fn update_coordinator(
+    axum::Json(req): axum::Json<UpdateFleetRequest>,
+) -> impl axum::response::IntoResponse {
+    use std::os::unix::process::CommandExt;
+
+    println!(
+        "Received UpdateCoordinator signal. Updating from {}...",
+        req.gcs_url
+    );
+
+    // Download binary from GCS
+    let status = std::process::Command::new("gsutil")
+        .args(["cp", &req.gcs_url, "/tmp/genohype"])
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => {
+            let msg = format!("gsutil cp failed with status: {}", s);
+            eprintln!("{}", msg);
+            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, msg);
+        }
+        Err(e) => {
+            let msg = format!("Failed to run gsutil: {}", e);
+            eprintln!("{}", msg);
+            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, msg);
+        }
+    }
+
+    // Make executable and move into place
+    if let Err(e) = std::process::Command::new("chmod")
+        .args(["+x", "/tmp/genohype"])
+        .status()
+    {
+        let msg = format!("chmod failed: {}", e);
+        eprintln!("{}", msg);
+        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, msg);
+    }
+
+    if let Err(e) = std::process::Command::new("sudo")
+        .args(["mv", "/tmp/genohype", "/usr/local/bin/genohype"])
+        .status()
+    {
+        let msg = format!("mv failed: {}", e);
+        eprintln!("{}", msg);
+        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, msg);
+    }
+
+    println!("Binary updated successfully. Restarting coordinator...");
+
+    // Spawn the restart in a background task so we can return the response first
+    tokio::spawn(async move {
+        // Small delay to allow response to be sent
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let args: Vec<String> = std::env::args().collect();
+        let err = std::process::Command::new("/usr/local/bin/genohype")
+            .args(&args[1..])
+            .exec();
+
+        // exec() only returns on error
+        eprintln!("Failed to exec new binary: {}", err);
+        std::process::exit(1);
+    });
+
+    (
+        axum::http::StatusCode::OK,
+        "Coordinator update initiated, restarting...".to_string(),
+    )
 }

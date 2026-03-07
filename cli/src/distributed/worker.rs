@@ -188,6 +188,44 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
                 println!("Received Exit signal. Worker shutting down.");
                 break;
             }
+            WorkResponse::UpdateBinary { gcs_url } => {
+                println!("Received UpdateBinary signal. Updating from {}...", gcs_url);
+
+                let status = std::process::Command::new("gsutil")
+                    .args(["cp", &gcs_url, "/tmp/genohype"])
+                    .status();
+
+                match status {
+                    Ok(s) if s.success() => {}
+                    _ => {
+                        eprintln!("Failed to download new binary from GCS. Retrying next poll.");
+                        tokio::time::sleep(Duration::from_millis(config.poll_interval_ms)).await;
+                        continue;
+                    }
+                }
+
+                std::process::Command::new("chmod")
+                    .args(["+x", "/tmp/genohype"])
+                    .status()
+                    .ok();
+                std::process::Command::new("sudo")
+                    .args(["mv", "/tmp/genohype", "/usr/local/bin/genohype"])
+                    .status()
+                    .ok();
+
+                println!("Binary updated successfully. Restarting worker process...");
+
+                use std::os::unix::process::CommandExt;
+                let args: Vec<String> = std::env::args().collect();
+                let err = std::process::Command::new("/usr/local/bin/genohype")
+                    .args(&args[1..])
+                    .exec();
+
+                return Err(crate::HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to exec new binary: {}", err),
+                )));
+            }
             WorkResponse::Wait => {
                 telemetry_state
                     .active_partition

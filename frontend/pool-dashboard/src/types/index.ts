@@ -97,6 +97,8 @@ export interface DashboardSummary {
   db_path?: string;
   /** GCS path for backup (if configured) */
   backup_path?: string;
+  /** Timestamp of last successful backup (milliseconds since epoch) */
+  last_backup_at?: number;
 }
 
 /**
