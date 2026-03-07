@@ -847,6 +847,7 @@ pub fn dispatch_job(
 ///
 /// Simulates CPU, Memory, and Network I/O loads concurrently based on the `StressSpec` parameters.
 /// Uses catch_unwind to handle panics (e.g., OOM) gracefully per-partition.
+/// Limits parallelism based on available memory to prevent OOM.
 fn process_stress(
     partitions: &[usize],
     spec: &crate::distributed::message::StressSpec,
@@ -856,33 +857,87 @@ fn process_stress(
     use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::time::Instant;
     use std::io::{Read, Write};
+    use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
-    println!("Processing {} stress partitions...", partitions.len());
+    // Check available memory BEFORE processing any partitions
+    // Fail early if we can't possibly fit the batch
+    let max_parallel = if spec.memory_mb > 0 {
+        let mut sys = System::new_with_specifics(
+            RefreshKind::new().with_memory(MemoryRefreshKind::new().with_ram())
+        );
+        sys.refresh_memory();
+        let available_mb = sys.available_memory() / (1024 * 1024);
+        // Allow 70% of available memory (30% headroom for system)
+        let usable_mb = (available_mb as f64 * 0.7) as u64;
+        let per_partition_mb = spec.memory_mb as u64;
+        let safe_parallel = (usable_mb / per_partition_mb).max(1) as usize;
 
-    let results: Vec<Result<usize>> = partitions.par_iter().map(|&partition_id| {
-        // Wrap each partition's work in catch_unwind to handle OOM panics gracefully
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            process_single_stress_partition(partition_id, spec, telemetry.as_ref())
-        }));
-
-        match result {
-            Ok(inner_result) => inner_result,
-            Err(panic_info) => {
-                let panic_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
-                    s.to_string()
-                } else if let Some(s) = panic_info.downcast_ref::<String>() {
-                    s.clone()
-                } else {
-                    "Unknown panic".to_string()
-                };
-                eprintln!("Partition {} panicked: {}", partition_id, panic_msg);
-                Err(crate::HailError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Partition {} panicked: {}", partition_id, panic_msg),
-                )))
-            }
+        // CRITICAL: If we can't even fit ONE partition, fail immediately
+        if safe_parallel == 0 || available_mb < per_partition_mb {
+            return Err(crate::HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                format!(
+                    "Batch rejected: insufficient memory ({} MB available, need {} MB per partition, {} partitions requested)",
+                    available_mb, per_partition_mb, partitions.len()
+                ),
+            )));
         }
-    }).collect();
+
+        // If batch is larger than what we can safely handle, fail early
+        // This prevents partial completion where some tasks succeed and others OOM
+        if partitions.len() > safe_parallel {
+            return Err(crate::HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                format!(
+                    "Batch too large for available memory: {} partitions requested but only {} can fit ({} MB available, {} MB per partition)",
+                    partitions.len(), safe_parallel, available_mb, per_partition_mb
+                ),
+            )));
+        }
+
+        println!(
+            "Memory check passed: {} partitions, {} MB available, {} MB per partition",
+            partitions.len(), available_mb, per_partition_mb
+        );
+        safe_parallel
+    } else {
+        rayon::current_num_threads()
+    };
+
+    println!("Processing {} stress partitions (max {} parallel)...", partitions.len(), max_parallel);
+
+    // Use a custom thread pool with limited parallelism
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(max_parallel.min(rayon::current_num_threads()))
+        .build()
+        .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap());
+
+    let results: Vec<Result<usize>> = pool.install(|| {
+        partitions.par_iter().map(|&partition_id| {
+            // Wrap each partition's work in catch_unwind to handle OOM panics gracefully
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                process_single_stress_partition(partition_id, spec, telemetry.as_ref())
+            }));
+
+            match result {
+                Ok(inner_result) => inner_result,
+                Err(panic_info) => {
+                    let panic_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "Unknown panic".to_string()
+                    };
+                    eprintln!("Partition {} panicked: {}", partition_id, panic_msg);
+                    Err(crate::HailError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Partition {} panicked: {}", partition_id, panic_msg),
+                    )))
+                }
+            }
+        }).collect()
+    });
 
     let mut total_rows = 0;
     let mut errors = Vec::new();

@@ -183,6 +183,8 @@ pub(crate) fn check_worker_liveness(state: &SharedState) {
     let now = Instant::now();
     let timeout = Duration::from_secs(WORKER_SUSPECT_TIMEOUT_SECS);
 
+    let mut dead_workers = Vec::new();
+
     for (worker_id, worker) in data.worker_registry.iter_mut() {
         if now.duration_since(worker.last_seen) > timeout
             && worker.status != WorkerStatus::SuspectedDead
@@ -192,6 +194,11 @@ pub(crate) fn check_worker_liveness(state: &SharedState) {
                 worker_id, WORKER_SUSPECT_TIMEOUT_SECS
             );
             worker.status = WorkerStatus::SuspectedDead;
+            dead_workers.push(worker_id.clone());
         }
+    }
+
+    for worker_id in dead_workers {
+        data.requeue_worker_tasks(&worker_id);
     }
 }

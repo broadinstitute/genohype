@@ -352,4 +352,128 @@ impl CoordinatorData {
             .unwrap_or_default()
             .as_millis() as u64
     }
+
+    /// Requeue all tasks assigned to a worker that is suspected dead.
+    pub(crate) fn requeue_worker_tasks(&mut self, dead_worker_id: &str) {
+        // 1. Standard partitions
+        let mut lost_parts = Vec::new();
+        for (&part_id, (worker, _)) in &self.processing_partitions {
+            if worker == dead_worker_id {
+                lost_parts.push(part_id);
+            }
+        }
+        for part_id in lost_parts {
+            self.processing_partitions.remove(&part_id);
+            let retries = self.retry_counts.entry(part_id).or_insert(0);
+            *retries += 1;
+            if *retries > 3 {
+                println!("Partition {} exceeded max retries (worker {} dead). Marking as failed.", part_id, dead_worker_id);
+                self.failed_partitions.insert(part_id);
+            } else {
+                println!("Worker {} died. Requeuing partition {} (retry {}/3)", dead_worker_id, part_id, retries);
+                self.pending_partitions.push_front(part_id);
+            }
+        }
+
+        // 2. Manhattan pipeline
+        if let Some(ref mut manhattan) = self.manhattan_state {
+            let mut lost_exome = Vec::new();
+            for (&part_id, (worker, _)) in &manhattan.exome_processing {
+                if worker == dead_worker_id {
+                    lost_exome.push(part_id);
+                }
+            }
+            for part_id in lost_exome {
+                manhattan.exome_processing.remove(&part_id);
+                println!("Worker {} died. Requeuing exome partition {}", dead_worker_id, part_id);
+                manhattan.exome_pending.push_front(part_id);
+            }
+
+            let mut lost_genome = Vec::new();
+            for (&part_id, (worker, _)) in &manhattan.genome_processing {
+                if worker == dead_worker_id {
+                    lost_genome.push(part_id);
+                }
+            }
+            for part_id in lost_genome {
+                manhattan.genome_processing.remove(&part_id);
+                println!("Worker {} died. Requeuing genome partition {}", dead_worker_id, part_id);
+                manhattan.genome_pending.push_front(part_id);
+            }
+        }
+
+        // 3. Ingestion
+        if let Some(ref mut ingestion) = self.ingestion_state {
+            let mut lost_tasks = Vec::new();
+            for (task_id, (pheno, ancestry, base_path, worker, _)) in &ingestion.active_tasks {
+                if worker == dead_worker_id {
+                    lost_tasks.push((task_id.clone(), pheno.clone(), ancestry.clone(), base_path.clone()));
+                }
+            }
+            for (task_id, pheno, ancestry, base_path) in lost_tasks {
+                ingestion.active_tasks.remove(&task_id);
+                println!("Worker {} died. Requeuing ingestion task {}/{}", dead_worker_id, ancestry, pheno);
+                ingestion.pending_tasks.push_front((pheno, ancestry, base_path));
+            }
+        }
+
+        // 4. Batch
+        if let Some(ref mut batch) = self.batch_state {
+            for (pheno_id, state) in &mut batch.active_phenotypes {
+                let mut lost_exome = Vec::new();
+                for (&part_id, (worker, _)) in &state.exome_processing {
+                    if worker == dead_worker_id {
+                        lost_exome.push(part_id);
+                    }
+                }
+                for part_id in lost_exome {
+                    state.exome_processing.remove(&part_id);
+                    println!("Worker {} died. Requeuing exome partition {} for {}", dead_worker_id, part_id, pheno_id);
+                    state.exome_pending.push_front(part_id);
+                }
+
+                let mut lost_genome = Vec::new();
+                for (&part_id, (worker, _)) in &state.genome_processing {
+                    if worker == dead_worker_id {
+                        lost_genome.push(part_id);
+                    }
+                }
+                for part_id in lost_genome {
+                    state.genome_processing.remove(&part_id);
+                    println!("Worker {} died. Requeuing genome partition {} for {}", dead_worker_id, part_id, pheno_id);
+                    state.genome_pending.push_front(part_id);
+                }
+            }
+        }
+
+        // 5. Check worker's current_task to handle tasks that don't track worker_id in a map (like AggregateBatch)
+        let mut failed_active_tasks = Vec::new();
+        if let Some(worker_state) = self.worker_registry.get_mut(dead_worker_id) {
+            if let Some(task_info) = worker_state.current_task.take() {
+                failed_active_tasks.push(task_info);
+            }
+        }
+
+        for task_info in failed_active_tasks {
+            let task_id = task_info.task_id;
+            if let Some(task) = self.active_tasks.remove(&task_id) {
+                if let ActiveTask::AggregateBatch { phenotype_ids, .. } = task {
+                    if let Some(ref mut batch) = self.batch_state {
+                        for pheno_id in phenotype_ids {
+                            let retries = batch.aggregate_retry_counts.entry(pheno_id.clone()).or_insert(0);
+                            *retries += 1;
+                            if *retries > MAX_AGGREGATE_RETRIES {
+                                println!("Phenotype {} exceeded max aggregate retries (worker {} dead). Marking as failed.", pheno_id, dead_worker_id);
+                                batch.failed_count += 1;
+                                batch.aggregate_specs.remove(&pheno_id);
+                            } else if let Some(spec) = batch.aggregate_specs.get(&pheno_id).cloned() {
+                                println!("Worker {} died. Requeuing aggregate task for {} (retry {})", dead_worker_id, pheno_id, retries);
+                                batch.ready_to_aggregate.push((pheno_id, spec));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

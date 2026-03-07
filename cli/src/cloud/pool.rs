@@ -2619,7 +2619,9 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             .par_iter()
             .map(|worker| {
                 let worker_cmd = format!(
-                    "nohup /usr/local/bin/genohype service start-worker \
+                    "pkill -f 'genohype service start-worker' || true; \
+                     sleep 1; \
+                     nohup /usr/local/bin/genohype service start-worker \
                      --url http://{}:3000 \
                      --worker-id {} \
                      > /tmp/worker.log 2>&1 &",
