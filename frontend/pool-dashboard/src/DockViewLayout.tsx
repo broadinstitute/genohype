@@ -94,50 +94,55 @@ export const applyOverviewLayout = (api: DockviewApi, isBatchJob: boolean) => {
 
 /**
  * Applies the Performance layout preset:
- * - Left sidebar: Cluster Efficiency
- * - Main area: 2x2 grid of metric charts (CPU, Memory, Throughput, Network)
+ * 3x2 grid of metric panels:
+ * - Row 1: Cluster Efficiency (left), CPU (right)
+ * - Row 2: Batch Size (left), Network (right)
+ * - Row 3: Throughput (left), Memory (right)
  */
 export const applyPerformanceLayout = (api: DockviewApi) => {
   clearPanels(api);
 
+  // Row 1: Cluster Efficiency | CPU
   const efficiency = api.addPanel({
     id: 'cluster_efficiency',
     component: 'clusterEfficiency',
     title: 'Cluster Efficiency',
   });
 
-  const cpu = api.addPanel({
+  api.addPanel({
     id: 'cpu_chart',
     component: 'cpuChart',
     title: 'CPU',
     position: { direction: 'right', referencePanel: efficiency.id },
   });
 
-  const memory = api.addPanel({
-    id: 'memory_chart',
-    component: 'memoryChart',
-    title: 'Memory',
-    position: { direction: 'right', referencePanel: cpu.id },
-  });
-
-  api.addPanel({
+  // Row 2: Batch Size | Network
+  const batchSize = api.addPanel({
     id: 'batch_size_chart',
     component: 'batchSizeChart',
     title: 'Batch Size',
-    position: { direction: 'right', referencePanel: memory.id },
-  });
-
-  const throughput = api.addPanel({
-    id: 'throughput_chart',
-    component: 'throughputChart',
-    title: 'Throughput',
-    position: { direction: 'below', referencePanel: cpu.id },
+    position: { direction: 'below', referencePanel: efficiency.id },
   });
 
   api.addPanel({
     id: 'network_chart',
     component: 'networkChart',
     title: 'Network',
+    position: { direction: 'right', referencePanel: batchSize.id },
+  });
+
+  // Row 3: Throughput | Memory
+  const throughput = api.addPanel({
+    id: 'throughput_chart',
+    component: 'throughputChart',
+    title: 'Throughput',
+    position: { direction: 'below', referencePanel: batchSize.id },
+  });
+
+  api.addPanel({
+    id: 'memory_chart',
+    component: 'memoryChart',
+    title: 'Memory',
     position: { direction: 'right', referencePanel: throughput.id },
   });
 };
