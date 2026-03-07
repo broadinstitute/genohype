@@ -92,12 +92,12 @@ async fn handle_work(
 ) -> impl IntoResponse {
     match state.plugin.get_work(&request.worker_id).await {
         Some(assignment) => {
+            let total_tasks = assignment.tasks.iter().filter_map(|t| t.total).max().unwrap_or(0);
             let response = WorkResponse::Task {
-                task_id: assignment.task_id,
-                partitions: assignment.partitions,
+                tasks: assignment.tasks,
                 input_path: assignment.input_path.unwrap_or_default(),
                 payload: assignment.payload,
-                total_partitions: 0, // Would come from config
+                total_tasks,
                 filters: assignment.filters,
                 intervals: Vec::new(),
             };
@@ -127,7 +127,7 @@ async fn handle_complete(
 
     match state
         .plugin
-        .complete_work(&request.worker_id, &request.task_id, result)
+        .complete_work(&request.worker_id, &request.tasks, result)
         .await
     {
         Ok(()) => (StatusCode::OK, Json(CompleteResponse { acknowledged: true })),
@@ -145,12 +145,12 @@ async fn handle_complete(
 async fn handle_status(State(state): State<Arc<CoordinatorState>>) -> impl IntoResponse {
     let (pending, processing, completed, total) = state.plugin.get_status().await;
     Json(StatusResponse {
-        pending,
-        processing,
-        completed,
-        total,
+        pending_tasks: pending,
+        processing_tasks: processing,
+        completed_tasks: completed,
+        total_tasks: total,
         total_items: 0,
-        failed: 0,
+        failed_tasks: 0,
         is_complete: pending == 0 && processing == 0,
     })
 }

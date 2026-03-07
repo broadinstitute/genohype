@@ -51,8 +51,8 @@ export const JobSummaryPanel: React.FC = () => {
   };
 
   const failedPercent =
-    summary.total_partitions > 0
-      ? (summary.failed_partitions / summary.total_partitions) * 100
+    summary.total_tasks > 0
+      ? (summary.failed_tasks / summary.total_tasks) * 100
       : 0;
 
   return (
@@ -113,7 +113,7 @@ export const JobSummaryPanel: React.FC = () => {
         <span className="progress-label">{summary.progress_percent.toFixed(1)}%</span>
       </div>
 
-      {/* Partition Stats */}
+      {/* Task Stats */}
       <div
         style={{
           display: 'flex',
@@ -124,20 +124,20 @@ export const JobSummaryPanel: React.FC = () => {
         }}
       >
         <span>
-          <strong style={{ color: 'var(--green)' }}>{summary.completed_partitions}</strong>{' '}
+          <strong style={{ color: 'var(--green)' }}>{summary.completed_tasks}</strong>{' '}
           done
         </span>
         <span>
-          <strong style={{ color: 'var(--cyan)' }}>{summary.processing_partitions}</strong>{' '}
+          <strong style={{ color: 'var(--cyan)' }}>{summary.processing_tasks}</strong>{' '}
           processing
         </span>
         <span>
-          <strong style={{ color: 'var(--text-dim)' }}>{summary.pending_partitions}</strong>{' '}
+          <strong style={{ color: 'var(--text-dim)' }}>{summary.pending_tasks}</strong>{' '}
           pending
         </span>
-        {summary.failed_partitions > 0 && (
+        {summary.failed_tasks > 0 && (
           <span>
-            <strong style={{ color: 'var(--red)' }}>{summary.failed_partitions}</strong> failed
+            <strong style={{ color: 'var(--red)' }}>{summary.failed_tasks}</strong> failed
           </span>
         )}
       </div>

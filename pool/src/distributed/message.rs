@@ -7,6 +7,79 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// A self-describing work unit in the coordinator's queue.
+///
+/// Unlike bare indices, `TaskDescriptor` carries full context for logging,
+/// dashboard display, and type-safe dispatch. The `payload` field holds
+/// domain-specific operation details (serialized as JSON).
+///
+/// # Example
+///
+/// ```ignore
+/// TaskDescriptor {
+///     id: "15".to_string(),
+///     task_type: "partition".to_string(),
+///     label: Some("Partition 15 → Parquet".to_string()),
+///     index: Some(15),
+///     total: Some(200),
+///     payload: serde_json::json!({
+///         "type": "partition",
+///         "table_path": "gs://bucket/table.ht",
+///         "partition_index": 15,
+///         "op": { "op": "export_parquet", "output_path": "gs://bucket/output/" }
+///     }),
+/// }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskDescriptor {
+    /// Unique identifier within this job (e.g., "0", "PHENO_123", "stress_42")
+    pub id: String,
+
+    /// What kind of work this represents (e.g., "partition", "phenotype", "stress")
+    pub task_type: String,
+
+    /// Human-readable label for dashboard display (e.g., "Blood Pressure (EUR)")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+
+    /// Progress tracking: which item is this out of how many?
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<usize>,
+
+    /// Total items in this category (for progress bars)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<usize>,
+
+    /// Domain-specific operation details (serialized TaskType enum)
+    pub payload: Value,
+}
+
+impl TaskDescriptor {
+    /// Create a simple partition task (backwards compatibility helper).
+    pub fn partition(index: usize, total: usize) -> Self {
+        Self {
+            id: index.to_string(),
+            task_type: "partition".to_string(),
+            label: Some(format!("Partition {}", index + 1)),
+            index: Some(index),
+            total: Some(total),
+            payload: serde_json::json!({
+                "partition_index": index
+            }),
+        }
+    }
+
+    /// Convert to CoreTaskInfo for per-core telemetry tracking.
+    pub fn to_core_task_info(&self) -> CoreTaskInfo {
+        CoreTaskInfo {
+            task_type: self.task_type.clone(),
+            task_id: self.id.clone(),
+            label: self.label.clone(),
+            parent: None,
+        }
+    }
+}
+
 /// Hardware capabilities of the worker.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HardwareSpec {
@@ -30,20 +103,17 @@ pub struct WorkRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum WorkResponse {
-    /// Work is available - process these partitions
+    /// Work is available - process these tasks
     #[serde(rename = "task")]
     Task {
-        /// Unique task identifier (for tracking in batch mode)
-        #[serde(default)]
-        task_id: String,
-        /// Partition indices to process
-        partitions: Vec<usize>,
+        /// Self-describing task descriptors (replaces task_id + partitions)
+        tasks: Vec<TaskDescriptor>,
         /// Path to input data
         input_path: String,
         /// Job specification (domain-specific, serialized as JSON)
         payload: Value,
-        /// Total number of partitions (for output file naming)
-        total_partitions: usize,
+        /// Total number of tasks in the job (for progress tracking)
+        total_tasks: usize,
         /// Filter conditions
         #[serde(default)]
         filters: Vec<String>,
@@ -64,11 +134,8 @@ pub enum WorkResponse {
 pub struct CompleteRequest {
     /// Worker that completed the work
     pub worker_id: String,
-    /// Unique task identifier (matches WorkResponse)
-    #[serde(default)]
-    pub task_id: String,
-    /// Partitions that were completed (or failed)
-    pub partitions: Vec<usize>,
+    /// Task IDs that were completed (or failed) - matches TaskDescriptor.id values
+    pub tasks: Vec<String>,
     /// Number of items processed
     pub items_processed: usize,
     /// Optional result data for aggregation
@@ -89,18 +156,18 @@ pub struct CompleteResponse {
 /// Status query response from coordinator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusResponse {
-    /// Number of partitions pending
-    pub pending: usize,
-    /// Number of partitions currently being processed
-    pub processing: usize,
-    /// Number of partitions completed
-    pub completed: usize,
-    /// Total partitions in the job
-    pub total: usize,
+    /// Number of tasks pending
+    pub pending_tasks: usize,
+    /// Number of tasks currently being processed
+    pub processing_tasks: usize,
+    /// Number of tasks completed
+    pub completed_tasks: usize,
+    /// Total tasks in the job
+    pub total_tasks: usize,
     /// Total items processed so far
     pub total_items: usize,
-    /// Number of partitions that permanently failed
-    pub failed: usize,
+    /// Number of tasks that permanently failed
+    pub failed_tasks: usize,
     /// Whether the job is complete
     pub is_complete: bool,
 }
@@ -238,16 +305,19 @@ pub struct HeartbeatResponse {
 pub struct DashboardSummary {
     /// Job progress percentage (0-100)
     pub progress_percent: f64,
-    /// Total partitions in the job
-    pub total_partitions: usize,
-    /// Partitions completed
-    pub completed_partitions: usize,
-    /// Partitions currently processing
-    pub processing_partitions: usize,
-    /// Partitions pending
-    pub pending_partitions: usize,
-    /// Partitions permanently failed
-    pub failed_partitions: usize,
+    /// Total tasks in the job
+    pub total_tasks: usize,
+    /// Number of tasks assigned per work request
+    #[serde(default)]
+    pub batch_size: usize,
+    /// Tasks completed
+    pub completed_tasks: usize,
+    /// Tasks currently processing
+    pub processing_tasks: usize,
+    /// Tasks pending
+    pub pending_tasks: usize,
+    /// Tasks permanently failed
+    pub failed_tasks: usize,
     /// Total items processed across all workers
     pub total_items: usize,
     /// Aggregate items per second across all workers

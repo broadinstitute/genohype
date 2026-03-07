@@ -11,8 +11,9 @@
 //!
 //! This allows the pool crate to be completely decoupled from the CLI's domain types.
 
-use crate::distributed::message::JobSpec;
+use crate::distributed::message::{JobSpec, TaskType};
 use crate::distributed::worker::dispatch_job;
+use genohype_pool::distributed::TaskDescriptor;
 use genohype_pool::{async_trait, CoordinatorPlugin, TaskHandler, TaskResult, WorkAssignment};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -48,11 +49,26 @@ impl TaskHandler for CliTaskHandler {
     async fn handle_task(
         &self,
         payload: &Value,
-        partitions: Vec<usize>,
+        tasks: Vec<TaskDescriptor>,
     ) -> Result<TaskResult, anyhow::Error> {
         // Deserialize the generic payload into our domain-specific JobSpec
         let job_spec: JobSpec = serde_json::from_value(payload.clone())
             .map_err(|e| anyhow::anyhow!("Failed to deserialize JobSpec: {}", e))?;
+
+        // Extract partition indices from task descriptors for backwards compatibility
+        // with the existing dispatch_job interface
+        let partitions: Vec<usize> = tasks
+            .iter()
+            .filter_map(|t| {
+                if let Ok(task_type) = serde_json::from_value::<TaskType>(t.payload.clone()) {
+                    if let TaskType::Partition { partition_index, .. } = task_type {
+                        return Some(partition_index);
+                    }
+                }
+                // Fallback: try to parse the task ID as a partition index
+                t.id.parse::<usize>().ok()
+            })
+            .collect();
 
         let input_path = self.input_path.clone();
         let filters = self.filters.clone();
@@ -162,12 +178,12 @@ impl CoordinatorPlugin for CliCoordinatorPlugin {
             .processing
             .insert(partition_id, (worker_id.to_string(), Instant::now()));
 
-        let task_id = uuid::Uuid::new_v4().to_string();
+        // Create a TaskDescriptor for this partition
+        let task = TaskDescriptor::partition(partition_id, queue.total);
 
         Some(WorkAssignment {
-            task_id,
+            tasks: vec![task],
             payload: queue.job_spec.clone().unwrap_or_else(|| serde_json::json!({})),
-            partitions: vec![partition_id],
             input_path: Some(queue.input_path.clone()),
             filters: queue.filters.clone(),
         })
@@ -176,7 +192,7 @@ impl CoordinatorPlugin for CliCoordinatorPlugin {
     async fn complete_work(
         &self,
         _worker_id: &str,
-        _task_id: &str,
+        tasks: &[String],
         result: TaskResult,
     ) -> Result<(), anyhow::Error> {
         let mut queue = self
@@ -184,19 +200,17 @@ impl CoordinatorPlugin for CliCoordinatorPlugin {
             .lock()
             .map_err(|e| anyhow::anyhow!("Failed to lock state: {}", e))?;
 
-        // Find and move partition from processing to completed
-        // (In a real implementation, task_id would map back to partition)
-        if result.is_success() {
-            // For simplicity, just mark the first processing partition as complete
-            if let Some((&partition_id, _)) = queue.processing.iter().next() {
-                queue.processing.remove(&partition_id);
-                queue.completed.insert(partition_id);
-            }
-        } else {
-            // On failure, re-queue the partition
-            if let Some((&partition_id, _)) = queue.processing.iter().next() {
-                queue.processing.remove(&partition_id);
-                queue.pending.push_back(partition_id);
+        // Convert task IDs back to partition indices and update state
+        for task_id in tasks {
+            if let Ok(partition_id) = task_id.parse::<usize>() {
+                if result.is_success() {
+                    queue.processing.remove(&partition_id);
+                    queue.completed.insert(partition_id);
+                } else {
+                    // On failure, re-queue the partition
+                    queue.processing.remove(&partition_id);
+                    queue.pending.push_back(partition_id);
+                }
             }
         }
 
@@ -245,15 +259,17 @@ mod tests {
         // Get work
         let work = plugin.get_work("worker-1").await;
         assert!(work.is_some());
+        let work = work.unwrap();
+        let task_ids: Vec<String> = work.tasks.iter().map(|t| t.id.clone()).collect();
 
         // Check status after get_work
         let (pending, processing, _, _) = plugin.get_status().await;
         assert_eq!(pending, 4);
         assert_eq!(processing, 1);
 
-        // Complete work
+        // Complete work using the actual task IDs
         let result = TaskResult::success(100, None);
-        plugin.complete_work("worker-1", "task-1", result).await.unwrap();
+        plugin.complete_work("worker-1", &task_ids, result).await.unwrap();
 
         // Check status after complete
         let (pending, processing, completed, _) = plugin.get_status().await;

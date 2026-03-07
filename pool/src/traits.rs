@@ -8,6 +8,8 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
+use crate::distributed::message::TaskDescriptor;
+
 /// Result of task execution.
 #[derive(Debug, Clone)]
 pub struct TaskResult {
@@ -46,7 +48,7 @@ impl TaskResult {
 
 /// Trait for handling task execution in a worker.
 ///
-/// Implementors receive generic JSON payloads and partition assignments,
+/// Implementors receive generic JSON payloads and task descriptors,
 /// deserialize them into domain-specific types, and execute the work.
 ///
 /// # Example
@@ -59,21 +61,21 @@ impl TaskResult {
 ///     async fn handle_task(
 ///         &self,
 ///         payload: &Value,
-///         partitions: Vec<usize>,
+///         tasks: Vec<TaskDescriptor>,
 ///     ) -> Result<TaskResult, anyhow::Error> {
 ///         let job: MyJobSpec = serde_json::from_value(payload.clone())?;
-///         // Process the job...
+///         // Process the job using task descriptors...
 ///         Ok(TaskResult::success(rows_processed, None))
 ///     }
 /// }
 /// ```
 #[async_trait]
 pub trait TaskHandler: Send + Sync {
-    /// Handle a task with the given payload and partition assignments.
+    /// Handle a task with the given payload and task descriptors.
     ///
     /// # Arguments
     /// * `payload` - JSON-serialized job specification
-    /// * `partitions` - List of partition indices to process
+    /// * `tasks` - Self-describing task descriptors to process
     ///
     /// # Returns
     /// * `Ok(TaskResult)` - Task completed (check `is_success()` for status)
@@ -81,19 +83,17 @@ pub trait TaskHandler: Send + Sync {
     async fn handle_task(
         &self,
         payload: &Value,
-        partitions: Vec<usize>,
+        tasks: Vec<TaskDescriptor>,
     ) -> Result<TaskResult, anyhow::Error>;
 }
 
 /// Work assignment from the coordinator.
 #[derive(Debug, Clone)]
 pub struct WorkAssignment {
-    /// Unique task identifier for tracking
-    pub task_id: String,
+    /// Self-describing task descriptors to process
+    pub tasks: Vec<TaskDescriptor>,
     /// JSON-serialized job specification
     pub payload: Value,
-    /// Partition indices to process
-    pub partitions: Vec<usize>,
     /// Optional: input path for the data source
     pub input_path: Option<String>,
     /// Optional: filter conditions
@@ -106,7 +106,7 @@ pub struct WorkAssignment {
 /// the generic coordinator HTTP server to work with different job types
 /// and scheduling strategies.
 ///
-/// Implementors manage their own state (e.g., partition queues, batch tracking,
+/// Implementors manage their own state (e.g., task queues, batch tracking,
 /// multi-phase pipelines) and expose a simple interface for the coordinator.
 #[async_trait]
 pub trait CoordinatorPlugin: Send + Sync {
@@ -123,12 +123,12 @@ pub trait CoordinatorPlugin: Send + Sync {
     ///
     /// # Arguments
     /// * `worker_id` - Worker that completed the work
-    /// * `task_id` - Task identifier from the work assignment
+    /// * `tasks` - Task IDs that were completed (matches TaskDescriptor.id values)
     /// * `result` - Result of task execution
     async fn complete_work(
         &self,
         worker_id: &str,
-        task_id: &str,
+        tasks: &[String],
         result: TaskResult,
     ) -> Result<(), anyhow::Error>;
 

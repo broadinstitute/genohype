@@ -65,18 +65,18 @@ export interface TelemetrySnapshot {
 export interface DashboardSummary {
   /** Job progress percentage (0-100) */
   progress_percent: number;
-  /** Total partitions in the job */
-  total_partitions: number;
-  /** Number of partitions assigned per work request */
+  /** Total tasks in the job */
+  total_tasks: number;
+  /** Number of tasks assigned per work request */
   batch_size?: number;
-  /** Partitions completed */
-  completed_partitions: number;
-  /** Partitions currently processing */
-  processing_partitions: number;
-  /** Partitions pending */
-  pending_partitions: number;
-  /** Partitions permanently failed */
-  failed_partitions: number;
+  /** Tasks completed */
+  completed_tasks: number;
+  /** Tasks currently processing */
+  processing_tasks: number;
+  /** Tasks pending */
+  pending_tasks: number;
+  /** Tasks permanently failed */
+  failed_tasks: number;
   /** Total items processed across all workers */
   total_items: number;
   /** Aggregate items per second across all workers */
@@ -172,8 +172,8 @@ export interface FailureRecord {
   timestamp_ms: number;
   /** Phenotype ID if applicable */
   phenotype_id?: string;
-  /** Partitions that failed */
-  partitions: number[];
+  /** Task IDs that failed */
+  tasks: string[];
   /** Worker that experienced the failure */
   worker_id: string;
   /** Error message */

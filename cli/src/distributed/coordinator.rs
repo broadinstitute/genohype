@@ -14,8 +14,9 @@ use crate::distributed::message::{
     DashboardSummary, DashboardWorker, EventsResponse, ExportMetricsRequest, ExportMetricsResponse,
     FailureRecord, FailuresResponse, HeartbeatRequest, HeartbeatResponse, JobConfigRequest,
     JobConfigResponse, JobEvent, JobResultResponse, JobSpec, ManhattanAggregateSpec,
-    ManhattanScanSpec, ManhattanSource, ManhattanSpec, PhenotypeStatus, StatusResponse,
-    TelemetrySnapshot, WorkRequest, WorkResponse, WorkerMetricsSeries,
+    ManhattanScanSpec, ManhattanSource, ManhattanSpec, PartitionOp, PhenotypeOp, PhenotypeStatus,
+    StatusResponse, TaskDescriptor, TaskType, TelemetrySnapshot, WorkRequest, WorkResponse,
+    WorkerMetricsSeries,
 };
 use crate::distributed::metrics_db::MetricsDb;
 use crate::manhattan::config::PlotType;
@@ -40,7 +41,7 @@ pub struct CoordinatorConfig {
     /// Job specification (what operation to perform)
     pub job_spec: Option<JobSpec>,
     /// Total number of partitions to process
-    pub total_partitions: usize,
+    pub total_tasks: usize,
     /// Number of partitions to assign per work request (batching)
     pub batch_size: usize,
     /// Timeout before rescheduling work (seconds)
@@ -61,7 +62,7 @@ impl Default for CoordinatorConfig {
             port: 3000,
             input_path: String::new(),
             job_spec: None,
-            total_partitions: 0,
+            total_tasks: 0,
             batch_size: 1, // Default to 1 partition per request for fine-grained retry
             timeout_secs: 600, // 10 minutes
             stuck_timeout_secs: 600, // 10 minutes for stuck job detection
@@ -209,7 +210,7 @@ struct ManhattanPipelineState {
 
     // Exome scan tracking
     /// Total exome partitions
-    exome_total_partitions: usize,
+    exome_total_tasks: usize,
     /// Pending exome partitions
     exome_pending: VecDeque<usize>,
     /// Processing exome partitions: partition_id -> (worker_id, start_time)
@@ -219,7 +220,7 @@ struct ManhattanPipelineState {
 
     // Genome scan tracking
     /// Total genome partitions
-    genome_total_partitions: usize,
+    genome_total_tasks: usize,
     /// Pending genome partitions
     genome_pending: VecDeque<usize>,
     /// Processing genome partitions: partition_id -> (worker_id, start_time)
@@ -262,7 +263,7 @@ struct CoordinatorData {
     /// Partitions currently being processed: partition_id -> (worker_id, start_time)
     processing_partitions: HashMap<usize, (String, Instant)>,
     /// Partitions that have been completed
-    completed_partitions: HashSet<usize>,
+    completed_tasks: HashSet<usize>,
     /// Configuration
     config: CoordinatorConfig,
     /// Total rows processed (reported by workers)
@@ -354,7 +355,7 @@ pub async fn start_coordinator(config: CoordinatorConfig) -> Result<()> {
         config.port,
         config.input_path,
         output_path,
-        config.total_partitions,
+        config.total_tasks,
         config.batch_size,
         config.timeout_secs,
     )
@@ -369,7 +370,7 @@ pub async fn run_coordinator(
     port: u16,
     input_path: String,
     output_path: String,
-    total_partitions: usize,
+    total_tasks: usize,
     batch_size: usize,
     timeout_secs: u64,
 ) -> Result<()> {
@@ -377,7 +378,7 @@ pub async fn run_coordinator(
     use tokio::net::TcpListener;
 
     // Determine if starting in idle mode (no job configured yet)
-    let idle = total_partitions == 0;
+    let idle = total_tasks == 0;
 
     // Convert output_path to JobSpec for backward compatibility
     let job_spec = if output_path.is_empty() {
@@ -397,7 +398,7 @@ pub async fn run_coordinator(
     } else {
         println!(
             "Coordinator starting on port {} with {} partitions",
-            port, total_partitions
+            port, total_tasks
         );
         println!("  Input: {}", input_path);
         if let Some(ref spec) = job_spec {
@@ -420,14 +421,14 @@ pub async fn run_coordinator(
     println!("  Metrics DB: /tmp/hail-coordinator-metrics.db");
 
     let state = Arc::new(Mutex::new(CoordinatorData {
-        pending_partitions: (0..total_partitions).collect(),
+        pending_partitions: (0..total_tasks).collect(),
         processing_partitions: HashMap::new(),
-        completed_partitions: HashSet::new(),
+        completed_tasks: HashSet::new(),
         config: CoordinatorConfig {
             port,
             input_path,
             job_spec,
-            total_partitions,
+            total_tasks,
             batch_size,
             timeout_secs,
             stuck_timeout_secs: 600, // Default 10 minutes
@@ -497,7 +498,7 @@ pub async fn run_coordinator(
                     )
                 } else if let Some(ref m) = data.manhattan_state {
                     // Single Manhattan pipeline uses separate tracking
-                    let total_parts = m.exome_total_partitions + m.genome_total_partitions + 1; // +1 for aggregate
+                    let total_parts = m.exome_total_tasks + m.genome_total_tasks + 1; // +1 for aggregate
                     let completed_parts = m.exome_completed.len() + m.genome_completed.len() + if m.aggregate_complete { 1 } else { 0 };
                     let processing_parts = m.exome_processing.len() + m.genome_processing.len() + if m.aggregate_dispatched && !m.aggregate_complete { 1 } else { 0 };
                     let pending_parts = m.exome_pending.len() + m.genome_pending.len();
@@ -516,9 +517,9 @@ pub async fn run_coordinator(
                     (
                         data.pending_partitions.len(),
                         data.processing_partitions.len(),
-                        data.completed_partitions.len(),
+                        data.completed_tasks.len(),
                         data.failed_partitions.len(),
-                        data.config.total_partitions,
+                        data.config.total_tasks,
                         data.total_rows,
                         data.idle,
                         false, // Standard jobs don't use this flag
@@ -689,7 +690,7 @@ fn check_stuck_job(state: &SharedState, timeout_secs: u64) {
         !m.exome_completed.is_empty() || !m.genome_completed.is_empty() || m.aggregate_complete
     } else {
         // For standard jobs, check standard counter
-        !data.completed_partitions.is_empty()
+        !data.completed_tasks.is_empty()
     };
 
     if has_progress {
@@ -900,11 +901,11 @@ fn activate_next_phenotypes(batch: &mut BatchState) {
             layout: spec.layout.clone(),
             y_scale: spec.y_scale.clone(),
             contig_lengths: spec.contig_lengths.clone().unwrap_or_default(),
-            exome_total_partitions: exome_partitions,
+            exome_total_tasks: exome_partitions,
             exome_pending: (0..exome_partitions).collect(),
             exome_processing: HashMap::new(),
             exome_completed: HashSet::new(),
-            genome_total_partitions: genome_partitions,
+            genome_total_tasks: genome_partitions,
             genome_pending: (0..genome_partitions).collect(),
             genome_processing: HashMap::new(),
             genome_completed: HashSet::new(),
@@ -990,30 +991,45 @@ fn get_ingestion_work(
         }
 
         println!(
-            "Assigned ingestion task {} ({}/{}) to worker {} ({} pending, {} active)",
+            "Assigned 1 ingest task to {} [{}/{}] ({} pending, {} active, {} done)",
+            worker_id,
             phenotype_id,
             ancestry,
-            ingestion.total_tasks - ingestion.pending_tasks.len() - ingestion.completed_count - ingestion.failed_count,
-            worker_id,
             ingestion.pending_tasks.len(),
-            ingestion.active_tasks.len()
+            ingestion.active_tasks.len(),
+            ingestion.completed_count
         );
 
         // Create IngestManhattanTask job spec
         let job_spec = JobSpec::IngestManhattanTask {
-            phenotype_id,
-            ancestry,
+            phenotype_id: phenotype_id.clone(),
+            ancestry: ancestry.clone(),
             base_path,
             clickhouse_url: ingestion.clickhouse_url.clone(),
             database: ingestion.database.clone(),
         };
 
+        // Create TaskDescriptor for this ingestion task
+        let task = TaskType::Phenotype {
+            phenotype_id: phenotype_id.clone(),
+            ancestry: Some(ancestry),
+            operation: PhenotypeOp::Ingest {
+                clickhouse_url: ingestion.clickhouse_url.clone(),
+                database: ingestion.database.clone(),
+            },
+        }
+        .into_descriptor(
+            task_id.clone(),
+            Some(format!("{} → Ingest", phenotype_id)),
+            None,
+            Some(ingestion.total_tasks),
+        );
+
         return axum::Json(WorkResponse::Task {
-            task_id,
-            partitions: vec![0], // Dummy partition for compatibility
+            tasks: vec![task],
             input_path: String::new(), // Not used for ingestion tasks
             payload: serde_json::to_value(&job_spec).unwrap_or_default(),
-            total_partitions: ingestion.total_tasks,
+            total_tasks: ingestion.total_tasks,
             filters: Vec::new(),
             intervals: Vec::new(),
         });
@@ -1095,16 +1111,38 @@ fn get_batch_work(
         }
 
         println!(
-            "Assigned aggregate batch ({} phenotypes) to worker {} [task={}]",
-            phenotype_ids.len(), worker_id, &task_id[..8]
+            "Assigned {} aggregate task(s) to {} [{:?}] ({} queued, {} done)",
+            phenotype_ids.len(),
+            worker_id,
+            phenotype_ids,
+            batch.ready_to_aggregate.len(),
+            batch.completed_count
         );
 
+        // Create TaskDescriptors for each phenotype in the batch
+        let tasks: Vec<TaskDescriptor> = phenotype_ids
+            .iter()
+            .enumerate()
+            .map(|(i, pid)| {
+                TaskType::Phenotype {
+                    phenotype_id: pid.clone(),
+                    ancestry: None,
+                    operation: PhenotypeOp::ManhattanAggregate,
+                }
+                .into_descriptor(
+                    pid.clone(),
+                    Some(format!("{} → Aggregate", pid)),
+                    Some(i),
+                    Some(phenotype_ids.len()),
+                )
+            })
+            .collect();
+
         return axum::Json(WorkResponse::Task {
-            task_id,
-            partitions: vec![0], // Aggregate batch uses spec list, not partitions
+            tasks,
             input_path: String::new(),
             payload: serde_json::to_value(&JobSpec::ManhattanAggregateBatch { specs: aggregate_specs }).unwrap_or_default(),
-            total_partitions: phenotype_ids.len(),
+            total_tasks: phenotype_ids.len(),
             filters: Vec::new(),
             intervals: Vec::new(),
         });
@@ -1170,6 +1208,29 @@ fn get_batch_work(
             ManhattanSource::Genome => "genome",
         };
 
+        // Create TaskDescriptors for each partition
+        let total_tasks = state.exome_total_tasks + state.genome_total_tasks;
+        let tasks: Vec<TaskDescriptor> = partitions
+            .iter()
+            .map(|&i| {
+                TaskType::Partition {
+                    table_path: table_path.clone(),
+                    partition_index: i,
+                    operation: PartitionOp::ManhattanScan {
+                        phenotype_id: phenotype_id.clone(),
+                        source: source_name.to_string(),
+                    },
+                }
+                .into_descriptor(
+                    i.to_string(),
+                    Some(format!("Partition {} → Scan ({})", i + 1, source_name)),
+                    Some(i),
+                    Some(total_tasks),
+                )
+            })
+            .collect();
+        let task_ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
+
         // Update worker status and track task info for AIMD duration tracking
         if let Some(w) = data.worker_registry.get_mut(worker_id) {
             w.status = WorkerStatus::Active;
@@ -1178,14 +1239,23 @@ fn get_batch_work(
                 phenotype_id: Some(phenotype_id.clone()),
                 phase: "scan".to_string(),
                 source: Some(source_name.to_string()),
-                partitions: partitions.clone(),
+                tasks: task_ids.clone(),
                 started_at_ms: CoordinatorData::now_ms(),
             });
         }
 
+        let pending_scans = state.exome_pending.len() + state.genome_pending.len();
+        let processing_scans = state.exome_processing.len() + state.genome_processing.len();
+        let completed_scans = state.exome_completed.len() + state.genome_completed.len();
         println!(
-            "Assigned {} partitions {:?} to worker {} for phenotype {} [task={}]",
-            source_name, partitions, worker_id, phenotype_id, &task_id[..8]
+            "Assigned {} {} scan task(s) to {} [{}] ({} pending, {} processing, {} done)",
+            tasks.len(),
+            source_name,
+            worker_id,
+            phenotype_id,
+            pending_scans,
+            processing_scans,
+            completed_scans
         );
 
         // Build ManhattanScanSpec with identity metadata
@@ -1219,11 +1289,10 @@ fn get_batch_work(
         };
 
         return axum::Json(WorkResponse::Task {
-            task_id,
-            partitions,
+            tasks,
             input_path: String::new(),
             payload: serde_json::to_value(&JobSpec::ManhattanScan(scan_spec)).unwrap_or_default(),
-            total_partitions: state.exome_total_partitions + state.genome_total_partitions,
+            total_tasks,
             filters: Vec::new(),
             intervals: Vec::new(),
         });
@@ -1334,37 +1403,59 @@ async fn get_work(
             }
         };
 
-        // Generate unique task ID for tracking
-        let task_id = Uuid::new_v4().to_string();
+        // Create TaskDescriptors for each partition
+        let total_tasks = data.config.total_tasks;
+        let input_path = data.config.input_path.clone();
+        // Pre-generate all tasks once, then select the ones we need
+        let all_tasks = job_spec.generate_tasks(&input_path, total_tasks);
+        let tasks: Vec<TaskDescriptor> = partitions
+            .iter()
+            .map(|&i| {
+                // Try to find by index first (most common case), then by ID
+                all_tasks
+                    .iter()
+                    .find(|t| t.index == Some(i))
+                    .cloned()
+                    .or_else(|| all_tasks.iter().find(|t| t.id == i.to_string()).cloned())
+                    .unwrap_or_else(|| TaskDescriptor::partition(i, total_tasks))
+            })
+            .collect();
+        let task_ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
+        let task_labels: Vec<String> = tasks
+            .iter()
+            .map(|t| t.label.clone().unwrap_or_else(|| t.id.clone()))
+            .collect();
+        let task_type = tasks.first().map(|t| t.task_type.as_str()).unwrap_or("unknown");
 
         // Update worker status and assign task info for AIMD duration tracking
         if let Some(w) = data.worker_registry.get_mut(&req.worker_id) {
             w.status = WorkerStatus::Active;
             w.current_task = Some(ActiveTaskInfo {
-                task_id: task_id.clone(),
+                task_id: task_ids.first().cloned().unwrap_or_default(),
                 phenotype_id: None,
-                phase: "export".to_string(),
+                phase: task_type.to_string(),
                 source: None,
-                partitions: partitions.clone(),
+                tasks: task_ids.clone(),
                 started_at_ms: CoordinatorData::now_ms(),
             });
         }
 
         println!(
-            "Assigned partitions {:?} to worker {} ({} pending, {} processing, {} complete)",
-            partitions,
+            "Assigned {} {} task(s) to {} [{:?}] ({} pending, {} processing, {} done)",
+            tasks.len(),
+            task_type,
             req.worker_id,
+            task_labels,
             data.pending_partitions.len(),
             data.processing_partitions.len(),
-            data.completed_partitions.len()
+            data.completed_tasks.len()
         );
 
         axum::Json(WorkResponse::Task {
-            task_id,
-            partitions,
+            tasks,
             input_path: data.config.input_path.clone(),
             payload: serde_json::to_value(&job_spec).unwrap_or_default(),
-            total_partitions: data.config.total_partitions,
+            total_tasks: data.config.total_tasks,
             filters: data.config.filters.clone(),
             intervals: data.config.intervals.clone(),
         })
@@ -1480,6 +1571,29 @@ fn get_manhattan_work(
                         .to_string()
                 });
 
+            // Create TaskDescriptors for each partition
+            let total_tasks = manhattan.exome_total_tasks + manhattan.genome_total_tasks;
+            let tasks: Vec<TaskDescriptor> = partitions
+                .iter()
+                .map(|&i| {
+                    TaskType::Partition {
+                        table_path: table_path.clone(),
+                        partition_index: i,
+                        operation: PartitionOp::ManhattanScan {
+                            phenotype_id: phenotype.clone(),
+                            source: source_name.to_string(),
+                        },
+                    }
+                    .into_descriptor(
+                        i.to_string(),
+                        Some(format!("Partition {} → Scan ({})", i + 1, source_name)),
+                        Some(i),
+                        Some(total_tasks),
+                    )
+                })
+                .collect();
+            let task_ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
+
             // Update worker status and task info for AIMD duration tracking
             if let Some(w) = data.worker_registry.get_mut(worker_id) {
                 w.status = WorkerStatus::Active;
@@ -1488,14 +1602,23 @@ fn get_manhattan_work(
                     phenotype_id: Some(phenotype.clone()),
                     phase: "scan".to_string(),
                     source: Some(source_name.to_string()),
-                    partitions: partitions.clone(),
+                    tasks: task_ids.clone(),
                     started_at_ms: CoordinatorData::now_ms(),
                 });
             }
 
+            let pending_scans = manhattan.exome_pending.len() + manhattan.genome_pending.len();
+            let processing_scans = manhattan.exome_processing.len() + manhattan.genome_processing.len();
+            let completed_scans = manhattan.exome_completed.len() + manhattan.genome_completed.len();
             println!(
-                "Assigned {} partitions {:?} to worker {} (scan phase)",
-                source_name, partitions, worker_id
+                "Assigned {} {} scan task(s) to {} [{}] ({} pending, {} processing, {} done)",
+                tasks.len(),
+                source_name,
+                worker_id,
+                phenotype,
+                pending_scans,
+                processing_scans,
+                completed_scans
             );
 
             // Build ManhattanScanSpec with identity metadata
@@ -1526,11 +1649,10 @@ fn get_manhattan_work(
             };
 
             axum::Json(WorkResponse::Task {
-                task_id,
-                partitions,
+                tasks,
                 input_path: String::new(), // Not used for ManhattanScan
                 payload: serde_json::to_value(&JobSpec::ManhattanScan(scan_spec)).unwrap_or_default(),
-                total_partitions: manhattan.exome_total_partitions + manhattan.genome_total_partitions,
+                total_tasks: manhattan.exome_total_tasks + manhattan.genome_total_tasks,
                 filters: Vec::new(),
                 intervals: Vec::new(),
             })
@@ -1558,9 +1680,11 @@ fn get_manhattan_work(
                 w.status = WorkerStatus::Active;
             }
 
+            let phenotype_id = manhattan.original_spec.phenotype.clone().unwrap_or_default();
             println!(
-                "Assigned aggregate task to worker {} (aggregate phase)",
-                worker_id
+                "Assigned 1 aggregate task to {} [{}] (final aggregation)",
+                worker_id,
+                phenotype_id
             );
 
             // Build ManhattanAggregateSpec
@@ -1590,12 +1714,25 @@ fn get_manhattan_work(
                 styling: manhattan.original_spec.styling.clone(),
             };
 
+            // Create TaskDescriptor for aggregate task
+            let phenotype_id = manhattan.original_spec.phenotype.clone().unwrap_or_default();
+            let task = TaskType::Phenotype {
+                phenotype_id: phenotype_id.clone(),
+                ancestry: manhattan.original_spec.ancestry.clone(),
+                operation: PhenotypeOp::ManhattanAggregate,
+            }
+            .into_descriptor(
+                task_id.clone(),
+                Some(format!("{} → Aggregate", phenotype_id)),
+                Some(0),
+                Some(1),
+            );
+
             axum::Json(WorkResponse::Task {
-                task_id,
-                partitions: vec![0], // Single aggregate task
+                tasks: vec![task],
                 input_path: String::new(),
                 payload: serde_json::to_value(&JobSpec::ManhattanAggregate(aggregate_spec)).unwrap_or_default(),
-                total_partitions: 1,
+                total_tasks: 1,
                 filters: Vec::new(),
                 intervals: Vec::new(),
             })
@@ -1615,17 +1752,24 @@ fn complete_manhattan_work(
 ) {
     *last_progress_time = Instant::now();
 
+    // Extract partition indices from task IDs
+    let partitions: Vec<usize> = req
+        .tasks
+        .iter()
+        .filter_map(|t| t.parse::<usize>().ok())
+        .collect();
+
     match manhattan.phase {
         ManhattanPhase::Scan => {
             // Try to find partitions in exome or genome processing maps
-            for &part_id in &req.partitions {
+            for &part_id in &partitions {
                 if manhattan.exome_processing.remove(&part_id).is_some() {
                     manhattan.exome_completed.insert(part_id);
                     println!(
                         "Exome partition {} complete ({}/{} exome done)",
                         part_id,
                         manhattan.exome_completed.len(),
-                        manhattan.exome_total_partitions
+                        manhattan.exome_total_tasks
                     );
                 } else if manhattan.genome_processing.remove(&part_id).is_some() {
                     manhattan.genome_completed.insert(part_id);
@@ -1633,7 +1777,7 @@ fn complete_manhattan_work(
                         "Genome partition {} complete ({}/{} genome done)",
                         part_id,
                         manhattan.genome_completed.len(),
-                        manhattan.genome_total_partitions
+                        manhattan.genome_total_tasks
                     );
                 } else {
                     // Partition wasn't in processing (maybe timed out and reassigned)
@@ -1645,13 +1789,13 @@ fn complete_manhattan_work(
             }
 
             // Check if scan phase is complete
-            let exome_done = manhattan.exome_completed.len() == manhattan.exome_total_partitions;
-            let genome_done = manhattan.genome_completed.len() == manhattan.genome_total_partitions;
+            let exome_done = manhattan.exome_completed.len() == manhattan.exome_total_tasks;
+            let genome_done = manhattan.genome_completed.len() == manhattan.genome_total_tasks;
             let exome_idle = manhattan.exome_pending.is_empty() && manhattan.exome_processing.is_empty();
             let genome_idle = manhattan.genome_pending.is_empty() && manhattan.genome_processing.is_empty();
 
-            if (exome_done || manhattan.exome_total_partitions == 0)
-                && (genome_done || manhattan.genome_total_partitions == 0)
+            if (exome_done || manhattan.exome_total_tasks == 0)
+                && (genome_done || manhattan.genome_total_tasks == 0)
                 && exome_idle
                 && genome_idle
             {
@@ -1685,9 +1829,12 @@ fn complete_manhattan_work(
 /// Handle completion for batch Manhattan jobs.
 /// Complete an ingestion task.
 fn complete_ingestion_work(ingestion: &mut IngestionState, req: &CompleteRequest) {
+    // Extract task ID from tasks list
+    let task_id = req.tasks.first().cloned().unwrap_or_default();
+
     // Remove from active tasks
     if let Some((phenotype_id, ancestry, _base_path, _worker_id, start_time)) =
-        ingestion.active_tasks.remove(&req.task_id)
+        ingestion.active_tasks.remove(&task_id)
     {
         let duration = start_time.elapsed();
         ingestion.completed_count += 1;
@@ -1705,7 +1852,7 @@ fn complete_ingestion_work(ingestion: &mut IngestionState, req: &CompleteRequest
         // Task not found - might have already been handled
         println!(
             "Warning: Ingestion task {} not found in active_tasks",
-            req.task_id
+            task_id
         );
         ingestion.completed_count += 1;
     }
@@ -1720,14 +1867,24 @@ fn complete_batch_work(
 ) {
     data.last_progress_time = Instant::now();
 
+    // Extract task ID from tasks list
+    let task_id = req.tasks.first().cloned().unwrap_or_default();
+
+    // Extract partition indices from task IDs
+    let partitions: Vec<usize> = req
+        .tasks
+        .iter()
+        .filter_map(|t| t.parse::<usize>().ok())
+        .collect();
+
     // Look up the task by task_id
-    let task = match data.active_tasks.remove(&req.task_id) {
+    let task = match data.active_tasks.remove(&task_id) {
         Some(task) => task,
         None => {
             // Task not found - might be a duplicate completion or old task
             println!(
                 "Warning: task {} not found in active_tasks (completion from {})",
-                req.task_id, req.worker_id
+                task_id, req.worker_id
             );
             return;
         }
@@ -1754,7 +1911,7 @@ fn complete_batch_work(
             };
 
             // Mark partitions as complete
-            for &part_id in &req.partitions {
+            for &part_id in &partitions {
                 match source {
                     ManhattanSource::Exome => {
                         if state.exome_processing.remove(&part_id).is_some() {
@@ -1775,13 +1932,13 @@ fn complete_batch_work(
             }
 
             // Check if scan phase is complete for this phenotype
-            let exome_done = state.exome_completed.len() == state.exome_total_partitions;
-            let genome_done = state.genome_completed.len() == state.genome_total_partitions;
+            let exome_done = state.exome_completed.len() == state.exome_total_tasks;
+            let genome_done = state.genome_completed.len() == state.genome_total_tasks;
             let exome_idle = state.exome_pending.is_empty() && state.exome_processing.is_empty();
             let genome_idle = state.genome_pending.is_empty() && state.genome_processing.is_empty();
 
-            if (exome_done || state.exome_total_partitions == 0)
-                && (genome_done || state.genome_total_partitions == 0)
+            if (exome_done || state.exome_total_tasks == 0)
+                && (genome_done || state.genome_total_tasks == 0)
                 && exome_idle
                 && genome_idle
             {
@@ -1840,8 +1997,8 @@ fn complete_batch_work(
                     ManhattanSource::Genome => "genome",
                 };
                 let (done, total) = match source {
-                    ManhattanSource::Exome => (state.exome_completed.len(), state.exome_total_partitions),
-                    ManhattanSource::Genome => (state.genome_completed.len(), state.genome_total_partitions),
+                    ManhattanSource::Exome => (state.exome_completed.len(), state.exome_total_tasks),
+                    ManhattanSource::Genome => (state.genome_completed.len(), state.genome_total_tasks),
                 };
                 println!(
                     "Phenotype {} {} progress: {}/{} partitions",
@@ -1939,6 +2096,14 @@ async fn complete_work(
         (None, None)
     };
 
+    // Extract task IDs and partition indices from request
+    let task_ids = &req.tasks;
+    let task_id = task_ids.first().cloned().unwrap_or_default();
+    let partitions: Vec<usize> = task_ids
+        .iter()
+        .filter_map(|t| t.parse::<usize>().ok())
+        .collect();
+
     // AIMD Batch Size Adjustment
     if let Some(w) = data.worker_registry.get_mut(&req.worker_id) {
         let max_batch = determine_batch_size(config_batch_size, worker_hardware.as_ref(), &job_spec_ref, memory_weight_mb);
@@ -1950,12 +2115,12 @@ async fn complete_work(
             w.current_batch_size = Some((current_batch / 2).max(1));
         } else if let Some(task) = &completed_task {
             let duration_secs = (now_ms.saturating_sub(task.started_at_ms)) as f64 / 1000.0;
-            let num_partitions = req.partitions.len() as f64;
+            let num_tasks = task_ids.len() as f64;
 
-            if num_partitions > 0.0 && duration_secs > 0.0 {
-                let time_per_partition = duration_secs / num_partitions;
+            if num_tasks > 0.0 && duration_secs > 0.0 {
+                let time_per_task = duration_secs / num_tasks;
                 // Target an ideal turnaround of 60 seconds
-                let target_batch = (60.0 / time_per_partition).round() as usize;
+                let target_batch = (60.0 / time_per_task).round() as usize;
                 let clamped_target = target_batch.clamp(1, max_batch);
 
                 let next_batch = if clamped_target > current_batch {
@@ -1974,7 +2139,7 @@ async fn complete_work(
     // Check if this is a failure report
     if let Some(ref error) = req.error {
         // Look up task BEFORE removing (need to know what type of task failed and when it started)
-        let failed_task = data.active_tasks.remove(&req.task_id);
+        let failed_task = data.active_tasks.remove(&task_id);
 
         // Calculate wasted time based on when the task started
         let wasted_duration_ms = match &failed_task {
@@ -1988,21 +2153,21 @@ async fn complete_work(
 
         // Log the error prominently
         println!(
-            "ERROR from worker {}: partitions {:?} failed: {} (wasted {:.1}s)",
-            req.worker_id, req.partitions, error, wasted_duration_ms as f64 / 1000.0
+            "ERROR from worker {}: tasks {:?} failed: {} (wasted {:.1}s)",
+            req.worker_id, task_ids, error, wasted_duration_ms as f64 / 1000.0
         );
 
         // Store the error for dashboard display
         data.last_error = Some(format!(
-            "Worker {} failed on partitions {:?}: {}",
-            req.worker_id, req.partitions, error
+            "Worker {} failed on tasks {:?}: {}",
+            req.worker_id, task_ids, error
         ));
 
         // Log failure to ring buffer (with wasted duration)
         data.log_failure(FailureRecord {
             timestamp_ms: now_ms,
             phenotype_id: None,
-            partitions: req.partitions.clone(),
+            tasks: task_ids.clone(),
             worker_id: req.worker_id.clone(),
             error: error.clone(),
             retry_count: 0,
@@ -2015,11 +2180,11 @@ async fn complete_work(
             event_type: "failed".to_string(),
             worker_id: Some(req.worker_id.clone()),
             phenotype_id: None,
-            details: format!("Failed partitions {:?}: {} (wasted {:.1}s)", req.partitions, error, wasted_duration_ms as f64 / 1000.0),
+            details: format!("Failed tasks {:?}: {} (wasted {:.1}s)", task_ids, error, wasted_duration_ms as f64 / 1000.0),
         });
 
         // Remove from processing and retry or mark as failed (for non-batch jobs)
-        for &part_id in &req.partitions {
+        for &part_id in &partitions {
             data.processing_partitions.remove(&part_id);
 
             // Use same retry logic as timeouts
@@ -2105,7 +2270,7 @@ async fn complete_work(
                     // Re-queue scan partitions back to the phenotype
                     if let Some(state) = batch.active_phenotypes.get_mut(&phenotype_id) {
                         // Put partitions back in pending
-                        for &part_id in &req.partitions {
+                        for &part_id in &partitions {
                             match source {
                                 ManhattanSource::Exome => {
                                     state.exome_processing.remove(&part_id);
@@ -2118,26 +2283,26 @@ async fn complete_work(
                             }
                         }
                         println!(
-                            "Re-queued {} scan partitions for phenotype {} (source: {:?})",
-                            req.partitions.len(), phenotype_id, source
+                            "Re-queued {} scan tasks for phenotype {} (source: {:?})",
+                            partitions.len(), phenotype_id, source
                         );
                     } else {
                         println!(
-                            "Warning: Phenotype {} not found for scan retry, partitions lost",
+                            "Warning: Phenotype {} not found for scan retry, tasks lost",
                             phenotype_id
                         );
                     }
                 }
                 None => {
                     // Task not found - might have already been handled or was a legacy task
-                    println!("Warning: Failed task {} not found in active_tasks", req.task_id);
+                    println!("Warning: Failed task {} not found in active_tasks", task_id);
                 }
             }
         }
 
         // For Manhattan jobs, also update the manhattan state
         if let Some(ref mut manhattan) = data.manhattan_state {
-            for &part_id in &req.partitions {
+            for &part_id in &partitions {
                 manhattan.exome_processing.remove(&part_id);
                 manhattan.genome_processing.remove(&part_id);
                 // If this was the aggregate task, mark it failed
@@ -2150,7 +2315,7 @@ async fn complete_work(
         // For ingestion jobs, mark task as failed
         if let Some(ref mut ingestion) = data.ingestion_state {
             if let Some((phenotype_id, ancestry, _base_path, _worker_id, _start_time)) =
-                ingestion.active_tasks.remove(&req.task_id)
+                ingestion.active_tasks.remove(&task_id)
             {
                 println!(
                     "Ingestion failed: {}/{} - {}",
@@ -2180,20 +2345,20 @@ async fn complete_work(
         data.manhattan_state = Some(manhattan);
     } else {
         // Standard job completion
-        for &part_id in &req.partitions {
+        for &part_id in &partitions {
             if data.processing_partitions.remove(&part_id).is_some() {
-                data.completed_partitions.insert(part_id);
+                data.completed_tasks.insert(part_id);
                 // Update progress timestamp (R3)
                 data.last_progress_time = Instant::now();
             } else {
                 // Partition wasn't in processing (maybe timed out and reassigned)
                 // Still mark as complete if not already
-                if !data.completed_partitions.contains(&part_id) {
+                if !data.completed_tasks.contains(&part_id) {
                     println!(
-                        "Warning: partition {} completed by {} but wasn't in processing map",
+                        "Warning: task {} completed by {} but wasn't in processing map",
                         part_id, req.worker_id
                     );
-                    data.completed_partitions.insert(part_id);
+                    data.completed_tasks.insert(part_id);
                 }
             }
         }
@@ -2202,7 +2367,7 @@ async fn complete_work(
     data.total_rows += req.items_processed;
 
     // Store result_json if present (for Summary/Validate jobs)
-    if let Some(result) = req.result_json {
+    if let Some(result) = req.result_json.clone() {
         data.aggregated_results.push(result);
     }
 
@@ -2210,7 +2375,7 @@ async fn complete_work(
     touch_worker(&mut data, &req.worker_id, None);
     if let Some(w) = data.worker_registry.get_mut(&req.worker_id) {
         w.total_rows += req.items_processed;
-        w.partitions_completed += req.partitions.len();
+        w.partitions_completed += task_ids.len();
     }
 
     // Log completion event (only for successful completions, not errors)
@@ -2220,12 +2385,12 @@ async fn complete_work(
             event_type: "completed".to_string(),
             worker_id: Some(req.worker_id.clone()),
             phenotype_id: None,
-            details: format!("Completed partitions {:?} ({} rows)", req.partitions, req.items_processed),
+            details: format!("Completed tasks {:?} ({} rows)", task_ids, req.items_processed),
         });
     }
 
-    let total = data.config.total_partitions;
-    let done = data.completed_partitions.len();
+    let total = data.config.total_tasks;
+    let done = data.completed_tasks.len();
 
     // Log progress periodically
     if done % 10 == 0 || done == total {
@@ -2260,7 +2425,7 @@ async fn get_status(
         (pending, processing, completed, total, is_complete)
     } else if let Some(ref m) = data.manhattan_state {
         // Check if this is a single Manhattan pipeline job
-        let total_parts = m.exome_total_partitions + m.genome_total_partitions;
+        let total_parts = m.exome_total_tasks + m.genome_total_tasks;
         let completed_parts = m.exome_completed.len() + m.genome_completed.len();
         let processing_parts = m.exome_processing.len() + m.genome_processing.len();
         let pending_parts = m.exome_pending.len() + m.genome_pending.len();
@@ -2275,13 +2440,13 @@ async fn get_status(
         (pending, processing, completed, total, is_complete)
     } else {
         let failed = data.failed_partitions.len();
-        let completed = data.completed_partitions.len();
-        let is_complete = (completed + failed) == data.config.total_partitions;
+        let completed = data.completed_tasks.len();
+        let is_complete = (completed + failed) == data.config.total_tasks;
         (
             data.pending_partitions.len(),
             data.processing_partitions.len(),
             completed,
-            data.config.total_partitions,
+            data.config.total_tasks,
             is_complete,
         )
     };
@@ -2289,12 +2454,12 @@ async fn get_status(
     let failed = data.failed_partitions.len();
 
     axum::Json(StatusResponse {
-        pending,
-        processing,
-        completed,
-        total,
+        pending_tasks: pending,
+        processing_tasks: processing,
+        completed_tasks: completed,
+        total_tasks: total,
         total_items: data.total_rows,
-        failed,
+        failed_tasks: failed,
         is_complete,
     })
 }
@@ -2476,13 +2641,13 @@ async fn submit_job(
     }
 
     // Validate request
-    // ManhattanBatch and IngestManhattan jobs don't use total_partitions (they manage tasks internally)
+    // ManhattanBatch and IngestManhattan jobs don't use total_tasks (they manage tasks internally)
     let is_batch_job = matches!(&req.job_spec, JobSpec::ManhattanBatch { .. });
     let is_ingest_job = matches!(&req.job_spec, JobSpec::IngestManhattan { .. });
-    if req.total_partitions == 0 && !is_batch_job && !is_ingest_job {
+    if req.total_tasks == 0 && !is_batch_job && !is_ingest_job {
         return axum::Json(JobConfigResponse {
             acknowledged: false,
-            error: Some("total_partitions must be greater than 0".to_string()),
+            error: Some("total_tasks must be greater than 0".to_string()),
         });
     }
 
@@ -2498,7 +2663,7 @@ async fn submit_job(
     // Configure the job
     data.config.input_path = req.input_path.clone();
     data.config.job_spec = Some(req.job_spec.clone());
-    data.config.total_partitions = req.total_partitions;
+    data.config.total_tasks = req.total_tasks;
     data.config.filters = req.filters.clone();
     data.config.intervals = req.intervals.clone();
     data.config.memory_weight_mb = req.memory_weight_mb;
@@ -2507,10 +2672,10 @@ async fn submit_job(
     }
 
     // Fill pending queue with partition indices
-    data.pending_partitions = (0..req.total_partitions).collect();
+    data.pending_partitions = (0..req.total_tasks).collect();
 
     // Reset job state
-    data.completed_partitions.clear();
+    data.completed_tasks.clear();
     data.processing_partitions.clear();
     data.failed_partitions.clear();
     data.retry_counts.clear();
@@ -2721,12 +2886,12 @@ async fn submit_job(
     // Initialize Manhattan pipeline state if this is a single Manhattan job
     data.manhattan_state = if let JobSpec::Manhattan { ref spec, mode } = req.job_spec {
         // For Manhattan jobs, we manage exome/genome partitions separately
-        // Use partition counts from spec if available, otherwise fall back to total_partitions
+        // Use partition counts from spec if available, otherwise fall back to total_tasks
         let exome_partitions = spec.exome_partitions.unwrap_or_else(|| {
-            if spec.exome.is_some() { req.total_partitions } else { 0 }
+            if spec.exome.is_some() { req.total_tasks } else { 0 }
         });
         let genome_partitions = spec.genome_partitions.unwrap_or_else(|| {
-            if spec.genome.is_some() && spec.exome.is_none() { req.total_partitions } else { 0 }
+            if spec.genome.is_some() && spec.exome.is_none() { req.total_tasks } else { 0 }
         });
 
         // Clear the standard partition tracking since Manhattan uses its own
@@ -2750,11 +2915,11 @@ async fn submit_job(
             layout: spec.layout.clone(),
             y_scale: spec.y_scale.clone(),
             contig_lengths: spec.contig_lengths.clone().unwrap_or_default(),
-            exome_total_partitions: exome_partitions,
+            exome_total_tasks: exome_partitions,
             exome_pending: (0..exome_partitions).collect(),
             exome_processing: HashMap::new(),
             exome_completed: HashSet::new(),
-            genome_total_partitions: genome_partitions,
+            genome_total_tasks: genome_partitions,
             genome_pending: (0..genome_partitions).collect(),
             genome_processing: HashMap::new(),
             genome_completed: HashSet::new(),
@@ -2773,7 +2938,7 @@ async fn submit_job(
     println!(
         "Job submitted: {} ({} partitions, input={}, output={})",
         req.job_spec.description(),
-        req.total_partitions,
+        req.total_tasks,
         req.input_path,
         output_desc
     );
@@ -2826,8 +2991,8 @@ async fn get_job_result(
 
     // Check if the job is complete
     let failed = data.failed_partitions.len();
-    let completed = data.completed_partitions.len();
-    let total = data.config.total_partitions;
+    let completed = data.completed_tasks.len();
+    let total = data.config.total_tasks;
     let is_complete = total > 0 && (completed + failed) == total;
 
     if data.idle {
@@ -2891,7 +3056,7 @@ async fn get_dashboard_summary(
         (completed, processing, pending, total, is_complete)
     } else if let Some(ref m) = data.manhattan_state {
         // Check if this is a single Manhattan pipeline job
-        let total_parts = m.exome_total_partitions + m.genome_total_partitions;
+        let total_parts = m.exome_total_tasks + m.genome_total_tasks;
         let completed_parts = m.exome_completed.len() + m.genome_completed.len();
         let processing_parts = m.exome_processing.len() + m.genome_processing.len();
         let pending_parts = m.exome_pending.len() + m.genome_pending.len();
@@ -2905,13 +3070,13 @@ async fn get_dashboard_summary(
 
         (completed, processing, pending, total, is_complete)
     } else {
-        let completed = data.completed_partitions.len();
-        let is_complete = (completed + failed) == data.config.total_partitions;
+        let completed = data.completed_tasks.len();
+        let is_complete = (completed + failed) == data.config.total_tasks;
         (
             completed,
             data.processing_partitions.len(),
             data.pending_partitions.len(),
-            data.config.total_partitions,
+            data.config.total_tasks,
             is_complete,
         )
     };
@@ -2963,12 +3128,12 @@ async fn get_dashboard_summary(
 
     axum::Json(DashboardSummary {
         progress_percent,
-        total_partitions: total,
+        total_tasks: total,
         batch_size: data.config.batch_size,
-        completed_partitions: completed,
-        processing_partitions: processing,
-        pending_partitions: pending,
-        failed_partitions: failed,
+        completed_tasks: completed,
+        processing_tasks: processing,
+        pending_tasks: pending,
+        failed_tasks: failed,
         total_items: data.total_rows,
         cluster_items_per_sec,
         elapsed_secs: elapsed,
@@ -3125,7 +3290,7 @@ async fn get_dashboard_workers(
             last_seen_secs: now.duration_since(w.last_seen).as_secs_f64(),
             telemetry: w.metrics_history.back().cloned(),
             total_items: w.total_rows,
-            partitions_completed: w.partitions_completed,
+            tasks_completed: w.partitions_completed,
             current_task: w.current_task.clone(),
         })
         .collect();

@@ -182,8 +182,8 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         if let Ok(output) = cmd.output() {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                // Check if it looks like a valid JSON response
-                return stdout.contains("\"pending\"") || stdout.contains("\"completed\"");
+                // Check if it looks like a valid JSON response (new field names)
+                return stdout.contains("\"pending_tasks\"") || stdout.contains("\"completed_tasks\"");
             }
         }
         false
@@ -228,7 +228,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         let request = JobConfigRequest {
             input_path: input_path.to_string(),
             job_spec: job_spec.clone(),
-            total_partitions,
+            total_tasks: total_partitions,
             batch_size,
             force,
             filters: filters.to_vec(),
@@ -582,22 +582,22 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                         println!();
                         println!("{}", "Job Status".bold().underline());
                         println!(
-                            "  Progress:    {}/{} partitions ({:.1}%)",
-                            status.completed,
-                            status.total,
-                            if status.total > 0 {
-                                (status.completed as f64 / status.total as f64) * 100.0
+                            "  Progress:    {}/{} tasks ({:.1}%)",
+                            status.completed_tasks,
+                            status.total_tasks,
+                            if status.total_tasks > 0 {
+                                (status.completed_tasks as f64 / status.total_tasks as f64) * 100.0
                             } else {
                                 0.0
                             }
                         );
-                        println!("  Processing:  {} workers active", status.processing);
-                        println!("  Pending:     {} partitions", status.pending);
-                        if status.failed > 0 {
+                        println!("  Processing:  {} workers active", status.processing_tasks);
+                        println!("  Pending:     {} tasks", status.pending_tasks);
+                        if status.failed_tasks > 0 {
                             println!(
-                                "  {} {} partitions",
+                                "  {} {} tasks",
                                 "Failed:".red(),
-                                status.failed
+                                status.failed_tasks
                             );
                         }
                         println!("  Rows:        {}", status.total_items);
@@ -1005,24 +1005,23 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             workers.len().to_string().bright_white()
         );
 
-        // Check if coordinator is running (we'll need to restart it)
-        let coord_was_running = self.check_coordinator_status(&coordinator, zone);
+        // Always stop any running coordinator before updating (to avoid "Address already in use")
+        println!(
+            "{}",
+            "Stopping any running coordinator service...".dimmed()
+        );
+        // Kill by process name and also by port (belt and suspenders)
+        let stop_cmd = "pkill -9 -f 'genohype service start-coordinator' 2>/dev/null; \
+                        pkill -9 -f 'genohype-worker' 2>/dev/null; \
+                        fuser -k 3000/tcp 2>/dev/null; \
+                        true";
+        let _ = self
+            .provider
+            .get_ssh_command(&coordinator.name, zone, stop_cmd)
+            .status();
 
-        // Stop coordinator if running (so we can update the binary)
-        if coord_was_running {
-            println!(
-                "{}",
-                "Stopping coordinator service for update...".dimmed()
-            );
-            let stop_cmd = "pkill -f 'genohype service start-coordinator' || true";
-            let _ = self
-                .provider
-                .get_ssh_command(&coordinator.name, zone, stop_cmd)
-                .status();
-
-            // Give it a moment to stop
-            std::thread::sleep(std::time::Duration::from_secs(1));
-        }
+        // Give processes time to fully terminate and release the port
+        std::thread::sleep(std::time::Duration::from_secs(2));
 
         // Deploy binary to coordinator
         println!("{}", "Uploading binary to coordinator...".dimmed());
@@ -1059,9 +1058,20 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
 
         // Verify coordinator is back up
         if !self.check_coordinator_status(&coordinator, zone) {
+            // Try to fetch the log to show what went wrong
+            let log_cmd = "tail -50 /tmp/coordinator.log 2>/dev/null || echo '(no log file)'";
+            if let Ok(output) = self
+                .provider
+                .get_ssh_command(&coordinator.name, zone, log_cmd)
+                .output()
+            {
+                let log_content = String::from_utf8_lossy(&output.stdout);
+                eprintln!("\n{}", "Coordinator log:".red().bold());
+                eprintln!("{}", log_content);
+            }
             return Err(HailError::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                "Coordinator failed to start after binary update. Check /tmp/coordinator.log",
+                "Coordinator failed to start after binary update",
             )));
         }
         println!(
@@ -1942,34 +1952,30 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             }
             println!("{} Job submitted via API", "OK".green().bold());
         } else {
-            // Legacy mode: start coordinator fresh (only supports basic parquet export)
-            let output_path = job_spec.output_path().ok_or_else(|| {
-                HailError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "Legacy coordinator mode only supports jobs with output paths",
-                ))
-            })?;
-
+            // Start coordinator in idle/API mode (no pre-configured job)
             println!(
                 "Starting coordinator on {} ({})...",
                 coordinator.name.cyan(),
                 coord_ip
             );
 
-            // Start coordinator service and save PID
-            let coord_cmd = format!(
+            // First ensure port is free
+            let cleanup_cmd = "fuser -k 3000/tcp 2>/dev/null; true";
+            let _ = self
+                .provider
+                .get_ssh_command(&coordinator.name, zone, cleanup_cmd)
+                .status();
+            std::thread::sleep(std::time::Duration::from_millis(500));
+
+            // Start coordinator service in idle mode (accepts jobs via API)
+            let coord_cmd =
                 "nohup /usr/local/bin/genohype service start-coordinator \
                  --port 3000 \
-                 --input '{}' \
-                 --output '{}' \
-                 --total-partitions {} \
-                 > /tmp/coordinator.log 2>&1 & echo $! > /tmp/coordinator.pid",
-                input_path, output_path, total_partitions
-            );
+                 > /tmp/coordinator.log 2>&1 & echo $! > /tmp/coordinator.pid";
 
             let status = self
                 .provider
-                .get_ssh_command(&coordinator.name, zone, &coord_cmd)
+                .get_ssh_command(&coordinator.name, zone, coord_cmd)
                 .status()
                 .map_err(HailError::Io)?;
 
@@ -1983,12 +1989,56 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             // Give coordinator a moment to bind its port
             std::thread::sleep(std::time::Duration::from_secs(2));
 
+            // Verify coordinator started successfully
+            if !self.check_coordinator_status(coordinator, zone) {
+                // Show log to help debug
+                let log_cmd = "tail -50 /tmp/coordinator.log 2>/dev/null || echo '(no log file)'";
+                if let Ok(output) = self
+                    .provider
+                    .get_ssh_command(&coordinator.name, zone, log_cmd)
+                    .output()
+                {
+                    let log_content = String::from_utf8_lossy(&output.stdout);
+                    eprintln!("\n{}", "Coordinator log:".red().bold());
+                    eprintln!("{}", log_content);
+                }
+                return Err(HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Coordinator failed to start. See log above.",
+                )));
+            }
+
             // Start workers
             println!(
                 "Starting {} worker(s)...",
                 workers.len().to_string().bright_white()
             );
             self.start_worker_services(workers, coord_ip, zone)?;
+
+            // Give workers a moment to connect to coordinator
+            println!("{}", "Waiting for workers to connect...".dimmed());
+            std::thread::sleep(std::time::Duration::from_secs(3));
+
+            // Submit job via API (same as the "coordinator already running" path)
+            println!("{}", "Submitting job via API...".dimmed());
+            if !self.submit_job_via_api(
+                coordinator,
+                zone,
+                &input_path,
+                &job_spec,
+                total_partitions,
+                force,
+                batch_size,
+                memory_weight_mb,
+                &filters,
+                &intervals,
+            )? {
+                return Err(HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Failed to submit job to coordinator via API",
+                )));
+            }
+            println!("{} Job submitted via API", "OK".green().bold());
         }
 
         println!();
@@ -3608,10 +3658,10 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                     - task.started_at_ms)
                     / 1000;
                 println!(
-                    "    Task: {} phase={} partitions={:?} ({}s)",
+                    "    Task: {} phase={} tasks={:?} ({}s)",
                     task.task_id.dimmed(),
                     task.phase.bright_white(),
-                    task.partitions,
+                    task.tasks,
                     duration_s
                 );
             } else {
@@ -3782,10 +3832,10 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                 let timestamp = format!("{}.{:03}", secs, millis);
 
                 println!(
-                    "[{}] {} partitions {:?}",
+                    "[{}] {} tasks {:?}",
                     timestamp.dimmed(),
                     f.worker_id.cyan(),
-                    f.partitions
+                    f.tasks
                 );
                 println!("  {}: {}", "Error".red(), f.error);
                 if f.retry_count > 0 {

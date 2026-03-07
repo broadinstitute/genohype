@@ -65,7 +65,7 @@ const FailureItem: React.FC<{ failure: FailureRecord }> = ({ failure }) => {
           </span>
         )}
         <span style={{ color: 'var(--yellow)' }}>
-          <strong>Partitions:</strong> [{failure.partitions.join(', ')}]
+          <strong>Tasks:</strong> [{failure.tasks.join(', ')}]
         </span>
       </div>
 

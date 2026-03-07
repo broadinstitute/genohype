@@ -8,8 +8,128 @@ use std::collections::HashMap;
 
 pub use genohype_pool::distributed::{
     CompleteRequest, CompleteResponse, CoreTaskInfo, HardwareSpec, HeartbeatRequest,
-    HeartbeatResponse, StatusResponse, TelemetrySnapshot, WorkRequest, WorkResponse,
+    HeartbeatResponse, StatusResponse, TaskDescriptor, TelemetrySnapshot, WorkRequest,
+    WorkResponse,
 };
+
+// ============================================================================
+// Domain-Specific Task Types
+// ============================================================================
+
+/// Describes what kind of work a task represents.
+///
+/// This is the domain-specific payload that gets serialized into `TaskDescriptor.payload`.
+/// Workers deserialize this to understand what operation to perform.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TaskType {
+    /// Scanning a partition of a Hail table
+    Partition {
+        table_path: String,
+        partition_index: usize,
+        operation: PartitionOp,
+    },
+
+    /// Processing a phenotype (Manhattan aggregate, ingest, etc.)
+    Phenotype {
+        phenotype_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ancestry: Option<String>,
+        operation: PhenotypeOp,
+    },
+
+    /// Synthetic stress test iteration
+    Stress { iteration: usize },
+
+    /// Locus plot generation
+    Locus {
+        phenotype_id: String,
+        chromosome: String,
+        position: u32,
+    },
+
+    /// Generic/custom task type
+    Custom {
+        name: String,
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        metadata: HashMap<String, String>,
+    },
+}
+
+/// Operation to perform on a Hail table partition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum PartitionOp {
+    /// Scan and export to Parquet
+    ExportParquet { output_path: String },
+
+    /// Scan and export to JSON
+    ExportJson {
+        output_path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group_by: Option<String>,
+    },
+
+    /// Scan and upload to ClickHouse
+    ExportClickhouse {
+        clickhouse_url: String,
+        table_name: String,
+    },
+
+    /// Scan and compute statistics
+    Summary,
+
+    /// Scan for Manhattan plot points
+    ManhattanScan {
+        /// Which phenotype this scan is for
+        phenotype_id: String,
+        /// "exome" or "genome"
+        source: String,
+    },
+}
+
+/// Operation to perform on a phenotype.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum PhenotypeOp {
+    /// Aggregate Manhattan scan results into final plots
+    ManhattanAggregate,
+
+    /// Ingest phenotype data into ClickHouse
+    Ingest {
+        clickhouse_url: String,
+        database: String,
+    },
+}
+
+impl TaskType {
+    /// Convert this task type into a TaskDescriptor for network transmission.
+    pub fn into_descriptor(
+        self,
+        id: String,
+        label: Option<String>,
+        index: Option<usize>,
+        total: Option<usize>,
+    ) -> TaskDescriptor {
+        let type_name = match &self {
+            TaskType::Partition { .. } => "partition",
+            TaskType::Phenotype { .. } => "phenotype",
+            TaskType::Stress { .. } => "stress",
+            TaskType::Locus { .. } => "locus",
+            TaskType::Custom { .. } => "custom",
+        }
+        .to_string();
+
+        TaskDescriptor {
+            id,
+            task_type: type_name,
+            label,
+            index,
+            total,
+            payload: serde_json::to_value(self).unwrap_or_default(),
+        }
+    }
+}
 
 /// Table initialization strategy for ingestion.
 ///
@@ -527,6 +647,143 @@ impl JobSpec {
             JobSpec::Stress(spec) => spec.write_dir.as_deref(),
         }
     }
+
+    /// Generate task descriptors for this job.
+    ///
+    /// Converts a job specification into discrete work units that can be
+    /// dispatched to workers. Each task includes full context for logging,
+    /// dashboard display, and type-safe dispatch.
+    ///
+    /// # Arguments
+    /// * `input_path` - Path to the input data (Hail table, etc.)
+    /// * `total_tasks` - Total number of tasks to generate (usually partition count)
+    pub fn generate_tasks(&self, input_path: &str, total_tasks: usize) -> Vec<TaskDescriptor> {
+        match self {
+            JobSpec::ExportParquet { output_path } => (0..total_tasks)
+                .map(|i| {
+                    TaskType::Partition {
+                        table_path: input_path.to_string(),
+                        partition_index: i,
+                        operation: PartitionOp::ExportParquet {
+                            output_path: output_path.clone(),
+                        },
+                    }
+                    .into_descriptor(
+                        i.to_string(),
+                        Some(format!("Partition {} → Parquet", i + 1)),
+                        Some(i),
+                        Some(total_tasks),
+                    )
+                })
+                .collect(),
+
+            JobSpec::ExportJson {
+                output_path,
+                group_by,
+            } => (0..total_tasks)
+                .map(|i| {
+                    TaskType::Partition {
+                        table_path: input_path.to_string(),
+                        partition_index: i,
+                        operation: PartitionOp::ExportJson {
+                            output_path: output_path.clone(),
+                            group_by: group_by.clone(),
+                        },
+                    }
+                    .into_descriptor(
+                        i.to_string(),
+                        Some(format!("Partition {} → JSON", i + 1)),
+                        Some(i),
+                        Some(total_tasks),
+                    )
+                })
+                .collect(),
+
+            JobSpec::ExportClickhouse {
+                clickhouse_url,
+                table_name,
+            } => (0..total_tasks)
+                .map(|i| {
+                    TaskType::Partition {
+                        table_path: input_path.to_string(),
+                        partition_index: i,
+                        operation: PartitionOp::ExportClickhouse {
+                            clickhouse_url: clickhouse_url.clone(),
+                            table_name: table_name.clone(),
+                        },
+                    }
+                    .into_descriptor(
+                        i.to_string(),
+                        Some(format!("Partition {} → ClickHouse", i + 1)),
+                        Some(i),
+                        Some(total_tasks),
+                    )
+                })
+                .collect(),
+
+            JobSpec::Summary => (0..total_tasks)
+                .map(|i| {
+                    TaskType::Partition {
+                        table_path: input_path.to_string(),
+                        partition_index: i,
+                        operation: PartitionOp::Summary,
+                    }
+                    .into_descriptor(
+                        i.to_string(),
+                        Some(format!("Partition {} → Stats", i + 1)),
+                        Some(i),
+                        Some(total_tasks),
+                    )
+                })
+                .collect(),
+
+            JobSpec::Stress(spec) => (0..spec.partitions)
+                .map(|i| {
+                    TaskType::Stress { iteration: i }.into_descriptor(
+                        format!("stress_{}", i),
+                        Some(format!("Stress {}", i + 1)),
+                        Some(i),
+                        Some(spec.partitions),
+                    )
+                })
+                .collect(),
+
+            JobSpec::ManhattanBatch { specs, .. } => specs
+                .iter()
+                .enumerate()
+                .map(|(i, spec)| {
+                    let pheno = spec.phenotype.clone().unwrap_or_default();
+                    let ancestry = spec.ancestry.clone();
+                    let label = ancestry
+                        .as_ref()
+                        .map(|a| format!("{} ({})", pheno, a))
+                        .unwrap_or_else(|| pheno.clone());
+
+                    TaskType::Phenotype {
+                        phenotype_id: pheno.clone(),
+                        ancestry,
+                        operation: PhenotypeOp::ManhattanAggregate,
+                    }
+                    .into_descriptor(
+                        pheno,
+                        Some(format!("{} → Aggregate", label)),
+                        Some(i),
+                        Some(specs.len()),
+                    )
+                })
+                .collect(),
+
+            // These job types have specialized runtime-managed queues or are single tasks
+            JobSpec::Validate { .. }
+            | JobSpec::Manhattan { .. }
+            | JobSpec::ManhattanScan(_)
+            | JobSpec::ManhattanAggregate(_)
+            | JobSpec::ManhattanAggregateBatch { .. }
+            | JobSpec::Loci(_)
+            | JobSpec::IngestManhattan { .. }
+            | JobSpec::IngestManhattanTask { .. } => vec![],
+        }
+    }
 }
 
 
@@ -537,19 +794,19 @@ impl JobSpec {
 pub struct DashboardSummary {
     /// Job progress percentage (0-100)
     pub progress_percent: f64,
-    /// Total partitions in the job
-    pub total_partitions: usize,
-    /// Number of partitions assigned per work request
+    /// Total tasks in the job
+    pub total_tasks: usize,
+    /// Number of tasks assigned per work request
     #[serde(default)]
     pub batch_size: usize,
-    /// Partitions completed
-    pub completed_partitions: usize,
-    /// Partitions currently processing
-    pub processing_partitions: usize,
-    /// Partitions pending
-    pub pending_partitions: usize,
-    /// Partitions permanently failed
-    pub failed_partitions: usize,
+    /// Tasks completed
+    pub completed_tasks: usize,
+    /// Tasks currently processing
+    pub processing_tasks: usize,
+    /// Tasks pending
+    pub pending_tasks: usize,
+    /// Tasks permanently failed
+    pub failed_tasks: usize,
     /// Total items processed across all workers
     pub total_items: usize,
     /// Aggregate items per second across all workers
@@ -595,9 +852,9 @@ pub struct JobConfigRequest {
     pub input_path: String,
     /// Job specification
     pub job_spec: JobSpec,
-    /// Total number of partitions to process
-    pub total_partitions: usize,
-    /// Number of partitions per work request (optional, defaults to coordinator's batch_size)
+    /// Total number of tasks to process
+    pub total_tasks: usize,
+    /// Number of tasks per work request (optional, defaults to coordinator's batch_size)
     #[serde(default)]
     pub batch_size: Option<usize>,
     /// Force submission even if a job is already running (supersede)
@@ -609,7 +866,7 @@ pub struct JobConfigRequest {
     /// Interval filters
     #[serde(default)]
     pub intervals: Vec<String>,
-    /// Hint for memory required per partition in MB (overrides default heuristics)
+    /// Hint for memory required per task in MB (overrides default heuristics)
     #[serde(default)]
     pub memory_weight_mb: Option<u64>,
 }
@@ -676,8 +933,8 @@ pub struct DashboardWorker {
     pub telemetry: Option<TelemetrySnapshot>,
     /// Total items reported by this worker
     pub total_items: usize,
-    /// Total partitions completed by this worker
-    pub partitions_completed: usize,
+    /// Total tasks completed by this worker
+    pub tasks_completed: usize,
     /// Currently assigned task, if any
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_task: Option<ActiveTaskInfo>,
@@ -723,7 +980,8 @@ pub struct ActiveTaskInfo {
     pub phase: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
-    pub partitions: Vec<usize>,
+    /// Task IDs being processed (replaces partition indices)
+    pub tasks: Vec<String>,
     pub started_at_ms: u64,
 }
 
@@ -745,7 +1003,8 @@ pub struct FailureRecord {
     pub timestamp_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phenotype_id: Option<String>,
-    pub partitions: Vec<usize>,
+    /// Task IDs that failed (replaces partition indices)
+    pub tasks: Vec<String>,
     pub worker_id: String,
     pub error: String,
     pub retry_count: usize,

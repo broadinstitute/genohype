@@ -91,23 +91,26 @@ pub async fn run_worker(
                 tokio::time::sleep(Duration::from_millis(config.poll_interval_ms)).await;
             }
             WorkResponse::Task {
-                task_id,
-                partitions,
+                tasks,
                 input_path: _,
                 payload,
-                total_partitions: _,
+                total_tasks: _,
                 filters: _,
                 intervals: _,
             } => {
+                let task_ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
+                let task_labels: Vec<String> = tasks
+                    .iter()
+                    .map(|t| t.label.clone().unwrap_or_else(|| t.id.clone()))
+                    .collect();
                 println!(
-                    "Received work {}: {} partition(s) {:?}",
-                    if task_id.is_empty() { "-" } else { &task_id },
-                    partitions.len(),
-                    partitions
+                    "Received {} task(s): {:?}",
+                    tasks.len(),
+                    task_labels
                 );
 
                 // Execute the task using the handler
-                let result = handler.handle_task(&payload, partitions.clone()).await;
+                let result = handler.handle_task(&payload, tasks).await;
 
                 let (items_processed, result_json, error) = match result {
                     Ok(task_result) => {
@@ -123,8 +126,7 @@ pub async fn run_worker(
                 // Report completion
                 let request = CompleteRequest {
                     worker_id: config.worker_id.clone(),
-                    task_id: task_id.clone(),
-                    partitions: partitions.clone(),
+                    tasks: task_ids.clone(),
                     items_processed,
                     result_json,
                     error,
@@ -135,8 +137,8 @@ pub async fn run_worker(
                 }
 
                 println!(
-                    "Completed partitions {:?} ({} items)",
-                    partitions, items_processed
+                    "Completed tasks {:?} ({} items)",
+                    task_ids, items_processed
                 );
             }
         }

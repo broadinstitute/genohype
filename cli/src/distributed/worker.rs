@@ -8,8 +8,8 @@
 
 use crate::distributed::message::{
     CompleteRequest, CoreTaskInfo, HeartbeatRequest, JobSpec, ManhattanAggregateSpec,
-    ManhattanScanSpec, ManhattanSource, ManhattanSpec, TelemetrySnapshot, WorkRequest,
-    WorkResponse,
+    ManhattanScanSpec, ManhattanSource, ManhattanSpec, TaskDescriptor, TaskType,
+    TelemetrySnapshot, WorkRequest, WorkResponse,
 };
 use genohype_core::io::{is_cloud_path, StreamingCloudWriter};
 use genohype_core::parquet::{build_record_batch, ParquetWriter};
@@ -195,11 +195,10 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
                 tokio::time::sleep(Duration::from_millis(config.poll_interval_ms)).await;
             }
             WorkResponse::Task {
-                task_id,
-                partitions,
+                tasks,
                 input_path,
                 payload,
-                total_partitions: _,
+                total_tasks: _,
                 filters,
                 intervals,
             } => {
@@ -211,6 +210,23 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
                     }
                 };
 
+                // Extract partition indices from task descriptors for backwards compatibility
+                let partitions: Vec<usize> = tasks
+                    .iter()
+                    .filter_map(|t| {
+                        if let Ok(task_type) = serde_json::from_value::<TaskType>(t.payload.clone()) {
+                            if let TaskType::Partition { partition_index, .. } = task_type {
+                                return Some(partition_index);
+                            }
+                        }
+                        // Fallback: try to parse the task ID as a partition index
+                        t.id.parse::<usize>().ok()
+                    })
+                    .collect();
+
+                // Extract task IDs for completion reporting
+                let task_ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
+
                 // Build description including batch info for aggregate batch jobs
                 let desc = if let JobSpec::ManhattanAggregateBatch { specs } = &job_spec {
                     format!("batch of {} aggregation tasks", specs.len())
@@ -219,10 +235,9 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
                 };
 
                 println!(
-                    "Received work {}: {} partition(s) {:?} ({})",
-                    if task_id.is_empty() { "-" } else { &task_id },
-                    partitions.len(),
-                    partitions,
+                    "Received {} task(s): {:?} ({})",
+                    tasks.len(),
+                    task_ids,
                     desc
                 );
 
@@ -262,14 +277,13 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
                     }
                     Ok(Err(e)) => {
                         let error_msg = format!("{}", e);
-                        eprintln!("Error processing partitions {:?}: {}", partitions, error_msg);
+                        eprintln!("Error processing tasks {:?}: {}", task_ids, error_msg);
                         cached_engine = None;
 
                         // Report failure to coordinator so it can track and display the error
                         let fail_req = CompleteRequest {
                             worker_id: config.worker_id.clone(),
-                            task_id: task_id.clone(),
-                            partitions: partitions.clone(),
+                            tasks: task_ids.clone(),
                             items_processed: 0,
                             result_json: None,
                             error: Some(error_msg),
@@ -280,7 +294,7 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
                         continue;
                     }
                     Err(e) => {
-                        eprintln!("Task panicked processing partitions {:?}: {}", partitions, e);
+                        eprintln!("Task panicked processing tasks {:?}: {}", task_ids, e);
                         cached_engine = None;
                         continue;
                     }
@@ -292,15 +306,14 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
                     .store(NO_ACTIVE_PARTITION, Ordering::Relaxed);
                 telemetry_state
                     .partitions_completed
-                    .fetch_add(partitions.len(), Ordering::Relaxed);
+                    .fetch_add(task_ids.len(), Ordering::Relaxed);
 
                 // Report completion (with optional result_json for aggregation)
                 if let Err(e) = report_completion(
                     &client,
                     &complete_url,
                     &config.worker_id,
-                    task_id,
-                    &partitions,
+                    &task_ids,
                     rows_processed,
                     result_json,
                 )
@@ -311,8 +324,8 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
                 }
 
                 println!(
-                    "Completed partitions {:?} ({} rows)",
-                    partitions, rows_processed
+                    "Completed tasks {:?} ({} rows)",
+                    task_ids, rows_processed
                 );
             }
         }
@@ -364,15 +377,13 @@ async fn report_completion(
     client: &reqwest::Client,
     url: &str,
     worker_id: &str,
-    task_id: String,
-    partitions: &[usize],
+    tasks: &[String],
     items_processed: usize,
     result_json: Option<serde_json::Value>,
 ) -> Result<()> {
     let request = CompleteRequest {
         worker_id: worker_id.to_string(),
-        task_id,
-        partitions: partitions.to_vec(),
+        tasks: tasks.to_vec(),
         items_processed,
         result_json,
         error: None,
