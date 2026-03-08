@@ -856,13 +856,11 @@ fn process_stress(
 ) -> Result<usize> {
     use rayon::prelude::*;
     use std::panic::{catch_unwind, AssertUnwindSafe};
-    use std::time::Instant;
-    use std::io::{Read, Write};
     use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
     // Check available memory BEFORE processing any partitions
-    // Fail early if we can't possibly fit the batch
-    let max_parallel = if spec.memory_mb > 0 {
+    // Fail early if we can't possibly fit the batch (unless skip_memory_check is set)
+    let max_parallel = if spec.memory_mb > 0 && !spec.skip_memory_check {
         let mut sys = System::new_with_specifics(
             RefreshKind::new().with_memory(MemoryRefreshKind::new().with_ram())
         );
@@ -901,6 +899,10 @@ fn process_stress(
             partitions.len(), available_mb, per_partition_mb
         );
         safe_parallel
+    } else if spec.skip_memory_check {
+        // Skip memory check - dangerous mode for OOM testing
+        println!("WARNING: Skipping memory pre-flight check (--skip-memory-check)");
+        rayon::current_num_threads()
     } else {
         rayon::current_num_threads()
     };
@@ -977,11 +979,29 @@ fn process_single_stress_partition(
     // Tag this thread for the dashboard's per-core task view (stress task type)
     let _core_guard = telemetry.map(|ts| CoreTaskGuard::custom(ts, "stress", partition_id.to_string()));
 
+    // Calculate actual memory to allocate (with optional jitter)
+    let actual_memory_mb = if let Some(pct) = spec.memory_jitter_pct {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        partition_id.hash(&mut hasher);
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos()
+            .hash(&mut hasher);
+        let pseudo_rand = (hasher.finish() % 1000) as f64 / 1000.0; // 0.0 to 1.0
+
+        let factor = 1.0 + (pseudo_rand - 0.5) * 2.0 * (pct as f64 / 100.0);
+        ((spec.memory_mb as f64 * factor) as usize).max(1)
+    } else {
+        spec.memory_mb
+    };
+
     // 1. Memory Load: allocate and hold a large vector.
     // Pre-check available memory to avoid allocation failure (which aborts, not panics)
     let mut mem_hog: Vec<u64> = Vec::new();
-    if spec.memory_mb > 0 {
-        let required_bytes = spec.memory_mb as u64 * 1024 * 1024;
+    if actual_memory_mb > 0 && !spec.skip_memory_check {
+        let required_bytes = actual_memory_mb as u64 * 1024 * 1024;
 
         // Check available memory before attempting allocation
         let mut sys = System::new_with_specifics(
@@ -1004,27 +1024,63 @@ fn process_single_stress_partition(
             )));
         }
 
-        let elements = (spec.memory_mb * 1024 * 1024) / 8;
+        let elements = (actual_memory_mb * 1024 * 1024) / 8;
         mem_hog.resize(elements, 0u64);
         // Force the OS to actually allocate the physical pages by writing to them.
         for i in 0..elements {
             mem_hog[i] = i as u64;
         }
+    } else if actual_memory_mb > 0 {
+        // Skip memory check mode - allocate without pre-check (dangerous)
+        let elements = (actual_memory_mb * 1024 * 1024) / 8;
+        mem_hog.resize(elements, 0u64);
+        for i in 0..elements {
+            mem_hog[i] = i as u64;
+        }
     }
 
-    // 2. CPU Load: spin doing heavy math operations.
+    // 2. CPU Load with optional gradual memory leak
+    // If leak_memory_mb is set, allocate memory gradually during CPU work
+    let mut leaked_memory: Vec<Vec<u8>> = Vec::new();
     if spec.cpu_secs > 0.0 {
         let start = Instant::now();
         let mut dummy: f64 = 1.0;
+
+        // Calculate leak parameters
+        let leak_chunks = if let Some(leak_mb) = spec.leak_memory_mb {
+            let chunk_size = 64 * 1024 * 1024; // 64MB chunks
+            (leak_mb * 1024 * 1024) / chunk_size
+        } else {
+            0
+        };
+
+        let chunk_interval = if leak_chunks > 0 {
+            spec.cpu_secs / leak_chunks as f64
+        } else {
+            f64::MAX
+        };
+
+        let mut next_leak_time = chunk_interval;
+
         while start.elapsed().as_secs_f64() < spec.cpu_secs {
             // Inner tight loop to avoid excessive clock reads
             for _ in 0..10_000 {
                 dummy = dummy.sin().cos().exp();
             }
+
+            // Gradual memory leak during CPU work
+            let elapsed = start.elapsed().as_secs_f64();
+            if elapsed >= next_leak_time && spec.leak_memory_mb.is_some() {
+                let chunk = vec![0xAA_u8; 64 * 1024 * 1024]; // 64MB chunk
+                leaked_memory.push(chunk);
+                next_leak_time += chunk_interval;
+            }
         }
         // Prevent the compiler from optimizing away the math loop
         std::hint::black_box(dummy);
     }
+    // Keep leaked memory alive
+    std::hint::black_box(&leaked_memory);
 
     // 3. Generate read data if requested (write temp file, then read it back)
     let generated_read_path = if spec.generate_read_data {

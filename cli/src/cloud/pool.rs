@@ -3956,6 +3956,9 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         let mut write_dir = None;
         let mut generate_read_data = false;
         let mut read_data_size_mb = 32;
+        let mut leak_memory_mb = None;
+        let mut skip_memory_check = false;
+        let mut memory_jitter_pct = None;
 
         let mut i = 0;
         while i < args.len() {
@@ -4012,6 +4015,26 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                         i += 1;
                     }
                 }
+                "--leak-memory-mb" => {
+                    if i + 1 < args.len() {
+                        leak_memory_mb = args[i + 1].parse().ok();
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                "--skip-memory-check" => {
+                    skip_memory_check = true;
+                    i += 1;
+                }
+                "--memory-jitter-pct" => {
+                    if i + 1 < args.len() {
+                        memory_jitter_pct = args[i + 1].parse().ok();
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
                 _ => i += 1,
             }
         }
@@ -4024,6 +4047,12 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             )));
         }
 
+        // Safety warning for dangerous memory options
+        if skip_memory_check || leak_memory_mb.is_some() {
+            use owo_colors::OwoColorize;
+            eprintln!("{}", "WARNING: Using unsafe memory options - worker may be killed by OOM".yellow().bold());
+        }
+
         let spec = StressSpec {
             partitions,
             cpu_secs,
@@ -4032,6 +4061,9 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             write_dir,
             generate_read_data,
             read_data_size_mb,
+            leak_memory_mb,
+            skip_memory_check,
+            memory_jitter_pct,
         };
 
         // Use a dummy input path and empty filters since stress tests don't read Hail tables

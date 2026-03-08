@@ -99,6 +99,17 @@ impl MetricsDb {
                 status_json TEXT NOT NULL,
                 PRIMARY KEY (job_id, phenotype_id)
             );
+
+            CREATE TABLE IF NOT EXISTS stress_job_params (
+                job_id TEXT PRIMARY KEY,
+                cpu_secs REAL,
+                memory_mb INTEGER,
+                leak_memory_mb INTEGER,
+                memory_jitter_pct INTEGER,
+                skip_memory_check BOOLEAN,
+                read_path TEXT,
+                write_dir TEXT
+            );
             "#,
         )?;
 
@@ -392,6 +403,29 @@ impl MetricsDb {
                 job.job_type,
             ],
         )?;
+
+        // Insert stress job parameters if this is a stress job
+        if let Some(spec_val) = &job.job_spec_json {
+            if spec_val.get("type").and_then(|v| v.as_str()) == Some("Stress") {
+                let _ = conn.execute(
+                    r#"
+                    INSERT INTO stress_job_params (job_id, cpu_secs, memory_mb, leak_memory_mb, memory_jitter_pct, skip_memory_check, read_path, write_dir)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    "#,
+                    params![
+                        job.job_id,
+                        spec_val.get("cpu_secs").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                        spec_val.get("memory_mb").and_then(|v| v.as_i64()).unwrap_or(0),
+                        spec_val.get("leak_memory_mb").and_then(|v| v.as_i64()),
+                        spec_val.get("memory_jitter_pct").and_then(|v| v.as_i64()),
+                        spec_val.get("skip_memory_check").and_then(|v| v.as_bool()).unwrap_or(false),
+                        spec_val.get("read_path").and_then(|v| v.as_str()),
+                        spec_val.get("write_dir").and_then(|v| v.as_str()),
+                    ],
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -654,7 +688,7 @@ impl MetricsDb {
     /// Delete a job and all its associated data.
     ///
     /// Performs a cascading delete across all tables: jobs, events, failures,
-    /// batch_phenotypes, and telemetry. Uses a transaction for atomicity.
+    /// batch_phenotypes, stress_job_params, and telemetry. Uses a transaction for atomicity.
     pub fn delete_job(&self, job_id: &str) -> SqliteResult<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
@@ -666,6 +700,7 @@ impl MetricsDb {
             "DELETE FROM batch_phenotypes WHERE job_id = ?1",
             params![job_id],
         )?;
+        tx.execute("DELETE FROM stress_job_params WHERE job_id = ?1", params![job_id])?;
         tx.execute("DELETE FROM telemetry WHERE job_id = ?1", params![job_id])?;
 
         tx.commit()?;

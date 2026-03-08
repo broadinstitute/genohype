@@ -180,6 +180,9 @@ export const JobSummaryPanel: React.FC = () => {
         </div>
       </div>
 
+      {/* Stress Parameters */}
+      <StressParamsPanel jobSpec={summary.job_spec} />
+
       {/* Cancel Button */}
       <div style={{ marginTop: '16px' }}>
         <button
@@ -189,6 +192,42 @@ export const JobSummaryPanel: React.FC = () => {
         >
           Cancel Job
         </button>
+      </div>
+    </div>
+  );
+};
+
+/** Renders stress test parameters when job_spec is a Stress job */
+const StressParamsPanel: React.FC<{ jobSpec: unknown }> = ({ jobSpec }) => {
+  if (!jobSpec) return null;
+
+  const spec = jobSpec as Record<string, unknown>;
+  if (spec.type !== 'Stress') return null;
+
+  return (
+    <div style={{ marginTop: '16px', padding: '12px', border: '1px dashed var(--border)', borderRadius: '4px' }}>
+      <h3 style={{ fontSize: '12px', marginBottom: '8px', color: 'var(--text-dim)' }}>Stress Parameters</h3>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px', fontSize: '11px' }}>
+        <div>
+          <span style={{ color: 'var(--text-dim)' }}>CPU: </span>
+          {String(spec.cpu_secs ?? 0)}s
+        </div>
+        <div>
+          <span style={{ color: 'var(--text-dim)' }}>Mem (upfront): </span>
+          {String(spec.memory_mb ?? 0)} MB
+        </div>
+        <div>
+          <span style={{ color: 'var(--text-dim)' }}>Mem (leak): </span>
+          {String(spec.leak_memory_mb ?? 0)} MB
+        </div>
+        <div>
+          <span style={{ color: 'var(--text-dim)' }}>Jitter: </span>
+          {spec.memory_jitter_pct ? `±${String(spec.memory_jitter_pct)}%` : 'None'}
+        </div>
+        <div>
+          <span style={{ color: 'var(--text-dim)' }}>Skip Check: </span>
+          {spec.skip_memory_check ? <span style={{ color: 'var(--red)' }}>True</span> : 'False'}
+        </div>
       </div>
     </div>
   );

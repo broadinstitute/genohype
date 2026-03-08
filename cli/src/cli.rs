@@ -755,6 +755,18 @@ pub struct StressArgs {
     /// Size in MB of generated read data per partition (default: 32)
     #[arg(long, default_value = "32")]
     pub read_data_size_mb: usize,
+
+    /// Memory to allocate gradually during CPU work (bypasses pre-flight memory check)
+    #[arg(long)]
+    pub leak_memory_mb: Option<usize>,
+
+    /// Skip worker-side pre-flight memory check (forces execution even if OOM is likely)
+    #[arg(long)]
+    pub skip_memory_check: bool,
+
+    /// Random jitter percentage to apply to memory per task (e.g. 50 = +/- 50%)
+    #[arg(long)]
+    pub memory_jitter_pct: Option<u8>,
 }
 
 /// Subcommands for managing cluster configurations (legacy).

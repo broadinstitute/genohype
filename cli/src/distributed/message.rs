@@ -236,6 +236,15 @@ pub struct StressSpec {
     /// Size in MB of generated read data per partition (default: 32)
     #[serde(default = "default_read_data_size_mb")]
     pub read_data_size_mb: usize,
+    /// Memory to allocate gradually during CPU work (bypasses pre-check)
+    #[serde(default)]
+    pub leak_memory_mb: Option<usize>,
+    /// Skip pre-flight memory check (dangerous, for testing only)
+    #[serde(default)]
+    pub skip_memory_check: bool,
+    /// Random jitter percentage for memory allocation (0-100)
+    #[serde(default)]
+    pub memory_jitter_pct: Option<u8>,
 }
 
 fn default_read_data_size_mb() -> usize {
