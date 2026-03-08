@@ -358,6 +358,8 @@ impl CoordinatorData {
 
     /// Requeue all tasks assigned to a worker that is suspected dead.
     pub(crate) fn requeue_worker_tasks(&mut self, dead_worker_id: &str) {
+        let now_ms = CoordinatorData::now_ms();
+
         // 1. Standard partitions
         let mut lost_parts = Vec::new();
         for (&part_id, (worker, _)) in &self.processing_partitions {
@@ -365,16 +367,31 @@ impl CoordinatorData {
                 lost_parts.push(part_id);
             }
         }
+        // Sort descending so push_front preserves ascending order
+        lost_parts.sort_by(|a, b| b.cmp(a));
+
         for part_id in lost_parts {
             self.processing_partitions.remove(&part_id);
-            let retries = self.retry_counts.entry(part_id).or_insert(0);
-            *retries += 1;
-            if *retries > 3 {
+            let retry_count = {
+                let retries = self.retry_counts.entry(part_id).or_insert(0);
+                *retries += 1;
+                *retries
+            };
+            if retry_count > 3 {
                 println!("Partition {} exceeded max retries (worker {} dead). Marking as failed.", part_id, dead_worker_id);
                 self.failed_partitions.insert(part_id);
             } else {
-                println!("Worker {} died. Requeuing partition {} (retry {}/3)", dead_worker_id, part_id, retries);
+                println!("Worker {} died. Requeuing partition {} (retry {}/3)", dead_worker_id, part_id, retry_count);
                 self.pending_partitions.push_front(part_id);
+
+                // Add REQUEUED event to dashboard
+                self.log_event(JobEvent {
+                    timestamp_ms: now_ms,
+                    event_type: "requeued".to_string(),
+                    worker_id: Some(dead_worker_id.to_string()),
+                    phenotype_id: None,
+                    details: format!("Task {} requeued after worker death (retry {}/3)", part_id, retry_count),
+                });
             }
         }
 
@@ -386,6 +403,7 @@ impl CoordinatorData {
                     lost_exome.push(part_id);
                 }
             }
+            lost_exome.sort_by(|a, b| b.cmp(a));
             for part_id in lost_exome {
                 manhattan.exome_processing.remove(&part_id);
                 println!("Worker {} died. Requeuing exome partition {}", dead_worker_id, part_id);
@@ -398,6 +416,7 @@ impl CoordinatorData {
                     lost_genome.push(part_id);
                 }
             }
+            lost_genome.sort_by(|a, b| b.cmp(a));
             for part_id in lost_genome {
                 manhattan.genome_processing.remove(&part_id);
                 println!("Worker {} died. Requeuing genome partition {}", dead_worker_id, part_id);
@@ -429,6 +448,7 @@ impl CoordinatorData {
                         lost_exome.push(part_id);
                     }
                 }
+                lost_exome.sort_by(|a, b| b.cmp(a));
                 for part_id in lost_exome {
                     state.exome_processing.remove(&part_id);
                     println!("Worker {} died. Requeuing exome partition {} for {}", dead_worker_id, part_id, pheno_id);
@@ -441,6 +461,7 @@ impl CoordinatorData {
                         lost_genome.push(part_id);
                     }
                 }
+                lost_genome.sort_by(|a, b| b.cmp(a));
                 for part_id in lost_genome {
                     state.genome_processing.remove(&part_id);
                     println!("Worker {} died. Requeuing genome partition {} for {}", dead_worker_id, part_id, pheno_id);

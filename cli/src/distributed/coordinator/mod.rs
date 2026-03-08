@@ -1989,26 +1989,58 @@ async fn complete_work(
             details: format!("Failed tasks {:?}: {} (wasted {:.1}s)", task_ids, error, wasted_duration_ms as f64 / 1000.0),
         });
 
-        // Remove from processing and retry or mark as failed (for non-batch jobs)
+        // Only process standard job partitions if they are actually in processing_partitions
+        // This implicitly skips batch/manhattan tasks which use different tracking maps
+        let mut parts_to_requeue = Vec::new();
         for &part_id in &partitions {
+            // Check ownership to prevent race conditions with timeouts stealing tasks
+            if let Some((current_worker, _)) = data.processing_partitions.get(&part_id) {
+                if current_worker != &req.worker_id {
+                    println!(
+                        "Warning: Worker {} reported failure for task {} but it is assigned to {}. Ignoring.",
+                        req.worker_id, part_id, current_worker
+                    );
+                    continue;
+                }
+            } else {
+                // Not in processing partitions (could be a batch job or timed out task)
+                continue;
+            }
+
             data.processing_partitions.remove(&part_id);
+            parts_to_requeue.push(part_id);
+        }
 
+        // Process requeues in reverse order to preserve original queue ordering
+        for &part_id in parts_to_requeue.iter().rev() {
             // Use same retry logic as timeouts
-            let retries = data.retry_counts.entry(part_id).or_insert(0);
-            *retries += 1;
+            let retry_count = {
+                let retries = data.retry_counts.entry(part_id).or_insert(0);
+                *retries += 1;
+                *retries
+            };
 
-            if *retries > 3 {
+            if retry_count > 3 {
                 println!(
                     "Partition {} exceeded max retries ({}), marking as permanently failed",
-                    part_id, retries
+                    part_id, retry_count
                 );
                 data.failed_partitions.insert(part_id);
             } else {
                 println!(
                     "Re-queuing partition {} for retry ({}/3)",
-                    part_id, retries
+                    part_id, retry_count
                 );
                 data.pending_partitions.push_front(part_id);
+
+                // Add REQUEUED event to dashboard
+                data.log_event(JobEvent {
+                    timestamp_ms: now_ms,
+                    event_type: "requeued".to_string(),
+                    worker_id: None,
+                    phenotype_id: None,
+                    details: format!("Task {} requeued after failure (retry {}/3)", part_id, retry_count),
+                });
             }
         }
 
@@ -2075,22 +2107,36 @@ async fn complete_work(
                 Some(ActiveTask::Scan { phenotype_id, source, .. }) => {
                     // Re-queue scan partitions back to the phenotype
                     if let Some(state) = batch.active_phenotypes.get_mut(&phenotype_id) {
-                        // Put partitions back in pending
+                        let mut valid_parts = Vec::new();
+
+                        // Check ownership
                         for &part_id in &partitions {
+                            let is_owned = match source {
+                                ManhattanSource::Exome => state.exome_processing.get(&part_id).map_or(false, |(w, _)| w == &req.worker_id),
+                                ManhattanSource::Genome => state.genome_processing.get(&part_id).map_or(false, |(w, _)| w == &req.worker_id),
+                            };
+
+                            if is_owned {
+                                match source {
+                                    ManhattanSource::Exome => { state.exome_processing.remove(&part_id); }
+                                    ManhattanSource::Genome => { state.genome_processing.remove(&part_id); }
+                                }
+                                valid_parts.push(part_id);
+                            } else {
+                                println!("Warning: Ignoring failure for {} partition {} from {} (not owned)", phenotype_id, part_id, req.worker_id);
+                            }
+                        }
+
+                        // Requeue in reverse order using push_front to preserve original sequence
+                        for &part_id in valid_parts.iter().rev() {
                             match source {
-                                ManhattanSource::Exome => {
-                                    state.exome_processing.remove(&part_id);
-                                    state.exome_pending.push_back(part_id);
-                                }
-                                ManhattanSource::Genome => {
-                                    state.genome_processing.remove(&part_id);
-                                    state.genome_pending.push_back(part_id);
-                                }
+                                ManhattanSource::Exome => state.exome_pending.push_front(part_id),
+                                ManhattanSource::Genome => state.genome_pending.push_front(part_id),
                             }
                         }
                         println!(
                             "Re-queued {} scan tasks for phenotype {} (source: {:?})",
-                            partitions.len(), phenotype_id, source
+                            valid_parts.len(), phenotype_id, source
                         );
                     } else {
                         println!(
@@ -2108,26 +2154,56 @@ async fn complete_work(
 
         // For Manhattan jobs, also update the manhattan state
         if let Some(ref mut manhattan) = data.manhattan_state {
+            let mut valid_exome = Vec::new();
+            let mut valid_genome = Vec::new();
+
             for &part_id in &partitions {
-                manhattan.exome_processing.remove(&part_id);
-                manhattan.genome_processing.remove(&part_id);
+                if manhattan.exome_processing.get(&part_id).map_or(false, |(w, _)| w == &req.worker_id) {
+                    manhattan.exome_processing.remove(&part_id);
+                    valid_exome.push(part_id);
+                }
+
+                if manhattan.genome_processing.get(&part_id).map_or(false, |(w, _)| w == &req.worker_id) {
+                    manhattan.genome_processing.remove(&part_id);
+                    valid_genome.push(part_id);
+                }
+
                 // If this was the aggregate task, mark it failed
                 if manhattan.aggregate_dispatched && !manhattan.aggregate_complete {
                     println!("Aggregate task failed - job cannot complete without fixing the error");
                 }
             }
+
+            for &part_id in valid_exome.iter().rev() {
+                manhattan.exome_pending.push_front(part_id);
+            }
+            for &part_id in valid_genome.iter().rev() {
+                manhattan.genome_pending.push_front(part_id);
+            }
         }
 
         // For ingestion jobs, mark task as failed
         if let Some(ref mut ingestion) = data.ingestion_state {
-            if let Some((phenotype_id, ancestry, _base_path, _worker_id, _start_time)) =
-                ingestion.active_tasks.remove(&task_id)
-            {
-                println!(
-                    "Ingestion failed: {}/{} - {}",
-                    phenotype_id, ancestry, req.error.as_ref().unwrap()
-                );
-                ingestion.failed_count += 1;
+            // Check ownership for ingestion tasks
+            let mut is_owned = false;
+            if let Some((_, _, _, worker_id, _)) = ingestion.active_tasks.get(&task_id) {
+                if worker_id == &req.worker_id {
+                    is_owned = true;
+                } else {
+                    println!("Warning: Ignoring failure for ingestion task {} from {} (assigned to {})", task_id, req.worker_id, worker_id);
+                }
+            }
+
+            if is_owned {
+                if let Some((phenotype_id, ancestry, _base_path, _worker_id, _start_time)) =
+                    ingestion.active_tasks.remove(&task_id)
+                {
+                    println!(
+                        "Ingestion failed: {}/{} - {}",
+                        phenotype_id, ancestry, req.error.as_ref().unwrap()
+                    );
+                    ingestion.failed_count += 1;
+                }
             }
         }
 
@@ -2152,20 +2228,34 @@ async fn complete_work(
     } else {
         // Standard job completion
         for &part_id in &partitions {
-            if data.processing_partitions.remove(&part_id).is_some() {
+            let mut valid_completion = false;
+
+            if let Some((worker_id, _)) = data.processing_partitions.get(&part_id) {
+                if worker_id == &req.worker_id {
+                    valid_completion = true;
+                } else {
+                    println!(
+                        "Warning: task {} completed by {} but is currently assigned to {}",
+                        part_id, req.worker_id, worker_id
+                    );
+                    // It was reassigned, but the slow worker finished it. We still count it as done.
+                }
+            } else {
+                println!(
+                    "Warning: task {} completed by {} but wasn't in processing map",
+                    part_id, req.worker_id
+                );
+            }
+
+            if valid_completion {
+                data.processing_partitions.remove(&part_id);
+            }
+
+            // Mark as complete regardless of ownership (work is done!)
+            if !data.completed_tasks.contains(&part_id) {
                 data.completed_tasks.insert(part_id);
                 // Update progress timestamp (R3)
                 data.last_progress_time = Instant::now();
-            } else {
-                // Partition wasn't in processing (maybe timed out and reassigned)
-                // Still mark as complete if not already
-                if !data.completed_tasks.contains(&part_id) {
-                    println!(
-                        "Warning: task {} completed by {} but wasn't in processing map",
-                        part_id, req.worker_id
-                    );
-                    data.completed_tasks.insert(part_id);
-                }
             }
         }
     }
