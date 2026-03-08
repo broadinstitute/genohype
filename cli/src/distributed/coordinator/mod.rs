@@ -580,6 +580,7 @@ fn touch_worker(
             latest_log_tail: None,
             hardware: None,
             current_batch_size: None,
+            max_batch_capacity: None,
             build_version: None,
         });
     worker.last_seen = Instant::now();
@@ -807,9 +808,12 @@ fn get_batch_work(
         .and_then(|w| w.hardware.as_ref());
 
     let max_batch_size = determine_batch_size(data.config.batch_size, worker_hw, &data.config.job_spec, data.config.memory_weight_mb);
+    // Respect learned capacity ceiling if it exists
+    let worker_cap = data.worker_registry.get(worker_id).and_then(|w| w.max_batch_capacity);
+    let effective_max = worker_cap.unwrap_or(max_batch_size).min(max_batch_size);
     let partition_batch_size = data.worker_registry.get(worker_id)
         .and_then(|w| w.current_batch_size)
-        .unwrap_or_else(|| (max_batch_size / 10).max(2).min(max_batch_size));
+        .unwrap_or_else(|| (effective_max / 10).max(2).min(effective_max));
 
     // Step 1: Activate phenotypes to fill the active pool
     activate_next_phenotypes(batch);
@@ -1125,9 +1129,12 @@ async fn get_work(
             .and_then(|w| w.hardware.as_ref());
 
         let max_batch_size = determine_batch_size(data.config.batch_size, worker_hw, &data.config.job_spec, data.config.memory_weight_mb);
+        // Respect learned capacity ceiling if it exists
+        let worker_cap = data.worker_registry.get(&req.worker_id).and_then(|w| w.max_batch_capacity);
+        let effective_max = worker_cap.unwrap_or(max_batch_size).min(max_batch_size);
         let batch_size = data.worker_registry.get(&req.worker_id)
             .and_then(|w| w.current_batch_size)
-            .unwrap_or_else(|| (max_batch_size / 10).max(2).min(max_batch_size));
+            .unwrap_or_else(|| (effective_max / 10).max(2).min(effective_max));
 
         while partitions.len() < batch_size {
             if let Some(next_id) = data.pending_partitions.pop_front() {
@@ -1241,9 +1248,12 @@ fn get_manhattan_work(
         .and_then(|w| w.hardware.as_ref());
 
     let max_batch_size = determine_batch_size(data.config.batch_size, worker_hw, &data.config.job_spec, data.config.memory_weight_mb);
+    // Respect learned capacity ceiling if it exists
+    let worker_cap = data.worker_registry.get(worker_id).and_then(|w| w.max_batch_capacity);
+    let effective_max = worker_cap.unwrap_or(max_batch_size).min(max_batch_size);
     let batch_size = data.worker_registry.get(worker_id)
         .and_then(|w| w.current_batch_size)
-        .unwrap_or_else(|| (max_batch_size / 10).max(2).min(max_batch_size));
+        .unwrap_or_else(|| (effective_max / 10).max(2).min(effective_max));
 
     // Generate unique task ID for tracking
     let task_id = Uuid::new_v4().to_string();
@@ -1830,6 +1840,23 @@ fn complete_batch_work(
     }
 }
 
+/// Extract the batch capacity from a "batch too large" error message.
+/// Returns the number of partitions the worker can handle, or None if not found.
+/// Expected format: "... only N can fit ..."
+fn extract_capacity_from_error(msg: &str) -> Option<usize> {
+    let prefix = "only ";
+    let suffix = " can fit";
+
+    if let Some(start_idx) = msg.find(prefix) {
+        let remainder = &msg[start_idx + prefix.len()..];
+        if let Some(end_idx) = remainder.find(suffix) {
+            let num_str = remainder[..end_idx].trim();
+            return num_str.parse::<usize>().ok();
+        }
+    }
+    None
+}
+
 /// Handler for POST /complete - worker reports completion.
 async fn complete_work(
     axum::extract::State(state): axum::extract::State<SharedState>,
@@ -1874,9 +1901,21 @@ async fn complete_work(
         // Start conservative if we don't have a baseline yet
         let current_batch = w.current_batch_size.unwrap_or((max_batch / 10).max(2).min(max_batch));
 
-        if req.error.is_some() {
-            // Multiplicative Decrease: halve the batch size on failure/timeout
-            w.current_batch_size = Some((current_batch / 2).max(1));
+        if let Some(ref err_msg) = req.error {
+            // Check if this is a "batch too large" error with capacity info
+            if let Some(capacity) = extract_capacity_from_error(err_msg) {
+                println!(
+                    "Worker {} reported memory capacity limit: {} partitions (was trying {})",
+                    req.worker_id, capacity, current_batch
+                );
+                // Store the learned ceiling
+                w.max_batch_capacity = Some(capacity);
+                // Drop to half the known capacity (safe margin)
+                w.current_batch_size = Some((capacity / 2).max(1));
+            } else {
+                // Standard Multiplicative Decrease: halve the batch size on failure/timeout
+                w.current_batch_size = Some((current_batch / 2).max(1));
+            }
         } else if let Some(task) = &completed_task {
             let duration_secs = (now_ms.saturating_sub(task.started_at_ms)) as f64 / 1000.0;
             let num_tasks = task_ids.len() as f64;
@@ -1885,7 +1924,9 @@ async fn complete_work(
                 let time_per_task = duration_secs / num_tasks;
                 // Target an ideal turnaround of 60 seconds
                 let target_batch = (60.0 / time_per_task).round() as usize;
-                let clamped_target = target_batch.clamp(1, max_batch);
+                // Respect the learned capacity ceiling if it exists
+                let effective_max = w.max_batch_capacity.unwrap_or(max_batch).min(max_batch);
+                let clamped_target = target_batch.clamp(1, effective_max);
 
                 let next_batch = if clamped_target > current_batch {
                     // Additive Increase / Slow Start: grow safely up to the optimal target

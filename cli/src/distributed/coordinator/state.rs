@@ -248,6 +248,9 @@ pub(crate) struct WorkerState {
     pub(crate) hardware: Option<HardwareSpec>,
     /// Dynamically adjusted batch size for this worker (AIMD algorithm)
     pub(crate) current_batch_size: Option<usize>,
+    /// Learned maximum batch capacity from "batch too large" errors
+    /// This caps AIMD growth to prevent repeated OOM failures
+    pub(crate) max_batch_capacity: Option<usize>,
     /// Git commit hash of the worker binary
     pub(crate) build_version: Option<String>,
 }
