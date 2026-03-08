@@ -5,45 +5,7 @@ use crate::cloud::CloudProvider;
 use crate::HailError;
 use crate::Result;
 
-/// Extension trait for command parsing.
-pub trait PoolParser {
-    /// Parse a command array into a JobSpec and input path.
-    fn parse_command_to_job_spec(
-        command: &[String],
-    ) -> Result<(String, crate::distributed::message::JobSpec, Vec<String>, Vec<String>)>;
-
-    /// Parse a `manhattan` command into a ManhattanSpec job.
-    fn parse_manhattan_command(
-        args: &[String],
-    ) -> Result<(String, crate::distributed::message::JobSpec, Vec<String>, Vec<String>)>;
-
-    /// Parse a `manhattan-batch` command into a ManhattanBatch job.
-    fn parse_manhattan_batch_command(
-        args: &[String],
-    ) -> Result<(String, crate::distributed::message::JobSpec, Vec<String>, Vec<String>)>;
-
-    /// Parse a `loci` command into a LociSpec job.
-    fn parse_loci_command(
-        args: &[String],
-    ) -> Result<(String, crate::distributed::message::JobSpec, Vec<String>, Vec<String>)>;
-
-    /// Parse a `stress` command into a StressSpec job.
-    fn parse_stress_command(
-        args: &[String],
-    ) -> Result<(String, crate::distributed::message::JobSpec, Vec<String>, Vec<String>)>;
-
-    /// Parse an `ingest` command into an IngestManhattan job.
-    fn parse_ingest_command(
-        args: &[String],
-    ) -> Result<(String, crate::distributed::message::JobSpec, Vec<String>, Vec<String>)>;
-
-    /// Parse `ingest manhattan` command arguments.
-    fn parse_ingest_manhattan_command(
-        args: &[String],
-    ) -> Result<(String, crate::distributed::message::JobSpec, Vec<String>, Vec<String>)>;
-}
-
-impl<P: CloudProvider + Sync> PoolParser for PoolManager<P> {
+impl<P: CloudProvider + Sync> PoolManager<P> {
     /// Parse a command array into a JobSpec and input path.
     ///
     /// Supported formats:
@@ -51,7 +13,7 @@ impl<P: CloudProvider + Sync> PoolParser for PoolManager<P> {
     /// - `export json <input> <output> [--where ...] [--interval ...]`
     ///
     /// Returns (input_path, job_spec, filters, intervals)
-    fn parse_command_to_job_spec(
+    pub(crate) fn parse_command_to_job_spec(
         command: &[String],
     ) -> Result<(String, crate::distributed::message::JobSpec, Vec<String>, Vec<String>)> {
         use crate::distributed::message::JobSpec;
@@ -205,7 +167,7 @@ impl<P: CloudProvider + Sync> PoolParser for PoolManager<P> {
     /// Parse a `manhattan` command into a ManhattanSpec job.
     ///
     /// Supports: manhattan --exome <path> --genome <path> --output <path> [--threshold ...] ...
-    fn parse_manhattan_command(
+    pub(crate) fn parse_manhattan_command(
         args: &[String],
     ) -> Result<(String, crate::distributed::message::JobSpec, Vec<String>, Vec<String>)> {
         use crate::distributed::message::{JobSpec, ManhattanSpec};
@@ -442,7 +404,7 @@ impl<P: CloudProvider + Sync> PoolParser for PoolManager<P> {
     /// Parse a `manhattan-batch` command into a ManhattanBatch job.
     ///
     /// Supports: manhattan-batch --config <path> or --assets-json <path> --output-dir <path> [--analysis-ids <id,...>] ...
-    fn parse_manhattan_batch_command(
+    pub(crate) fn parse_manhattan_batch_command(
         args: &[String],
     ) -> Result<(String, crate::distributed::message::JobSpec, Vec<String>, Vec<String>)> {
         use crate::distributed::message::{JobSpec, ManhattanSpec};
@@ -754,7 +716,7 @@ impl<P: CloudProvider + Sync> PoolParser for PoolManager<P> {
     }
 
     /// Parse a `loci` command into a LociSpec job.
-    fn parse_loci_command(
+    pub(crate) fn parse_loci_command(
         args: &[String],
     ) -> Result<(String, crate::distributed::message::JobSpec, Vec<String>, Vec<String>)> {
         use crate::distributed::message::{JobSpec, LociSpec};
@@ -877,7 +839,7 @@ impl<P: CloudProvider + Sync> PoolParser for PoolManager<P> {
     }
 
     /// Parse a `stress` command into a StressSpec job.
-    fn parse_stress_command(
+    pub(crate) fn parse_stress_command(
         args: &[String],
     ) -> Result<(String, crate::distributed::message::JobSpec, Vec<String>, Vec<String>)> {
         use crate::distributed::message::{JobSpec, StressSpec};
@@ -1006,7 +968,7 @@ impl<P: CloudProvider + Sync> PoolParser for PoolManager<P> {
     /// Parse an `ingest` command into an IngestManhattan job.
     ///
     /// Supports: ingest manhattan --input-dir <path> --clickhouse-url <url> [--database <db>]
-    fn parse_ingest_command(
+    pub(crate) fn parse_ingest_command(
         args: &[String],
     ) -> Result<(String, crate::distributed::message::JobSpec, Vec<String>, Vec<String>)> {
         if args.is_empty() {
@@ -1032,7 +994,7 @@ impl<P: CloudProvider + Sync> PoolParser for PoolManager<P> {
     }
 
     /// Parse `ingest manhattan` command arguments.
-    fn parse_ingest_manhattan_command(
+    pub(crate) fn parse_ingest_manhattan_command(
         args: &[String],
     ) -> Result<(String, crate::distributed::message::JobSpec, Vec<String>, Vec<String>)> {
         use crate::distributed::message::{InitStrategy, JobSpec};

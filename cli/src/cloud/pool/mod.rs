@@ -13,11 +13,8 @@ pub mod lifecycle;
 pub mod parser;
 pub mod submit;
 
-pub use binary::PoolBinary;
-pub use client::PoolClient;
-pub use lifecycle::PoolLifecycle;
-pub use parser::PoolParser;
-pub use submit::PoolSubmit;
+// Re-export helper types
+pub use submit::{read_completed_checkpoint, WorkerMessage};
 
 use crate::cloud::CloudProvider;
 

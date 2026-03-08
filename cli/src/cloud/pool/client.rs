@@ -6,46 +6,9 @@ use crate::HailError;
 use crate::Result;
 use owo_colors::OwoColorize;
 
-pub trait PoolClient {
-    fn check_coordinator_status(&self, coordinator: &Instance, zone: &str) -> bool;
-    fn fetch_coordinator_api(
-        &self,
-        coordinator: &Instance,
-        zone: &str,
-        endpoint: &str,
-        port: u16,
-    ) -> Result<String>;
-    fn submit_job_via_api(
-        &self,
-        coordinator: &Instance,
-        zone: &str,
-        input_path: &str,
-        job_spec: &crate::distributed::message::JobSpec,
-        total_partitions: usize,
-        force: bool,
-        batch_size: Option<usize>,
-        memory_weight_mb: Option<u64>,
-        filters: &[String],
-        intervals: &[String],
-    ) -> Result<bool>;
-    fn export_metrics_to_gcs(
-        &self,
-        pool_name: &str,
-        coordinator: &Instance,
-        zone: &str,
-        bucket_path: &str,
-    );
-    fn cancel(&self, name: &str, zone: &str) -> Result<()>;
-    fn status(&self, name: &str, zone: &str) -> Result<()>;
-    fn workers(&self, name: &str, zone: &str) -> Result<()>;
-    fn events(&self, name: &str, zone: &str, follow: bool) -> Result<()>;
-    fn failures(&self, name: &str, zone: &str) -> Result<()>;
-    fn logs(&self, name: &str, zone: &str, worker_id: &str) -> Result<()>;
-}
-
-impl<P: CloudProvider + Sync> PoolClient for PoolManager<P> {
+impl<P: CloudProvider + Sync> PoolManager<P> {
     /// Check if coordinator service is already running and reachable.
-    fn check_coordinator_status(&self, coordinator: &Instance, zone: &str) -> bool {
+    pub(crate) fn check_coordinator_status(&self, coordinator: &Instance, zone: &str) -> bool {
         // Try to reach the coordinator's /status endpoint via SSH
         let mut cmd = self.provider.get_ssh_command(
             &coordinator.name,
@@ -69,7 +32,7 @@ impl<P: CloudProvider + Sync> PoolClient for PoolManager<P> {
     ///
     /// If you have an IAP tunnel running (`gcloud compute ssh ... -L 3000:localhost:3000`),
     /// this will use it directly, avoiding the overhead of SSH per-request.
-    fn fetch_coordinator_api(
+    pub(crate) fn fetch_coordinator_api(
         &self,
         coordinator: &Instance,
         zone: &str,
@@ -106,7 +69,7 @@ impl<P: CloudProvider + Sync> PoolClient for PoolManager<P> {
     }
 
     /// Submit job configuration to an already-running coordinator via its API.
-    fn submit_job_via_api(
+    pub(crate) fn submit_job_via_api(
         &self,
         coordinator: &Instance,
         zone: &str,
@@ -239,7 +202,7 @@ impl<P: CloudProvider + Sync> PoolClient for PoolManager<P> {
 
     /// Export metrics database to GCS via coordinator API.
     /// Best-effort: failures are logged but don't block pool destruction.
-    fn export_metrics_to_gcs(
+    pub(crate) fn export_metrics_to_gcs(
         &self,
         pool_name: &str,
         coordinator: &Instance,
@@ -341,7 +304,7 @@ impl<P: CloudProvider + Sync> PoolClient for PoolManager<P> {
     }
 
     /// Cancel a distributed job running on the pool.
-    fn cancel(&self, name: &str, zone: &str) -> Result<()> {
+    pub(crate) fn cancel(&self, name: &str, zone: &str) -> Result<()> {
         let instances = self.provider.list_instances(name)?;
         let coordinator = instances.iter().find(|i| i.name.ends_with("-coordinator"));
 
@@ -385,7 +348,7 @@ impl<P: CloudProvider + Sync> PoolClient for PoolManager<P> {
     }
 
     /// Get status of a distributed job running on the pool.
-    fn status(&self, name: &str, zone: &str) -> Result<()> {
+    pub(crate) fn status(&self, name: &str, zone: &str) -> Result<()> {
         let instances = self.provider.list_instances(name)?;
         let coordinator = instances
             .iter()
@@ -427,7 +390,7 @@ impl<P: CloudProvider + Sync> PoolClient for PoolManager<P> {
     }
 
     /// Show real-time worker activity.
-    fn workers(&self, name: &str, zone: &str) -> Result<()> {
+    pub(crate) fn workers(&self, name: &str, zone: &str) -> Result<()> {
         use crate::distributed::message::DashboardWorker;
 
         let instances = self.provider.list_instances(name)?;
@@ -504,7 +467,7 @@ impl<P: CloudProvider + Sync> PoolClient for PoolManager<P> {
     }
 
     /// Tail the event log.
-    fn events(&self, name: &str, zone: &str, follow: bool) -> Result<()> {
+    pub(crate) fn events(&self, name: &str, zone: &str, follow: bool) -> Result<()> {
         use crate::distributed::message::EventsResponse;
 
         let instances = self.provider.list_instances(name)?;
@@ -589,7 +552,7 @@ impl<P: CloudProvider + Sync> PoolClient for PoolManager<P> {
     }
 
     /// Show recent task failures.
-    fn failures(&self, name: &str, zone: &str) -> Result<()> {
+    pub(crate) fn failures(&self, name: &str, zone: &str) -> Result<()> {
         use crate::distributed::message::FailuresResponse;
 
         let instances = self.provider.list_instances(name)?;
@@ -642,7 +605,7 @@ impl<P: CloudProvider + Sync> PoolClient for PoolManager<P> {
     }
 
     /// Show tail of a specific worker's logs.
-    fn logs(&self, name: &str, zone: &str, worker_id: &str) -> Result<()> {
+    pub(crate) fn logs(&self, name: &str, zone: &str, worker_id: &str) -> Result<()> {
         let instances = self.provider.list_instances(name)?;
         let coordinator = instances
             .iter()

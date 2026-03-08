@@ -2,7 +2,7 @@
 
 use crate::cli::PoolCommands;
 use crate::cloud::gcp::GcpClient;
-use crate::cloud::pool::{PoolBinary, PoolClient, PoolLifecycle, PoolManager, PoolSubmit};
+use crate::cloud::pool::PoolManager;
 use crate::cloud::PoolConfig;
 use crate::config;
 use genohype_core::Result;

@@ -1,115 +1,25 @@
 //! Job submission orchestration.
 
-use super::binary::PoolBinary;
-use super::client::PoolClient;
-use super::lifecycle::PoolLifecycle;
-use super::parser::PoolParser;
+mod legacy_runner;
+mod preflight;
+
+pub use legacy_runner::WorkerMessage;
+pub use preflight::read_completed_checkpoint;
+
 use super::PoolManager;
 use crate::benchmark::BenchmarkReport;
-use crate::cloud::{CloudProvider, Instance, ProgressUpdate};
+use crate::cloud::{CloudProvider, Instance};
 use crate::HailError;
 use crate::Result;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use owo_colors::OwoColorize;
-use rayon::prelude::*;
-use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Instant;
 
-/// Messages sent from worker threads to the coordinator.
-pub enum WorkerMessage {
-    /// A log line from the worker
-    Log { worker_id: usize, line: String },
-    /// A progress update from the worker
-    Progress {
-        worker_id: usize,
-        update: ProgressUpdate,
-    },
-    /// A benchmark report from the worker
-    Report {
-        worker_id: usize,
-        report: BenchmarkReport,
-    },
-    /// Worker completed successfully
-    Complete { worker_id: usize },
-    /// Worker encountered an error
-    Error { worker_id: usize, message: String },
-}
-
-/// Read the checkpoint file listing completed phenotypes.
-///
-/// The checkpoint file is a simple newline-delimited list of relative paths
-/// like "meta/height" or "afr/1234".
-pub fn read_completed_checkpoint(checkpoint_path: &str) -> Result<std::collections::HashSet<String>> {
-    use object_store::ObjectStore;
-    use object_store::path::Path as ObjPath;
-
-    let url = url::Url::parse(checkpoint_path).map_err(|e| {
-        HailError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("Invalid checkpoint URL: {}", e),
-        ))
-    })?;
-
-    let (store, path): (std::sync::Arc<dyn ObjectStore>, ObjPath) = match url.scheme() {
-        #[cfg(feature = "gcp")]
-        "gs" => {
-            let bucket = url.host_str().ok_or_else(|| {
-                HailError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "Missing bucket in GCS URL",
-                ))
-            })?;
-            let path = url.path().trim_start_matches('/');
-            (genohype_core::io::get_gcs_client(bucket)?, ObjPath::from(path))
-        }
-        scheme => {
-            return Err(HailError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("Unsupported URL scheme for checkpoint: {}", scheme),
-            )));
-        }
-    };
-
-    // Read the file contents
-    let rt = tokio::runtime::Runtime::new().map_err(|e| {
-        HailError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-    })?;
-
-    let bytes = rt.block_on(async {
-        store.get(&path).await?.bytes().await
-    }).map_err(|e| {
-        HailError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Failed to read checkpoint: {}", e),
-        ))
-    })?;
-
-    // Parse as newline-delimited list
-    let content = String::from_utf8_lossy(&bytes);
-    let completed: std::collections::HashSet<String> = content
-        .lines()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    Ok(completed)
-}
-
-pub trait PoolSubmit {
-    fn start_idle_coordinator(&self, pool_name: &str, zone: &str, _skip_build: bool, pool_db_path: Option<&str>, binary_deployed_via_startup: bool) -> Result<()>;
-    fn submit(&self, name: &str, zone: &str, binary_path: Option<String>, auto_stop: bool, force_redeploy: bool, force: bool, autoscale: bool, skip_build: bool, batch_size: Option<usize>, memory_weight_mb: Option<u64>, config: Option<&crate::cloud::ScalingConfig>, command: &[String]) -> Result<()>;
-    fn submit_internal(&self, name: &str, zone: &str, binary_path: Option<String>, auto_stop: bool, force_redeploy: bool, force: bool, batch_size: Option<usize>, memory_weight_mb: Option<u64>, config: Option<&crate::cloud::ScalingConfig>, command: &[String]) -> Result<()>;
-    fn submit_distributed(&self, _pool_name: &str, zone: &str, coordinator: &Instance, workers: &[Instance], command: &[String], auto_stop: bool, force: bool, batch_size: Option<usize>, memory_weight_mb: Option<u64>, config: Option<&crate::cloud::ScalingConfig>) -> Result<()>;
-    fn start_worker_services(&self, workers: &[Instance], coord_ip: &str, zone: &str) -> Result<()>;
-    fn fetch_and_display_summary_results(&self, coordinator: &Instance, zone: &str) -> Result<()>;
-    fn run_worker_job(worker_id: usize, cmd: std::process::Command, tx: &mpsc::Sender<WorkerMessage>) -> Result<()>;
-}
-
-impl<P: CloudProvider + Sync> PoolSubmit for PoolManager<P> {
+impl<P: CloudProvider + Sync> PoolManager<P> {
     /// Start coordinator in idle mode (binary already deployed via startup script or needs deployment).
-    fn start_idle_coordinator(
+    pub(crate) fn start_idle_coordinator(
         &self,
         pool_name: &str,
         zone: &str,
@@ -273,7 +183,7 @@ EOF
     ///
     /// If `autoscale` is true and `config` is provided, automatically scales
     /// workers up before the job and down to 0 after the job completes.
-    fn submit(
+    pub(crate) fn submit(
         &self,
         name: &str,
         zone: &str,
@@ -389,7 +299,7 @@ EOF
     }
 
     /// Internal submit implementation (called by submit, handles the actual job).
-    fn submit_internal(
+    pub(crate) fn submit_internal(
         &self,
         name: &str,
         zone: &str,
@@ -865,7 +775,7 @@ EOF
     /// 4. Or starts the coordinator service on the coordinator VM (legacy)
     /// 5. Starts worker services on all worker VMs
     /// 6. Streams coordinator logs for progress monitoring
-    fn submit_distributed(
+    pub(crate) fn submit_distributed(
         &self,
         _pool_name: &str,
         zone: &str,
@@ -1422,7 +1332,7 @@ EOF
     }
 
     /// Start worker services on the given instances.
-    fn start_worker_services(&self, workers: &[Instance], coord_ip: &str, zone: &str) -> Result<()> {
+    pub(crate) fn start_worker_services(&self, workers: &[Instance], coord_ip: &str, zone: &str) -> Result<()> {
         use rayon::prelude::*;
 
         let worker_results: Vec<Result<()>> = workers
@@ -1476,7 +1386,7 @@ EOF
     }
 
     /// Fetch aggregated summary results from coordinator and display them.
-    fn fetch_and_display_summary_results(&self, coordinator: &Instance, zone: &str) -> Result<()> {
+    pub(crate) fn fetch_and_display_summary_results(&self, coordinator: &Instance, zone: &str) -> Result<()> {
         use genohype_core::summary::stats::StatsAccumulator;
 
         // Fetch results file saved by coordinator before exit
@@ -1571,57 +1481,6 @@ EOF
             );
         }
 
-        Ok(())
-    }
-
-    /// Run a job on a single worker, streaming output.
-    fn run_worker_job(
-        worker_id: usize,
-        mut cmd: std::process::Command,
-        tx: &mpsc::Sender<WorkerMessage>,
-    ) -> Result<()> {
-        let mut child = cmd.spawn().map_err(HailError::Io)?;
-
-        // Stream stdout
-        if let Some(stdout) = child.stdout.take() {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines() {
-                if let Ok(l) = line {
-                    // Check if line is JSON
-                    if l.trim().starts_with('{') {
-                        // Try to parse as progress update first
-                        if l.contains("\"type\":\"progress\"") {
-                            if let Ok(update) = serde_json::from_str::<ProgressUpdate>(&l) {
-                                let _ = tx.send(WorkerMessage::Progress { worker_id, update });
-                                continue;
-                            }
-                        }
-                        // Try to parse as benchmark report
-                        if l.contains("\"total_rows\"") {
-                            if let Ok(report) = serde_json::from_str::<BenchmarkReport>(&l) {
-                                let _ = tx.send(WorkerMessage::Report { worker_id, report });
-                                continue;
-                            }
-                        }
-                    }
-                    // Otherwise send as log line
-                    let _ = tx.send(WorkerMessage::Log {
-                        worker_id,
-                        line: l,
-                    });
-                }
-            }
-        }
-
-        let status = child.wait().map_err(HailError::Io)?;
-        if !status.success() {
-            return Err(HailError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Worker {} exited with status: {}", worker_id, status),
-            )));
-        }
-
-        let _ = tx.send(WorkerMessage::Complete { worker_id });
         Ok(())
     }
 }

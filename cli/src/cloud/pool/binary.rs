@@ -1,6 +1,5 @@
 //! Binary compilation and deployment operations.
 
-use super::client::PoolClient;
 use super::PoolManager;
 use crate::cloud::{CloudProvider, Instance};
 use crate::HailError;
@@ -9,38 +8,9 @@ use owo_colors::OwoColorize;
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 
-pub trait PoolBinary {
-    fn stage_binary_to_gcs(&self, binary: &Path, pool_db_path: &str) -> Result<String>;
-    fn update_binary(
-        &self,
-        name: &str,
-        zone: &str,
-        binary_path: Option<String>,
-        skip_build: bool,
-        pool_db_path: Option<&str>,
-    ) -> Result<()>;
-    fn update_binary_via_api(
-        &self,
-        binary_path: Option<String>,
-        skip_build: bool,
-        pool_db_path: Option<&str>,
-        port: u16,
-    ) -> Result<()>;
-    fn deploy_binary(&self, binary: &Path, instances: &[Instance], zone: &str) -> Result<()>;
-    fn propagate_binary_from_coordinator(
-        &self,
-        coordinator_ip: &str,
-        workers: &[Instance],
-        zone: &str,
-    ) -> Result<()>;
-    fn build_linux_binary(features: &[&str]) -> Result<()>;
-    fn has_bundled_binary(&self) -> bool;
-    fn locate_binary(&self, path: Option<String>) -> Result<PathBuf>;
-}
-
-impl<P: CloudProvider + Sync> PoolBinary for PoolManager<P> {
+impl<P: CloudProvider + Sync> PoolManager<P> {
     /// Stage the genohype binary to GCS for fast worker pulls.
-    fn stage_binary_to_gcs(&self, binary: &Path, pool_db_path: &str) -> Result<String> {
+    pub(crate) fn stage_binary_to_gcs(&self, binary: &Path, pool_db_path: &str) -> Result<String> {
         use genohype_core::io::CloudWriter;
         use std::io::Write;
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -83,7 +53,7 @@ impl<P: CloudProvider + Sync> PoolBinary for PoolManager<P> {
     ///
     /// This is useful for updating code on a long-running pool without
     /// destroying and recreating it.
-    fn update_binary(
+    pub(crate) fn update_binary(
         &self,
         name: &str,
         zone: &str,
@@ -327,7 +297,7 @@ EOF
     ///
     /// Requires an IAP tunnel to the coordinator on localhost:port.
     /// Uses /api/update-coordinator and /api/update-fleet endpoints.
-    fn update_binary_via_api(
+    pub(crate) fn update_binary_via_api(
         &self,
         binary_path: Option<String>,
         skip_build: bool,
@@ -583,7 +553,7 @@ EOF
     }
 
     /// Deploy binary to instances via SCP upload.
-    fn deploy_binary(&self, binary: &Path, instances: &[Instance], zone: &str) -> Result<()> {
+    pub(crate) fn deploy_binary(&self, binary: &Path, instances: &[Instance], zone: &str) -> Result<()> {
         instances.par_iter().try_for_each(|inst| {
             // Upload to /tmp first (user writable)
             self.provider
@@ -614,7 +584,7 @@ EOF
     ///
     /// This is much faster than uploading to each worker via SCP from the client machine,
     /// since it leverages the high-bandwidth GCP internal network.
-    fn propagate_binary_from_coordinator(
+    pub(crate) fn propagate_binary_from_coordinator(
         &self,
         coordinator_ip: &str,
         workers: &[Instance],
@@ -661,7 +631,7 @@ EOF
     ///
     /// On macOS, uses `cargo linux` (cargo-zigbuild) to cross-compile.
     /// On Linux, uses regular `cargo build`.
-    fn build_linux_binary(features: &[&str]) -> Result<()> {
+    pub(crate) fn build_linux_binary(features: &[&str]) -> Result<()> {
         let is_macos = cfg!(target_os = "macos");
 
         if is_macos {
@@ -745,7 +715,7 @@ EOF
     }
 
     /// Check if a bundled worker binary exists next to the executable.
-    fn has_bundled_binary(&self) -> bool {
+    pub(crate) fn has_bundled_binary(&self) -> bool {
         if let Ok(exe_path) = std::env::current_exe() {
             if let Some(exe_dir) = exe_path.parent() {
                 // Check for genohype-worker (standard release name)
@@ -758,7 +728,7 @@ EOF
     }
 
     /// Locate the Linux binary for deployment.
-    fn locate_binary(&self, path: Option<String>) -> Result<PathBuf> {
+    pub(crate) fn locate_binary(&self, path: Option<String>) -> Result<PathBuf> {
         if let Some(p) = path {
             let path = PathBuf::from(&p);
             if path.exists() {

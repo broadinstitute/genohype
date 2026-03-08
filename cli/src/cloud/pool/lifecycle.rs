@@ -1,8 +1,5 @@
 //! Pool lifecycle management (create, destroy, scale, list).
 
-use super::binary::PoolBinary;
-use super::client::PoolClient;
-use super::submit::PoolSubmit;
 use super::PoolManager;
 use crate::cloud::startup;
 use crate::cloud::{CloudProvider, Instance, PoolConfig};
@@ -10,23 +7,14 @@ use crate::HailError;
 use crate::Result;
 use owo_colors::OwoColorize;
 
-pub trait PoolLifecycle {
-    fn create(&self, config: &PoolConfig, wait: bool, skip_build: bool) -> Result<()>;
-    fn wait_for_pool_ready(&self, pool_name: &str, zone: &str, timeout_secs: u64) -> Result<()>;
-    fn destroy(&self, name: &str, zone: &str, metrics_bucket: Option<&str>) -> Result<()>;
-    fn list(&self, name: &str) -> Result<Vec<Instance>>;
-    fn scale(&self, name: &str, target_workers: usize, zone: &str, binary_path: Option<String>, skip_build: bool, config: &crate::cloud::ScalingConfig) -> Result<()>;
-    fn wait_for_startup_complete(&self, instance_name: &str, zone: &str, timeout_secs: u64) -> Result<()>;
-}
-
-impl<P: CloudProvider + Sync> PoolLifecycle for PoolManager<P> {
+impl<P: CloudProvider + Sync> PoolManager<P> {
     /// Create a new worker pool.
     ///
     /// Provisions `config.worker_count` VMs in parallel.
     /// If `wait` is true, polls until all VMs have completed their startup scripts.
     /// Automatically builds Linux binary if on macOS (unless `skip_build` is true).
     /// If `with_coordinator` is true, also starts the coordinator in idle mode.
-    fn create(&self, config: &PoolConfig, wait: bool, skip_build: bool) -> Result<()> {
+    pub(crate) fn create(&self, config: &PoolConfig, wait: bool, skip_build: bool) -> Result<()> {
         // Determine if we should build
         // 1. Explicit skip_build -> skip
         // 2. We have a bundled binary -> skip (Release mode)
@@ -107,7 +95,7 @@ impl<P: CloudProvider + Sync> PoolLifecycle for PoolManager<P> {
     }
 
     /// Wait for all instances in a pool to complete their startup scripts.
-    fn wait_for_pool_ready(&self, pool_name: &str, zone: &str, timeout_secs: u64) -> Result<()> {
+    pub(crate) fn wait_for_pool_ready(&self, pool_name: &str, zone: &str, timeout_secs: u64) -> Result<()> {
         use std::time::{Duration, Instant};
 
         let start = Instant::now();
@@ -167,7 +155,7 @@ impl<P: CloudProvider + Sync> PoolLifecycle for PoolManager<P> {
     ///
     /// Deletes all VMs tagged with the pool name.
     /// If `metrics_bucket` is provided, exports metrics to GCS before deletion.
-    fn destroy(&self, name: &str, zone: &str, metrics_bucket: Option<&str>) -> Result<()> {
+    pub(crate) fn destroy(&self, name: &str, zone: &str, metrics_bucket: Option<&str>) -> Result<()> {
         println!("{} pool '{}'...", "Destroying".red(), name.bright_white());
 
         // First list to show what we're deleting
@@ -197,7 +185,7 @@ impl<P: CloudProvider + Sync> PoolLifecycle for PoolManager<P> {
     }
 
     /// List instances in a pool.
-    fn list(&self, name: &str) -> Result<Vec<Instance>> {
+    pub(crate) fn list(&self, name: &str) -> Result<Vec<Instance>> {
         let instances = self.provider.list_instances(name)?;
 
         if instances.is_empty() {
@@ -233,7 +221,7 @@ impl<P: CloudProvider + Sync> PoolLifecycle for PoolManager<P> {
     /// - Scale down: delete workers with highest indices
     ///
     /// The coordinator is never affected by scaling operations.
-    fn scale(
+    pub(crate) fn scale(
         &self,
         name: &str,
         target_workers: usize,
@@ -456,7 +444,7 @@ impl<P: CloudProvider + Sync> PoolLifecycle for PoolManager<P> {
     }
 
     /// Wait for startup script to complete on a specific instance.
-    fn wait_for_startup_complete(
+    pub(crate) fn wait_for_startup_complete(
         &self,
         instance_name: &str,
         zone: &str,
