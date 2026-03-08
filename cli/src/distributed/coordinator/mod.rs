@@ -22,6 +22,7 @@
 pub mod api;
 pub mod monitor;
 pub mod scheduler;
+pub mod services;
 pub mod state;
 pub mod ui;
 

@@ -3,16 +3,17 @@
 //! Handlers for job submission, cancellation, result retrieval,
 //! metrics export, fleet management, and binary serving.
 
+use crate::distributed::coordinator::services;
 use crate::distributed::coordinator::state::{
-    BatchState, CoordinatorData, IngestionState, ManhattanPhase, ManhattanPipelineState,
+    CoordinatorData, ManhattanPhase, ManhattanPipelineState,
     SharedState, WorkerStatus, BATCH_ACTIVE_LIMIT,
 };
 use crate::distributed::message::{
     CancelRequest, CancelResponse, EventsResponse, ExportMetricsRequest, ExportMetricsResponse,
     FailuresResponse, JobConfigRequest, JobConfigResponse, JobRecord, JobResultResponse,
-    JobSpec, ManhattanAggregateSpec, PhenotypeStatus, UpdateFleetRequest,
+    JobSpec, UpdateFleetRequest,
 };
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 use uuid::Uuid;
 
@@ -21,75 +22,6 @@ use uuid::Uuid;
 pub(crate) struct EventsQuery {
     #[serde(default)]
     pub(crate) since_ms: u64,
-}
-
-/// Discover phenotypes for ingestion by scanning GCS for manifest.json files.
-///
-/// Expected directory structure: {input_dir}/{ancestry}/{phenotype_id}/manifest.json
-/// Returns: Vec of (phenotype_id, ancestry, base_path)
-pub(crate) fn discover_phenotypes_for_ingestion(
-    input_dir: &str,
-) -> crate::Result<Vec<(String, String, String)>> {
-    use std::process::Command;
-
-    let input_dir = input_dir.trim_end_matches('/');
-
-    // Use gsutil to list all manifest.json files recursively
-    // This is more reliable than object_store listing for discovering subdirectories
-    let output = Command::new("gsutil")
-        .args(["-m", "ls", "-r", &format!("{}/**/manifest.json", input_dir)])
-        .output()
-        .map_err(|e| {
-            crate::HailError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to run gsutil: {}", e),
-            ))
-        })?;
-
-    if !output.status.success() {
-        // If no files found, return empty vec (not an error)
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("matched no objects") || stderr.contains("CommandException") {
-            return Ok(Vec::new());
-        }
-        return Err(crate::HailError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("gsutil failed: {}", stderr),
-        )));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut phenotypes = Vec::new();
-
-    for line in stdout.lines() {
-        let line = line.trim();
-        if !line.ends_with("/manifest.json") {
-            continue;
-        }
-
-        // Parse path: gs://bucket/base/{ancestry}/{phenotype_id}/manifest.json
-        // Remove /manifest.json to get base_path
-        let base_path = line.trim_end_matches("/manifest.json");
-
-        // Extract ancestry and phenotype_id from path
-        // Take last two segments
-        let segments: Vec<&str> = base_path.split('/').collect();
-        if segments.len() < 2 {
-            continue;
-        }
-
-        let phenotype_id = segments[segments.len() - 1].to_string();
-        let ancestry = segments[segments.len() - 2].to_string();
-
-        // Skip if ancestry looks like a bucket or path component
-        if ancestry.is_empty() || phenotype_id.is_empty() {
-            continue;
-        }
-
-        phenotypes.push((phenotype_id, ancestry, base_path.to_string()));
-    }
-
-    Ok(phenotypes)
 }
 
 /// Handler for POST /api/job - submit a job to an idle coordinator.
@@ -291,80 +223,8 @@ pub(crate) async fn submit_job(
             total_phenotypes, BATCH_ACTIVE_LIMIT, mode
         );
 
-        // Initialize status map for all phenotypes
-        let mut phenotype_statuses = HashMap::new();
-        for spec in specs {
-            let id = spec.output_path.clone();
-            phenotype_statuses.insert(
-                id.clone(),
-                PhenotypeStatus {
-                    id,
-                    stage: if mode == crate::distributed::message::ExecutionMode::AggregateOnly {
-                        "aggregating".to_string()
-                    } else {
-                        "queued".to_string()
-                    },
-                    partitions_done: 0,
-                    partitions_total: 0, // Updated when activated
-                    result: None,
-                    error: None,
-                    duration_secs: None,
-                    cpu_core_secs: None,
-                },
-            );
-        }
-
-        let mut batch_state = BatchState {
-            mode,
-            phenotype_statuses,
-            phenotype_start_times: HashMap::new(),
-            phenotype_cpu_secs: HashMap::new(),
-            pending_queue: VecDeque::new(),
-            active_phenotypes: HashMap::new(),
-            ready_to_aggregate: Vec::new(),
-            completed_count: 0,
-            failed_count: 0,
-            total_phenotypes,
-            aggregate_retry_counts: HashMap::new(),
-            aggregate_specs: HashMap::new(),
-        };
-
-        if mode == crate::distributed::message::ExecutionMode::AggregateOnly {
-            for spec in specs {
-                let id = spec.output_path.clone();
-                let aggregate_spec = ManhattanAggregateSpec {
-                    output_path: spec.output_path.clone(),
-                    phenotype_id: spec.phenotype.clone(),
-                    ancestry: spec.ancestry.clone(),
-                    exome_results: spec.exome.clone(),
-                    genome_results: spec.genome.clone(),
-                    gene_burden: spec.gene_burden.clone(),
-                    exome_exp_p: spec.exome_exp_p.clone(),
-                    genome_exp_p: spec.genome_exp_p.clone(),
-                    exome_annotations: spec.exome_annotations.clone(),
-                    genome_annotations: spec.genome_annotations.clone(),
-                    genes: spec.genes.clone(),
-                    threshold: spec.threshold,
-                    gene_threshold: spec.gene_threshold,
-                    locus_threshold: spec.locus_threshold,
-                    locus_window: spec.locus_window,
-                    locus_plots: spec.locus_plots,
-                    min_variants_per_locus: spec.min_variants_per_locus,
-                    width: spec.width,
-                    height: spec.height,
-                    layout: spec.layout.clone().unwrap_or_default(),
-                    y_scale: spec.y_scale.clone().unwrap_or_default(),
-                    cleanup: false,
-                    styling: spec.styling.clone(),
-                };
-                batch_state
-                    .aggregate_specs
-                    .insert(id.clone(), aggregate_spec.clone());
-                batch_state.ready_to_aggregate.push((id, aggregate_spec));
-            }
-        } else {
-            batch_state.pending_queue = specs.iter().cloned().collect();
-        }
+        // Use the services layer to initialize batch state
+        let batch_state = services::init_batch_state(specs, mode);
 
         data.batch_state = Some(batch_state);
 
@@ -404,67 +264,29 @@ pub(crate) async fn submit_job(
         // Execute DDL based on init_strategy (before dispatching tasks)
         #[cfg(feature = "clickhouse")]
         {
-            use crate::distributed::message::InitStrategy;
-            use crate::export::ClickHouseClient;
-            use crate::ingest::get_manhattan_schemas;
-
-            if *init_strategy != InitStrategy::Append {
-                println!("  Initializing tables...");
-                let client = ClickHouseClient::new(clickhouse_url);
-                let schemas = get_manhattan_schemas();
-
-                for (table_name, create_sql) in schemas {
-                    // If replace strategy, drop the table first
-                    if *init_strategy == InitStrategy::Replace {
-                        let drop_sql = format!("DROP TABLE IF EXISTS {}", table_name);
-                        match client.execute(&drop_sql) {
-                            Ok(_) => println!("    Dropped table: {}", table_name),
-                            Err(e) => {
-                                return axum::Json(JobConfigResponse {
-                                    acknowledged: false,
-                                    error: Some(format!(
-                                        "Failed to drop table {}: {}",
-                                        table_name, e
-                                    )),
-                                });
-                            }
-                        }
-                    }
-
-                    // Create the table (for both Create and Replace strategies)
-                    match client.execute(create_sql) {
-                        Ok(_) => println!("    Created table: {}", table_name),
-                        Err(e) => {
-                            return axum::Json(JobConfigResponse {
-                                acknowledged: false,
-                                error: Some(format!(
-                                    "Failed to create table {}: {}",
-                                    table_name, e
-                                )),
-                            });
-                        }
-                    }
-                }
-                println!("  Table initialization complete.");
+            if let Err(e) = services::init_clickhouse_tables(clickhouse_url, init_strategy) {
+                return axum::Json(JobConfigResponse {
+                    acknowledged: false,
+                    error: Some(e),
+                });
             }
         }
 
         // Discover phenotypes by scanning for manifest.json files
         // Structure: {input_dir}/{ancestry}/{phenotype_id}/manifest.json
-        match discover_phenotypes_for_ingestion(input_dir) {
+        match services::discover_phenotypes_for_ingestion(input_dir) {
             Ok(phenotypes) => {
                 let total = phenotypes.len();
                 println!("  Discovered {} phenotypes for ingestion", total);
 
-                data.ingestion_state = Some(IngestionState {
-                    pending_tasks: phenotypes.into_iter().collect(),
-                    active_tasks: HashMap::new(),
-                    clickhouse_url: clickhouse_url.clone(),
-                    database: database.clone(),
-                    completed_count: 0,
-                    failed_count: 0,
-                    total_tasks: total,
-                });
+                #[cfg(feature = "clickhouse")]
+                {
+                    data.ingestion_state = Some(services::create_ingestion_state(
+                        phenotypes,
+                        clickhouse_url,
+                        database,
+                    ));
+                }
 
                 return axum::Json(JobConfigResponse {
                     acknowledged: true,
