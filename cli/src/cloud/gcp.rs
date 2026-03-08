@@ -183,23 +183,27 @@ impl CloudProvider for GcpClient {
         self.check_gcloud_installed()?;
 
         // Generate startup scripts (with optional binary download from GCS)
-        let worker_script =
-            super::startup::generate_startup_script(config.binary_gcs_url.as_deref());
-        let coordinator_script = config.wireguard.as_ref().map(|wg| {
-            super::startup::generate_coordinator_startup_script(wg, config.binary_gcs_url.as_deref())
-        });
+        // Workers auto-start and connect to coordinator via internal DNS
+        let worker_script = super::startup::generate_worker_startup_script(
+            config.binary_gcs_url.as_deref(),
+            &config.name,
+        );
+        // Coordinator auto-starts if binary is provided
+        let coordinator_script = super::startup::generate_coordinator_startup_script(
+            config.wireguard.as_ref(),
+            config.binary_gcs_url.as_deref(),
+            config.pool_db_path.as_deref(),
+        );
 
         // Build list of instances to create: coordinator (optional) + workers
         let mut instance_configs: Vec<(String, String, String)> = Vec::new(); // (name, tags, script)
 
         // Add coordinator if requested
         if config.with_coordinator {
-            // Use WireGuard script for coordinator if configured, otherwise standard script
-            let coord_script = coordinator_script.clone().unwrap_or_else(|| worker_script.clone());
             instance_configs.push((
                 format!("{}-coordinator", config.name),
                 format!("genohype-coordinator,pool-{},role-coordinator", config.name),
-                coord_script,
+                coordinator_script,
             ));
         }
 

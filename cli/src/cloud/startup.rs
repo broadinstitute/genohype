@@ -10,10 +10,13 @@ use super::WireGuardConfig;
 /// The script installs minimal dependencies needed to run the Rust binary:
 /// - libssl-dev (for TLS/HTTPS support)
 /// - ca-certificates (for certificate verification)
+/// - curl (for health checks and API calls)
 ///
-/// If `binary_gcs_url` is provided, the binary is downloaded from GCS during startup.
-/// This eliminates the need for SSH-based binary deployment.
-pub fn generate_startup_script(binary_gcs_url: Option<&str>) -> String {
+/// If `binary_gcs_url` is provided, the binary is downloaded from GCS during startup
+/// and the worker service is automatically started, connecting to the coordinator
+/// via internal DNS (`{pool_name}-coordinator:3000`). This achieves "zero-SSH"
+/// deployment for distributed jobs.
+pub fn generate_worker_startup_script(binary_gcs_url: Option<&str>, pool_name: &str) -> String {
     let binary_download = if let Some(gcs_url) = binary_gcs_url {
         format!(
             r#"
@@ -23,8 +26,13 @@ gsutil cp {} /tmp/genohype
 chmod +x /tmp/genohype
 mv /tmp/genohype /usr/local/bin/genohype
 echo "Binary installed at /usr/local/bin/genohype"
+
+# Start worker service
+WORKER_ID=$(curl -s "http://metadata.google.internal/computeMetadata/v1/instance/name" -H "Metadata-Flavor: Google")
+echo "Starting worker $WORKER_ID connecting to {}-coordinator..."
+nohup /usr/local/bin/genohype service start-worker --url http://{}-coordinator:3000 --worker-id $WORKER_ID > /tmp/worker.log 2>&1 &
 "#,
-            gcs_url
+            gcs_url, pool_name, pool_name
         )
     } else {
         String::new()
@@ -40,7 +48,7 @@ echo "Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 # Install dependencies required for the Rust binary
 apt-get update -qq
-apt-get install -y -qq libssl-dev ca-certificates
+apt-get install -y -qq libssl-dev ca-certificates curl
 
 # Create directory for the binary
 mkdir -p /usr/local/bin
@@ -58,23 +66,30 @@ echo "=== Worker VM initialized ==="
     )
 }
 
-/// Generate the startup script for the coordinator VM with WireGuard VPN.
+/// Generate the startup script for the coordinator VM with optional WireGuard VPN.
 ///
 /// This script includes:
 /// - All worker dependencies
-/// - WireGuard installation and configuration
+/// - WireGuard installation and configuration (if provided)
 /// - Secret resolution via Google Secret Manager (for `secret:` prefixed values)
 /// - Binary download from GCS (if `binary_gcs_url` is provided)
+/// - Auto-start coordinator service (if binary is provided)
 ///
 /// # Security
 /// The `secret:` prefix pattern allows storing sensitive values (like private keys)
 /// in Google Secret Manager. The VM uses its service account identity to fetch
 /// secrets at boot time, avoiding exposure in metadata or logs.
 pub fn generate_coordinator_startup_script(
-    wireguard: &WireGuardConfig,
+    wireguard: Option<&WireGuardConfig>,
     binary_gcs_url: Option<&str>,
+    pool_db_path: Option<&str>,
 ) -> String {
     let binary_download = if let Some(gcs_url) = binary_gcs_url {
+        let db_arg = match pool_db_path {
+            Some(path) => format!("--backup-path {}", path),
+            None => String::new(),
+        };
+
         format!(
             r#"
 # Download binary from GCS (pre-staged)
@@ -83,8 +98,64 @@ gsutil cp {} /tmp/genohype
 chmod +x /tmp/genohype
 mv /tmp/genohype /usr/local/bin/genohype
 echo "Binary installed at /usr/local/bin/genohype"
+
+# Start coordinator service
+echo "Starting coordinator..."
+nohup /usr/local/bin/genohype service start-coordinator --port 3000 --db-path /var/lib/genohype/ops.db {} > /tmp/coordinator.log 2>&1 &
+echo $! > /tmp/coordinator.pid
 "#,
-            gcs_url
+            gcs_url, db_arg
+        )
+    } else {
+        String::new()
+    };
+
+    let wg_install = if let Some(wg) = wireguard {
+        format!(
+            r#"
+# Install WireGuard
+echo "Installing WireGuard..."
+apt-get install -y -qq wireguard
+
+# Resolve WireGuard configuration values
+WG_PEER_PUBKEY=$(resolve_secret "{}")
+WG_PRIVATE_KEY=$(resolve_secret "{}")
+
+# Create WireGuard configuration
+echo "Configuring WireGuard..."
+cat > /etc/wireguard/wg0.conf << WGEOF
+[Interface]
+PrivateKey = $WG_PRIVATE_KEY
+Address = {}
+
+[Peer]
+PublicKey = $WG_PEER_PUBKEY
+Endpoint = {}
+AllowedIPs = {}
+PersistentKeepalive = 25
+WGEOF
+
+# Secure the config file
+chmod 600 /etc/wireguard/wg0.conf
+
+# Enable and start WireGuard
+echo "Starting WireGuard..."
+systemctl enable wg-quick@wg0
+systemctl start wg-quick@wg0
+
+# Verify WireGuard is running
+if wg show wg0 > /dev/null 2>&1; then
+    echo "WireGuard interface wg0 is up"
+    wg show wg0
+else
+    echo "WARNING: WireGuard interface wg0 failed to start"
+fi
+"#,
+            wg.peer_public_key,
+            wg.client_private_key,
+            wg.client_address,
+            wg.endpoint,
+            wg.allowed_ips
         )
     } else {
         String::new()
@@ -113,45 +184,8 @@ resolve_secret() {{
 
 # Install dependencies required for the Rust binary
 apt-get update -qq
-apt-get install -y -qq libssl-dev ca-certificates
-
-# Install WireGuard
-echo "Installing WireGuard..."
-apt-get install -y -qq wireguard
-
-# Resolve WireGuard configuration values
-WG_PEER_PUBKEY=$(resolve_secret "{peer_public_key}")
-WG_PRIVATE_KEY=$(resolve_secret "{client_private_key}")
-
-# Create WireGuard configuration
-echo "Configuring WireGuard..."
-cat > /etc/wireguard/wg0.conf << WGEOF
-[Interface]
-PrivateKey = $WG_PRIVATE_KEY
-Address = {client_address}
-
-[Peer]
-PublicKey = $WG_PEER_PUBKEY
-Endpoint = {endpoint}
-AllowedIPs = {allowed_ips}
-PersistentKeepalive = 25
-WGEOF
-
-# Secure the config file
-chmod 600 /etc/wireguard/wg0.conf
-
-# Enable and start WireGuard
-echo "Starting WireGuard..."
-systemctl enable wg-quick@wg0
-systemctl start wg-quick@wg0
-
-# Verify WireGuard is running
-if wg show wg0 > /dev/null 2>&1; then
-    echo "WireGuard interface wg0 is up"
-    wg show wg0
-else
-    echo "WARNING: WireGuard interface wg0 failed to start"
-fi
+apt-get install -y -qq libssl-dev ca-certificates curl
+{}
 
 # Create directory for the binary
 mkdir -p /usr/local/bin
@@ -159,19 +193,15 @@ mkdir -p /usr/local/bin
 # Create directory for the active SQLite database
 mkdir -p /var/lib/genohype
 chmod 777 /var/lib/genohype
-{binary_download}
+{}
 
 # Create a marker file to indicate VM is ready
 touch /tmp/genohype-ready
 
 echo "=== Coordinator VM initialized ==="
 "#,
-        peer_public_key = wireguard.peer_public_key,
-        client_private_key = wireguard.client_private_key,
-        client_address = wireguard.client_address,
-        endpoint = wireguard.endpoint,
-        allowed_ips = wireguard.allowed_ips,
-        binary_download = binary_download,
+        wg_install,
+        binary_download
     )
 }
 
@@ -180,7 +210,7 @@ echo "=== Coordinator VM initialized ==="
 /// Useful for adding project-specific setup steps.
 #[allow(dead_code)]
 pub fn generate_startup_script_with_extras(extra_commands: &str) -> String {
-    let mut script = generate_startup_script(None);
+    let mut script = generate_worker_startup_script(None, "default");
     // Remove the final echo and add custom commands before it
     script = script.trim_end_matches("echo \"=== Worker VM initialized ===\"\n").to_string();
     script.push_str("\n# Custom setup\n");
@@ -195,7 +225,7 @@ mod tests {
 
     #[test]
     fn test_startup_script_contains_essentials() {
-        let script = generate_startup_script(None);
+        let script = generate_worker_startup_script(None, "testpool");
         assert!(script.contains("#!/bin/bash"));
         assert!(script.contains("apt-get"));
         assert!(script.contains("libssl-dev"));
@@ -206,9 +236,11 @@ mod tests {
 
     #[test]
     fn test_startup_script_with_binary_url() {
-        let script = generate_startup_script(Some("gs://bucket/path/genohype"));
+        let script = generate_worker_startup_script(Some("gs://bucket/path/genohype"), "testpool");
         assert!(script.contains("gsutil cp gs://bucket/path/genohype"));
         assert!(script.contains("/usr/local/bin/genohype"));
+        assert!(script.contains("start-worker"));
+        assert!(script.contains("testpool-coordinator:3000"));
     }
 
     #[test]
@@ -228,7 +260,7 @@ mod tests {
             client_private_key: "secret:wg-coord-privkey".to_string(),
         };
 
-        let script = generate_coordinator_startup_script(&wg_config, None);
+        let script = generate_coordinator_startup_script(Some(&wg_config), None, None);
 
         // Check essential components
         assert!(script.contains("#!/bin/bash"));
@@ -248,5 +280,38 @@ mod tests {
         // Check it still has worker essentials
         assert!(script.contains("libssl-dev"));
         assert!(script.contains("genohype-ready"));
+    }
+
+    #[test]
+    fn test_coordinator_startup_script_with_binary_autostart() {
+        let script = generate_coordinator_startup_script(
+            None,
+            Some("gs://bucket/path/genohype"),
+            Some("gs://bucket/backup/ops.db"),
+        );
+
+        // Check binary download and auto-start
+        assert!(script.contains("gsutil cp gs://bucket/path/genohype"));
+        assert!(script.contains("start-coordinator"));
+        assert!(script.contains("--port 3000"));
+        assert!(script.contains("--backup-path gs://bucket/backup/ops.db"));
+        assert!(script.contains("/tmp/coordinator.pid"));
+
+        // No WireGuard
+        assert!(!script.contains("wireguard"));
+    }
+
+    #[test]
+    fn test_coordinator_startup_script_no_wireguard_no_binary() {
+        let script = generate_coordinator_startup_script(None, None, None);
+
+        // Basic essentials only
+        assert!(script.contains("#!/bin/bash"));
+        assert!(script.contains("libssl-dev"));
+        assert!(script.contains("genohype-ready"));
+
+        // No WireGuard, no auto-start
+        assert!(!script.contains("wireguard"));
+        assert!(!script.contains("start-coordinator"));
     }
 }

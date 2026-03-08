@@ -175,12 +175,38 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                 ))
             })?;
 
-        // Binary deployment: skip if already done via startup script
+        let coord_ip = coordinator.ip().unwrap_or("localhost");
+
+        // Binary deployment and coordinator startup: different paths for startup-script vs SSH
         if binary_deployed_via_startup {
             println!(
-                "{} Binary deployed via startup script (zero SSH)",
+                "{} Binary deployed and service started via startup script (zero SSH)",
                 "OK".green().bold()
             );
+
+            // Wait for coordinator API to be reachable (it started from startup script)
+            print!("{}", "  Waiting for coordinator API to be reachable".dimmed());
+            use std::io::Write;
+            let mut ready = false;
+            for _ in 0..15 {
+                std::io::stdout().flush().ok();
+                if self.check_coordinator_status(coordinator, zone) {
+                    ready = true;
+                    break;
+                }
+                print!(".");
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+            println!();
+
+            if !ready {
+                println!(
+                    "{} Coordinator API did not become reachable. It may still be starting.",
+                    "Warning:".yellow()
+                );
+            } else {
+                println!("{} Coordinator is running", "OK".green().bold());
+            }
         } else {
             // Fallback: deploy via SCP
             let binary = self.locate_binary(None)?;
@@ -189,42 +215,41 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                 "Setup:".cyan()
             );
             self.deploy_binary(&binary, &[coordinator.clone()], zone)?;
+
+            // Start coordinator in idle mode via SSH
+            println!(
+                "{} Starting coordinator in idle mode on {}...",
+                "Setup:".cyan(),
+                coordinator.name.cyan()
+            );
+
+            let mut coord_cmd = String::from(
+                "nohup /usr/local/bin/genohype service start-coordinator \
+                 --port 3000 \
+                 --db-path /var/lib/genohype/ops.db",
+            );
+            if let Some(backup) = pool_db_path {
+                coord_cmd.push_str(&format!(" --backup-path {}", backup));
+            }
+            coord_cmd.push_str(" > /tmp/coordinator.log 2>&1 & echo $! > /tmp/coordinator.pid");
+
+            let status = self
+                .provider
+                .get_ssh_command(&coordinator.name, zone, &coord_cmd)
+                .status()
+                .map_err(HailError::Io)?;
+
+            if !status.success() {
+                return Err(HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Failed to start coordinator service in idle mode",
+                )));
+            }
+
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            println!("{} Coordinator started in idle mode", "OK".green().bold());
         }
 
-        // Start coordinator in idle mode
-        println!(
-            "{} Starting coordinator in idle mode on {}...",
-            "Setup:".cyan(),
-            coordinator.name.cyan()
-        );
-
-        let mut coord_cmd = String::from(
-            "nohup /usr/local/bin/genohype service start-coordinator \
-             --port 3000 \
-             --db-path /var/lib/genohype/ops.db",
-        );
-        if let Some(backup) = pool_db_path {
-            coord_cmd.push_str(&format!(" --backup-path {}", backup));
-        }
-        coord_cmd.push_str(" > /tmp/coordinator.log 2>&1 & echo $! > /tmp/coordinator.pid");
-
-        let status = self
-            .provider
-            .get_ssh_command(&coordinator.name, zone, &coord_cmd)
-            .status()
-            .map_err(HailError::Io)?;
-
-        if !status.success() {
-            return Err(HailError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Failed to start coordinator service in idle mode",
-            )));
-        }
-
-        std::thread::sleep(std::time::Duration::from_secs(2));
-
-        let coord_ip = coordinator.ip().unwrap_or("localhost");
-        println!("{} Coordinator started in idle mode", "OK".green().bold());
         println!("  Dashboard: http://{}:3000/dashboard", coord_ip);
         println!(
             "  Submit jobs with: genohype pool submit {} -- <command>",
@@ -240,17 +265,21 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
 
         if !workers.is_empty() {
             if binary_deployed_via_startup {
+                // Workers should already be running from startup script
                 println!(
-                    "{} {} workers have binary via startup script",
+                    "{} {} workers started via startup script",
                     "OK".green().bold(),
                     workers.len()
                 );
             } else {
-                // Fallback: workers pull from coordinator
-                println!("{}", "Pre-deploying binary to workers...".dimmed());
-                self.pre_deploy_binary_to_workers(coord_ip, &workers, zone)?;
+                // Fallback: deploy binary and start workers via coordinator
                 println!(
-                    "{} Binary pre-deployed to {} worker(s)",
+                    "{}",
+                    "Deploying binary and starting workers via coordinator...".dimmed()
+                );
+                self.propagate_binary_from_coordinator(coord_ip, &workers, zone)?;
+                println!(
+                    "{} Binary deployed and {} worker(s) started",
                     "OK".green().bold(),
                     workers.len()
                 );
@@ -877,7 +906,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                     machine_type: config.machine_type.clone(),
                     zone: zone.to_string(),
                     tags: vec![tags],
-                    startup_script: super::startup::generate_startup_script(None),
+                    startup_script: super::startup::generate_worker_startup_script(None, name),
                     spot: config.spot,
                     network: config.network.clone(),
                     subnet: config.subnet.clone(),
@@ -2380,16 +2409,44 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                 coord_ip
             );
 
-            // Start workers FIRST so they're connected when we submit the job
-            println!(
-                "Starting {} worker(s)...",
-                workers.len().to_string().bright_white()
-            );
-            self.start_worker_services(workers, coord_ip, zone)?;
+            // Check how many workers are already connected (they may have started via startup script)
+            let mut connected_count = 0;
+            if let Ok(workers_json) =
+                self.fetch_coordinator_api(coordinator, zone, "/api/dashboard/workers", 3000)
+            {
+                if let Ok(worker_list) =
+                    serde_json::from_str::<Vec<crate::distributed::message::DashboardWorker>>(
+                        &workers_json,
+                    )
+                {
+                    connected_count = worker_list
+                        .iter()
+                        .filter(|w| w.status != "suspected_dead")
+                        .count();
+                }
+            }
 
-            // Give workers a moment to connect to coordinator
-            println!("{}", "Waiting for workers to connect...".dimmed());
-            std::thread::sleep(std::time::Duration::from_secs(3));
+            if connected_count < workers.len() {
+                // Some workers are not connected - start missing ones via SSH
+                println!(
+                    "{} {}/{} workers connected. Starting missing workers via SSH...",
+                    "Warning:".yellow(),
+                    connected_count,
+                    workers.len()
+                );
+                self.start_worker_services(workers, coord_ip, zone)?;
+
+                // Give workers a moment to connect to coordinator
+                println!("{}", "Waiting for workers to connect...".dimmed());
+                std::thread::sleep(std::time::Duration::from_secs(3));
+            } else {
+                println!(
+                    "{} {}/{} workers already connected",
+                    "OK".green(),
+                    connected_count,
+                    workers.len()
+                );
+            }
 
             // For ClickHouse export jobs, create the target table before submitting
             // Workers will INSERT into this table, so it must exist first
@@ -2519,16 +2576,43 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                 )));
             }
 
-            // Start workers
-            println!(
-                "Starting {} worker(s)...",
-                workers.len().to_string().bright_white()
-            );
-            self.start_worker_services(workers, coord_ip, zone)?;
+            // Check if any workers are already connected (may have started from startup script)
+            let mut connected_count = 0;
+            if let Ok(workers_json) =
+                self.fetch_coordinator_api(coordinator, zone, "/api/dashboard/workers", 3000)
+            {
+                if let Ok(worker_list) =
+                    serde_json::from_str::<Vec<crate::distributed::message::DashboardWorker>>(
+                        &workers_json,
+                    )
+                {
+                    connected_count = worker_list
+                        .iter()
+                        .filter(|w| w.status != "suspected_dead")
+                        .count();
+                }
+            }
 
-            // Give workers a moment to connect to coordinator
-            println!("{}", "Waiting for workers to connect...".dimmed());
-            std::thread::sleep(std::time::Duration::from_secs(3));
+            if connected_count < workers.len() {
+                // Start missing workers via SSH
+                println!(
+                    "Starting {} worker(s) ({} already connected)...",
+                    workers.len().to_string().bright_white(),
+                    connected_count
+                );
+                self.start_worker_services(workers, coord_ip, zone)?;
+
+                // Give workers a moment to connect to coordinator
+                println!("{}", "Waiting for workers to connect...".dimmed());
+                std::thread::sleep(std::time::Duration::from_secs(3));
+            } else {
+                println!(
+                    "{} {}/{} workers already connected",
+                    "OK".green(),
+                    connected_count,
+                    workers.len()
+                );
+            }
 
             // Submit job via API (same as the "coordinator already running" path)
             println!("{}", "Submitting job via API...".dimmed());
@@ -2823,48 +2907,6 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             println!(
                 "   {} {} (from coordinator)",
                 "Deployed to".dimmed(),
-                worker.name.cyan()
-            );
-            Ok(())
-        })
-    }
-
-    /// Pre-deploy binary from coordinator to workers without starting worker processes.
-    /// Used during pool creation to prime workers with the binary.
-    fn pre_deploy_binary_to_workers(
-        &self,
-        coordinator_ip: &str,
-        workers: &[Instance],
-        zone: &str,
-    ) -> Result<()> {
-        workers.par_iter().try_for_each(|worker| {
-            // Download binary from coordinator and install it, but don't start worker process
-            let curl_cmd = format!(
-                "curl -sL --retry 3 --retry-delay 2 http://{}:3000/api/binary -o /tmp/genohype && \
-                 chmod +x /tmp/genohype && \
-                 sudo mv /tmp/genohype /usr/local/bin/genohype",
-                coordinator_ip
-            );
-
-            let status = self
-                .provider
-                .get_ssh_command(&worker.name, zone, &curl_cmd)
-                .status()
-                .map_err(HailError::Io)?;
-
-            if !status.success() {
-                return Err(HailError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!(
-                        "Failed to pre-deploy binary to {}",
-                        worker.name
-                    ),
-                )));
-            }
-
-            println!(
-                "   {} {}",
-                "Binary deployed to".dimmed(),
                 worker.name.cyan()
             );
             Ok(())
