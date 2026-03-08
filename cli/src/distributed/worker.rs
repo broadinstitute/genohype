@@ -646,6 +646,7 @@ fn spawn_telemetry_loop(
                 network_tx_bytes_sec: net_tx_sec,
                 core_tasks,
                 current_batch_size: None, // Set by coordinator, not known to worker
+                max_batch_capacity: None, // Set by coordinator, not known to worker
             };
 
             let req = HeartbeatRequest {

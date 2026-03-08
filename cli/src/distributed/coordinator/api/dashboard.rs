@@ -282,6 +282,7 @@ pub(crate) async fn get_dashboard_workers(
             worker_id: id.clone(),
             status: w.status.as_str().to_string(),
             current_batch_size: w.current_batch_size,
+            max_batch_capacity: w.max_batch_capacity,
             last_seen_secs: now.duration_since(w.last_seen).as_secs_f64(),
             telemetry: w.metrics_history.back().cloned(),
             total_items: w.total_rows,

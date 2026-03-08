@@ -530,6 +530,7 @@ pub async fn run_coordinator(
         .route("/api/events", get(api::jobs::get_events))
         .route("/api/failures", get(api::jobs::get_failures))
         .route("/api/workers/:worker_id/logs", get(api::jobs::get_worker_logs))
+        .route("/api/workers/:worker_id/reset-capacity", post(api::jobs::reset_worker_capacity))
         .route("/api/update-fleet", post(api::jobs::update_fleet))
         .route("/api/update-coordinator", post(api::jobs::update_coordinator))
         // History API
@@ -2313,8 +2314,9 @@ async fn handle_heartbeat(
             }
         }
 
-        // Inject the current batch size into telemetry before persistence
+        // Inject the current batch size and capacity ceiling into telemetry before persistence
         req.telemetry.current_batch_size = w.current_batch_size;
+        req.telemetry.max_batch_capacity = w.max_batch_capacity;
 
         // Store telemetry snapshot in memory (for quick access to latest)
         w.metrics_history.push_back(req.telemetry.clone());

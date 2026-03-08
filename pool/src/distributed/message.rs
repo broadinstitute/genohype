@@ -294,6 +294,11 @@ pub struct TelemetrySnapshot {
     /// The current dynamically adjusted batch size for this worker
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_batch_size: Option<usize>,
+
+    /// Learned maximum batch capacity from "batch too large" errors
+    /// This caps AIMD growth to prevent repeated OOM failures
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_batch_capacity: Option<usize>,
 }
 
 /// Heartbeat request from worker to coordinator.
@@ -363,6 +368,9 @@ pub struct DashboardWorker {
     /// Current dynamically adjusted batch size
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_batch_size: Option<usize>,
+    /// Learned maximum batch capacity (caps AIMD growth)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_batch_capacity: Option<usize>,
     /// Current telemetry
     #[serde(skip_serializing_if = "Option::is_none")]
     pub telemetry: Option<TelemetrySnapshot>,

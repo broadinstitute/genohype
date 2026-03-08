@@ -57,6 +57,8 @@ export interface TelemetrySnapshot {
   core_tasks?: Record<number, CoreTaskInfo>;
   /** Current dynamically adjusted batch size */
   current_batch_size?: number;
+  /** Learned maximum batch capacity (caps AIMD growth) */
+  max_batch_capacity?: number;
 }
 
 /**
@@ -113,6 +115,8 @@ export interface DashboardWorker {
   status: string;
   /** Current dynamically adjusted batch size */
   current_batch_size?: number;
+  /** Learned maximum batch capacity (caps AIMD growth) */
+  max_batch_capacity?: number;
   /** Current telemetry */
   telemetry?: TelemetrySnapshot;
   /** Time since last heartbeat in seconds */

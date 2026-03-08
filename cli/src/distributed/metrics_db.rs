@@ -46,7 +46,8 @@ impl MetricsDb {
                 network_tx_bytes_sec REAL,
                 network_rx_total_bytes INTEGER,
                 network_tx_total_bytes INTEGER,
-                current_batch_size INTEGER
+                current_batch_size INTEGER,
+                max_batch_capacity INTEGER
             );
 
             CREATE INDEX IF NOT EXISTS idx_telemetry_worker_time
@@ -154,6 +155,19 @@ impl MetricsDb {
             let _ = conn.execute_batch("ALTER TABLE telemetry ADD COLUMN current_batch_size INTEGER;");
         }
 
+        // Add max_batch_capacity column if it doesn't exist (for existing databases)
+        let has_max_cap: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('telemetry') WHERE name = 'max_batch_capacity'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0) > 0;
+
+        if !has_max_cap {
+            let _ = conn.execute_batch("ALTER TABLE telemetry ADD COLUMN max_batch_capacity INTEGER;");
+        }
+
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -186,8 +200,9 @@ impl MetricsDb {
                 active_partition, partitions_completed,
                 disk_used_bytes, disk_total_bytes,
                 network_rx_bytes_sec, network_tx_bytes_sec,
-                network_rx_total_bytes, network_tx_total_bytes, current_batch_size, job_id
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                network_rx_total_bytes, network_tx_total_bytes, current_batch_size, job_id,
+                max_batch_capacity
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
             "#,
             params![
                 worker_id,
@@ -207,6 +222,7 @@ impl MetricsDb {
                 None::<i64>, // network_tx_total_bytes (no longer in TelemetrySnapshot)
                 snapshot.current_batch_size.map(|v| v as i64),
                 job_id,
+                snapshot.max_batch_capacity.map(|v| v as i64),
             ],
         )?;
         Ok(())
@@ -221,7 +237,8 @@ impl MetricsDb {
                    rows_per_sec, total_rows, active_partition, partitions_completed,
                    disk_used_bytes, disk_total_bytes,
                    network_rx_bytes_sec, network_tx_bytes_sec,
-                   network_rx_total_bytes, network_tx_total_bytes, current_batch_size
+                   network_rx_total_bytes, network_tx_total_bytes, current_batch_size,
+                   max_batch_capacity
             FROM telemetry
             WHERE worker_id = ?1
             ORDER BY timestamp_ms ASC
@@ -249,6 +266,7 @@ impl MetricsDb {
                     network_tx_bytes_sec: row.get(11)?,
                     core_tasks: None, // Not persisted - real-time only
                     current_batch_size: row.get::<_, Option<i64>>(14)?.map(|v| v as usize),
+                    max_batch_capacity: row.get::<_, Option<i64>>(15)?.map(|v| v as usize),
                 })
             })?
             .collect::<SqliteResult<Vec<_>>>()?;
@@ -270,7 +288,8 @@ impl MetricsDb {
                    rows_per_sec, total_rows, active_partition, partitions_completed,
                    disk_used_bytes, disk_total_bytes,
                    network_rx_bytes_sec, network_tx_bytes_sec,
-                   network_rx_total_bytes, network_tx_total_bytes, current_batch_size
+                   network_rx_total_bytes, network_tx_total_bytes, current_batch_size,
+                   max_batch_capacity
             FROM telemetry
             WHERE worker_id = ?1
             ORDER BY timestamp_ms DESC
@@ -299,6 +318,7 @@ impl MetricsDb {
                     network_tx_bytes_sec: row.get(11)?,
                     core_tasks: None, // Not persisted - real-time only
                     current_batch_size: row.get::<_, Option<i64>>(14)?.map(|v| v as usize),
+                    max_batch_capacity: row.get::<_, Option<i64>>(15)?.map(|v| v as usize),
                 })
             })?
             .collect::<SqliteResult<Vec<_>>>()?;
@@ -673,7 +693,8 @@ impl MetricsDb {
                 SELECT timestamp_ms, cpu_percent, memory_used_bytes, memory_total_bytes,
                        rows_per_sec, total_rows, active_partition, partitions_completed,
                        disk_used_bytes, disk_total_bytes,
-                       network_rx_bytes_sec, network_tx_bytes_sec, current_batch_size
+                       network_rx_bytes_sec, network_tx_bytes_sec, current_batch_size,
+                       max_batch_capacity
                 FROM telemetry
                 WHERE job_id = ?1 AND worker_id = ?2
                 ORDER BY timestamp_ms ASC
@@ -700,6 +721,7 @@ impl MetricsDb {
                         network_tx_bytes_sec: row.get(11)?,
                         core_tasks: None,
                         current_batch_size: row.get::<_, Option<i64>>(12)?.map(|v| v as usize),
+                        max_batch_capacity: row.get::<_, Option<i64>>(13)?.map(|v| v as usize),
                     })
                 })?
                 .collect::<SqliteResult<Vec<_>>>()?;
@@ -746,6 +768,7 @@ mod tests {
             network_tx_bytes_sec: Some(500_000.0),
             core_tasks: None,
             current_batch_size: Some(24),
+            max_batch_capacity: Some(32),
         };
 
         db.insert_snapshot("worker-1", &snapshot).unwrap();

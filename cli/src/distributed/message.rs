@@ -938,6 +938,9 @@ pub struct DashboardWorker {
     /// Current dynamically adjusted batch size
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_batch_size: Option<usize>,
+    /// Learned maximum batch capacity (caps AIMD growth)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_batch_capacity: Option<usize>,
     /// Seconds since last heartbeat
     pub last_seen_secs: f64,
     /// Latest telemetry snapshot

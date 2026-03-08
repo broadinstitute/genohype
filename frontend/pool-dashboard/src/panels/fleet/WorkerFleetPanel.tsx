@@ -418,7 +418,13 @@ const WorkerCard: React.FC<{ worker: DashboardWorker; coordinatorVersion?: strin
             )}
 
             {/* Resource Stats */}
-            <WorkerStats telemetry={t} partitionsCompleted={t.partitions_completed} currentBatch={worker.current_batch_size} />
+            <WorkerStats
+              workerId={worker.worker_id}
+              telemetry={t}
+              partitionsCompleted={t.partitions_completed}
+              currentBatch={worker.current_batch_size}
+              maxBatchCapacity={worker.max_batch_capacity}
+            />
           </>
         ) : (
           <div className="empty-state" style={{ height: 'auto' }}>
@@ -568,10 +574,19 @@ const CoresGrid: React.FC<{
  * Worker resource statistics (memory, network, throughput).
  */
 const WorkerStats: React.FC<{
+  workerId: string;
   telemetry: TelemetrySnapshot;
   partitionsCompleted: number;
   currentBatch?: number;
-}> = ({ telemetry, partitionsCompleted, currentBatch }) => {
+  maxBatchCapacity?: number;
+}> = ({ workerId, telemetry, partitionsCompleted, currentBatch, maxBatchCapacity }) => {
+  const handleResetCapacity = async () => {
+    try {
+      await fetch(`/api/workers/${workerId}/reset-capacity`, { method: 'POST' });
+    } catch (e) {
+      console.error("Failed to reset capacity:", e);
+    }
+  };
   const formatBytes = (bytes: number | undefined): string => {
     if (bytes === undefined) return '--';
     if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
@@ -623,9 +638,30 @@ const WorkerStats: React.FC<{
       </div>
 
       {/* Batch Size */}
-      <div>
-        <span style={{ color: 'var(--text-dim)' }}>Batch Size: </span>
-        <span style={{ color: 'var(--cyan)' }}>{currentBatch ?? '--'}</span>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+        <span style={{ color: 'var(--text-dim)' }}>Batch: </span>
+        <span style={{ color: maxBatchCapacity ? 'var(--yellow)' : 'var(--cyan)' }}>
+          {currentBatch ?? '--'}
+          {maxBatchCapacity && ` / ${maxBatchCapacity}`}
+        </span>
+        {maxBatchCapacity && (
+          <button
+            onClick={handleResetCapacity}
+            title="Reset capacity limit"
+            style={{
+              background: 'rgba(255,255,255,0.1)',
+              border: 'none',
+              color: 'var(--text)',
+              borderRadius: '3px',
+              cursor: 'pointer',
+              padding: '1px 4px',
+              fontSize: '9px',
+              marginLeft: '2px',
+            }}
+          >
+            ↻
+          </button>
+        )}
       </div>
 
       {/* Partitions Done */}

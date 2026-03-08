@@ -238,6 +238,14 @@ pub(crate) async fn submit_job(
     data.batch_state = None;
     data.active_tasks.clear();
 
+    // Reset learned capacity limits for all workers on new job submission.
+    // The max_batch_capacity is job-specific (depends on data schema, operation type, etc.)
+    // so we wipe it to prevent "ghost constraints" from previous jobs.
+    for worker in data.worker_registry.values_mut() {
+        worker.max_batch_capacity = None;
+        worker.current_batch_size = None;
+    }
+
     // Don't clear worker registry on resubmission/superseding, as we want to keep connected workers
     // Only clear if this is a fresh start and we want to purge stale workers
     // data.worker_registry.clear();
@@ -895,4 +903,32 @@ pub(crate) async fn serve_binary() -> impl axum::response::IntoResponse {
             .body(axum::body::Body::from(format!("Task panicked: {}", e)))
             .unwrap(),
     }
+}
+
+/// Handler for POST /api/workers/:worker_id/reset-capacity
+///
+/// Resets the learned max_batch_capacity for a worker, allowing it to
+/// probe for larger batch sizes again. Useful when a worker was throttled
+/// due to a transient memory spike or anomalously large partition.
+pub(crate) async fn reset_worker_capacity(
+    axum::extract::Path(worker_id): axum::extract::Path<String>,
+    axum::extract::State(state): axum::extract::State<SharedState>,
+) -> impl axum::response::IntoResponse {
+    let mut data = state.lock().unwrap();
+    if let Some(w) = data.worker_registry.get_mut(&worker_id) {
+        let old_cap = w.max_batch_capacity;
+        w.max_batch_capacity = None;
+        println!(
+            "Reset max_batch_capacity for worker {} (was {:?})",
+            worker_id, old_cap
+        );
+        return (
+            axum::http::StatusCode::OK,
+            axum::Json(serde_json::json!({ "success": true, "previous_capacity": old_cap })),
+        );
+    }
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        axum::Json(serde_json::json!({ "error": "Worker not found" })),
+    )
 }
