@@ -1823,7 +1823,9 @@ fn run_export_bigquery(args: cli::ExportBigqueryArgs) -> Result<()> {
 /// Run pool management commands
 fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> Result<()> {
     use crate::cloud::gcp::GcpClient;
-    use crate::cloud::pool::PoolManager;
+    use crate::cloud::pool::{
+        PoolBinary, PoolClient, PoolLifecycle, PoolManager, PoolParser, PoolSubmit,
+    };
     use crate::cloud::PoolConfig;
 
     let client = GcpClient::new();
