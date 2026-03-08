@@ -1980,13 +1980,13 @@ async fn complete_work(
             wasted_duration_ms,
         });
 
-        // Log event
+        // Log event as warning (will be retried) - individual REQUEUED events show retry status
         data.log_event(JobEvent {
             timestamp_ms: now_ms,
-            event_type: "failed".to_string(),
+            event_type: "warning".to_string(),
             worker_id: Some(req.worker_id.clone()),
             phenotype_id: None,
-            details: format!("Failed tasks {:?}: {} (wasted {:.1}s)", task_ids, error, wasted_duration_ms as f64 / 1000.0),
+            details: format!("Batch failed: {} (wasted {:.1}s)", error, wasted_duration_ms as f64 / 1000.0),
         });
 
         // Only process standard job partitions if they are actually in processing_partitions
@@ -2026,6 +2026,15 @@ async fn complete_work(
                     part_id, retry_count
                 );
                 data.failed_partitions.insert(part_id);
+
+                // Log permanent failure event
+                data.log_event(JobEvent {
+                    timestamp_ms: now_ms,
+                    event_type: "failed".to_string(),
+                    worker_id: None,
+                    phenotype_id: None,
+                    details: format!("Task {} permanently failed after {} retries", part_id, retry_count),
+                });
             } else {
                 println!(
                     "Re-queuing partition {} for retry ({}/3)",
