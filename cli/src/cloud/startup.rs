@@ -27,10 +27,32 @@ chmod +x /tmp/genohype
 mv /tmp/genohype /usr/local/bin/genohype
 echo "Binary installed at /usr/local/bin/genohype"
 
-# Start worker service
+# Create and start worker systemd service
 WORKER_ID=$(curl -s "http://metadata.google.internal/computeMetadata/v1/instance/name" -H "Metadata-Flavor: Google")
-echo "Starting worker $WORKER_ID connecting to {}-coordinator..."
-nohup /usr/local/bin/genohype service start-worker --url http://{}-coordinator:3000 --worker-id $WORKER_ID > /tmp/worker.log 2>&1 &
+echo "Creating systemd service for worker $WORKER_ID connecting to {}-coordinator..."
+cat > /etc/systemd/system/genohype-worker.service << 'SVCEOF'
+[Unit]
+Description=Genohype Worker
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/genohype service start-worker --url http://{}-coordinator:3000 --worker-id WORKER_ID_PLACEHOLDER
+Restart=always
+RestartSec=3
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+
+# Replace placeholder with actual worker ID
+sed -i "s/WORKER_ID_PLACEHOLDER/$WORKER_ID/" /etc/systemd/system/genohype-worker.service
+
+systemctl daemon-reload
+systemctl enable --now genohype-worker
+echo "Worker service started via systemd"
 "#,
             gcs_url, pool_name, pool_name
         )
@@ -99,10 +121,28 @@ chmod +x /tmp/genohype
 mv /tmp/genohype /usr/local/bin/genohype
 echo "Binary installed at /usr/local/bin/genohype"
 
-# Start coordinator service
-echo "Starting coordinator..."
-nohup /usr/local/bin/genohype service start-coordinator --port 3000 --db-path /var/lib/genohype/ops.db {} > /tmp/coordinator.log 2>&1 &
-echo $! > /tmp/coordinator.pid
+# Create and start coordinator systemd service
+echo "Creating systemd service for coordinator..."
+cat > /etc/systemd/system/genohype-coordinator.service << 'SVCEOF'
+[Unit]
+Description=Genohype Coordinator
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/genohype service start-coordinator --port 3000 --db-path /var/lib/genohype/ops.db {}
+Restart=always
+RestartSec=3
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+
+systemctl daemon-reload
+systemctl enable --now genohype-coordinator
+echo "Coordinator service started via systemd"
 "#,
             gcs_url, db_arg
         )
@@ -241,6 +281,11 @@ mod tests {
         assert!(script.contains("/usr/local/bin/genohype"));
         assert!(script.contains("start-worker"));
         assert!(script.contains("testpool-coordinator:3000"));
+        // Check systemd service creation
+        assert!(script.contains("genohype-worker.service"));
+        assert!(script.contains("Restart=always"));
+        assert!(script.contains("systemctl daemon-reload"));
+        assert!(script.contains("systemctl enable --now genohype-worker"));
     }
 
     #[test]
@@ -295,7 +340,11 @@ mod tests {
         assert!(script.contains("start-coordinator"));
         assert!(script.contains("--port 3000"));
         assert!(script.contains("--backup-path gs://bucket/backup/ops.db"));
-        assert!(script.contains("/tmp/coordinator.pid"));
+        // Check systemd service creation
+        assert!(script.contains("genohype-coordinator.service"));
+        assert!(script.contains("Restart=always"));
+        assert!(script.contains("systemctl daemon-reload"));
+        assert!(script.contains("systemctl enable --now genohype-coordinator"));
 
         // No WireGuard
         assert!(!script.contains("wireguard"));

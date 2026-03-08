@@ -223,15 +223,29 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                 coordinator.name.cyan()
             );
 
-            let mut coord_cmd = String::from(
-                "nohup /usr/local/bin/genohype service start-coordinator \
-                 --port 3000 \
-                 --db-path /var/lib/genohype/ops.db",
+            let backup_arg = pool_db_path
+                .map(|b| format!(" --backup-path {}", b))
+                .unwrap_or_default();
+            let coord_cmd = format!(
+                "sudo bash -c 'cat > /etc/systemd/system/genohype-coordinator.service << EOF
+[Unit]
+Description=Genohype Coordinator
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/genohype service start-coordinator --port 3000 --db-path /var/lib/genohype/ops.db{}
+Restart=always
+RestartSec=3
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target
+EOF
+' && sudo systemctl daemon-reload && sudo systemctl enable --now genohype-coordinator",
+                backup_arg
             );
-            if let Some(backup) = pool_db_path {
-                coord_cmd.push_str(&format!(" --backup-path {}", backup));
-            }
-            coord_cmd.push_str(" > /tmp/coordinator.log 2>&1 & echo $! > /tmp/coordinator.pid");
 
             let status = self
                 .provider
@@ -1169,10 +1183,9 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             "{}",
             "Stopping any running coordinator service...".dimmed()
         );
-        let stop_cmd = "pkill -9 -f 'genohype service start-coordinator' 2>/dev/null; \
-                        pkill -9 -f 'genohype-worker' 2>/dev/null; \
-                        fuser -k 3000/tcp 2>/dev/null; \
-                        true";
+        let stop_cmd = "sudo systemctl stop genohype-coordinator 2>/dev/null || true; \
+                        sudo systemctl stop genohype-worker 2>/dev/null || true; \
+                        fuser -k 3000/tcp 2>/dev/null || true";
         let _ = self
             .provider
             .get_ssh_command(&coordinator.name, zone, stop_cmd)
@@ -1213,15 +1226,30 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             "{}",
             "Starting coordinator service with new binary...".dimmed()
         );
-        let mut coord_cmd = String::from(
-            "nohup /usr/local/bin/genohype service start-coordinator \
-             --port 3000 \
-             --db-path /var/lib/genohype/ops.db",
+        let backup_arg = pool_db_path
+            .as_ref()
+            .map(|b| format!(" --backup-path {}", b))
+            .unwrap_or_default();
+        let coord_cmd = format!(
+            "sudo bash -c 'cat > /etc/systemd/system/genohype-coordinator.service << EOF
+[Unit]
+Description=Genohype Coordinator
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/genohype service start-coordinator --port 3000 --db-path /var/lib/genohype/ops.db{}
+Restart=always
+RestartSec=3
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target
+EOF
+' && sudo systemctl daemon-reload && sudo systemctl restart genohype-coordinator",
+            backup_arg
         );
-        if let Some(ref backup) = pool_db_path {
-            coord_cmd.push_str(&format!(" --backup-path {}", backup));
-        }
-        coord_cmd.push_str(" > /tmp/coordinator.log 2>&1 & echo $! > /tmp/coordinator.pid");
         let status = self
             .provider
             .get_ssh_command(&coordinator.name, zone, &coord_cmd)
@@ -1240,7 +1268,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
 
         // Verify coordinator is back up
         if !self.check_coordinator_status(&coordinator, zone) {
-            let log_cmd = "tail -50 /tmp/coordinator.log 2>/dev/null || echo '(no log file)'";
+            let log_cmd = "journalctl -u genohype-coordinator -n 50 --no-pager 2>/dev/null || echo '(no log available)'";
             if let Ok(output) = self
                 .provider
                 .get_ssh_command(&coordinator.name, zone, log_cmd)
@@ -1806,7 +1834,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
 
                 // Stop any existing coordinator first
                 println!("{}", "Stopping existing coordinator...".dimmed());
-                let stop_cmd = "pkill -f 'genohype service start-coordinator' || true";
+                let stop_cmd = "sudo systemctl stop genohype-coordinator 2>/dev/null || true";
                 let _ = self
                     .provider
                     .get_ssh_command(&coord.name, zone, stop_cmd)
@@ -1840,16 +1868,29 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                     "{}",
                     "Starting coordinator service to serve binary/API...".dimmed()
                 );
-                let mut coord_cmd = String::from(
-                    "nohup /usr/local/bin/genohype service start-coordinator \
-                     --port 3000 \
-                     --db-path /var/lib/genohype/ops.db",
+                let backup_arg = pool_db_path
+                    .map(|b| format!(" --backup-path {}", b))
+                    .unwrap_or_default();
+                let coord_cmd = format!(
+                    "sudo bash -c 'cat > /etc/systemd/system/genohype-coordinator.service << EOF
+[Unit]
+Description=Genohype Coordinator
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/genohype service start-coordinator --port 3000 --db-path /var/lib/genohype/ops.db{}
+Restart=always
+RestartSec=3
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target
+EOF
+' && sudo systemctl daemon-reload && sudo systemctl restart genohype-coordinator",
+                    backup_arg
                 );
-                if let Some(backup) = pool_db_path {
-                    coord_cmd.push_str(&format!(" --backup-path {}", backup));
-                }
-                coord_cmd
-                    .push_str(" > /tmp/coordinator.log 2>&1 & echo $! > /tmp/coordinator.pid");
                 let status = self
                     .provider
                     .get_ssh_command(&coord.name, zone, &coord_cmd)
@@ -2531,15 +2572,30 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             std::thread::sleep(std::time::Duration::from_millis(500));
 
             // Start coordinator service in idle mode (accepts jobs via API)
-            let mut coord_cmd = String::from(
-                "nohup /usr/local/bin/genohype service start-coordinator \
-                 --port 3000 \
-                 --db-path /var/lib/genohype/ops.db"
+            let backup_arg = config
+                .and_then(|c| c.pool_db_path.as_deref())
+                .map(|b| format!(" --backup-path {}", b))
+                .unwrap_or_default();
+            let coord_cmd = format!(
+                "sudo bash -c 'cat > /etc/systemd/system/genohype-coordinator.service << EOF
+[Unit]
+Description=Genohype Coordinator
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/genohype service start-coordinator --port 3000 --db-path /var/lib/genohype/ops.db{}
+Restart=always
+RestartSec=3
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target
+EOF
+' && sudo systemctl daemon-reload && sudo systemctl enable --now genohype-coordinator",
+                backup_arg
             );
-            if let Some(backup) = config.and_then(|c| c.pool_db_path.as_deref()) {
-                coord_cmd.push_str(&format!(" --backup-path {}", backup));
-            }
-            coord_cmd.push_str(" > /tmp/coordinator.log 2>&1 & echo $! > /tmp/coordinator.pid");
 
             let status = self
                 .provider
@@ -2560,7 +2616,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             // Verify coordinator started successfully
             if !self.check_coordinator_status(coordinator, zone) {
                 // Show log to help debug
-                let log_cmd = "tail -50 /tmp/coordinator.log 2>/dev/null || echo '(no log file)'";
+                let log_cmd = "journalctl -u genohype-coordinator -n 50 --no-pager 2>/dev/null || echo '(no log available)'";
                 if let Ok(output) = self
                     .provider
                     .get_ssh_command(&coordinator.name, zone, log_cmd)
@@ -2652,7 +2708,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         let mut log_cmd = self.provider.get_ssh_command(
             &coordinator.name,
             zone,
-            "tail -n +1 -f --pid=$(cat /tmp/coordinator.pid) /tmp/coordinator.log",
+            "journalctl -u genohype-coordinator -f --no-pager",
         );
 
         // This blocks until coordinator exits or user interrupts
@@ -2703,12 +2759,23 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             .par_iter()
             .map(|worker| {
                 let worker_cmd = format!(
-                    "pkill -f 'genohype service start-worker' || true; \
-                     sleep 1; \
-                     nohup /usr/local/bin/genohype service start-worker \
-                     --url http://{}:3000 \
-                     --worker-id {} \
-                     > /tmp/worker.log 2>&1 &",
+                    "sudo bash -c 'cat > /etc/systemd/system/genohype-worker.service << EOF
+[Unit]
+Description=Genohype Worker
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/genohype service start-worker --url http://{}:3000 --worker-id {}
+Restart=always
+RestartSec=3
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target
+EOF
+' && sudo systemctl daemon-reload && sudo systemctl restart genohype-worker",
                     coord_ip, worker.name
                 );
 
@@ -2876,16 +2943,15 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         zone: &str,
     ) -> Result<()> {
         workers.par_iter().try_for_each(|worker| {
-            // Download binary from coordinator, install it, and restart worker process
-            // The worker process must be restarted to pick up the new binary!
+            // Download binary from coordinator, install it, and restart worker service
+            // The worker service must be restarted to pick up the new binary!
             let curl_cmd = format!(
-                "curl -sL --retry 3 --retry-delay 2 http://{}:3000/api/binary -o /tmp/genohype && \
+                "sudo systemctl stop genohype-worker 2>/dev/null || true && \
+                 curl -sL --retry 3 --retry-delay 2 http://{}:3000/api/binary -o /tmp/genohype && \
                  chmod +x /tmp/genohype && \
                  sudo mv /tmp/genohype /usr/local/bin/genohype && \
-                 pkill -f 'genohype service start-worker' || true && \
-                 sleep 1 && \
-                 nohup /usr/local/bin/genohype service start-worker --url http://{}:3000 --worker-id {} > /tmp/worker.log 2>&1 &",
-                coordinator_ip, coordinator_ip, worker.name
+                 sudo systemctl start genohype-worker",
+                coordinator_ip
             );
 
             let status = self
