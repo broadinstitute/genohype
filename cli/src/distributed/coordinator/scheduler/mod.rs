@@ -3,10 +3,11 @@
 //! This module contains the core work allocation and completion logic for
 //! different job types: standard partition jobs, Manhattan pipelines,
 //! Manhattan batch jobs, and ingestion jobs.
-//!
-//! The scheduler functions are kept together due to their tight coupling
-//! with CoordinatorData state management.
 
-// Re-export scheduler functions from the main module
-// These are implemented in coordinator/mod.rs due to tight coupling
-// with state management, but logically belong to the scheduler.
+pub mod assignment;
+pub mod capacity;
+pub mod completion;
+
+pub(crate) use assignment::{get_batch_work, get_ingestion_work, get_manhattan_work};
+pub(crate) use capacity::{determine_batch_size, extract_capacity_from_error};
+pub(crate) use completion::{complete_batch_work, complete_ingestion_work, complete_manhattan_work};

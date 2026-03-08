@@ -318,6 +318,39 @@ pub(crate) struct CoordinatorData {
 pub(crate) type SharedState = Arc<Mutex<CoordinatorData>>;
 
 impl CoordinatorData {
+    /// Ensure a worker exists in the registry and update last_seen.
+    pub(crate) fn touch_worker(
+        &mut self,
+        worker_id: &str,
+        hardware: Option<HardwareSpec>,
+        build_version: Option<String>,
+    ) {
+        use std::time::Instant;
+        let worker = self
+            .worker_registry
+            .entry(worker_id.to_string())
+            .or_insert_with(|| WorkerState {
+                last_seen: Instant::now(),
+                status: WorkerStatus::Idle,
+                metrics_history: VecDeque::new(),
+                total_rows: 0,
+                partitions_completed: 0,
+                current_task: None,
+                latest_log_tail: None,
+                hardware: None,
+                current_batch_size: None,
+                max_batch_capacity: None,
+                build_version: None,
+            });
+        worker.last_seen = Instant::now();
+        if hardware.is_some() {
+            worker.hardware = hardware;
+        }
+        if build_version.is_some() {
+            worker.build_version = build_version;
+        }
+    }
+
     /// Log an event to the ring buffer and persist to database.
     pub(crate) fn log_event(&mut self, event: JobEvent) {
         // Persist to database if we have a current job
