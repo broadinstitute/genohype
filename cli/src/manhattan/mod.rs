@@ -11,6 +11,7 @@ pub mod layout;
 pub mod loci_writer;
 pub mod locus;
 pub mod pipeline;
+pub mod qq;
 pub mod qq_writer;
 pub mod reference;
 pub mod render;

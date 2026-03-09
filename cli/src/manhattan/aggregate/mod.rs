@@ -19,8 +19,9 @@ use crate::manhattan::data::{
     ManifestSigHits, ManifestSignificantHits, ManifestStats,
 };
 use crate::manhattan::genes::{
-    render_gene_manhattan_styled, scan_gene_burden_to_parquet, scan_qq_to_parquet,
+    render_gene_manhattan_styled, scan_gene_burden_to_parquet,
 };
+use crate::manhattan::qq::scan_qq_to_parquet;
 use crate::manhattan::layout::ChromosomeLayout;
 use crate::manhattan::pipeline::composite_partial_pngs_with_style;
 use genohype_core::error::Result;
