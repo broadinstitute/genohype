@@ -4,7 +4,7 @@
 //! worker health, detect stuck jobs, handle timeouts, and perform backups.
 
 use crate::distributed::coordinator::state::{
-    CoordinatorData, SharedState, WorkerStatus, WORKER_SUSPECT_TIMEOUT_SECS,
+    CoordinatorData, JobExecutionState, SharedState, WorkerStatus, WORKER_SUSPECT_TIMEOUT_SECS,
 };
 use crate::distributed::metrics_db::MetricsDb;
 use std::time::{Duration, Instant};
@@ -89,18 +89,26 @@ pub(crate) fn check_stuck_job(state: &SharedState, timeout_secs: u64) {
     // Only consider it stuck if ZERO partitions have completed
     // (if some completed but now it's stalled, that's different - likely worker issues handled by timeouts)
     // Check batch state, Manhattan state, and standard counters
-    let has_progress = if let Some(ref batch) = data.batch_state {
-        // For batch jobs, check if any phenotypes completed
-        batch.completed_count > 0
-            || !batch.active_phenotypes.values().all(|s| {
-                s.exome_completed.is_empty() && s.genome_completed.is_empty()
-            })
-    } else if let Some(ref m) = data.manhattan_state {
-        // For single Manhattan jobs, check if any exome/genome partitions completed
-        !m.exome_completed.is_empty() || !m.genome_completed.is_empty() || m.aggregate_complete
-    } else {
-        // For standard jobs, check standard counter
-        !data.completed_tasks.is_empty()
+    let has_progress = match &data.job_state {
+        JobExecutionState::Batch(batch) => {
+            // For batch jobs, check if any phenotypes completed
+            batch.completed_count > 0
+                || !batch.active_phenotypes.values().all(|s| {
+                    s.exome_completed.is_empty() && s.genome_completed.is_empty()
+                })
+        }
+        JobExecutionState::Manhattan(m) => {
+            // For single Manhattan jobs, check if any exome/genome partitions completed
+            !m.exome_completed.is_empty() || !m.genome_completed.is_empty() || m.aggregate_complete
+        }
+        JobExecutionState::Ingestion(ing) => {
+            // For ingestion jobs, check if any tasks completed
+            ing.completed_count > 0
+        }
+        JobExecutionState::Standard => {
+            // For standard jobs, check standard counter
+            !data.completed_tasks.is_empty()
+        }
     };
 
     if has_progress {
@@ -128,10 +136,8 @@ pub(crate) fn check_stuck_job(state: &SharedState, timeout_secs: u64) {
         // Reset state
         data.pending_partitions.clear();
         data.processing_partitions.clear();
-        data.manhattan_state = None;
-        data.batch_state = None;
+        data.job_state = JobExecutionState::Standard;
         data.active_tasks.clear();
-        data.ingestion_state = None;
         // Note: We intentionally keep current_job_id so the dashboard continues
         // to display the failed job's metrics until a new job is submitted.
         data.idle = true;

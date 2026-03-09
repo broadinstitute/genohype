@@ -5,7 +5,7 @@
 
 use crate::distributed::coordinator::services;
 use crate::distributed::coordinator::state::{
-    CoordinatorData, ManhattanPhase, ManhattanPipelineState,
+    CoordinatorData, JobExecutionState, ManhattanPhase, ManhattanPipelineState,
     SharedState, WorkerStatus, BATCH_ACTIVE_LIMIT,
 };
 use crate::distributed::message::{
@@ -166,8 +166,7 @@ pub(crate) async fn submit_job(
     data.job_start_time = Instant::now();
     data.last_progress_time = Instant::now();
     data.aggregated_results.clear();
-    data.manhattan_state = None;
-    data.batch_state = None;
+    data.job_state = JobExecutionState::Standard;
     data.active_tasks.clear();
 
     // Reset learned capacity limits for all workers on new job submission.
@@ -226,7 +225,7 @@ pub(crate) async fn submit_job(
         // Use the services layer to initialize batch state
         let batch_state = services::init_batch_state(specs, mode);
 
-        data.batch_state = Some(batch_state);
+        data.job_state = JobExecutionState::Batch(batch_state);
 
         let output_desc = specs
             .first()
@@ -281,7 +280,7 @@ pub(crate) async fn submit_job(
 
                 #[cfg(feature = "clickhouse")]
                 {
-                    data.ingestion_state = Some(services::create_ingestion_state(
+                    data.job_state = JobExecutionState::Ingestion(services::create_ingestion_state(
                         phenotypes,
                         clickhouse_url,
                         database,
@@ -303,7 +302,7 @@ pub(crate) async fn submit_job(
     }
 
     // Initialize Manhattan pipeline state if this is a single Manhattan job
-    data.manhattan_state = if let JobSpec::Manhattan { ref spec, mode } = req.job_spec {
+    if let JobSpec::Manhattan { ref spec, mode } = req.job_spec {
         // For Manhattan jobs, we manage exome/genome partitions separately
         // Use partition counts from spec if available, otherwise fall back to total_tasks
         let exome_partitions = spec.exome_partitions.unwrap_or_else(|| {
@@ -335,7 +334,7 @@ pub(crate) async fn submit_job(
             exome_partitions, genome_partitions, mode
         );
 
-        Some(ManhattanPipelineState {
+        data.job_state = JobExecutionState::Manhattan(ManhattanPipelineState {
             mode,
             phase: initial_phase,
             original_spec: spec.clone(),
@@ -352,10 +351,8 @@ pub(crate) async fn submit_job(
             genome_completed: HashSet::new(),
             aggregate_dispatched: false,
             aggregate_complete: false,
-        })
-    } else {
-        None
-    };
+        });
+    }
 
     let output_desc = req
         .job_spec
@@ -404,10 +401,8 @@ pub(crate) async fn cancel_job(
     // Reset job state
     data.pending_partitions.clear();
     data.processing_partitions.clear();
-    data.manhattan_state = None;
-    data.batch_state = None;
+    data.job_state = JobExecutionState::Standard;
     data.active_tasks.clear();
-    data.ingestion_state = None;
     data.idle = true;
     // Note: We intentionally keep current_job_id so the dashboard continues
     // to display the cancelled job's metrics until a new job is submitted.

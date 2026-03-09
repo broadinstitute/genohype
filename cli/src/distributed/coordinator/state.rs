@@ -33,6 +33,23 @@ pub(crate) const MAX_EVENTS: usize = 1000;
 /// Maximum failures in the ring buffer
 pub(crate) const MAX_FAILURES: usize = 100;
 
+/// Represents the current execution state for a job.
+///
+/// Since a coordinator only runs one job type at a time, these states are mutually exclusive.
+/// This enum makes illegal states unrepresentable (e.g., having both batch and manhattan state).
+#[derive(Debug, Default)]
+pub(crate) enum JobExecutionState {
+    /// No specialized state (standard partition-based jobs like ExportParquet)
+    #[default]
+    Standard,
+    /// Single Manhattan pipeline job
+    Manhattan(ManhattanPipelineState),
+    /// Manhattan batch job (multiple phenotypes)
+    Batch(BatchState),
+    /// Manhattan ingestion into ClickHouse
+    Ingestion(IngestionState),
+}
+
 /// Configuration for the coordinator.
 #[allow(dead_code)]
 pub struct CoordinatorConfig {
@@ -289,16 +306,12 @@ pub(crate) struct CoordinatorData {
     pub(crate) metrics_db: MetricsDb,
     /// Aggregated results from workers (for Summary/Validate jobs)
     pub(crate) aggregated_results: Vec<serde_json::Value>,
-    /// Manhattan pipeline state (only set for single Manhattan jobs)
-    pub(crate) manhattan_state: Option<ManhattanPipelineState>,
-    /// Batch state (only set for ManhattanBatch jobs)
-    pub(crate) batch_state: Option<BatchState>,
+    /// Current job execution state (unified state for Manhattan, Batch, Ingestion, or Standard)
+    pub(crate) job_state: JobExecutionState,
     /// Active tasks: task_id -> ActiveTask (for batch mode tracking)
     pub(crate) active_tasks: HashMap<String, ActiveTask>,
     /// Last error message from a failed task
     pub(crate) last_error: Option<String>,
-    /// Ingestion state (for IngestManhattan jobs)
-    pub(crate) ingestion_state: Option<IngestionState>,
     /// Ring buffer of recent events (max 1000)
     pub(crate) events: VecDeque<JobEvent>,
     /// Ring buffer of recent failures (max 100)
@@ -428,78 +441,79 @@ impl CoordinatorData {
             }
         }
 
-        // 2. Manhattan pipeline
-        if let Some(ref mut manhattan) = self.manhattan_state {
-            let mut lost_exome = Vec::new();
-            for (&part_id, (worker, _)) in &manhattan.exome_processing {
-                if worker == dead_worker_id {
-                    lost_exome.push(part_id);
-                }
-            }
-            lost_exome.sort_by(|a, b| b.cmp(a));
-            for part_id in lost_exome {
-                manhattan.exome_processing.remove(&part_id);
-                println!("Worker {} died. Requeuing exome partition {}", dead_worker_id, part_id);
-                manhattan.exome_pending.push_front(part_id);
-            }
-
-            let mut lost_genome = Vec::new();
-            for (&part_id, (worker, _)) in &manhattan.genome_processing {
-                if worker == dead_worker_id {
-                    lost_genome.push(part_id);
-                }
-            }
-            lost_genome.sort_by(|a, b| b.cmp(a));
-            for part_id in lost_genome {
-                manhattan.genome_processing.remove(&part_id);
-                println!("Worker {} died. Requeuing genome partition {}", dead_worker_id, part_id);
-                manhattan.genome_pending.push_front(part_id);
-            }
-        }
-
-        // 3. Ingestion
-        if let Some(ref mut ingestion) = self.ingestion_state {
-            let mut lost_tasks = Vec::new();
-            for (task_id, (pheno, ancestry, base_path, worker, _)) in &ingestion.active_tasks {
-                if worker == dead_worker_id {
-                    lost_tasks.push((task_id.clone(), pheno.clone(), ancestry.clone(), base_path.clone()));
-                }
-            }
-            for (task_id, pheno, ancestry, base_path) in lost_tasks {
-                ingestion.active_tasks.remove(&task_id);
-                println!("Worker {} died. Requeuing ingestion task {}/{}", dead_worker_id, ancestry, pheno);
-                ingestion.pending_tasks.push_front((pheno, ancestry, base_path));
-            }
-        }
-
-        // 4. Batch
-        if let Some(ref mut batch) = self.batch_state {
-            for (pheno_id, state) in &mut batch.active_phenotypes {
+        // 2. Job-specific state requeuing
+        match &mut self.job_state {
+            JobExecutionState::Manhattan(ref mut manhattan) => {
                 let mut lost_exome = Vec::new();
-                for (&part_id, (worker, _)) in &state.exome_processing {
+                for (&part_id, (worker, _)) in &manhattan.exome_processing {
                     if worker == dead_worker_id {
                         lost_exome.push(part_id);
                     }
                 }
                 lost_exome.sort_by(|a, b| b.cmp(a));
                 for part_id in lost_exome {
-                    state.exome_processing.remove(&part_id);
-                    println!("Worker {} died. Requeuing exome partition {} for {}", dead_worker_id, part_id, pheno_id);
-                    state.exome_pending.push_front(part_id);
+                    manhattan.exome_processing.remove(&part_id);
+                    println!("Worker {} died. Requeuing exome partition {}", dead_worker_id, part_id);
+                    manhattan.exome_pending.push_front(part_id);
                 }
 
                 let mut lost_genome = Vec::new();
-                for (&part_id, (worker, _)) in &state.genome_processing {
+                for (&part_id, (worker, _)) in &manhattan.genome_processing {
                     if worker == dead_worker_id {
                         lost_genome.push(part_id);
                     }
                 }
                 lost_genome.sort_by(|a, b| b.cmp(a));
                 for part_id in lost_genome {
-                    state.genome_processing.remove(&part_id);
-                    println!("Worker {} died. Requeuing genome partition {} for {}", dead_worker_id, part_id, pheno_id);
-                    state.genome_pending.push_front(part_id);
+                    manhattan.genome_processing.remove(&part_id);
+                    println!("Worker {} died. Requeuing genome partition {}", dead_worker_id, part_id);
+                    manhattan.genome_pending.push_front(part_id);
                 }
+            }
+            JobExecutionState::Ingestion(ref mut ingestion) => {
+                let mut lost_tasks = Vec::new();
+                for (task_id, (pheno, ancestry, base_path, worker, _)) in &ingestion.active_tasks {
+                    if worker == dead_worker_id {
+                        lost_tasks.push((task_id.clone(), pheno.clone(), ancestry.clone(), base_path.clone()));
+                    }
+                }
+                for (task_id, pheno, ancestry, base_path) in lost_tasks {
+                    ingestion.active_tasks.remove(&task_id);
+                    println!("Worker {} died. Requeuing ingestion task {}/{}", dead_worker_id, ancestry, pheno);
+                    ingestion.pending_tasks.push_front((pheno, ancestry, base_path));
+                }
+            }
+            JobExecutionState::Batch(ref mut batch) => {
+                for (pheno_id, state) in &mut batch.active_phenotypes {
+                    let mut lost_exome = Vec::new();
+                    for (&part_id, (worker, _)) in &state.exome_processing {
+                        if worker == dead_worker_id {
+                            lost_exome.push(part_id);
+                        }
+                    }
+                    lost_exome.sort_by(|a, b| b.cmp(a));
+                    for part_id in lost_exome {
+                        state.exome_processing.remove(&part_id);
+                        println!("Worker {} died. Requeuing exome partition {} for {}", dead_worker_id, part_id, pheno_id);
+                        state.exome_pending.push_front(part_id);
+                    }
+
+                    let mut lost_genome = Vec::new();
+                    for (&part_id, (worker, _)) in &state.genome_processing {
+                        if worker == dead_worker_id {
+                            lost_genome.push(part_id);
+                        }
+                    }
+                    lost_genome.sort_by(|a, b| b.cmp(a));
+                    for part_id in lost_genome {
+                        state.genome_processing.remove(&part_id);
+                        println!("Worker {} died. Requeuing genome partition {} for {}", dead_worker_id, part_id, pheno_id);
+                        state.genome_pending.push_front(part_id);
+                    }
+                }
+            }
+            JobExecutionState::Standard => {
+                // No additional state to requeue for standard jobs
             }
         }
 
@@ -515,7 +529,7 @@ impl CoordinatorData {
             let task_id = task_info.task_id;
             if let Some(task) = self.active_tasks.remove(&task_id) {
                 if let ActiveTask::AggregateBatch { phenotype_ids, .. } = task {
-                    if let Some(ref mut batch) = self.batch_state {
+                    if let JobExecutionState::Batch(ref mut batch) = self.job_state {
                         for pheno_id in phenotype_ids {
                             let retries = batch.aggregate_retry_counts.entry(pheno_id.clone()).or_insert(0);
                             *retries += 1;

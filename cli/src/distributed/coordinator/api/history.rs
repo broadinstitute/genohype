@@ -3,7 +3,7 @@
 //! Handlers for retrieving historical job data from the metrics database.
 
 use crate::distributed::coordinator::api::dashboard::build_dashboard_summary;
-use crate::distributed::coordinator::state::SharedState;
+use crate::distributed::coordinator::state::{JobExecutionState, SharedState};
 use crate::distributed::message::{
     BatchStatusResponse, DashboardMetrics, DashboardSummary, EventsResponse, FailuresResponse,
     JobRecord, PhenotypeStatus, WorkerMetricsSeries,
@@ -242,7 +242,7 @@ pub(crate) async fn get_history_job_batch(
     // If requesting the current active job, return live data
     if let Some(ref current_id) = data.current_job_id {
         if current_id == &job_id {
-            if let Some(ref batch) = data.batch_state {
+            if let JobExecutionState::Batch(batch) = &data.job_state {
                 let phenotypes: Vec<PhenotypeStatus> =
                     batch.phenotype_statuses.values().cloned().collect();
                 return axum::Json(BatchStatusResponse { phenotypes });

@@ -25,6 +25,7 @@
 //! This enables processing 12TB datasets without local staging.
 
 pub mod adapter;
+pub mod resolver;
 pub mod writer;
 
 pub use adapter::{
@@ -33,4 +34,5 @@ pub use adapter::{
 };
 #[cfg(feature = "gcp")]
 pub use adapter::get_gcs_client;
+pub use resolver::{resolve_url, resolve_url_for_write, ResolvedStore};
 pub use writer::{CloudWriter, OutputWriter, StreamingCloudWriter};

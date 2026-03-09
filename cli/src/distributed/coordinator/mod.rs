@@ -31,7 +31,7 @@ pub use state::CoordinatorConfig;
 
 // Re-export internal state types for use within the crate
 pub(crate) use state::{
-    ActiveTask, BatchState, CoordinatorData, IngestionState,
+    ActiveTask, BatchState, CoordinatorData, IngestionState, JobExecutionState,
     ManhattanPhase, ManhattanPipelineState, SharedState, WorkerStatus,
     AGGREGATE_BATCH_SIZE, BATCH_ACTIVE_LIMIT, MAX_AGGREGATE_RETRIES, MAX_METRICS_HISTORY,
 };
@@ -236,11 +236,9 @@ pub async fn run_coordinator(
         idle,
         metrics_db,
         aggregated_results: Vec::new(),
-        manhattan_state: None,
-        batch_state: None,
+        job_state: JobExecutionState::Standard,
         active_tasks: HashMap::new(),
         last_error: None,
-        ingestion_state: None,
         events: VecDeque::new(),
         failures: VecDeque::new(),
         events_since_backup: 0,
@@ -277,54 +275,73 @@ pub async fn run_coordinator(
             // For batch/Manhattan jobs, use their state; otherwise use standard counters
             let (pending, processing, completed, failed, total, rows, is_idle, is_batch_complete) = {
                 let data = monitor_state.lock().unwrap();
-                if let Some(ref batch) = data.batch_state {
-                    // Batch jobs use phenotype-level tracking
-                    let total = batch.total_phenotypes;
-                    let completed = batch.completed_count;
-                    let pending = batch.pending_queue.len();
-                    let processing = batch.active_phenotypes.len() + batch.ready_to_aggregate.len();
-                    let is_complete = batch.pending_queue.is_empty()
-                        && batch.active_phenotypes.is_empty()
-                        && batch.ready_to_aggregate.is_empty()
-                        && (batch.completed_count + batch.failed_count) == batch.total_phenotypes;
-                    (
-                        pending,
-                        processing,
-                        completed,
-                        batch.failed_count,
-                        total,
-                        data.total_rows,
-                        data.idle,
-                        is_complete,
-                    )
-                } else if let Some(ref m) = data.manhattan_state {
-                    // Single Manhattan pipeline uses separate tracking
-                    let total_parts = m.exome_total_tasks + m.genome_total_tasks + 1; // +1 for aggregate
-                    let completed_parts = m.exome_completed.len() + m.genome_completed.len() + if m.aggregate_complete { 1 } else { 0 };
-                    let processing_parts = m.exome_processing.len() + m.genome_processing.len() + if m.aggregate_dispatched && !m.aggregate_complete { 1 } else { 0 };
-                    let pending_parts = m.exome_pending.len() + m.genome_pending.len();
-                    let is_complete = m.phase == ManhattanPhase::Complete;
-                    (
-                        pending_parts,
-                        processing_parts,
-                        completed_parts,
-                        data.failed_partitions.len(),
-                        total_parts,
-                        data.total_rows,
-                        data.idle,
-                        is_complete,
-                    )
-                } else {
-                    (
-                        data.pending_partitions.len(),
-                        data.processing_partitions.len(),
-                        data.completed_tasks.len(),
-                        data.failed_partitions.len(),
-                        data.config.total_tasks,
-                        data.total_rows,
-                        data.idle,
-                        false, // Standard jobs don't use this flag
-                    )
+                match &data.job_state {
+                    JobExecutionState::Batch(batch) => {
+                        // Batch jobs use phenotype-level tracking
+                        let total = batch.total_phenotypes;
+                        let completed = batch.completed_count;
+                        let pending = batch.pending_queue.len();
+                        let processing = batch.active_phenotypes.len() + batch.ready_to_aggregate.len();
+                        let is_complete = batch.pending_queue.is_empty()
+                            && batch.active_phenotypes.is_empty()
+                            && batch.ready_to_aggregate.is_empty()
+                            && (batch.completed_count + batch.failed_count) == batch.total_phenotypes;
+                        (
+                            pending,
+                            processing,
+                            completed,
+                            batch.failed_count,
+                            total,
+                            data.total_rows,
+                            data.idle,
+                            is_complete,
+                        )
+                    }
+                    JobExecutionState::Manhattan(m) => {
+                        // Single Manhattan pipeline uses separate tracking
+                        let total_parts = m.exome_total_tasks + m.genome_total_tasks + 1; // +1 for aggregate
+                        let completed_parts = m.exome_completed.len() + m.genome_completed.len() + if m.aggregate_complete { 1 } else { 0 };
+                        let processing_parts = m.exome_processing.len() + m.genome_processing.len() + if m.aggregate_dispatched && !m.aggregate_complete { 1 } else { 0 };
+                        let pending_parts = m.exome_pending.len() + m.genome_pending.len();
+                        let is_complete = m.phase == ManhattanPhase::Complete;
+                        (
+                            pending_parts,
+                            processing_parts,
+                            completed_parts,
+                            data.failed_partitions.len(),
+                            total_parts,
+                            data.total_rows,
+                            data.idle,
+                            is_complete,
+                        )
+                    }
+                    JobExecutionState::Ingestion(ing) => {
+                        let is_complete = ing.pending_tasks.is_empty()
+                            && ing.active_tasks.is_empty()
+                            && (ing.completed_count + ing.failed_count) == ing.total_tasks;
+                        (
+                            ing.pending_tasks.len(),
+                            ing.active_tasks.len(),
+                            ing.completed_count,
+                            ing.failed_count,
+                            ing.total_tasks,
+                            data.total_rows,
+                            data.idle,
+                            is_complete,
+                        )
+                    }
+                    JobExecutionState::Standard => {
+                        (
+                            data.pending_partitions.len(),
+                            data.processing_partitions.len(),
+                            data.completed_tasks.len(),
+                            data.failed_partitions.len(),
+                            data.config.total_tasks,
+                            data.total_rows,
+                            data.idle,
+                            false, // Standard jobs don't use this flag
+                        )
+                    }
                 }
             };
 
@@ -493,10 +510,8 @@ pub async fn run_coordinator(
                     data.completed_tasks.clear();
                     data.failed_partitions.clear();
                     data.retry_counts.clear();
-                    data.manhattan_state = None;
-                    data.batch_state = None;
+                    data.job_state = JobExecutionState::Standard;
                     data.active_tasks.clear();
-                    data.ingestion_state = None;
                     data.aggregated_results.clear();
                     data.total_rows = 0;
                     data.scan_cpu_secs = 0.0;
@@ -588,29 +603,29 @@ async fn get_work(
         return axum::Json(WorkResponse::Wait);
     }
 
-    // Check for Manhattan batch job (multi-phenotype scheduling)
-    if data.batch_state.is_some() {
-        let mut batch = data.batch_state.take().unwrap();
-        let result = get_batch_work(&mut data, &mut batch, &req.worker_id);
-        data.batch_state = Some(batch);
-        return result;
-    }
-
-    // Check for Manhattan pipeline job (two-phase execution)
-    if data.manhattan_state.is_some() {
-        // Take manhattan state out temporarily to avoid borrow issues
-        let mut manhattan = data.manhattan_state.take().unwrap();
-        let result = get_manhattan_work(&mut data, &mut manhattan, &req.worker_id);
-        data.manhattan_state = Some(manhattan);
-        return result;
-    }
-
-    // Check for ingestion job
-    if data.ingestion_state.is_some() {
-        let mut ingestion = data.ingestion_state.take().unwrap();
-        let result = get_ingestion_work(&mut data, &mut ingestion, &req.worker_id);
-        data.ingestion_state = Some(ingestion);
-        return result;
+    // Check for specialized job types using the JobExecutionState enum
+    // We need to temporarily swap out the state to avoid borrow issues
+    let current_state = std::mem::take(&mut data.job_state);
+    match current_state {
+        JobExecutionState::Batch(mut batch) => {
+            let result = get_batch_work(&mut data, &mut batch, &req.worker_id);
+            data.job_state = JobExecutionState::Batch(batch);
+            return result;
+        }
+        JobExecutionState::Manhattan(mut manhattan) => {
+            let result = get_manhattan_work(&mut data, &mut manhattan, &req.worker_id);
+            data.job_state = JobExecutionState::Manhattan(manhattan);
+            return result;
+        }
+        JobExecutionState::Ingestion(mut ingestion) => {
+            let result = get_ingestion_work(&mut data, &mut ingestion, &req.worker_id);
+            data.job_state = JobExecutionState::Ingestion(ingestion);
+            return result;
+        }
+        JobExecutionState::Standard => {
+            // Continue with standard job handling below
+            data.job_state = JobExecutionState::Standard;
+        }
     }
 
     // Standard (non-Manhattan) job: check if there's pending work
@@ -925,7 +940,7 @@ async fn complete_work(
         }
 
         // For batch jobs, handle retry logic based on task type
-        if let Some(ref mut batch) = data.batch_state {
+        if let JobExecutionState::Batch(ref mut batch) = data.job_state {
             match failed_task {
                 Some(ActiveTask::AggregateBatch { phenotype_ids, .. }) => {
                     // Re-queue aggregate tasks for retry
@@ -1033,7 +1048,7 @@ async fn complete_work(
         }
 
         // For Manhattan jobs, also update the manhattan state
-        if let Some(ref mut manhattan) = data.manhattan_state {
+        if let JobExecutionState::Manhattan(ref mut manhattan) = data.job_state {
             let mut valid_exome = Vec::new();
             let mut valid_genome = Vec::new();
 
@@ -1063,7 +1078,7 @@ async fn complete_work(
         }
 
         // For ingestion jobs, mark task as failed
-        if let Some(ref mut ingestion) = data.ingestion_state {
+        if let JobExecutionState::Ingestion(ref mut ingestion) = data.job_state {
             // Check ownership for ingestion tasks
             let mut is_owned = false;
             if let Some((_, _, _, worker_id, _)) = ingestion.active_tasks.get(&task_id) {
@@ -1090,24 +1105,25 @@ async fn complete_work(
         return axum::Json(CompleteResponse { acknowledged: true });
     }
 
-    // Check if this is an ingestion job
-    if data.ingestion_state.is_some() {
-        let mut ingestion = data.ingestion_state.take().unwrap();
-        complete_ingestion_work(&mut ingestion, &req);
-        data.ingestion_state = Some(ingestion);
-    } else if data.batch_state.is_some() {
-        // Check if this is a batch Manhattan job
-        let mut batch = data.batch_state.take().unwrap();
-        complete_batch_work(&mut data, &mut batch, &req);
-        data.batch_state = Some(batch);
-    } else if data.manhattan_state.is_some() {
-        // Check if this is a single Manhattan pipeline job
-        let mut manhattan = data.manhattan_state.take().unwrap();
-        complete_manhattan_work(&mut manhattan, &req, &mut data.last_progress_time);
-        data.manhattan_state = Some(manhattan);
-    } else {
-        // Standard job completion
-        for &part_id in &partitions {
+    // Handle completion based on job type using the JobExecutionState enum
+    let current_state = std::mem::take(&mut data.job_state);
+    match current_state {
+        JobExecutionState::Ingestion(mut ingestion) => {
+            complete_ingestion_work(&mut ingestion, &req);
+            data.job_state = JobExecutionState::Ingestion(ingestion);
+        }
+        JobExecutionState::Batch(mut batch) => {
+            complete_batch_work(&mut data, &mut batch, &req);
+            data.job_state = JobExecutionState::Batch(batch);
+        }
+        JobExecutionState::Manhattan(mut manhattan) => {
+            complete_manhattan_work(&mut manhattan, &req, &mut data.last_progress_time);
+            data.job_state = JobExecutionState::Manhattan(manhattan);
+        }
+        JobExecutionState::Standard => {
+            data.job_state = JobExecutionState::Standard;
+            // Standard job completion
+            for &part_id in &partitions {
             let mut valid_completion = false;
 
             if let Some((worker_id, _)) = data.processing_partitions.get(&part_id) {
@@ -1136,6 +1152,7 @@ async fn complete_work(
                 data.completed_tasks.insert(part_id);
                 // Update progress timestamp (R3)
                 data.last_progress_time = Instant::now();
+            }
             }
         }
     }
@@ -1188,43 +1205,58 @@ async fn get_status(
 ) -> axum::Json<StatusResponse> {
     let data = state.lock().unwrap();
 
-    // Check for batch Manhattan job
-    let (pending, processing, completed, total, is_complete) = if let Some(ref batch) = data.batch_state {
-        let total = batch.total_phenotypes;
-        let completed = batch.completed_count;
-        let pending = batch.pending_queue.len();
-        let processing = batch.active_phenotypes.len() + batch.ready_to_aggregate.len();
-        let is_complete = batch.pending_queue.is_empty()
-            && batch.active_phenotypes.is_empty()
-            && batch.ready_to_aggregate.is_empty()
-            && (batch.completed_count + batch.failed_count) == batch.total_phenotypes;
-        (pending, processing, completed, total, is_complete)
-    } else if let Some(ref m) = data.manhattan_state {
-        // Check if this is a single Manhattan pipeline job
-        let total_parts = m.exome_total_tasks + m.genome_total_tasks;
-        let completed_parts = m.exome_completed.len() + m.genome_completed.len();
-        let processing_parts = m.exome_processing.len() + m.genome_processing.len();
-        let pending_parts = m.exome_pending.len() + m.genome_pending.len();
+    // Check for job type using the JobExecutionState enum
+    let (pending, processing, completed, total, is_complete) = match &data.job_state {
+        JobExecutionState::Batch(batch) => {
+            let total = batch.total_phenotypes;
+            let completed = batch.completed_count;
+            let pending = batch.pending_queue.len();
+            let processing = batch.active_phenotypes.len() + batch.ready_to_aggregate.len();
+            let is_complete = batch.pending_queue.is_empty()
+                && batch.active_phenotypes.is_empty()
+                && batch.ready_to_aggregate.is_empty()
+                && (batch.completed_count + batch.failed_count) == batch.total_phenotypes;
+            (pending, processing, completed, total, is_complete)
+        }
+        JobExecutionState::Manhattan(m) => {
+            let total_parts = m.exome_total_tasks + m.genome_total_tasks;
+            let completed_parts = m.exome_completed.len() + m.genome_completed.len();
+            let processing_parts = m.exome_processing.len() + m.genome_processing.len();
+            let pending_parts = m.exome_pending.len() + m.genome_pending.len();
 
-        // Add aggregate phase (+1 task)
-        let total = total_parts + 1;
-        let completed = completed_parts + if m.aggregate_complete { 1 } else { 0 };
-        let processing = processing_parts + if m.aggregate_dispatched && !m.aggregate_complete { 1 } else { 0 };
-        let pending = pending_parts + if !m.aggregate_dispatched && m.phase == ManhattanPhase::Aggregate { 1 } else { 0 };
-        let is_complete = m.phase == ManhattanPhase::Complete;
+            // Add aggregate phase (+1 task)
+            let total = total_parts + 1;
+            let completed = completed_parts + if m.aggregate_complete { 1 } else { 0 };
+            let processing = processing_parts + if m.aggregate_dispatched && !m.aggregate_complete { 1 } else { 0 };
+            let pending = pending_parts + if !m.aggregate_dispatched && m.phase == ManhattanPhase::Aggregate { 1 } else { 0 };
+            let is_complete = m.phase == ManhattanPhase::Complete;
 
-        (pending, processing, completed, total, is_complete)
-    } else {
-        let failed = data.failed_partitions.len();
-        let completed = data.completed_tasks.len();
-        let is_complete = (completed + failed) == data.config.total_tasks;
-        (
-            data.pending_partitions.len(),
-            data.processing_partitions.len(),
-            completed,
-            data.config.total_tasks,
-            is_complete,
-        )
+            (pending, processing, completed, total, is_complete)
+        }
+        JobExecutionState::Ingestion(ing) => {
+            let is_complete = ing.pending_tasks.is_empty()
+                && ing.active_tasks.is_empty()
+                && (ing.completed_count + ing.failed_count) == ing.total_tasks;
+            (
+                ing.pending_tasks.len(),
+                ing.active_tasks.len(),
+                ing.completed_count,
+                ing.total_tasks,
+                is_complete,
+            )
+        }
+        JobExecutionState::Standard => {
+            let failed = data.failed_partitions.len();
+            let completed = data.completed_tasks.len();
+            let is_complete = (completed + failed) == data.config.total_tasks;
+            (
+                data.pending_partitions.len(),
+                data.processing_partitions.len(),
+                completed,
+                data.config.total_tasks,
+                is_complete,
+            )
+        }
     };
 
     let failed = data.failed_partitions.len();

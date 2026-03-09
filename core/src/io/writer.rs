@@ -29,7 +29,6 @@ use object_store::{ObjectStore, WriteMultipart};
 use std::io::Write;
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use url::Url;
 
 /// Minimum part size for multipart uploads (5MB for S3/GCS)
 const MIN_PART_SIZE: usize = 5 * 1024 * 1024;
@@ -76,35 +75,7 @@ impl CloudWriter {
     /// # Ok::<(), hail_decoder::HailError>(())
     /// ```
     pub fn new(url_str: &str) -> Result<Self> {
-        let url = Url::parse(url_str)
-            .map_err(|e| HailError::InvalidFormat(format!("Invalid URL: {}", e)))?;
-
-        let (store, path): (Arc<dyn ObjectStore>, ObjPath) = match url.scheme() {
-            #[cfg(feature = "gcp")]
-            "gs" => {
-                let bucket = url.host_str()
-                    .ok_or_else(|| HailError::InvalidFormat("Missing bucket in GCS URL".to_string()))?;
-                let path = url.path().trim_start_matches('/');
-
-                (crate::io::get_gcs_client(bucket)?, ObjPath::from(path))
-            }
-            #[cfg(feature = "aws")]
-            "s3" => {
-                let bucket = url.host_str()
-                    .ok_or_else(|| HailError::InvalidFormat("Missing bucket in S3 URL".to_string()))?;
-                let path = url.path().trim_start_matches('/');
-
-                let s3 = object_store::aws::AmazonS3Builder::new()
-                    .with_bucket_name(bucket)
-                    .build()
-                    .map_err(|e| HailError::InvalidFormat(format!("Failed to create S3 client: {}", e)))?;
-
-                (Arc::new(s3), ObjPath::from(path))
-            }
-            scheme => {
-                return Err(HailError::InvalidFormat(format!("Unsupported URL scheme for writing: {}", scheme)));
-            }
-        };
+        let (store, path) = crate::io::resolve_url_for_write(url_str)?;
 
         Ok(CloudWriter {
             store,
@@ -231,39 +202,7 @@ impl StreamingCloudWriter {
     /// Part size must be at least 5MB (cloud provider minimum).
     pub fn with_part_size(url_str: &str, part_size: usize) -> Result<Self> {
         let part_size = part_size.max(MIN_PART_SIZE);
-
-        let url = Url::parse(url_str)
-            .map_err(|e| HailError::InvalidFormat(format!("Invalid URL: {}", e)))?;
-
-        let (store, path): (Arc<dyn ObjectStore>, ObjPath) = match url.scheme() {
-            #[cfg(feature = "gcp")]
-            "gs" => {
-                let bucket = url.host_str()
-                    .ok_or_else(|| HailError::InvalidFormat("Missing bucket in GCS URL".to_string()))?;
-                let obj_path = url.path().trim_start_matches('/');
-
-                (crate::io::get_gcs_client(bucket)?, ObjPath::from(obj_path))
-            }
-            #[cfg(feature = "aws")]
-            "s3" => {
-                let bucket = url.host_str()
-                    .ok_or_else(|| HailError::InvalidFormat("Missing bucket in S3 URL".to_string()))?;
-                let obj_path = url.path().trim_start_matches('/');
-
-                let s3 = object_store::aws::AmazonS3Builder::new()
-                    .with_bucket_name(bucket)
-                    .build()
-                    .map_err(|e| HailError::InvalidFormat(format!("Failed to create S3 client: {}", e)))?;
-
-                (Arc::new(s3), ObjPath::from(obj_path))
-            }
-            scheme => {
-                return Err(HailError::InvalidFormat(format!(
-                    "Unsupported URL scheme for streaming write: {}", scheme
-                )));
-            }
-        };
-
+        let (store, path) = crate::io::resolve_url_for_write(url_str)?;
         Self::from_store(store, path, part_size)
     }
 

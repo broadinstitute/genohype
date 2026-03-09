@@ -24,7 +24,6 @@ use std::io::{Read, Seek, SeekFrom};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
 use tracing::trace;
-use url::Url;
 
 /// Default chunk size for cloud reads (8MB) - used by non-prefetching reader
 const DEFAULT_CHUNK_SIZE: usize = 8 * 1024 * 1024;
@@ -530,45 +529,7 @@ pub fn get_reader(path: &str) -> Result<BoxedReader> {
 /// Uses `PrefetchingCloudReader` which spawns a background task to fetch
 /// data ahead of the read position, hiding network latency.
 fn create_cloud_reader(url_str: &str) -> Result<BoxedReader> {
-    let url = Url::parse(url_str)
-        .map_err(|e| HailError::InvalidFormat(format!("Invalid URL: {}", e)))?;
-
-    let (store, path): (Arc<dyn ObjectStore>, ObjPath) = match url.scheme() {
-        #[cfg(feature = "gcp")]
-        "gs" => {
-            let bucket = url.host_str()
-                .ok_or_else(|| HailError::InvalidFormat("Missing bucket in GCS URL".to_string()))?;
-            let path = url.path().trim_start_matches('/');
-
-            (get_gcs_client(bucket)?, ObjPath::from(path))
-        }
-        #[cfg(feature = "aws")]
-        "s3" => {
-            let bucket = url.host_str()
-                .ok_or_else(|| HailError::InvalidFormat("Missing bucket in S3 URL".to_string()))?;
-            let path = url.path().trim_start_matches('/');
-
-            let s3 = object_store::aws::AmazonS3Builder::new()
-                .with_bucket_name(bucket)
-                .build()
-                .map_err(|e| HailError::InvalidFormat(format!("Failed to create S3 client: {}", e)))?;
-
-            (Arc::new(s3), ObjPath::from(path))
-        }
-        #[cfg(feature = "http")]
-        "http" | "https" => {
-            // For HTTP, use the HttpStore
-            let http = object_store::http::HttpBuilder::new()
-                .with_url(url_str)
-                .build()
-                .map_err(|e| HailError::InvalidFormat(format!("Failed to create HTTP client: {}", e)))?;
-
-            (Arc::new(http), ObjPath::from(""))
-        }
-        scheme => {
-            return Err(HailError::InvalidFormat(format!("Unsupported URL scheme: {}", scheme)));
-        }
-    };
+    let (store, path) = crate::io::resolve_url(url_str)?;
 
     // Get the file size via HEAD request
     let file_size = IO_RUNTIME.block_on(async {
@@ -640,40 +601,7 @@ fn range_read_local(path: &str, offset: u64, length: usize) -> Result<Vec<u8>> {
 
 /// Read a byte range from a cloud storage URL
 fn range_read_cloud(url_str: &str, offset: u64, length: usize) -> Result<Vec<u8>> {
-    let url = Url::parse(url_str)
-        .map_err(|e| HailError::InvalidFormat(format!("Invalid URL: {}", e)))?;
-
-    let (store, path): (Arc<dyn ObjectStore>, ObjPath) = match url.scheme() {
-        #[cfg(feature = "gcp")]
-        "gs" => {
-            let bucket = url.host_str()
-                .ok_or_else(|| HailError::InvalidFormat("Missing bucket in GCS URL".to_string()))?;
-            let path = url.path().trim_start_matches('/');
-            (get_gcs_client(bucket)?, ObjPath::from(path))
-        }
-        #[cfg(feature = "aws")]
-        "s3" => {
-            let bucket = url.host_str()
-                .ok_or_else(|| HailError::InvalidFormat("Missing bucket in S3 URL".to_string()))?;
-            let path = url.path().trim_start_matches('/');
-            let s3 = object_store::aws::AmazonS3Builder::new()
-                .with_bucket_name(bucket)
-                .build()
-                .map_err(|e| HailError::InvalidFormat(format!("Failed to create S3 client: {}", e)))?;
-            (Arc::new(s3), ObjPath::from(path))
-        }
-        #[cfg(feature = "http")]
-        "http" | "https" => {
-            let http = object_store::http::HttpBuilder::new()
-                .with_url(url_str)
-                .build()
-                .map_err(|e| HailError::InvalidFormat(format!("Failed to create HTTP client: {}", e)))?;
-            (Arc::new(http), ObjPath::from(""))
-        }
-        scheme => {
-            return Err(HailError::InvalidFormat(format!("Unsupported URL scheme: {}", scheme)));
-        }
-    };
+    let (store, path) = crate::io::resolve_url(url_str)?;
 
     let range = offset as usize..(offset as usize + length);
     let bytes = IO_RUNTIME.block_on(async {
@@ -718,40 +646,7 @@ pub fn read_single_block(path: &str, file_offset: u64) -> Result<Vec<u8>> {
 /// The size of the file in bytes
 pub fn get_file_size(path: &str) -> Result<u64> {
     if is_cloud_path(path) {
-        let url = Url::parse(path)
-            .map_err(|e| HailError::InvalidFormat(format!("Invalid URL: {}", e)))?;
-
-        let (store, obj_path): (Arc<dyn ObjectStore>, ObjPath) = match url.scheme() {
-            #[cfg(feature = "gcp")]
-            "gs" => {
-                let bucket = url.host_str()
-                    .ok_or_else(|| HailError::InvalidFormat("Missing bucket in GCS URL".to_string()))?;
-                let path = url.path().trim_start_matches('/');
-                (get_gcs_client(bucket)?, ObjPath::from(path))
-            }
-            #[cfg(feature = "aws")]
-            "s3" => {
-                let bucket = url.host_str()
-                    .ok_or_else(|| HailError::InvalidFormat("Missing bucket in S3 URL".to_string()))?;
-                let path = url.path().trim_start_matches('/');
-                let s3 = object_store::aws::AmazonS3Builder::new()
-                    .with_bucket_name(bucket)
-                    .build()
-                    .map_err(|e| HailError::InvalidFormat(format!("Failed to create S3 client: {}", e)))?;
-                (Arc::new(s3), ObjPath::from(path))
-            }
-            #[cfg(feature = "http")]
-            "http" | "https" => {
-                let http = object_store::http::HttpBuilder::new()
-                    .with_url(path)
-                    .build()
-                    .map_err(|e| HailError::InvalidFormat(format!("Failed to create HTTP client: {}", e)))?;
-                (Arc::new(http), ObjPath::from(""))
-            }
-            scheme => {
-                return Err(HailError::InvalidFormat(format!("Unsupported URL scheme: {}", scheme)));
-            }
-        };
+        let (store, obj_path) = crate::io::resolve_url(path)?;
 
         let meta = IO_RUNTIME.block_on(async {
             store.head(&obj_path).await

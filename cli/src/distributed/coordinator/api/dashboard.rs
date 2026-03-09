@@ -4,7 +4,7 @@
 //! bottleneck analysis, worker status, and metrics.
 
 use crate::distributed::coordinator::state::{
-    CoordinatorData, ManhattanPhase, SharedState, WorkerStatus,
+    CoordinatorData, JobExecutionState, ManhattanPhase, SharedState, WorkerStatus,
 };
 use crate::distributed::message::{
     BatchStatusResponse, DashboardBatchProgress, DashboardBottleneck, DashboardMetrics,
@@ -17,9 +17,9 @@ pub(crate) fn build_dashboard_summary(data: &CoordinatorData) -> DashboardSummar
     let elapsed = data.job_start_time.elapsed().as_secs_f64();
     let failed = data.failed_partitions.len();
 
-    // Check for batch Manhattan job (multi-phenotype mode)
-    let (completed, processing, pending, total, is_complete) =
-        if let Some(ref batch) = data.batch_state {
+    // Check for job type using the JobExecutionState enum
+    let (completed, processing, pending, total, is_complete) = match &data.job_state {
+        JobExecutionState::Batch(batch) => {
             // For batch jobs, track phenotype-level progress
             let total = batch.total_phenotypes;
             let completed = batch.completed_count;
@@ -34,7 +34,8 @@ pub(crate) fn build_dashboard_summary(data: &CoordinatorData) -> DashboardSummar
                 && (batch.completed_count + batch.failed_count) == batch.total_phenotypes;
 
             (completed, processing, pending, total, is_complete)
-        } else if let Some(ref m) = data.manhattan_state {
+        }
+        JobExecutionState::Manhattan(m) => {
             let total_parts = m.exome_total_tasks + m.genome_total_tasks;
             let completed_parts = m.exome_completed.len() + m.genome_completed.len();
             let processing_parts = m.exome_processing.len() + m.genome_processing.len();
@@ -57,7 +58,20 @@ pub(crate) fn build_dashboard_summary(data: &CoordinatorData) -> DashboardSummar
             let is_complete = m.phase == ManhattanPhase::Complete;
 
             (completed, processing, pending, total, is_complete)
-        } else {
+        }
+        JobExecutionState::Ingestion(ing) => {
+            let is_complete = ing.pending_tasks.is_empty()
+                && ing.active_tasks.is_empty()
+                && (ing.completed_count + ing.failed_count) == ing.total_tasks;
+            (
+                ing.completed_count,
+                ing.active_tasks.len(),
+                ing.pending_tasks.len(),
+                ing.total_tasks,
+                is_complete,
+            )
+        }
+        JobExecutionState::Standard => {
             let completed = data.completed_tasks.len();
             let is_complete = (completed + failed) == data.config.total_tasks;
             (
@@ -67,7 +81,8 @@ pub(crate) fn build_dashboard_summary(data: &CoordinatorData) -> DashboardSummar
                 data.config.total_tasks,
                 is_complete,
             )
-        };
+        }
+    };
 
     let progress_percent = if total > 0 {
         (completed as f64 / total as f64) * 100.0
@@ -91,7 +106,7 @@ pub(crate) fn build_dashboard_summary(data: &CoordinatorData) -> DashboardSummar
         None
     };
 
-    let batch_progress = if let Some(ref batch) = data.batch_state {
+    let batch_progress = if let JobExecutionState::Batch(batch) = &data.job_state {
         let in_aggregate = batch
             .phenotype_statuses
             .values()
@@ -332,7 +347,7 @@ pub(crate) async fn get_batch_status(
     axum::extract::State(state): axum::extract::State<SharedState>,
 ) -> axum::Json<BatchStatusResponse> {
     let data = state.lock().unwrap();
-    let phenotypes = if let Some(ref batch) = data.batch_state {
+    let phenotypes = if let JobExecutionState::Batch(batch) = &data.job_state {
         let mut list: Vec<PhenotypeStatus> = batch.phenotype_statuses.values().cloned().collect();
         // Sort by ID for stability
         list.sort_by(|a, b| a.id.cmp(&b.id));
