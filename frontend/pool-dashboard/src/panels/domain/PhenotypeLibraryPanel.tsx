@@ -6,26 +6,8 @@ import '../panels.css';
 export const PhenotypeLibraryPanel: React.FC = () => {
   const catalog = useAtomValue(catalogAtom);
   const summary = useAtomValue(summaryAtom);
-  const [configPath, setConfigPath] = useState('/Users/msolomon/data/axaou-local/phenotype-data.toml');
   const [filter, setFilter] = useState('');
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-
-  const handleLoadConfig = async () => {
-    try {
-      const res = await fetch('/api/catalog/load', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ config_path: configPath }),
-      });
-      const data = await res.json();
-      if (!data.success) {
-        alert('Failed to load config: ' + data.error);
-      }
-    } catch (e) {
-      console.error(e);
-      alert('Error loading config.');
-    }
-  };
 
   const handleAction = async (endpoint: string) => {
     if (selectedIds.size === 0) return;
@@ -43,7 +25,6 @@ export const PhenotypeLibraryPanel: React.FC = () => {
       });
       const data = await res.json();
       if (data.success) {
-        // Clear selection on success
         setSelectedIds(new Set());
       } else {
         alert('Action failed: ' + data.error);
@@ -86,23 +67,11 @@ export const PhenotypeLibraryPanel: React.FC = () => {
         <h2 className="panel-title" style={{ margin: 0 }}>Phenotype Library ({catalog.length})</h2>
         <div style={{ display: 'flex', gap: '8px' }}>
           <input
-            value={configPath}
-            onChange={e => setConfigPath(e.target.value)}
-            placeholder="TOML Config Path"
-            style={{ padding: '4px 8px', background: 'var(--bg)', color: 'var(--text)', border: '1px solid var(--border)', borderRadius: '4px', width: '300px', fontSize: '11px' }}
+            value={filter}
+            onChange={e => setFilter(e.target.value)}
+            placeholder="Filter by ID or Description..."
+            style={{ padding: '4px 8px', background: 'var(--bg)', color: 'var(--text)', border: '1px solid var(--border)', borderRadius: '4px', fontSize: '11px', width: '200px' }}
           />
-          <button className="btn btn-primary" onClick={handleLoadConfig}>Load Config</button>
-        </div>
-      </div>
-
-      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '12px', alignItems: 'center' }}>
-        <input
-          value={filter}
-          onChange={e => setFilter(e.target.value)}
-          placeholder="Filter by ID or Description..."
-          style={{ padding: '4px 8px', background: 'var(--bg)', color: 'var(--text)', border: '1px solid var(--border)', borderRadius: '4px', fontSize: '11px', width: '200px' }}
-        />
-        <div style={{ display: 'flex', gap: '8px' }}>
           <button
             className="btn btn-primary"
             disabled={selectedIds.size === 0}
@@ -172,7 +141,7 @@ export const PhenotypeLibraryPanel: React.FC = () => {
         </table>
         {filteredCatalog.length === 0 && (
           <div className="empty-state" style={{ padding: '24px' }}>
-            No phenotypes available. Load a config file first.
+            No phenotypes available. Catalog loads automatically when a batch job is submitted with a config.
           </div>
         )}
       </div>

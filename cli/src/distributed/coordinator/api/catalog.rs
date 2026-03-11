@@ -96,7 +96,7 @@ pub(crate) async fn process_catalog_api(
 
     if data.idle || !matches!(data.job_state, JobExecutionState::Batch(_)) {
         let primary_input = specs.first().and_then(|s| s.primary_input_path()).unwrap_or("batch").to_string();
-        let job_spec = JobSpec::ManhattanBatch { specs, mode };
+        let job_spec = JobSpec::ManhattanBatch { specs, mode, config: None };
 
         data.config.input_path = primary_input;
         data.config.job_spec = Some(job_spec.clone());

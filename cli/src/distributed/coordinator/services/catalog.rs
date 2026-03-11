@@ -12,11 +12,21 @@ pub struct CatalogState {
     pub inputs: HashMap<(String, String), PhenotypeInput>,
 }
 
+/// Load catalog from a TOML config file path.
 pub fn load_catalog(config_path: &str) -> crate::Result<CatalogState> {
     println!("Loading catalog from config: {}", config_path);
     let path = std::path::Path::new(config_path);
     let config = ManhattanJobConfig::load(path)?;
+    build_catalog(config)
+}
 
+/// Load catalog from an already-parsed config (e.g. embedded in a job spec).
+pub fn load_catalog_from_config(config: ManhattanJobConfig) -> crate::Result<CatalogState> {
+    println!("Loading catalog from embedded config");
+    build_catalog(config)
+}
+
+fn build_catalog(config: ManhattanJobConfig) -> crate::Result<CatalogState> {
     let assets_json = config.job.assets_json.as_ref().ok_or_else(|| {
         crate::HailError::InvalidFormat("job.assets_json is required in config".to_string())
     })?;

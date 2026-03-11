@@ -712,7 +712,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             crate::distributed::message::ExecutionMode::Full
         };
 
-        Ok((primary_input, JobSpec::ManhattanBatch { specs, mode }, Vec::new(), Vec::new()))
+        Ok((primary_input, JobSpec::ManhattanBatch { specs, mode, config: Some(job_config) }, Vec::new(), Vec::new()))
     }
 
     /// Parse a `loci` command into a LociSpec job.

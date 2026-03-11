@@ -9,7 +9,7 @@ pub mod catalog;
 
 pub use batch_init::{create_aggregate_spec_from_manhattan_spec, init_batch_state};
 pub use ingest_init::discover_phenotypes_for_ingestion;
-pub use catalog::{load_catalog, CatalogState};
+pub use catalog::{load_catalog, load_catalog_from_config, CatalogState};
 
 #[cfg(feature = "clickhouse")]
 pub use ingest_init::{create_ingestion_state, init_clickhouse_tables};

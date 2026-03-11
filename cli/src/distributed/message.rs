@@ -180,7 +180,13 @@ pub enum JobSpec {
     /// Generate Manhattan plot (high-level submission - coordinator splits into phases)
     Manhattan { spec: ManhattanSpec, mode: ExecutionMode },
     /// Submit a batch of Manhattan plots (coordinator queues them)
-    ManhattanBatch { specs: Vec<ManhattanSpec>, mode: ExecutionMode },
+    ManhattanBatch {
+        specs: Vec<ManhattanSpec>,
+        mode: ExecutionMode,
+        /// Original job config for catalog/library features (optional, not sent to workers)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        config: Option<crate::manhattan::config::ManhattanJobConfig>,
+    },
     /// Phase 1: Worker scans partitions, outputs partial PNGs + sig.parquet
     ManhattanScan(ManhattanScanSpec),
     /// Phase 2: Single worker aggregates results, joins annotations, generates locus plots

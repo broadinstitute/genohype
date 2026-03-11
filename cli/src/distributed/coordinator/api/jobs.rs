@@ -211,7 +211,7 @@ pub(crate) async fn submit_job(
     data.idle = false;
 
     // Handle ManhattanBatch jobs (batch scheduling mode)
-    if let JobSpec::ManhattanBatch { ref specs, mode } = req.job_spec {
+    if let JobSpec::ManhattanBatch { ref specs, mode, ref config } = req.job_spec {
         let total_phenotypes = specs.len();
 
         // Clear standard partition tracking - batch mode uses its own
@@ -221,6 +221,19 @@ pub(crate) async fn submit_job(
             "Initializing Manhattan batch: {} phenotypes (lazy loading, max {} active, mode={:?})",
             total_phenotypes, BATCH_ACTIVE_LIMIT, mode
         );
+
+        // Auto-load catalog from embedded config if available
+        if let Some(job_config) = config {
+            match services::catalog::load_catalog_from_config(job_config.clone()) {
+                Ok(catalog) => {
+                    println!("Auto-loaded catalog with {} phenotypes", catalog.entries.len());
+                    data.catalog = Some(catalog);
+                }
+                Err(e) => {
+                    println!("Warning: Failed to auto-load catalog: {}", e);
+                }
+            }
+        }
 
         // Use the services layer to initialize batch state
         let batch_state = services::init_batch_state(specs, mode);
