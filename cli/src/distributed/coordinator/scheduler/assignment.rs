@@ -235,9 +235,19 @@ pub(crate) fn get_batch_work(
             },
         );
 
-        // Update worker status
+        // Update worker status and task info for visibility
         if let Some(w) = data.worker_registry.get_mut(worker_id) {
             w.status = WorkerStatus::Active;
+            // Set ActiveTaskInfo for aggregate batch - use first phenotype as primary context
+            let first_phenotype = phenotype_ids.first().cloned();
+            w.current_task = Some(ActiveTaskInfo {
+                task_id: task_id.clone(),
+                phenotype_id: first_phenotype,
+                phase: "aggregate".to_string(),
+                source: None, // Aggregate phase doesn't have a specific source
+                tasks: phenotype_ids.clone(),
+                started_at_ms: CoordinatorData::now_ms(),
+            });
         }
 
         println!(
@@ -250,17 +260,26 @@ pub(crate) fn get_batch_work(
         );
 
         // Create TaskDescriptors for each phenotype in the batch
+        // IMPORTANT: The first descriptor uses the coordinator's task_id (UUID) so it can
+        // be matched when the worker reports completion. Remaining descriptors use phenotype
+        // IDs for progress tracking. This mirrors the scan task pattern.
         let tasks: Vec<TaskDescriptor> = phenotype_ids
             .iter()
             .enumerate()
             .map(|(i, pid)| {
+                // First task uses coordinator's task_id for active_tasks lookup
+                let descriptor_id = if i == 0 {
+                    task_id.clone()
+                } else {
+                    pid.clone()
+                };
                 TaskType::Phenotype {
                     phenotype_id: pid.clone(),
                     ancestry: None,
                     operation: PhenotypeOp::ManhattanAggregate,
                 }
                 .into_descriptor(
-                    pid.clone(),
+                    descriptor_id,
                     Some(format!("{} → Aggregate", pid)),
                     Some(i),
                     Some(phenotype_ids.len()),
@@ -670,11 +689,22 @@ pub(crate) fn get_manhattan_work(
             // Dispatch aggregate task
             manhattan.aggregate_dispatched = true;
 
+            let phenotype_id = manhattan.original_spec.phenotype.clone().unwrap_or_default();
+            let ancestry = manhattan.original_spec.ancestry.clone();
+
+            // Update worker status and task info for visibility
             if let Some(w) = data.worker_registry.get_mut(worker_id) {
                 w.status = WorkerStatus::Active;
+                w.current_task = Some(ActiveTaskInfo {
+                    task_id: task_id.clone(),
+                    phenotype_id: Some(phenotype_id.clone()),
+                    phase: "aggregate".to_string(),
+                    source: ancestry.clone(), // Use ancestry as source context for aggregate
+                    tasks: vec![phenotype_id.clone()],
+                    started_at_ms: CoordinatorData::now_ms(),
+                });
             }
 
-            let phenotype_id = manhattan.original_spec.phenotype.clone().unwrap_or_default();
             println!(
                 "Assigned 1 aggregate task to {} [{}] (final aggregation)",
                 worker_id,

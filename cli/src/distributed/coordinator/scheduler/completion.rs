@@ -273,8 +273,12 @@ pub(crate) fn complete_batch_work(
             let duration_secs = (now_ms.saturating_sub(started_at_ms)) as f64 / 1000.0;
             data.aggregate_cpu_secs += duration_secs;
 
+            // Check if this is a global batch error or if we have individual results
+            let is_global_error = req.error.is_some() && req.result_json.is_none();
+
             // Extract individual summaries if available
-            let results_map: HashMap<String, serde_json::Value> =
+            // Each summary may have its own "error" field for per-phenotype failures
+            let results_map: HashMap<String, (serde_json::Value, bool)> =
                 if let Some(ref json) = req.result_json {
                     if let Some(results_array) = json.get("batch_results").and_then(|v| v.as_array())
                     {
@@ -283,7 +287,12 @@ pub(crate) fn complete_batch_work(
                             phenotype_ids
                                 .iter()
                                 .zip(results_array.iter())
-                                .map(|(id, res)| (id.clone(), res.clone()))
+                                .map(|(id, res)| {
+                                    // Check if this specific phenotype had an error
+                                    let has_error = res.get("error").and_then(|e| e.as_str()).is_some()
+                                        || res.get("status").and_then(|s| s.as_str()) == Some("error");
+                                    (id.clone(), (res.clone(), has_error))
+                                })
                                 .collect()
                         } else {
                             HashMap::new()
@@ -295,12 +304,12 @@ pub(crate) fn complete_batch_work(
                     HashMap::new()
                 };
 
-            // Aggregate batch completed - mark all phenotypes as done
-            for phenotype_id in phenotype_ids {
-                batch.completed_count += 1;
+            const MAX_AGGREGATE_RETRIES: usize = 2;
 
+            // Process each phenotype individually for granular tracking
+            for phenotype_id in phenotype_ids {
                 // Calculate duration from start time
-                let duration_secs = batch
+                let phenotype_duration_secs = batch
                     .phenotype_start_times
                     .get(&phenotype_id)
                     .map(|start| start.elapsed().as_secs_f64());
@@ -308,29 +317,99 @@ pub(crate) fn complete_batch_work(
                 // Get accumulated CPU core-seconds
                 let cpu_core_secs = batch.phenotype_cpu_secs.get(&phenotype_id).copied();
 
-                // Update status
-                if let Some(status) = batch.phenotype_statuses.get_mut(&phenotype_id) {
-                    status.stage = "completed".to_string();
-                    status.duration_secs = duration_secs;
-                    status.cpu_core_secs = cpu_core_secs;
-                    if let Some(res) = results_map.get(&phenotype_id) {
-                        status.result = Some(res.clone());
+                // Determine if this phenotype failed
+                let phenotype_failed = is_global_error
+                    || results_map.get(&phenotype_id).map(|(_, err)| *err).unwrap_or(false);
+
+                if phenotype_failed {
+                    // Check if we should retry or mark as permanently failed
+                    let retries = batch.aggregate_retry_counts.entry(phenotype_id.clone()).or_insert(0);
+                    *retries += 1;
+
+                    if *retries > MAX_AGGREGATE_RETRIES {
+                        // Permanently failed
+                        batch.failed_count += 1;
+
+                        let error_msg = if let Some((res, _)) = results_map.get(&phenotype_id) {
+                            res.get("error")
+                                .and_then(|e| e.as_str())
+                                .map(|s| s.to_string())
+                        } else {
+                            req.error.clone()
+                        };
+
+                        if let Some(status) = batch.phenotype_statuses.get_mut(&phenotype_id) {
+                            status.stage = "failed".to_string();
+                            status.error = error_msg.clone();
+                            status.duration_secs = phenotype_duration_secs;
+                            status.cpu_core_secs = cpu_core_secs;
+                        }
+
+                        // Clean up tracking data
+                        batch.phenotype_start_times.remove(&phenotype_id);
+                        batch.phenotype_cpu_secs.remove(&phenotype_id);
+                        batch.aggregate_specs.remove(&phenotype_id);
+                        batch.aggregate_retry_counts.remove(&phenotype_id);
+
+                        println!(
+                            "Phenotype {} FAILED after {} retries: {:?}",
+                            phenotype_id, MAX_AGGREGATE_RETRIES, error_msg
+                        );
+                    } else {
+                        // Requeue for retry if we have the spec
+                        if let Some(spec) = batch.aggregate_specs.get(&phenotype_id).cloned() {
+                            println!(
+                                "Phenotype {} aggregate failed, requeueing for retry ({}/{})",
+                                phenotype_id, retries, MAX_AGGREGATE_RETRIES
+                            );
+                            batch.ready_to_aggregate.push((phenotype_id.clone(), spec));
+
+                            // Update status
+                            if let Some(status) = batch.phenotype_statuses.get_mut(&phenotype_id) {
+                                status.stage = "retry_queued".to_string();
+                            }
+                        } else {
+                            // No spec to retry with, mark as failed
+                            batch.failed_count += 1;
+                            if let Some(status) = batch.phenotype_statuses.get_mut(&phenotype_id) {
+                                status.stage = "failed".to_string();
+                                status.error = Some("No aggregate spec available for retry".to_string());
+                            }
+
+                            println!(
+                                "Phenotype {} FAILED (no aggregate spec for retry)",
+                                phenotype_id
+                            );
+                        }
                     }
+                } else {
+                    // Success
+                    batch.completed_count += 1;
+
+                    // Update status
+                    if let Some(status) = batch.phenotype_statuses.get_mut(&phenotype_id) {
+                        status.stage = "completed".to_string();
+                        status.duration_secs = phenotype_duration_secs;
+                        status.cpu_core_secs = cpu_core_secs;
+                        if let Some((res, _)) = results_map.get(&phenotype_id) {
+                            status.result = Some(res.clone());
+                        }
+                    }
+
+                    // Clean up tracking data
+                    batch.phenotype_start_times.remove(&phenotype_id);
+                    batch.phenotype_cpu_secs.remove(&phenotype_id);
+                    batch.aggregate_specs.remove(&phenotype_id);
+                    batch.aggregate_retry_counts.remove(&phenotype_id);
+
+                    let duration_str = phenotype_duration_secs
+                        .map(|d| format!("{:.1}s", d))
+                        .unwrap_or_else(|| "--".to_string());
+                    println!(
+                        "Phenotype {} complete ({}/{}) [{}]",
+                        phenotype_id, batch.completed_count, batch.total_phenotypes, duration_str
+                    );
                 }
-
-                // Clean up tracking data
-                batch.phenotype_start_times.remove(&phenotype_id);
-                batch.phenotype_cpu_secs.remove(&phenotype_id);
-                batch.aggregate_specs.remove(&phenotype_id);
-                batch.aggregate_retry_counts.remove(&phenotype_id);
-
-                let duration_str = duration_secs
-                    .map(|d| format!("{:.1}s", d))
-                    .unwrap_or_else(|| "--".to_string());
-                println!(
-                    "Phenotype {} complete ({}/{}) [{}]",
-                    phenotype_id, batch.completed_count, batch.total_phenotypes, duration_str
-                );
             }
         }
     }
@@ -342,7 +421,7 @@ mod tests {
     use crate::distributed::coordinator::{
         CoordinatorConfig, ManhattanPipelineState, JobExecutionState,
     };
-    use crate::distributed::message::{ExecutionMode, ManhattanSpec};
+    use crate::distributed::message::{ExecutionMode, ManhattanSpec, PhenotypeStatus, ManhattanAggregateSpec};
     use crate::distributed::metrics_db::MetricsDb;
     use std::collections::{HashSet, VecDeque};
     use std::time::Instant;
@@ -592,5 +671,153 @@ mod tests {
         // State should be unchanged
         assert!(data.active_tasks.is_empty());
         assert_eq!(data.scan_cpu_secs, 0.0);
+    }
+
+    /// Regression test: aggregate batch completion must use UUID task_id (not phenotype ID).
+    ///
+    /// Previously, the coordinator assigned aggregate batch tasks with phenotype IDs as
+    /// descriptor IDs. Workers echo back descriptor IDs in the completion request, so
+    /// `req.tasks[0]` was a phenotype ID — but `active_tasks` was keyed by UUID.
+    /// This caused a lookup miss: the completion handler returned early with a warning,
+    /// never transitioning phenotypes to "completed" or incrementing `completed_count`.
+    #[test]
+    fn test_aggregate_batch_completion_with_uuid_task_id() {
+        let task_id = Uuid::new_v4().to_string();
+        let phenotype_ids = vec![
+            "pheno_A".to_string(),
+            "pheno_B".to_string(),
+            "pheno_C".to_string(),
+        ];
+
+        let metrics_db = MetricsDb::in_memory().unwrap();
+
+        let mut data = CoordinatorData {
+            pending_partitions: VecDeque::new(),
+            processing_partitions: HashMap::new(),
+            completed_tasks: HashSet::new(),
+            config: CoordinatorConfig::default(),
+            total_rows: 0,
+            scan_cpu_secs: 0.0,
+            aggregate_cpu_secs: 0.0,
+            wasted_cpu_secs: 0.0,
+            retry_counts: HashMap::new(),
+            failed_partitions: HashSet::new(),
+            worker_registry: HashMap::new(),
+            job_start_time: Instant::now(),
+            last_progress_time: Instant::now(),
+            idle: false,
+            metrics_db,
+            aggregated_results: Vec::new(),
+            job_state: JobExecutionState::Standard,
+            active_tasks: HashMap::new(),
+            last_error: None,
+            events: VecDeque::new(),
+            failures: VecDeque::new(),
+            events_since_backup: 0,
+            last_backup_at: None,
+            update_fleet_url: None,
+            updated_workers: HashSet::new(),
+            current_job_id: Some("test-job".to_string()),
+            session_id: "test-session".to_string(),
+        };
+
+        // Insert aggregate batch task keyed by UUID (as coordinator does)
+        data.active_tasks.insert(
+            task_id.clone(),
+            ActiveTask::AggregateBatch {
+                phenotype_ids: phenotype_ids.clone(),
+                started_at_ms: CoordinatorData::now_ms() - 5000,
+            },
+        );
+
+        // Set up batch state with phenotype statuses in "aggregating" stage
+        let mut batch = create_test_batch_state();
+        batch.total_phenotypes = 3;
+        for pid in &phenotype_ids {
+            batch.phenotype_statuses.insert(
+                pid.clone(),
+                PhenotypeStatus {
+                    id: pid.clone(),
+                    stage: "aggregating".to_string(),
+                    partitions_done: 10,
+                    partitions_total: 10,
+                    result: None,
+                    error: None,
+                    duration_secs: None,
+                    cpu_core_secs: None,
+                },
+            );
+            batch.aggregate_specs.insert(pid.clone(), ManhattanAggregateSpec {
+                output_path: format!("gs://test/{}", pid),
+                phenotype_id: Some(pid.clone()),
+                ancestry: None,
+                exome_results: None,
+                genome_results: None,
+                gene_burden: None,
+                exome_exp_p: None,
+                genome_exp_p: None,
+                exome_annotations: None,
+                genome_annotations: None,
+                genes: None,
+                threshold: 5e-8,
+                gene_threshold: 2.5e-6,
+                locus_threshold: 0.01,
+                locus_window: 1_000_000,
+                locus_plots: false,
+                min_variants_per_locus: 1,
+                width: 1200,
+                height: 400,
+                layout: Default::default(),
+                y_scale: Default::default(),
+                cleanup: false,
+                styling: Default::default(),
+            });
+        }
+
+        // Simulate completion: first task ID is the UUID (as fixed in assignment.rs),
+        // remaining are phenotype IDs
+        let req = CompleteRequest {
+            worker_id: "test-worker".to_string(),
+            tasks: vec![task_id.clone(), "pheno_B".to_string(), "pheno_C".to_string()],
+            items_processed: 0, // Aggregate tasks report 0 rows
+            result_json: None,
+            error: None,
+            session_id: Some("test-session".to_string()),
+        };
+
+        complete_batch_work(&mut data, &mut batch, &req);
+
+        // Verify: Task should be removed from active_tasks
+        assert!(
+            !data.active_tasks.contains_key(&task_id),
+            "Task should be removed from active_tasks after completion"
+        );
+
+        // Verify: All 3 phenotypes should be marked as completed
+        assert_eq!(
+            batch.completed_count, 3,
+            "All phenotypes in the batch should be counted as completed"
+        );
+
+        for pid in &phenotype_ids {
+            let status = batch.phenotype_statuses.get(pid).expect("status should exist");
+            assert_eq!(
+                status.stage, "completed",
+                "Phenotype {} should be in 'completed' stage, got '{}'",
+                pid, status.stage
+            );
+        }
+
+        // Verify: Aggregate specs should be cleaned up
+        assert!(
+            batch.aggregate_specs.is_empty(),
+            "Aggregate specs should be cleaned up after completion"
+        );
+
+        // Verify: CPU time should be tracked
+        assert!(
+            data.aggregate_cpu_secs > 0.0,
+            "aggregate_cpu_secs should be incremented"
+        );
     }
 }
