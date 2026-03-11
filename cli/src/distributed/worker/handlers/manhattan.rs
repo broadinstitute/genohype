@@ -2,7 +2,7 @@
 //!
 //! Processes Manhattan scan (Phase 1) and aggregate (Phase 2) jobs.
 
-use crate::distributed::message::{ManhattanAggregateSpec, ManhattanScanSpec, ManhattanSource};
+use crate::distributed::message::{CoreTaskInfo, ManhattanAggregateSpec, ManhattanScanSpec, ManhattanSource};
 use crate::distributed::worker::telemetry::{CoreTaskGuard, TelemetryState};
 use crate::Result;
 use genohype_core::query::QueryEngine;
@@ -73,7 +73,15 @@ pub fn process_manhattan_scan_v2(
         .par_iter()
         .map(|&partition_id| {
             // Track the active partition for this Rayon thread (RAII guard)
-            let _core_guard = telemetry.as_ref().map(|ts| CoreTaskGuard::partition(ts, partition_id));
+            // Include phenotype as label so dashboard shows which phenotype each core is scanning
+            let _core_guard = telemetry.as_ref().map(|ts| {
+                CoreTaskGuard::new(ts, CoreTaskInfo {
+                    task_type: "partition".to_string(),
+                    task_id: partition_id.to_string(),
+                    label: Some(phenotype.clone()),
+                    parent: None,
+                })
+            });
 
             let engine = QueryEngine::open_path(table_path)?;
             let iter = engine.scan_partition_iter(partition_id, &[])?;

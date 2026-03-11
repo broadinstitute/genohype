@@ -127,12 +127,17 @@ pub fn dispatch_job(
 
             // Set phenotype context to indicate aggregate batch mode
             if let Some(ref ts) = telemetry {
-                // Use first spec's info as primary context, or show "batch" if multiple
-                if let Some(first) = specs.first() {
-                    let phenotype_id = first.phenotype_id.as_deref().unwrap_or("batch");
-                    let ancestry = first.ancestry.as_deref();
-                    ts.set_aggregate_phase(phenotype_id, ancestry);
-                }
+                let count = specs.len();
+                let first_id = specs.first()
+                    .and_then(|s| s.phenotype_id.as_deref())
+                    .unwrap_or("batch");
+                let display_id = if count > 1 {
+                    format!("{} (+{})", first_id, count - 1)
+                } else {
+                    first_id.to_string()
+                };
+                let ancestry = specs.first().and_then(|s| s.ancestry.as_deref());
+                ts.set_aggregate_phase(&display_id, ancestry);
             }
 
             // Execute all aggregations in parallel using the worker's thread pool
@@ -142,9 +147,10 @@ pub fn dispatch_job(
             let results: Vec<Result<(usize, serde_json::Value)>> = specs.par_iter()
                 .map(|spec| {
                     // Track the phenotype being processed on this Rayon thread
+                    // Use phenotype_id as the display label (not ancestry)
                     let phenotype_id = spec.phenotype_id.clone()
                         .unwrap_or_else(|| "unknown".to_string());
-                    let label = spec.ancestry.clone();
+                    let label = Some(phenotype_id.clone());
                     let _core_guard = telemetry.as_ref()
                         .map(|ts| CoreTaskGuard::phenotype(ts, &phenotype_id, label));
 
