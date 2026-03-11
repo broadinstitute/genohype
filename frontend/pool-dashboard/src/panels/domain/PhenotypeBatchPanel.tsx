@@ -311,6 +311,11 @@ const PhenotypeRow: React.FC<{ phenotype: PhenotypeStatus }> = ({ phenotype: p }
       </td>
       <td style={{ padding: '8px' }}>
         <span className={`stage-badge ${p.stage}`}>{p.stage}</span>
+        {p.error && (
+          <div style={{ fontSize: '10px', color: 'var(--red)', marginTop: '2px', maxWidth: '300px', wordBreak: 'break-word' }}>
+            {p.error}
+          </div>
+        )}
       </td>
       <td style={{ padding: '8px' }}>
         {p.partitions_total > 0 ? (

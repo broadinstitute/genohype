@@ -30,23 +30,32 @@ pub(crate) fn activate_next_phenotypes(batch: &mut BatchState) {
         // Use the output_path as the ID since it should be unique per phenotype
         let phenotype_id = spec.output_path.clone();
 
-        // Get partition counts from the spec (set by CLI/pool submit)
-        // If not set, fall back to 0 (skip that source)
-        let exome_partitions = spec.exome_partitions.unwrap_or(0);
-        let genome_partitions = spec.genome_partitions.unwrap_or(0);
+        // Get partition counts from the spec (set by CLI/pool submit).
+        // If not set, lazily count by reading Hail table metadata.
+        let exome_partitions = spec.exome_partitions.unwrap_or_else(|| {
+            count_partitions_if_present(spec.exome.as_deref(), "exome", &phenotype_id)
+        });
+        let genome_partitions = spec.genome_partitions.unwrap_or_else(|| {
+            count_partitions_if_present(spec.genome.as_deref(), "genome", &phenotype_id)
+        });
 
         if exome_partitions == 0 && genome_partitions == 0 {
-            // No partitions to scan - this phenotype needs partition counts
-            // For now, skip it with a warning (CLI should set partition counts)
+            let error_msg = if spec.exome.is_some() || spec.genome.is_some() {
+                format!(
+                    "Failed to read partition counts from tables (exome={:?}, genome={:?})",
+                    spec.exome, spec.genome
+                )
+            } else {
+                "No exome or genome table paths specified".to_string()
+            };
             println!(
-                "Warning: Phenotype {} has no partition counts set, skipping",
-                phenotype_id
+                "Warning: Phenotype {} has no partitions: {}",
+                phenotype_id, error_msg
             );
             batch.failed_count += 1;
-            // Update status to failed
             if let Some(status) = batch.phenotype_statuses.get_mut(&phenotype_id) {
                 status.stage = "failed".to_string();
-                status.error = Some("No partition counts set".to_string());
+                status.error = Some(error_msg);
             }
             continue;
         }
@@ -85,6 +94,28 @@ pub(crate) fn activate_next_phenotypes(batch: &mut BatchState) {
         };
 
         batch.active_phenotypes.insert(phenotype_id, pipeline_state);
+    }
+}
+
+/// Count partitions for a Hail table path, returning 0 on failure.
+fn count_partitions_if_present(path: Option<&str>, source: &str, phenotype_id: &str) -> usize {
+    let path = match path {
+        Some(p) => p,
+        None => return 0,
+    };
+    match genohype_core::query::QueryEngine::open_path(path) {
+        Ok(engine) => {
+            let n = engine.num_partitions();
+            println!("  Counted {} {} partitions for {}", n, source, phenotype_id);
+            n
+        }
+        Err(e) => {
+            println!(
+                "Warning: Failed to count {} partitions for {} ({}): {}",
+                source, phenotype_id, path, e
+            );
+            0
+        }
     }
 }
 
