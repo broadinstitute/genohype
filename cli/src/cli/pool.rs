@@ -60,9 +60,9 @@ pub enum PoolCommands {
         /// Name of the pool to submit to
         name: String,
 
-        /// GCP zone where the pool is located
-        #[arg(long, default_value = "us-central1-a")]
-        zone: String,
+        /// GCP zone where the pool is located (default: from config or us-central1-a)
+        #[arg(long)]
+        zone: Option<String>,
 
         /// Target cluster for this job (overrides job config with cluster's ClickHouse URL and output path)
         #[arg(long)]
@@ -114,9 +114,9 @@ pub enum PoolCommands {
         #[arg(long)]
         workers: usize,
 
-        /// GCP zone (defaults to us-central1-a)
-        #[arg(long, default_value = "us-central1-a")]
-        zone: String,
+        /// GCP zone (default: from config or us-central1-a)
+        #[arg(long)]
+        zone: Option<String>,
 
         /// Path to the Linux-compiled binary (optional)
         #[arg(long)]
@@ -132,9 +132,9 @@ pub enum PoolCommands {
         /// Name of the pool to destroy
         name: String,
 
-        /// GCP zone where the pool is located
-        #[arg(long, default_value = "us-central1-a")]
-        zone: String,
+        /// GCP zone where the pool is located (default: from config or us-central1-a)
+        #[arg(long)]
+        zone: Option<String>,
 
         /// GCS bucket path to export metrics database before destruction (e.g., gs://my-bucket/metrics/)
         #[arg(long)]
@@ -152,9 +152,9 @@ pub enum PoolCommands {
         /// Name of the pool
         name: String,
 
-        /// GCP zone where the pool is located
-        #[arg(long, default_value = "us-central1-a")]
-        zone: String,
+        /// GCP zone where the pool is located (default: from config or us-central1-a)
+        #[arg(long)]
+        zone: Option<String>,
     },
 
     /// Update the binary on a running pool (upload to coordinator, workers pull)
@@ -162,9 +162,9 @@ pub enum PoolCommands {
         /// Name of the pool
         name: String,
 
-        /// GCP zone where the pool is located
-        #[arg(long, default_value = "us-central1-a")]
-        zone: String,
+        /// GCP zone where the pool is located (default: from config or us-central1-a)
+        #[arg(long)]
+        zone: Option<String>,
 
         /// Path to the Linux-compiled binary (defaults to target/x86_64-unknown-linux-gnu/release/genohype)
         #[arg(long)]
@@ -188,9 +188,9 @@ pub enum PoolCommands {
         /// Name of the pool
         name: String,
 
-        /// GCP zone where the pool is located
-        #[arg(long, default_value = "us-central1-a")]
-        zone: String,
+        /// GCP zone where the pool is located (default: from config or us-central1-a)
+        #[arg(long)]
+        zone: Option<String>,
     },
 
     /// Show real-time worker activity
@@ -198,9 +198,9 @@ pub enum PoolCommands {
         /// Name of the pool
         name: String,
 
-        /// GCP zone where the pool is located
-        #[arg(long, default_value = "us-central1-a")]
-        zone: String,
+        /// GCP zone where the pool is located (default: from config or us-central1-a)
+        #[arg(long)]
+        zone: Option<String>,
     },
 
     /// Tail the event log
@@ -208,9 +208,9 @@ pub enum PoolCommands {
         /// Name of the pool
         name: String,
 
-        /// GCP zone where the pool is located
-        #[arg(long, default_value = "us-central1-a")]
-        zone: String,
+        /// GCP zone where the pool is located (default: from config or us-central1-a)
+        #[arg(long)]
+        zone: Option<String>,
 
         /// Follow the event stream (like tail -f)
         #[arg(short, long)]
@@ -222,9 +222,9 @@ pub enum PoolCommands {
         /// Name of the pool
         name: String,
 
-        /// GCP zone where the pool is located
-        #[arg(long, default_value = "us-central1-a")]
-        zone: String,
+        /// GCP zone where the pool is located (default: from config or us-central1-a)
+        #[arg(long)]
+        zone: Option<String>,
     },
 
     /// Show tail of a specific worker's logs
@@ -232,9 +232,9 @@ pub enum PoolCommands {
         /// Name of the pool
         name: String,
 
-        /// GCP zone where the pool is located
-        #[arg(long, default_value = "us-central1-a")]
-        zone: String,
+        /// GCP zone where the pool is located (default: from config or us-central1-a)
+        #[arg(long)]
+        zone: Option<String>,
 
         /// Worker ID to query logs for
         #[arg(long)]

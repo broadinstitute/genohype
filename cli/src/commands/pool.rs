@@ -8,6 +8,17 @@ use crate::config;
 use genohype_core::Result;
 use owo_colors::OwoColorize;
 
+/// Resolve zone: CLI arg > pool profile > config defaults > fallback
+fn resolve_zone(
+    zone: Option<String>,
+    pool_name: &str,
+    app_config: &config::Config,
+) -> String {
+    zone.or_else(|| app_config.get_pool(pool_name).map(|p| p.zone.clone()))
+        .or_else(|| app_config.defaults.zone.clone())
+        .unwrap_or_else(|| "us-central1-a".to_string())
+}
+
 /// Run pool management commands
 pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> Result<()> {
     let client = GcpClient::new();
@@ -38,10 +49,7 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
             let resolved_machine_type = machine_type
                 .or_else(|| profile.as_ref().map(|p| p.machine_type.clone()))
                 .unwrap_or_else(|| "c3-highcpu-22".to_string());
-            let resolved_zone = zone
-                .or_else(|| profile.as_ref().map(|p| p.zone.clone()))
-                .or_else(|| app_config.defaults.zone.clone())
-                .unwrap_or_else(|| "us-central1-a".to_string());
+            let resolved_zone = resolve_zone(zone, &name, app_config);
             let resolved_spot = spot
                 .or_else(|| profile.as_ref().map(|p| p.spot))
                 .unwrap_or(false);
@@ -249,6 +257,8 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
                 }
             }
 
+            let resolved_zone = resolve_zone(zone, &name, app_config);
+
             // Convert ResolvedPoolConfig to ScalingConfig if available
             let scaling_config = app_config.get_pool(&name).map(|p| {
                 crate::cloud::ScalingConfig {
@@ -264,7 +274,7 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
             });
             manager.submit(
                 &name,
-                &zone,
+                &resolved_zone,
                 binary,
                 auto_stop,
                 redeploy_binary,
@@ -305,20 +315,23 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
                 pool_db_path: pool_config.pool_db_path.clone(),
             };
 
-            manager.scale(&name, workers, &zone, binary, skip_build, &scaling_config)?;
+            let resolved_zone = resolve_zone(zone, &name, app_config);
+            manager.scale(&name, workers, &resolved_zone, binary, skip_build, &scaling_config)?;
         }
         PoolCommands::Destroy {
             name,
             zone,
             metrics_bucket,
         } => {
-            manager.destroy(&name, &zone, metrics_bucket.as_deref())?;
+            let resolved_zone = resolve_zone(zone, &name, app_config);
+            manager.destroy(&name, &resolved_zone, metrics_bucket.as_deref())?;
         }
         PoolCommands::List { name } => {
             manager.list(&name)?;
         }
         PoolCommands::Status { name, zone } => {
-            manager.status(&name, &zone)?;
+            let resolved_zone = resolve_zone(zone, &name, app_config);
+            manager.status(&name, &resolved_zone)?;
         }
         PoolCommands::UpdateBinary {
             name,
@@ -328,6 +341,7 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
             via_api,
             port,
         } => {
+            let resolved_zone = resolve_zone(zone, &name, app_config);
             let pool_config = app_config.get_pool(&name);
             let pool_db_path = pool_config.as_ref().and_then(|p| p.pool_db_path.clone());
             // CLI flag overrides config, config defaults to false
@@ -350,23 +364,28 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
                     api_port,
                 )?;
             } else {
-                manager.update_binary(&name, &zone, binary, skip_build, pool_db_path.as_deref())?;
+                manager.update_binary(&name, &resolved_zone, binary, skip_build, pool_db_path.as_deref())?;
             }
         }
         PoolCommands::Cancel { name, zone } => {
-            manager.cancel(&name, &zone)?;
+            let resolved_zone = resolve_zone(zone, &name, app_config);
+            manager.cancel(&name, &resolved_zone)?;
         }
         PoolCommands::Workers { name, zone } => {
-            manager.workers(&name, &zone)?;
+            let resolved_zone = resolve_zone(zone, &name, app_config);
+            manager.workers(&name, &resolved_zone)?;
         }
         PoolCommands::Events { name, zone, follow } => {
-            manager.events(&name, &zone, follow)?;
+            let resolved_zone = resolve_zone(zone, &name, app_config);
+            manager.events(&name, &resolved_zone, follow)?;
         }
         PoolCommands::Failures { name, zone } => {
-            manager.failures(&name, &zone)?;
+            let resolved_zone = resolve_zone(zone, &name, app_config);
+            manager.failures(&name, &resolved_zone)?;
         }
         PoolCommands::Logs { name, zone, worker } => {
-            manager.logs(&name, &zone, &worker)?;
+            let resolved_zone = resolve_zone(zone, &name, app_config);
+            manager.logs(&name, &resolved_zone, &worker)?;
         }
     }
 
