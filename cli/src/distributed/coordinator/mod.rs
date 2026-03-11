@@ -44,13 +44,14 @@ use crate::distributed::message::{
 use crate::distributed::metrics_db::MetricsDb;
 use crate::Result;
 use std::collections::{HashMap, HashSet, VecDeque};
+use uuid::Uuid;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 // Import functions from extracted modules
 use api::dashboard::build_dashboard_summary;
-use monitor::{backup_db, check_stuck_job, check_timeouts, check_worker_liveness};
+use monitor::{backup_db, check_cpu_status_consistency, check_stuck_job, check_timeouts, check_worker_liveness};
 use scheduler::{
     complete_batch_work, complete_ingestion_work, complete_manhattan_work,
     determine_batch_size, extract_capacity_from_error, get_batch_work, get_ingestion_work,
@@ -246,7 +247,14 @@ pub async fn run_coordinator(
         update_fleet_url: None,
         updated_workers: HashSet::new(),
         current_job_id: None,
+        session_id: Uuid::new_v4().to_string(),
     }));
+
+    // Log session ID for debugging
+    {
+        let data = state.lock().unwrap();
+        println!("  Session ID: {}", &data.session_id[..8]);
+    }
 
     // Start background timeout monitor
     let monitor_state = state.clone();
@@ -258,6 +266,7 @@ pub async fn run_coordinator(
             tokio::time::sleep(Duration::from_secs(30)).await;
             check_timeouts(&monitor_state, timeout_secs);
             check_worker_liveness(&monitor_state);
+            check_cpu_status_consistency(&monitor_state);
 
             // Track events for periodic backup trigger
             let current_events = { monitor_state.lock().unwrap().events.len() };
@@ -727,6 +736,7 @@ async fn get_work(
             total_tasks: data.config.total_tasks,
             filters: data.config.filters.clone(),
             intervals: data.config.intervals.clone(),
+            session_id: Some(data.session_id.clone()),
         })
     } else if !data.processing_partitions.is_empty() {
         // Work in progress but nothing pending - tell worker to wait
@@ -751,6 +761,17 @@ async fn complete_work(
 ) -> axum::Json<CompleteResponse> {
     let mut data = state.lock().unwrap();
     let now_ms = CoordinatorData::now_ms();
+
+    // Check session_id to detect stale completions from a previous coordinator session
+    // This happens when coordinator restarts while workers continue running
+    if let Some(ref req_session_id) = req.session_id {
+        if *req_session_id != data.session_id {
+            // Silently ignore stale completions - don't spam warnings
+            // The work will be re-assigned if still pending, or the worker will get new work
+            return axum::Json(CompleteResponse { acknowledged: true });
+        }
+    }
+    // Note: If session_id is None (old worker), we process normally for backwards compatibility
 
     // Extract config values before borrowing worker_registry mutably
     let config_batch_size = data.config.batch_size;

@@ -203,6 +203,7 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
                 total_tasks: _,
                 filters,
                 intervals,
+                session_id,
             } => {
                 let job_spec: JobSpec = match serde_json::from_value(payload) {
                     Ok(spec) => spec,
@@ -294,6 +295,7 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
                             items_processed: 0,
                             result_json: None,
                             error: Some(error_msg),
+                            session_id: session_id.clone(),
                         };
                         if let Err(post_err) = client.post(&complete_url).json(&fail_req).send().await {
                             eprintln!("Failed to report error to coordinator: {}", post_err);
@@ -312,6 +314,7 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
                             items_processed: 0,
                             result_json: None,
                             error: Some(error_msg),
+                            session_id: session_id.clone(),
                         };
                         if let Err(post_err) = client.post(&complete_url).json(&fail_req).send().await {
                             eprintln!("Failed to report panic to coordinator: {}", post_err);
@@ -336,6 +339,7 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
                     &task_ids,
                     rows_processed,
                     result_json,
+                    session_id.clone(),
                 )
                 .await
                 {
@@ -401,6 +405,7 @@ async fn report_completion(
     tasks: &[String],
     items_processed: usize,
     result_json: Option<serde_json::Value>,
+    session_id: Option<String>,
 ) -> Result<()> {
     let request = CompleteRequest {
         worker_id: worker_id.to_string(),
@@ -408,6 +413,7 @@ async fn report_completion(
         items_processed,
         result_json,
         error: None,
+        session_id,
     };
 
     client
