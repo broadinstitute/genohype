@@ -8,6 +8,26 @@ export const PhenotypeLibraryPanel: React.FC = () => {
   const summary = useAtomValue(summaryAtom);
   const [filter, setFilter] = useState('');
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [configPath, setConfigPath] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  const handleLoadConfig = async () => {
+    if (!configPath.trim()) return;
+    setLoading(true);
+    try {
+      const res = await fetch('/api/catalog/load', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ config_path: configPath }),
+      });
+      const data = await res.json();
+      if (!data.success) alert('Failed: ' + data.error);
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setLoading(false);
+    }
+  };
 
   const handleAction = async (endpoint: string) => {
     if (selectedIds.size === 0) return;
@@ -140,8 +160,23 @@ export const PhenotypeLibraryPanel: React.FC = () => {
           </tbody>
         </table>
         {filteredCatalog.length === 0 && (
-          <div className="empty-state" style={{ padding: '24px' }}>
-            No phenotypes available. Catalog loads automatically when a batch job is submitted with a config.
+          <div className="empty-state" style={{ padding: '24px', textAlign: 'center' }}>
+            <p>No phenotypes loaded yet.</p>
+            <p style={{ fontSize: '11px', opacity: 0.7, marginBottom: '12px' }}>
+              Catalog loads automatically with batch jobs. You can also load manually:
+            </p>
+            <div style={{ display: 'flex', gap: '8px', justifyContent: 'center' }}>
+              <input
+                value={configPath}
+                onChange={e => setConfigPath(e.target.value)}
+                placeholder="Path to phenotype TOML config..."
+                onKeyDown={e => e.key === 'Enter' && handleLoadConfig()}
+                style={{ padding: '4px 8px', background: 'var(--bg)', color: 'var(--text)', border: '1px solid var(--border)', borderRadius: '4px', width: '350px', fontSize: '11px' }}
+              />
+              <button className="btn btn-primary" onClick={handleLoadConfig} disabled={loading || !configPath.trim()}>
+                {loading ? 'Loading...' : 'Load'}
+              </button>
+            </div>
           </div>
         )}
       </div>

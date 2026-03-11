@@ -23,7 +23,24 @@ pub(crate) async fn load_catalog_api(
 pub(crate) async fn get_catalog_api(
     State(state): State<SharedState>,
 ) -> Json<Vec<CatalogEntry>> {
-    let data = state.lock().unwrap();
+    let mut data = state.lock().unwrap();
+
+    // Lazy-load: if catalog is empty but the current job has an embedded config, load it now
+    if data.catalog.is_none() {
+        if let Some(JobSpec::ManhattanBatch { config: Some(ref cfg), .. }) = data.config.job_spec {
+            let cfg = cfg.clone();
+            match crate::distributed::coordinator::services::catalog::load_catalog_from_config(cfg) {
+                Ok(catalog) => {
+                    println!("Lazy-loaded catalog with {} phenotypes", catalog.entries.len());
+                    data.catalog = Some(catalog);
+                }
+                Err(e) => {
+                    println!("Warning: Failed to lazy-load catalog: {}", e);
+                }
+            }
+        }
+    }
+
     if let Some(catalog) = &data.catalog {
         let mut entries = catalog.entries.clone();
 
