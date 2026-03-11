@@ -1,6 +1,5 @@
-use crate::distributed::coordinator::services::catalog::load_catalog;
-use crate::distributed::coordinator::state::{JobExecutionState, SharedState};
-use crate::distributed::message::{CatalogEntry, JobSpec, LoadCatalogRequest, ProcessCatalogRequest};
+use crate::distributed::coordinator::state::{CoordinatorData, JobExecutionState, SharedState};
+use crate::distributed::message::{CatalogEntry, JobEvent, JobSpec, LoadCatalogRequest, ProcessCatalogRequest};
 use axum::{extract::State, Json};
 use crate::manhattan::batch::BatchConfig;
 
@@ -225,9 +224,19 @@ pub(crate) async fn process_catalog_api(
             job_type: Some("manhattan batch (catalog)".to_string()),
         });
 
+        let pheno_names: Vec<String> = req.phenotypes.iter().map(|(id, anc)| format!("{}/{}", anc, id)).collect();
+        data.log_event(JobEvent {
+            timestamp_ms: CoordinatorData::now_ms(),
+            event_type: "submitted".to_string(),
+            worker_id: None,
+            phenotype_id: None,
+            details: format!("Started batch from catalog: {} phenotypes ({})", pheno_names.len(), pheno_names.join(", ")),
+        });
+
         Json(serde_json::json!({ "success": true, "message": "Started new batch job" }))
     } else {
         // Append to existing batch job
+        let mut appended = Vec::new();
         if let JobExecutionState::Batch(ref mut batch) = data.job_state {
             for spec in specs {
                 let id = spec.output_path.clone();
@@ -242,11 +251,21 @@ pub(crate) async fn process_catalog_api(
                         duration_secs: None,
                         cpu_core_secs: None,
                     });
+                    appended.push(spec.phenotype.clone().unwrap_or_default());
                     batch.pending_queue.push_back(spec);
                     batch.total_phenotypes += 1;
                 }
             }
             crate::distributed::coordinator::scheduler::assignment::activate_next_phenotypes(batch);
+        }
+        if !appended.is_empty() {
+            data.log_event(JobEvent {
+                timestamp_ms: CoordinatorData::now_ms(),
+                event_type: "submitted".to_string(),
+                worker_id: None,
+                phenotype_id: None,
+                details: format!("Appended {} phenotypes to batch: {}", appended.len(), appended.join(", ")),
+            });
         }
         Json(serde_json::json!({ "success": true, "message": "Appended to running batch job" }))
     }

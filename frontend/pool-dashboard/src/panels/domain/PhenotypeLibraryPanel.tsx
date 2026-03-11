@@ -3,14 +3,30 @@ import { useAtomValue } from 'jotai';
 import { catalogAtom, summaryAtom } from '../../atoms/dashboardAtoms';
 import '../panels.css';
 
+const selectStyle: React.CSSProperties = {
+  padding: '4px 8px',
+  background: 'var(--bg)',
+  color: 'var(--text)',
+  border: '1px solid var(--border)',
+  borderRadius: '4px',
+  fontSize: '11px',
+};
+
 export const PhenotypeLibraryPanel: React.FC = () => {
   const catalog = useAtomValue(catalogAtom);
   const summary = useAtomValue(summaryAtom);
   const [filter, setFilter] = useState('');
+  const [ancestryFilter, setAncestryFilter] = useState<string>('');
+  const [traitTypeFilter, setTraitTypeFilter] = useState<string>('');
+  const [assetFilter, setAssetFilter] = useState<string>('');
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [assetsPath, setAssetsPath] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Derive unique filter options from catalog
+  const ancestries = useMemo(() => [...new Set(catalog.map(c => c.ancestry))].sort(), [catalog]);
+  const traitTypes = useMemo(() => [...new Set(catalog.map(c => c.trait_type).filter(Boolean))].sort() as string[], [catalog]);
 
   const handleLoadAssets = async () => {
     if (!assetsPath.trim()) return;
@@ -60,13 +76,31 @@ export const PhenotypeLibraryPanel: React.FC = () => {
   };
 
   const filteredCatalog = useMemo(() => {
-    if (!filter) return catalog;
-    const lower = filter.toLowerCase();
-    return catalog.filter(c =>
-      c.id.toLowerCase().includes(lower) ||
-      (c.description && c.description.toLowerCase().includes(lower))
-    );
-  }, [catalog, filter]);
+    let result = catalog;
+    if (ancestryFilter) {
+      result = result.filter(c => c.ancestry === ancestryFilter);
+    }
+    if (traitTypeFilter) {
+      result = result.filter(c => c.trait_type === traitTypeFilter);
+    }
+    if (assetFilter) {
+      result = result.filter(c => {
+        if (assetFilter === 'exome') return c.has_exome;
+        if (assetFilter === 'genome') return c.has_genome;
+        if (assetFilter === 'burden') return c.has_gene_burden;
+        if (assetFilter === 'both') return c.has_exome && c.has_genome;
+        return true;
+      });
+    }
+    if (filter) {
+      const lower = filter.toLowerCase();
+      result = result.filter(c =>
+        c.id.toLowerCase().includes(lower) ||
+        (c.description && c.description.toLowerCase().includes(lower))
+      );
+    }
+    return result;
+  }, [catalog, filter, ancestryFilter, traitTypeFilter, assetFilter]);
 
   const toggleSelect = (key: string) => {
     const next = new Set(selectedIds);
@@ -87,15 +121,9 @@ export const PhenotypeLibraryPanel: React.FC = () => {
 
   return (
     <div className="panel-container" style={{ display: 'flex', flexDirection: 'column' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '12px', alignItems: 'center' }}>
-        <h2 className="panel-title" style={{ margin: 0 }}>Phenotype Library ({catalog.length})</h2>
+      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px', alignItems: 'center' }}>
+        <h2 className="panel-title" style={{ margin: 0 }}>Phenotype Library ({filteredCatalog.length}/{catalog.length})</h2>
         <div style={{ display: 'flex', gap: '8px' }}>
-          <input
-            value={filter}
-            onChange={e => setFilter(e.target.value)}
-            placeholder="Filter by ID or Description..."
-            style={{ padding: '4px 8px', background: 'var(--bg)', color: 'var(--text)', border: '1px solid var(--border)', borderRadius: '4px', fontSize: '11px', width: '200px' }}
-          />
           <button
             className="btn btn-primary"
             disabled={selectedIds.size === 0}
@@ -114,8 +142,36 @@ export const PhenotypeLibraryPanel: React.FC = () => {
           </button>
         </div>
       </div>
+
+      {/* Filter controls */}
+      <div style={{ display: 'flex', gap: '8px', marginBottom: '8px', flexWrap: 'wrap' }}>
+        <input
+          value={filter}
+          onChange={e => setFilter(e.target.value)}
+          placeholder="Search by ID or description..."
+          style={{ ...selectStyle, width: '200px' }}
+        />
+        <select value={ancestryFilter} onChange={e => setAncestryFilter(e.target.value)} style={selectStyle}>
+          <option value="">All ancestries</option>
+          {ancestries.map(a => <option key={a} value={a}>{a}</option>)}
+        </select>
+        {traitTypes.length > 0 && (
+          <select value={traitTypeFilter} onChange={e => setTraitTypeFilter(e.target.value)} style={selectStyle}>
+            <option value="">All trait types</option>
+            {traitTypes.map(t => <option key={t} value={t}>{t}</option>)}
+          </select>
+        )}
+        <select value={assetFilter} onChange={e => setAssetFilter(e.target.value)} style={selectStyle}>
+          <option value="">All assets</option>
+          <option value="exome">Has exome</option>
+          <option value="genome">Has genome</option>
+          <option value="both">Exome + Genome</option>
+          <option value="burden">Has gene burden</option>
+        </select>
+      </div>
+
       {error && (
-        <div style={{ padding: '8px', marginBottom: '12px', background: 'rgba(248, 81, 73, 0.1)', color: 'var(--red)', border: '1px solid var(--red)', borderRadius: '4px', fontSize: '11px' }}>
+        <div style={{ padding: '8px', marginBottom: '8px', background: 'rgba(248, 81, 73, 0.1)', color: 'var(--red)', border: '1px solid var(--red)', borderRadius: '4px', fontSize: '11px' }}>
           {error}
         </div>
       )}
@@ -168,7 +224,7 @@ export const PhenotypeLibraryPanel: React.FC = () => {
             })}
           </tbody>
         </table>
-        {filteredCatalog.length === 0 && (
+        {filteredCatalog.length === 0 && catalog.length === 0 && (
           <div className="empty-state" style={{ padding: '24px', textAlign: 'center' }}>
             <p>No phenotypes loaded yet.</p>
             <div style={{ display: 'flex', gap: '8px', justifyContent: 'center' }}>
@@ -177,12 +233,17 @@ export const PhenotypeLibraryPanel: React.FC = () => {
                 onChange={e => setAssetsPath(e.target.value)}
                 placeholder="gs://bucket/path/to/assets.json"
                 onKeyDown={e => e.key === 'Enter' && handleLoadAssets()}
-                style={{ padding: '4px 8px', background: 'var(--bg)', color: 'var(--text)', border: '1px solid var(--border)', borderRadius: '4px', width: '350px', fontSize: '11px' }}
+                style={{ ...selectStyle, width: '350px' }}
               />
               <button className="btn btn-primary" onClick={handleLoadAssets} disabled={loading || !assetsPath.trim()}>
                 {loading ? 'Loading...' : 'Load Phenotypes'}
               </button>
             </div>
+          </div>
+        )}
+        {filteredCatalog.length === 0 && catalog.length > 0 && (
+          <div className="empty-state" style={{ padding: '24px', textAlign: 'center' }}>
+            No phenotypes match the current filters.
           </div>
         )}
       </div>
