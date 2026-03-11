@@ -8,17 +8,17 @@ export const PhenotypeLibraryPanel: React.FC = () => {
   const summary = useAtomValue(summaryAtom);
   const [filter, setFilter] = useState('');
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  const [configPath, setConfigPath] = useState('');
+  const [assetsPath, setAssetsPath] = useState('gs://axaou-central/browserv2/v8-assets.json');
   const [loading, setLoading] = useState(false);
 
-  const handleLoadConfig = async () => {
-    if (!configPath.trim()) return;
+  const handleLoadAssets = async () => {
+    if (!assetsPath.trim()) return;
     setLoading(true);
     try {
       const res = await fetch('/api/catalog/load', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ config_path: configPath }),
+        body: JSON.stringify({ assets_json: assetsPath }),
       });
       const data = await res.json();
       if (!data.success) alert('Failed: ' + data.error);
@@ -162,19 +162,16 @@ export const PhenotypeLibraryPanel: React.FC = () => {
         {filteredCatalog.length === 0 && (
           <div className="empty-state" style={{ padding: '24px', textAlign: 'center' }}>
             <p>No phenotypes loaded yet.</p>
-            <p style={{ fontSize: '11px', opacity: 0.7, marginBottom: '12px' }}>
-              Catalog loads automatically with batch jobs. You can also load manually:
-            </p>
             <div style={{ display: 'flex', gap: '8px', justifyContent: 'center' }}>
               <input
-                value={configPath}
-                onChange={e => setConfigPath(e.target.value)}
-                placeholder="Path to phenotype TOML config..."
-                onKeyDown={e => e.key === 'Enter' && handleLoadConfig()}
+                value={assetsPath}
+                onChange={e => setAssetsPath(e.target.value)}
+                placeholder="gs://bucket/path/to/assets.json"
+                onKeyDown={e => e.key === 'Enter' && handleLoadAssets()}
                 style={{ padding: '4px 8px', background: 'var(--bg)', color: 'var(--text)', border: '1px solid var(--border)', borderRadius: '4px', width: '350px', fontSize: '11px' }}
               />
-              <button className="btn btn-primary" onClick={handleLoadConfig} disabled={loading || !configPath.trim()}>
-                {loading ? 'Loading...' : 'Load'}
+              <button className="btn btn-primary" onClick={handleLoadAssets} disabled={loading || !assetsPath.trim()}>
+                {loading ? 'Loading...' : 'Load Phenotypes'}
               </button>
             </div>
           </div>

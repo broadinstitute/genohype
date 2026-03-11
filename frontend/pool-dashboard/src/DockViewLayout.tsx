@@ -18,6 +18,7 @@ import {
   FailuresPanel,
   PhenotypeBatchPanel,
   PhenotypeLibraryPanel,
+  JobConfigPanel,
   JobHistoryPanel,
 } from './panels';
 
@@ -35,6 +36,7 @@ const components: Record<string, React.FC> = {
   failures: FailuresPanel,
   phenotypeBatch: PhenotypeBatchPanel,
   phenotypeLibrary: PhenotypeLibraryPanel,
+  jobConfig: JobConfigPanel,
   jobHistory: JobHistoryPanel,
 };
 
@@ -213,6 +215,43 @@ export const applyFleetLayout = (api: DockviewApi) => {
 };
 
 /**
+ * Applies the Phenotype layout preset:
+ * - Left sidebar: Job Config
+ * - Main area: Phenotype Library (top), Phenotype Batch (tabbed)
+ * - Bottom: Event Log
+ */
+export const applyPhenotypeLayout = (api: DockviewApi) => {
+  clearPanels(api);
+
+  const config = api.addPanel({
+    id: 'job_config',
+    component: 'jobConfig',
+    title: 'Job Config',
+  });
+
+  const library = api.addPanel({
+    id: 'phenotype_library',
+    component: 'phenotypeLibrary',
+    title: 'Phenotype Library',
+    position: { direction: 'right', referencePanel: config.id },
+  });
+
+  api.addPanel({
+    id: 'phenotype_batch',
+    component: 'phenotypeBatch',
+    title: 'Phenotype Batch',
+    position: { direction: 'within', referencePanel: library.id },
+  });
+
+  api.addPanel({
+    id: 'event_log',
+    component: 'eventLog',
+    title: 'Event Log',
+    position: { direction: 'below', referencePanel: library.id },
+  });
+};
+
+/**
  * Applies the History layout preset:
  * - Full-screen Job History panel for browsing past jobs
  */
@@ -253,6 +292,9 @@ export const DockViewLayout: React.FC = () => {
         break;
       case 'fleet':
         applyFleetLayout(api);
+        break;
+      case 'phenotype':
+        applyPhenotypeLayout(api);
         break;
       case 'history':
         applyHistoryLayout(api);

@@ -120,7 +120,25 @@ pub fn load_and_group_assets(
     sample: Option<f64>,
     limit: Option<usize>,
 ) -> Result<Vec<PhenotypeInput>> {
-    let file = File::open(path).map_err(HailError::Io)?;
+    // Support GCS paths by downloading to a temp file first
+    let _tmp_file; // keep alive for the duration of this function
+    let local_path = if path.starts_with("gs://") {
+        let tmp = std::env::temp_dir().join("genohype-assets.json");
+        let status = std::process::Command::new("gsutil")
+            .args(["cp", path, tmp.to_str().unwrap()])
+            .status()
+            .map_err(|e| HailError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("gsutil: {}", e))))?;
+        if !status.success() {
+            return Err(HailError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("gsutil cp failed for {}", path))));
+        }
+        _tmp_file = Some(tmp.clone());
+        tmp
+    } else {
+        _tmp_file = None;
+        std::path::PathBuf::from(path)
+    };
+
+    let file = File::open(&local_path).map_err(HailError::Io)?;
     let reader = BufReader::new(file);
 
     // Try to parse as wrapped object first, fall back to plain array

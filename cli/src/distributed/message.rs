@@ -1116,10 +1116,15 @@ pub struct DashboardBottleneck {
     pub avg_network_tx_mb: f64,
 }
 
-/// Request to load a TOML configuration and parse the catalog.
+/// Request to load a catalog. Provide either a TOML config path or a raw assets JSON path.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LoadCatalogRequest {
-    pub config_path: String,
+    /// Path to a TOML config file (loads full config with settings)
+    #[serde(default)]
+    pub config_path: Option<String>,
+    /// Path to assets JSON (local or gs://) - loads just the phenotype list
+    #[serde(default)]
+    pub assets_json: Option<String>,
 }
 
 /// Represents a single phenotype available in the catalog.

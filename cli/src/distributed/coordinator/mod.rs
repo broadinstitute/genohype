@@ -552,6 +552,7 @@ pub async fn run_coordinator(
         // Catalog API
         .route("/api/catalog/load", post(api::catalog::load_catalog_api))
         .route("/api/catalog", get(api::catalog::get_catalog_api))
+        .route("/api/catalog/config", get(api::catalog::get_config_api))
         .route("/api/catalog/process", post(api::catalog::process_catalog_api))
         .route("/api/catalog/ingest", post(api::catalog::ingest_catalog_api))
         // Job management API

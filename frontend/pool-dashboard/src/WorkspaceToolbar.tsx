@@ -61,6 +61,9 @@ export const WorkspaceToolbar: React.FC = () => {
       <button onClick={() => handlePresetChange('fleet')} style={getButtonStyle('fleet')}>
         Fleet
       </button>
+      <button onClick={() => handlePresetChange('phenotype')} style={getButtonStyle('phenotype')}>
+        Phenotype
+      </button>
       <div style={{ width: '1px', background: 'var(--border, #30363d)', margin: '0 4px' }} />
       <button onClick={() => handlePresetChange('history')} style={getButtonStyle('history')}>
         Job History

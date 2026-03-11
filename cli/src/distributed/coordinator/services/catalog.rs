@@ -26,6 +26,15 @@ pub fn load_catalog_from_config(config: ManhattanJobConfig) -> crate::Result<Cat
     build_catalog(config)
 }
 
+/// Load catalog from just an assets JSON path (no TOML config needed).
+/// Uses default settings - suitable for browsing the full phenotype list.
+pub fn load_catalog_from_assets(assets_json: &str) -> crate::Result<CatalogState> {
+    println!("Loading catalog from assets JSON: {}", assets_json);
+    let mut config = ManhattanJobConfig::default();
+    config.job.assets_json = Some(assets_json.to_string());
+    build_catalog(config)
+}
+
 fn build_catalog(config: ManhattanJobConfig) -> crate::Result<CatalogState> {
     let assets_json = config.job.assets_json.as_ref().ok_or_else(|| {
         crate::HailError::InvalidFormat("job.assets_json is required in config".to_string())

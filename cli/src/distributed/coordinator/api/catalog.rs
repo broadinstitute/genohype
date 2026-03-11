@@ -8,11 +8,22 @@ pub(crate) async fn load_catalog_api(
     State(state): State<SharedState>,
     Json(req): Json<LoadCatalogRequest>,
 ) -> Json<serde_json::Value> {
-    match load_catalog(&req.config_path) {
-        Ok(catalog) => {
+    use crate::distributed::coordinator::services::catalog;
+
+    let result = if let Some(ref config_path) = req.config_path {
+        catalog::load_catalog(config_path)
+    } else if let Some(ref assets_json) = req.assets_json {
+        catalog::load_catalog_from_assets(assets_json)
+    } else {
+        return Json(serde_json::json!({ "success": false, "error": "Provide config_path or assets_json" }));
+    };
+
+    match result {
+        Ok(cat) => {
+            let count = cat.entries.len();
             let mut data = state.lock().unwrap();
-            data.catalog = Some(catalog);
-            Json(serde_json::json!({ "success": true }))
+            data.catalog = Some(cat);
+            Json(serde_json::json!({ "success": true, "count": count }))
         }
         Err(e) => {
             Json(serde_json::json!({ "success": false, "error": e.to_string() }))
@@ -99,6 +110,22 @@ fn synthesize_catalog_from_batch(
 
     entries.sort_by(|a, b| a.id.cmp(&b.id).then(a.ancestry.cmp(&b.ancestry)));
     Json(entries)
+}
+
+/// Serve the embedded job config as JSON (for the config panel).
+pub(crate) async fn get_config_api(
+    State(state): State<SharedState>,
+) -> Json<serde_json::Value> {
+    let data = state.lock().unwrap();
+
+    // Try catalog config first, then fall back to job spec's embedded config
+    if let Some(ref catalog) = data.catalog {
+        return Json(serde_json::to_value(&catalog.config).unwrap_or(serde_json::json!(null)));
+    }
+    if let Some(JobSpec::ManhattanBatch { config: Some(ref cfg), .. }) = data.config.job_spec {
+        return Json(serde_json::to_value(cfg).unwrap_or(serde_json::json!(null)));
+    }
+    Json(serde_json::json!(null))
 }
 
 pub(crate) async fn process_catalog_api(
