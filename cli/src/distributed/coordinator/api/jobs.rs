@@ -222,11 +222,14 @@ pub(crate) async fn submit_job(
             total_phenotypes, BATCH_ACTIVE_LIMIT, mode
         );
 
-        // Schedule catalog auto-load in the background (don't block job submission)
+        // Schedule catalog auto-load in the background (don't block job submission).
+        // Uses a plain OS thread because load_catalog_from_config does sync GCS I/O
+        // via read_gcs_file, which creates its own tokio runtime. spawn_blocking
+        // threads inherit the tokio handle but can't use block_in_place, causing panics.
         if let Some(job_config) = config {
             let state_clone = state.clone();
             let cfg = job_config.clone();
-            tokio::task::spawn_blocking(move || {
+            std::thread::spawn(move || {
                 match services::catalog::load_catalog_from_config(cfg) {
                     Ok(catalog) => {
                         println!("Auto-loaded catalog with {} phenotypes", catalog.entries.len());
