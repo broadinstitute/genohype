@@ -222,17 +222,22 @@ pub(crate) async fn submit_job(
             total_phenotypes, BATCH_ACTIVE_LIMIT, mode
         );
 
-        // Auto-load catalog from embedded config if available
+        // Schedule catalog auto-load in the background (don't block job submission)
         if let Some(job_config) = config {
-            match services::catalog::load_catalog_from_config(job_config.clone()) {
-                Ok(catalog) => {
-                    println!("Auto-loaded catalog with {} phenotypes", catalog.entries.len());
-                    data.catalog = Some(catalog);
+            let state_clone = state.clone();
+            let cfg = job_config.clone();
+            tokio::task::spawn_blocking(move || {
+                match services::catalog::load_catalog_from_config(cfg) {
+                    Ok(catalog) => {
+                        println!("Auto-loaded catalog with {} phenotypes", catalog.entries.len());
+                        let mut data = state_clone.lock().expect("state lock poisoned");
+                        data.catalog = Some(catalog);
+                    }
+                    Err(e) => {
+                        println!("Warning: Failed to auto-load catalog: {}", e);
+                    }
                 }
-                Err(e) => {
-                    println!("Warning: Failed to auto-load catalog: {}", e);
-                }
-            }
+            });
         }
 
         // Use the services layer to initialize batch state
