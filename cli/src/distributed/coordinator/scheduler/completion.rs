@@ -6,7 +6,7 @@
 use crate::distributed::coordinator::{
     ActiveTask, BatchState, CoordinatorData, IngestionState, ManhattanPhase, ManhattanPipelineState,
 };
-use crate::distributed::message::{CompleteRequest, ManhattanAggregateSpec, ManhattanSource};
+use crate::distributed::message::{CompleteRequest, JobEvent, ManhattanAggregateSpec, ManhattanSource};
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -209,12 +209,26 @@ pub(crate) fn complete_batch_work(
                     if let Some(status) = batch.phenotype_statuses.get_mut(&phenotype_id) {
                         status.stage = "completed".to_string();
                     }
+                    data.log_event(JobEvent {
+                        timestamp_ms: now_ms,
+                        event_type: "completed".to_string(),
+                        worker_id: Some(req.worker_id.clone()),
+                        phenotype_id: Some(phenotype_id.clone()),
+                        details: format!("Scan complete (ScanOnly mode) [{}/{}]", batch.completed_count, batch.total_phenotypes),
+                    });
                     batch.active_phenotypes.remove(&phenotype_id);
                 } else {
                     println!(
                         "Phenotype {} scan complete, moving to aggregate queue",
                         phenotype_id
                     );
+                    data.log_event(JobEvent {
+                        timestamp_ms: now_ms,
+                        event_type: "phase".to_string(),
+                        worker_id: Some(req.worker_id.clone()),
+                        phenotype_id: Some(phenotype_id.clone()),
+                        details: "Scan complete, queued for aggregation".to_string(),
+                    });
 
                     // Build aggregate spec and move to ready_to_aggregate
                     let original = &state.original_spec;
@@ -351,10 +365,18 @@ pub(crate) fn complete_batch_work(
                         batch.aggregate_specs.remove(&phenotype_id);
                         batch.aggregate_retry_counts.remove(&phenotype_id);
 
+                        let error_detail = error_msg.as_deref().unwrap_or("unknown error");
                         println!(
-                            "Phenotype {} FAILED after {} retries: {:?}",
-                            phenotype_id, MAX_AGGREGATE_RETRIES, error_msg
+                            "Phenotype {} FAILED after {} retries: {}",
+                            phenotype_id, MAX_AGGREGATE_RETRIES, error_detail
                         );
+                        data.log_event(JobEvent {
+                            timestamp_ms: now_ms,
+                            event_type: "failed".to_string(),
+                            worker_id: Some(req.worker_id.clone()),
+                            phenotype_id: Some(phenotype_id.clone()),
+                            details: format!("Permanently failed after {} retries: {}", MAX_AGGREGATE_RETRIES, error_detail),
+                        });
                     } else {
                         // Requeue for retry if we have the spec
                         if let Some(spec) = batch.aggregate_specs.get(&phenotype_id).cloned() {
@@ -362,6 +384,13 @@ pub(crate) fn complete_batch_work(
                                 "Phenotype {} aggregate failed, requeueing for retry ({}/{})",
                                 phenotype_id, retries, MAX_AGGREGATE_RETRIES
                             );
+                            data.log_event(JobEvent {
+                                timestamp_ms: now_ms,
+                                event_type: "requeued".to_string(),
+                                worker_id: Some(req.worker_id.clone()),
+                                phenotype_id: Some(phenotype_id.clone()),
+                                details: format!("Aggregate failed, retry {}/{}", retries, MAX_AGGREGATE_RETRIES),
+                            });
                             batch.ready_to_aggregate.push((phenotype_id.clone(), spec));
 
                             // Update status
@@ -380,6 +409,13 @@ pub(crate) fn complete_batch_work(
                                 "Phenotype {} FAILED (no aggregate spec for retry)",
                                 phenotype_id
                             );
+                            data.log_event(JobEvent {
+                                timestamp_ms: now_ms,
+                                event_type: "failed".to_string(),
+                                worker_id: Some(req.worker_id.clone()),
+                                phenotype_id: Some(phenotype_id.clone()),
+                                details: "Failed: no aggregate spec available for retry".to_string(),
+                            });
                         }
                     }
                 } else {
@@ -409,6 +445,13 @@ pub(crate) fn complete_batch_work(
                         "Phenotype {} complete ({}/{}) [{}]",
                         phenotype_id, batch.completed_count, batch.total_phenotypes, duration_str
                     );
+                    data.log_event(JobEvent {
+                        timestamp_ms: now_ms,
+                        event_type: "completed".to_string(),
+                        worker_id: Some(req.worker_id.clone()),
+                        phenotype_id: Some(phenotype_id.clone()),
+                        details: format!("Completed [{}/{}] in {}", batch.completed_count, batch.total_phenotypes, duration_str),
+                    });
                 }
             }
         }
