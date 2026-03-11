@@ -103,6 +103,18 @@ impl BatchSummary {
 /// 1. Plain array: `[{...}, {...}]`
 /// 2. Object with assets field: `{"assets": [{...}, {...}]}`
 ///
+/// Fetch bytes from an object store path.
+#[cfg(feature = "gcp")]
+async fn fetch_bytes(client: &std::sync::Arc<dyn object_store::ObjectStore>, path: &object_store::path::Path) -> Result<Vec<u8>> {
+    let result = client.get(path).await.map_err(|e| {
+        HailError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("GCS get failed: {}", e)))
+    })?;
+    let bytes = result.bytes().await.map_err(|e| {
+        HailError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("GCS read failed: {}", e)))
+    })?;
+    Ok(bytes.to_vec())
+}
+
 /// Read a file from GCS using the object_store crate.
 #[cfg(feature = "gcp")]
 fn read_gcs_file(gs_path: &str) -> Result<Vec<u8>> {
@@ -120,31 +132,14 @@ fn read_gcs_file(gs_path: &str) -> Result<Vec<u8>> {
 
     // Use Handle::current() if inside a tokio runtime, else create a new one.
     // This supports both async contexts (coordinator) and sync contexts (CLI).
-    let handle = tokio::runtime::Handle::try_current();
-    if let Ok(handle) = handle {
-        return tokio::task::block_in_place(|| handle.block_on(async {
-            let result = client.get(&obj_path).await.map_err(|e| {
-                HailError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("GCS get failed: {}", e)))
-            })?;
-            let bytes = result.bytes().await.map_err(|e| {
-                HailError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("GCS read failed: {}", e)))
-            })?;
-            Ok(bytes.to_vec())
-        }));
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| handle.block_on(fetch_bytes(&client, &obj_path)))
+    } else {
+        let rt = tokio::runtime::Runtime::new().map_err(|e| {
+            HailError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        })?;
+        rt.block_on(fetch_bytes(&client, &obj_path))
     }
-
-    let rt = tokio::runtime::Runtime::new().map_err(|e| {
-        HailError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-    })?;
-    rt.block_on(async {
-        let result = client.get(&obj_path).await.map_err(|e| {
-            HailError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("GCS get failed: {}", e)))
-        })?;
-        let bytes = result.bytes().await.map_err(|e| {
-            HailError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("GCS read failed: {}", e)))
-        })?;
-        Ok(bytes.to_vec())
-    })
 }
 
 #[cfg(not(feature = "gcp"))]

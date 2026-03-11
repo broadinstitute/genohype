@@ -21,7 +21,7 @@ pub(crate) async fn load_catalog_api(
     match result {
         Ok(cat) => {
             let count = cat.entries.len();
-            let mut data = state.lock().unwrap();
+            let mut data = state.lock().expect("state lock poisoned");
             data.catalog = Some(cat);
             Json(serde_json::json!({ "success": true, "count": count }))
         }
@@ -34,22 +34,40 @@ pub(crate) async fn load_catalog_api(
 pub(crate) async fn get_catalog_api(
     State(state): State<SharedState>,
 ) -> Json<Vec<CatalogEntry>> {
-    let mut data = state.lock().unwrap();
+    // Phase 1: check if we need to load, and grab the config (lock released after this block)
+    let pending_config = {
+        let data = state.lock().expect("state lock poisoned");
+        if data.catalog.is_none() {
+            if let Some(JobSpec::ManhattanBatch { config: Some(ref cfg), .. }) = data.config.job_spec {
+                Some(cfg.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
 
-    // Lazy-load: if catalog is empty but the current job has an embedded config, load it now
-    if data.catalog.is_none() {
-        if let Some(JobSpec::ManhattanBatch { config: Some(ref cfg), .. }) = data.config.job_spec {
-            let cfg = cfg.clone();
-            match crate::distributed::coordinator::services::catalog::load_catalog_from_config(cfg) {
-                Ok(catalog) => {
-                    println!("Lazy-loaded catalog with {} phenotypes", catalog.entries.len());
-                    data.catalog = Some(catalog);
-                }
-                Err(e) => {
-                    println!("Warning: Failed to lazy-load catalog: {}", e);
-                }
+    // Phase 2: do the expensive I/O outside the lock
+    let loaded_catalog = if let Some(cfg) = pending_config {
+        match crate::distributed::coordinator::services::catalog::load_catalog_from_config(cfg) {
+            Ok(catalog) => {
+                println!("Lazy-loaded catalog with {} phenotypes", catalog.entries.len());
+                Some(catalog)
+            }
+            Err(e) => {
+                println!("Warning: Failed to lazy-load catalog: {}", e);
+                None
             }
         }
+    } else {
+        None
+    };
+
+    // Phase 3: re-acquire lock to update state and formulate response
+    let mut data = state.lock().expect("state lock poisoned");
+    if let Some(cat) = loaded_catalog {
+        data.catalog = Some(cat);
     }
 
     if let Some(catalog) = &data.catalog {
@@ -116,7 +134,7 @@ fn synthesize_catalog_from_batch(
 pub(crate) async fn get_config_api(
     State(state): State<SharedState>,
 ) -> Json<serde_json::Value> {
-    let data = state.lock().unwrap();
+    let data = state.lock().expect("state lock poisoned");
 
     // Try catalog config first, then fall back to job spec's embedded config
     if let Some(ref catalog) = data.catalog {
@@ -132,7 +150,7 @@ pub(crate) async fn process_catalog_api(
     State(state): State<SharedState>,
     Json(req): Json<ProcessCatalogRequest>,
 ) -> Json<serde_json::Value> {
-    let mut data = state.lock().unwrap();
+    let mut data = state.lock().expect("state lock poisoned");
 
     let catalog = if let Some(cat) = &data.catalog {
         cat.clone()
@@ -238,7 +256,7 @@ pub(crate) async fn ingest_catalog_api(
     State(state): State<SharedState>,
     Json(req): Json<ProcessCatalogRequest>,
 ) -> Json<serde_json::Value> {
-    let mut data = state.lock().unwrap();
+    let mut data = state.lock().expect("state lock poisoned");
 
     if !data.idle {
         return Json(serde_json::json!({ "success": false, "error": "Coordinator is busy. Wait for job to finish." }));

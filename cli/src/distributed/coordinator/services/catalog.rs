@@ -66,35 +66,38 @@ fn build_catalog(config: ManhattanJobConfig) -> crate::Result<CatalogState> {
         inputs_map.insert(key, input);
     }
 
-    // Enrich with metadata from Hail table
-    let meta_path = "gs://aou_results/414k/utils/aou_phenotype_meta_info.ht";
-    println!("Enriching catalog with metadata from {}", meta_path);
+    // Enrich with metadata from Hail table if configured
+    if let Some(meta_path) = &config.job.metadata_path {
+        println!("Enriching catalog with metadata from {}", meta_path);
 
-    if let Ok(engine) = QueryEngine::open_path(meta_path) {
-        if let Ok(iter) = engine.query_iter(&[]) {
-            for row_res in iter {
-                if let Ok(EncodedValue::Struct(fields)) = row_res {
-                    let get_str = |k: &str| -> Option<String> {
-                        fields.iter().find(|(n, _)| n == k).and_then(|(_, v)| v.as_string())
-                    };
-                    let get_int = |k: &str| -> Option<i32> {
-                        fields.iter().find(|(n, _)| n == k).and_then(|(_, v)| v.as_i32())
-                    };
+        if let Ok(engine) = QueryEngine::open_path(meta_path) {
+            if let Ok(iter) = engine.query_iter(&[]) {
+                for row_res in iter {
+                    if let Ok(EncodedValue::Struct(fields)) = row_res {
+                        let get_str = |k: &str| -> Option<String> {
+                            fields.iter().find(|(n, _)| n == k).and_then(|(_, v)| v.as_string())
+                        };
+                        let get_int = |k: &str| -> Option<i32> {
+                            fields.iter().find(|(n, _)| n == k).and_then(|(_, v)| v.as_i32())
+                        };
 
-                    if let (Some(id), Some(ancestry)) = (get_str("phenoname"), get_str("ancestry")) {
-                        let key = (id, ancestry);
-                        if let Some(entry) = entries_map.get_mut(&key) {
-                            entry.description = get_str("description");
-                            entry.trait_type = get_str("trait_type");
-                            entry.n_cases = get_int("n_cases");
-                            entry.n_controls = get_int("n_controls");
+                        if let (Some(id), Some(ancestry)) = (get_str("phenoname"), get_str("ancestry")) {
+                            let key = (id, ancestry);
+                            if let Some(entry) = entries_map.get_mut(&key) {
+                                entry.description = get_str("description");
+                                entry.trait_type = get_str("trait_type");
+                                entry.n_cases = get_int("n_cases");
+                                entry.n_controls = get_int("n_controls");
+                            }
                         }
                     }
                 }
             }
+        } else {
+            println!("Warning: Could not open metadata table at {}, skipping enrichment.", meta_path);
         }
     } else {
-        println!("Warning: Could not open metadata table at {}, skipping enrichment.", meta_path);
+        println!("No metadata_path provided in config, skipping enrichment.");
     }
 
     let mut entries: Vec<CatalogEntry> = entries_map.into_values().collect();

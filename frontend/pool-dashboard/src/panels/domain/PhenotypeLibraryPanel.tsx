@@ -8,12 +8,14 @@ export const PhenotypeLibraryPanel: React.FC = () => {
   const summary = useAtomValue(summaryAtom);
   const [filter, setFilter] = useState('');
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  const [assetsPath, setAssetsPath] = useState('gs://axaou-central/browserv2/v8-assets.json');
+  const [assetsPath, setAssetsPath] = useState('');
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const handleLoadAssets = async () => {
     if (!assetsPath.trim()) return;
     setLoading(true);
+    setError(null);
     try {
       const res = await fetch('/api/catalog/load', {
         method: 'POST',
@@ -21,9 +23,10 @@ export const PhenotypeLibraryPanel: React.FC = () => {
         body: JSON.stringify({ assets_json: assetsPath }),
       });
       const data = await res.json();
-      if (!data.success) alert('Failed: ' + data.error);
+      if (!data.success) setError('Failed: ' + data.error);
     } catch (e) {
       console.error(e);
+      setError('Network error connecting to server');
     } finally {
       setLoading(false);
     }
@@ -31,6 +34,7 @@ export const PhenotypeLibraryPanel: React.FC = () => {
 
   const handleAction = async (endpoint: string) => {
     if (selectedIds.size === 0) return;
+    setError(null);
 
     const phenotypes = Array.from(selectedIds).map(key => {
       const [id, ancestry] = key.split('::');
@@ -47,11 +51,11 @@ export const PhenotypeLibraryPanel: React.FC = () => {
       if (data.success) {
         setSelectedIds(new Set());
       } else {
-        alert('Action failed: ' + data.error);
+        setError('Action failed: ' + data.error);
       }
     } catch (e) {
       console.error(e);
-      alert('Error communicating with server.');
+      setError('Error communicating with server');
     }
   };
 
@@ -110,6 +114,11 @@ export const PhenotypeLibraryPanel: React.FC = () => {
           </button>
         </div>
       </div>
+      {error && (
+        <div style={{ padding: '8px', marginBottom: '12px', background: 'rgba(248, 81, 73, 0.1)', color: 'var(--red)', border: '1px solid var(--red)', borderRadius: '4px', fontSize: '11px' }}>
+          {error}
+        </div>
+      )}
 
       <div style={{ flex: 1, overflowY: 'auto' }}>
         <table className="data-table">

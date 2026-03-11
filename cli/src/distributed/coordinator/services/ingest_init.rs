@@ -14,49 +14,38 @@ pub fn discover_phenotypes_for_ingestion(
     input_dir: &str,
     filter: Option<&[(String, String)]>,
 ) -> crate::Result<Vec<(String, String, String)>> {
-    use std::process::Command;
-
     let input_dir = input_dir.trim_end_matches('/');
 
-    // Use gsutil to list all manifest.json files recursively
-    // This is more reliable than object_store listing for discovering subdirectories
-    let output = Command::new("gsutil")
-        .args(["-m", "ls", "-r", &format!("{}/**/manifest.json", input_dir)])
-        .output()
-        .map_err(|e| {
-            crate::HailError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to run gsutil: {}", e),
-            ))
+    let url = url::Url::parse(input_dir).map_err(|e| {
+        crate::HailError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("Invalid URL: {}", e),
+        ))
+    })?;
+
+    let bucket = url.host_str().ok_or_else(|| {
+        crate::HailError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Missing bucket in GCS URL",
+        ))
+    })?;
+
+    let client = genohype_core::io::adapter::get_gcs_client(bucket)?;
+    let prefix = object_store::path::Path::from(url.path().trim_start_matches('/'));
+
+    let manifest_paths = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| handle.block_on(list_manifests(&client, &prefix, bucket)))
+    } else {
+        let rt = tokio::runtime::Runtime::new().map_err(|e| {
+            crate::HailError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
         })?;
+        rt.block_on(list_manifests(&client, &prefix, bucket))
+    };
 
-    if !output.status.success() {
-        // If no files found, return empty vec (not an error)
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("matched no objects") || stderr.contains("CommandException") {
-            return Ok(Vec::new());
-        }
-        return Err(crate::HailError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("gsutil failed: {}", stderr),
-        )));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let mut phenotypes = Vec::new();
 
-    for line in stdout.lines() {
-        let line = line.trim();
-        if !line.ends_with("/manifest.json") {
-            continue;
-        }
-
-        // Parse path: gs://bucket/base/{ancestry}/{phenotype_id}/manifest.json
-        // Remove /manifest.json to get base_path
-        let base_path = line.trim_end_matches("/manifest.json");
-
-        // Extract ancestry and phenotype_id from path
-        // Take last two segments
+    for full_path in manifest_paths {
+        let base_path = full_path.trim_end_matches("/manifest.json");
         let segments: Vec<&str> = base_path.split('/').collect();
         if segments.len() < 2 {
             continue;
@@ -65,12 +54,10 @@ pub fn discover_phenotypes_for_ingestion(
         let phenotype_id = segments[segments.len() - 1].to_string();
         let ancestry = segments[segments.len() - 2].to_string();
 
-        // Skip if ancestry looks like a bucket or path component
         if ancestry.is_empty() || phenotype_id.is_empty() {
             continue;
         }
 
-        // If a filter is provided, ensure this phenotype is in it
         if let Some(f) = filter {
             if !f.iter().any(|(id, anc)| id == &phenotype_id && anc == &ancestry) {
                 continue;
@@ -81,6 +68,27 @@ pub fn discover_phenotypes_for_ingestion(
     }
 
     Ok(phenotypes)
+}
+
+/// List all manifest.json paths under a given prefix using object_store.
+async fn list_manifests(
+    client: &std::sync::Arc<dyn object_store::ObjectStore>,
+    prefix: &object_store::path::Path,
+    bucket: &str,
+) -> Vec<String> {
+    use futures::StreamExt;
+
+    let mut paths = Vec::new();
+    let mut stream = client.list(Some(prefix));
+    while let Some(res) = stream.next().await {
+        if let Ok(meta) = res {
+            let location = meta.location.to_string();
+            if location.ends_with("/manifest.json") {
+                paths.push(format!("gs://{}/{}", bucket, location));
+            }
+        }
+    }
+    paths
 }
 
 /// Initialize ClickHouse tables for Manhattan ingestion based on init strategy.

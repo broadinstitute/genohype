@@ -90,6 +90,9 @@ pub struct JobSettings {
     /// Path to genome annotations table
     pub genome_annotations: Option<String>,
 
+    /// Path to phenotype metadata Hail table (for catalog enrichment)
+    pub metadata_path: Option<String>,
+
     /// P-value threshold for genome-wide significance
     #[serde(default = "default_threshold")]
     pub threshold: f64,
