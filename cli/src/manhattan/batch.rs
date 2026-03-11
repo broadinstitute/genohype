@@ -7,8 +7,6 @@ use crate::manhattan::config::ManhattanConfig;
 use crate::{HailError, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::BufReader;
 
 /// A single entry from the assets.json file.
 #[derive(Debug, Deserialize)]
@@ -105,6 +103,58 @@ impl BatchSummary {
 /// 1. Plain array: `[{...}, {...}]`
 /// 2. Object with assets field: `{"assets": [{...}, {...}]}`
 ///
+/// Read a file from GCS using the object_store crate.
+#[cfg(feature = "gcp")]
+fn read_gcs_file(gs_path: &str) -> Result<Vec<u8>> {
+    use genohype_core::io::adapter::get_gcs_client;
+    use object_store::path::Path as ObjPath;
+
+    let url = url::Url::parse(gs_path).map_err(|e| {
+        HailError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("Invalid GCS URL: {}", e)))
+    })?;
+    let bucket = url.host_str().ok_or_else(|| {
+        HailError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Missing bucket in GCS URL"))
+    })?;
+    let obj_path = ObjPath::from(url.path());
+    let client = get_gcs_client(bucket)?;
+
+    // Use Handle::current() if inside a tokio runtime, else create a new one.
+    // This supports both async contexts (coordinator) and sync contexts (CLI).
+    let handle = tokio::runtime::Handle::try_current();
+    if let Ok(handle) = handle {
+        return tokio::task::block_in_place(|| handle.block_on(async {
+            let result = client.get(&obj_path).await.map_err(|e| {
+                HailError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("GCS get failed: {}", e)))
+            })?;
+            let bytes = result.bytes().await.map_err(|e| {
+                HailError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("GCS read failed: {}", e)))
+            })?;
+            Ok(bytes.to_vec())
+        }));
+    }
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| {
+        HailError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+    })?;
+    rt.block_on(async {
+        let result = client.get(&obj_path).await.map_err(|e| {
+            HailError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("GCS get failed: {}", e)))
+        })?;
+        let bytes = result.bytes().await.map_err(|e| {
+            HailError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("GCS read failed: {}", e)))
+        })?;
+        Ok(bytes.to_vec())
+    })
+}
+
+#[cfg(not(feature = "gcp"))]
+fn read_gcs_file(_gs_path: &str) -> Result<Vec<u8>> {
+    Err(HailError::Io(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "GCS support requires the 'gcp' feature",
+    )))
+}
+
 /// Parameter behavior:
 /// - `analysis_ids`: Guaranteed inclusions (always in result, processed first)
 /// - `ancestries`: Filter applied to all phenotypes
@@ -120,26 +170,14 @@ pub fn load_and_group_assets(
     sample: Option<f64>,
     limit: Option<usize>,
 ) -> Result<Vec<PhenotypeInput>> {
-    // Support GCS paths by downloading to a temp file first
-    let _tmp_file; // keep alive for the duration of this function
-    let local_path = if path.starts_with("gs://") {
-        let tmp = std::env::temp_dir().join("genohype-assets.json");
-        let status = std::process::Command::new("gsutil")
-            .args(["cp", path, tmp.to_str().unwrap()])
-            .status()
-            .map_err(|e| HailError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("gsutil: {}", e))))?;
-        if !status.success() {
-            return Err(HailError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("gsutil cp failed for {}", path))));
-        }
-        _tmp_file = Some(tmp.clone());
-        tmp
+    // Support GCS paths using object_store
+    let json_bytes: Vec<u8> = if path.starts_with("gs://") {
+        read_gcs_file(path)?
     } else {
-        _tmp_file = None;
-        std::path::PathBuf::from(path)
+        std::fs::read(path).map_err(HailError::Io)?
     };
 
-    let file = File::open(&local_path).map_err(HailError::Io)?;
-    let reader = BufReader::new(file);
+    let reader = std::io::Cursor::new(&json_bytes);
 
     // Try to parse as wrapped object first, fall back to plain array
     let value: serde_json::Value = serde_json::from_reader(reader)?;
