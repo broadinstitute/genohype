@@ -98,25 +98,32 @@ pub(crate) fn activate_next_phenotypes(batch: &mut BatchState) {
 }
 
 /// Count partitions for a Hail table path, returning 0 on failure.
+/// Uses block_in_place since QueryEngine::open_path does blocking GCS I/O
+/// and this is called from tokio worker threads (async handlers).
 fn count_partitions_if_present(path: Option<&str>, source: &str, phenotype_id: &str) -> usize {
     let path = match path {
         Some(p) => p,
         None => return 0,
     };
-    match genohype_core::query::QueryEngine::open_path(path) {
-        Ok(engine) => {
-            let n = engine.num_partitions();
-            println!("  Counted {} {} partitions for {}", n, source, phenotype_id);
-            n
+    let path = path.to_string();
+    let source = source.to_string();
+    let phenotype_id = phenotype_id.to_string();
+    tokio::task::block_in_place(move || {
+        match genohype_core::query::QueryEngine::open_path(&path) {
+            Ok(engine) => {
+                let n = engine.num_partitions();
+                println!("  Counted {} {} partitions for {}", n, source, phenotype_id);
+                n
+            }
+            Err(e) => {
+                println!(
+                    "Warning: Failed to count {} partitions for {} ({}): {}",
+                    source, phenotype_id, path, e
+                );
+                0
+            }
         }
-        Err(e) => {
-            println!(
-                "Warning: Failed to count {} partitions for {} ({}): {}",
-                source, phenotype_id, path, e
-            );
-            0
-        }
-    }
+    })
 }
 
 /// Get work for an ingestion job.
