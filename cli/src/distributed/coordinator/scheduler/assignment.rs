@@ -157,6 +157,7 @@ pub(crate) fn get_ingestion_work(
             total_tasks: ingestion.total_tasks,
             filters: Vec::new(),
             intervals: Vec::new(),
+            session_id: Some(data.session_id.clone()),
         });
     }
 
@@ -274,6 +275,7 @@ pub(crate) fn get_batch_work(
             total_tasks: phenotype_ids.len(),
             filters: Vec::new(),
             intervals: Vec::new(),
+            session_id: Some(data.session_id.clone()),
         });
     }
 
@@ -321,12 +323,12 @@ pub(crate) fn get_batch_work(
 
         let task_id = Uuid::new_v4().to_string();
 
-        // Track this task (using first partition as identifier)
+        // Track this task with all partition IDs for completion handling
         data.active_tasks.insert(
             task_id.clone(),
             ActiveTask::Scan {
                 phenotype_id: phenotype_id.clone(),
-                partition_id: partitions[0],
+                partition_ids: partitions.clone(),
                 source,
                 started_at_ms: CoordinatorData::now_ms(),
             },
@@ -338,10 +340,20 @@ pub(crate) fn get_batch_work(
         };
 
         // Create TaskDescriptors for each partition
+        // IMPORTANT: The first descriptor uses the coordinator's task_id (UUID) so it can
+        // be matched when the worker reports completion. Remaining descriptors use partition
+        // indices for progress tracking.
         let total_tasks = state.exome_total_tasks + state.genome_total_tasks;
         let tasks: Vec<TaskDescriptor> = partitions
             .iter()
-            .map(|&i| {
+            .enumerate()
+            .map(|(idx, &i)| {
+                // First task uses coordinator's task_id for active_tasks lookup
+                let descriptor_id = if idx == 0 {
+                    task_id.clone()
+                } else {
+                    i.to_string()
+                };
                 TaskType::Partition {
                     table_path: table_path.clone(),
                     partition_index: i,
@@ -351,7 +363,7 @@ pub(crate) fn get_batch_work(
                     },
                 }
                 .into_descriptor(
-                    i.to_string(),
+                    descriptor_id,
                     Some(format!("Partition {} → Scan ({})", i + 1, source_name)),
                     Some(i),
                     Some(total_tasks),
@@ -424,6 +436,7 @@ pub(crate) fn get_batch_work(
             total_tasks,
             filters: Vec::new(),
             intervals: Vec::new(),
+            session_id: Some(data.session_id.clone()),
         });
     }
 
@@ -635,6 +648,7 @@ pub(crate) fn get_manhattan_work(
                 total_tasks: manhattan.exome_total_tasks + manhattan.genome_total_tasks,
                 filters: Vec::new(),
                 intervals: Vec::new(),
+                session_id: Some(data.session_id.clone()),
             })
         }
 
@@ -715,6 +729,7 @@ pub(crate) fn get_manhattan_work(
                 total_tasks: 1,
                 filters: Vec::new(),
                 intervals: Vec::new(),
+                session_id: Some(data.session_id.clone()),
             })
         }
 

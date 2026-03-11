@@ -134,12 +134,13 @@ pub(crate) enum ManhattanPhase {
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) enum ActiveTask {
-    /// A scan task for a specific phenotype and partition
+    /// A scan task for a specific phenotype and partitions
     Scan {
         /// Unique ID for the phenotype (e.g., analysis_id)
         phenotype_id: String,
-        /// Which partition is being scanned
-        partition_id: usize,
+        /// Which partitions are being scanned (stored here so completion doesn't
+        /// need to parse task IDs back to partition indices)
+        partition_ids: Vec<usize>,
         /// Source (exome or genome)
         source: ManhattanSource,
         /// Timestamp when this task was assigned (milliseconds since epoch)
@@ -326,6 +327,10 @@ pub(crate) struct CoordinatorData {
     pub(crate) updated_workers: HashSet<String>,
     /// Unique ID for the currently running job (for history tracking)
     pub(crate) current_job_id: Option<String>,
+    /// Unique session ID for this coordinator instance (generated on startup)
+    /// Workers echo this back in completions; mismatched IDs indicate stale completions
+    /// from a previous coordinator session after restart
+    pub(crate) session_id: String,
 }
 
 pub(crate) type SharedState = Arc<Mutex<CoordinatorData>>;
