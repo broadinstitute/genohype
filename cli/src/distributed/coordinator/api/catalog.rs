@@ -56,8 +56,49 @@ pub(crate) async fn get_catalog_api(
         }
         Json(entries)
     } else {
-        Json(vec![])
+        // No catalog loaded - synthesize entries from the running batch job's specs + statuses
+        synthesize_catalog_from_batch(&data)
     }
+}
+
+/// Build catalog entries from whatever the coordinator already has in memory:
+/// the ManhattanBatch specs and the BatchState phenotype statuses.
+fn synthesize_catalog_from_batch(
+    data: &crate::distributed::coordinator::state::CoordinatorData,
+) -> Json<Vec<CatalogEntry>> {
+    let mut entries = Vec::new();
+
+    // Extract specs from the job spec
+    if let Some(JobSpec::ManhattanBatch { ref specs, .. }) = data.config.job_spec {
+        for spec in specs {
+            let id = spec.phenotype.clone().unwrap_or_default();
+            let ancestry = spec.ancestry.clone().unwrap_or_default();
+            let mut status = "idle".to_string();
+
+            // Look up live status from batch state
+            if let JobExecutionState::Batch(ref batch) = data.job_state {
+                if let Some(ps) = batch.phenotype_statuses.get(&spec.output_path) {
+                    status = ps.stage.clone();
+                }
+            }
+
+            entries.push(CatalogEntry {
+                id,
+                ancestry,
+                description: None,
+                trait_type: None,
+                n_cases: None,
+                n_controls: None,
+                has_exome: spec.exome.is_some(),
+                has_genome: spec.genome.is_some(),
+                has_gene_burden: spec.gene_burden.is_some(),
+                status,
+            });
+        }
+    }
+
+    entries.sort_by(|a, b| a.id.cmp(&b.id).then(a.ancestry.cmp(&b.ancestry)));
+    Json(entries)
 }
 
 pub(crate) async fn process_catalog_api(
