@@ -299,7 +299,33 @@ pub(crate) fn get_batch_work(
     }
 
     // Step 3: Priority 2 - Find scan work from active phenotypes
-    for (phenotype_id, state) in batch.active_phenotypes.iter_mut() {
+    // Use round-robin to distribute work across phenotypes instead of always
+    // hitting the same one (HashMap iteration order is stable but arbitrary).
+    let mut phenotype_keys: Vec<String> = batch.active_phenotypes.keys().cloned().collect();
+    phenotype_keys.sort(); // Deterministic order
+
+    let num_phenotypes = phenotype_keys.len();
+    let start_idx = if num_phenotypes > 0 {
+        batch.scan_round_robin % num_phenotypes
+    } else {
+        0
+    };
+
+    // Rotate the list so we start from the round-robin position
+    let ordered_keys: Vec<String> = phenotype_keys
+        .iter()
+        .cycle()
+        .skip(start_idx)
+        .take(num_phenotypes)
+        .cloned()
+        .collect();
+
+    for phenotype_id in &ordered_keys {
+        let state = match batch.active_phenotypes.get_mut(phenotype_id) {
+            Some(s) => s,
+            None => continue,
+        };
+
         // Try exome first, then genome
         let (source, partitions, table_path) = if let Some(part_id) = state.exome_pending.pop_front() {
             let mut parts = vec![part_id];
@@ -339,6 +365,9 @@ pub(crate) fn get_batch_work(
             // No pending work for this phenotype, continue to next
             continue;
         };
+
+        // Advance round-robin for next assignment
+        batch.scan_round_robin += 1;
 
         let task_id = Uuid::new_v4().to_string();
 

@@ -442,6 +442,7 @@ mod tests {
             total_phenotypes: 1,
             aggregate_retry_counts: HashMap::new(),
             aggregate_specs: HashMap::new(),
+            scan_round_robin: 0,
         }
     }
 

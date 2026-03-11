@@ -54,6 +54,7 @@ pub fn init_batch_state(specs: &[ManhattanSpec], mode: ExecutionMode) -> BatchSt
         total_phenotypes,
         aggregate_retry_counts: HashMap::new(),
         aggregate_specs: HashMap::new(),
+        scan_round_robin: 0,
     };
 
     if mode == ExecutionMode::AggregateOnly {

@@ -183,6 +183,8 @@ pub(crate) struct BatchState {
     pub(crate) aggregate_retry_counts: HashMap<String, usize>,
     /// Aggregate specs for phenotypes that may need retry (phenotype_id -> spec)
     pub(crate) aggregate_specs: HashMap<String, ManhattanAggregateSpec>,
+    /// Round-robin index for distributing scan work across active phenotypes
+    pub(crate) scan_round_robin: usize,
 }
 
 /// State for managing Manhattan ingestion into ClickHouse.
