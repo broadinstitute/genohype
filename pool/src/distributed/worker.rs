@@ -97,6 +97,7 @@ pub async fn run_worker(
                 total_tasks: _,
                 filters: _,
                 intervals: _,
+                session_id,
             } => {
                 let task_ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
                 let task_labels: Vec<String> = tasks
@@ -130,6 +131,7 @@ pub async fn run_worker(
                     items_processed,
                     result_json,
                     error,
+                    session_id,
                 };
 
                 if let Err(e) = client.post(&complete_url).json(&request).send().await {

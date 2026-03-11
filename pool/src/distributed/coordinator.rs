@@ -100,6 +100,7 @@ async fn handle_work(
                 total_tasks,
                 filters: assignment.filters,
                 intervals: Vec::new(),
+                session_id: None, // Generic pool coordinator doesn't use session tracking
             };
             (StatusCode::OK, Json(response))
         }

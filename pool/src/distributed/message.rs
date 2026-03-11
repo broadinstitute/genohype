@@ -123,6 +123,10 @@ pub enum WorkResponse {
         /// Interval filters
         #[serde(default)]
         intervals: Vec<String>,
+        /// Session ID for this coordinator instance (workers echo this back in completions)
+        /// Used to detect stale completions from a previous coordinator session after restart
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
     },
     /// No work available but job is still in progress - wait and retry
     #[serde(rename = "wait")]
@@ -156,6 +160,9 @@ pub struct CompleteRequest {
     /// Error message if the task failed (None = success)
     #[serde(default)]
     pub error: Option<String>,
+    /// Session ID echoed from WorkResponse (for detecting stale completions after coordinator restart)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 /// Response to completion request.
@@ -299,6 +306,24 @@ pub struct TelemetrySnapshot {
     /// This caps AIMD growth to prevent repeated OOM failures
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_batch_capacity: Option<usize>,
+
+    // Phenotype visibility fields for better dashboard display
+
+    /// Currently processing phenotype ID (if in a Manhattan/batch job)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_phenotype_id: Option<String>,
+
+    /// Current processing phase: "scan", "aggregate", "ingest", "idle"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_phase: Option<String>,
+
+    /// Current data source being processed: "exome", "genome"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_source: Option<String>,
+
+    /// Ancestry being processed (for multi-ancestry jobs): "meta", "EUR", "AFR", etc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_ancestry: Option<String>,
 }
 
 /// Heartbeat request from worker to coordinator.
