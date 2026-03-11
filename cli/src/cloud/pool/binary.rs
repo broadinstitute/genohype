@@ -593,13 +593,34 @@ EOF
         workers.par_iter().try_for_each(|worker| {
             // Download binary from coordinator, install it, and restart worker service
             // The worker service must be restarted to pick up the new binary!
+            // Create service file if it doesn't exist (handles pools created without GCS staging)
             let curl_cmd = format!(
                 "sudo systemctl stop genohype-worker 2>/dev/null || true && \
                  curl -sL --retry 3 --retry-delay 2 http://{}:3000/api/binary -o /tmp/genohype && \
                  chmod +x /tmp/genohype && \
                  sudo mv /tmp/genohype /usr/local/bin/genohype && \
-                 sudo systemctl start genohype-worker",
-                coordinator_ip
+                 if [ ! -f /etc/systemd/system/genohype-worker.service ]; then \
+                   WORKER_ID=$(hostname) && \
+                   sudo bash -c 'cat > /etc/systemd/system/genohype-worker.service << EOF
+[Unit]
+Description=Genohype Worker
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/genohype service start-worker --url http://{}:3000 --worker-id '\"$WORKER_ID\"'
+Restart=always
+RestartSec=3
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target
+EOF
+' && sudo systemctl daemon-reload; \
+                 fi && \
+                 sudo systemctl enable --now genohype-worker",
+                coordinator_ip, coordinator_ip
             );
 
             let status = self
