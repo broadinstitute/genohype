@@ -554,6 +554,7 @@ mod tests {
             updated_workers: HashSet::new(),
             current_job_id: Some("test-job".to_string()),
             session_id: "test-session".to_string(),
+            catalog: None,
         };
 
         // Insert the active task with UUID as key and all partition_ids
@@ -652,6 +653,7 @@ mod tests {
             updated_workers: HashSet::new(),
             current_job_id: Some("test-job".to_string()),
             session_id: "test-session".to_string(),
+            catalog: None,
         };
 
         let mut batch = create_test_batch_state();
@@ -720,6 +722,7 @@ mod tests {
             updated_workers: HashSet::new(),
             current_job_id: Some("test-job".to_string()),
             session_id: "test-session".to_string(),
+            catalog: None,
         };
 
         // Insert aggregate batch task keyed by UUID (as coordinator does)

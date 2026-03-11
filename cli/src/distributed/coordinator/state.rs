@@ -336,6 +336,8 @@ pub(crate) struct CoordinatorData {
     /// Workers echo this back in completions; mismatched IDs indicate stale completions
     /// from a previous coordinator session after restart
     pub(crate) session_id: String,
+    /// Loaded phenotype catalog for interactive processing
+    pub(crate) catalog: Option<crate::distributed::coordinator::services::CatalogState>,
 }
 
 pub(crate) type SharedState = Arc<Mutex<CoordinatorData>>;

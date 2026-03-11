@@ -1111,6 +1111,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             clickhouse_url,
             database,
             init_strategy,
+            phenotypes: None,
         };
 
         // Use input_dir as the "input_path" for job tracking

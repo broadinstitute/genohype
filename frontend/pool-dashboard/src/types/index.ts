@@ -64,6 +64,19 @@ export interface TelemetrySnapshot {
 /**
  * Dashboard summary for the overall job.
  */
+export interface CatalogEntry {
+  id: string;
+  ancestry: string;
+  description: string | null;
+  trait_type: string | null;
+  n_cases: number | null;
+  n_controls: number | null;
+  has_exome: boolean;
+  has_genome: boolean;
+  has_gene_burden: boolean;
+  status: string;
+}
+
 export interface DashboardSummary {
   /** Job progress percentage (0-100) */
   progress_percent: number;

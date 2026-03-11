@@ -248,6 +248,7 @@ pub async fn run_coordinator(
         updated_workers: HashSet::new(),
         current_job_id: None,
         session_id: Uuid::new_v4().to_string(),
+        catalog: None,
     }));
 
     // Log session ID for debugging
@@ -548,6 +549,11 @@ pub async fn run_coordinator(
         .route("/api/dashboard/workers", get(api::dashboard::get_dashboard_workers))
         .route("/api/dashboard/metrics", get(api::dashboard::get_dashboard_metrics))
         .route("/api/dashboard/batch", get(api::dashboard::get_batch_status))
+        // Catalog API
+        .route("/api/catalog/load", post(api::catalog::load_catalog_api))
+        .route("/api/catalog", get(api::catalog::get_catalog_api))
+        .route("/api/catalog/process", post(api::catalog::process_catalog_api))
+        .route("/api/catalog/ingest", post(api::catalog::ingest_catalog_api))
         // Job management API
         .route("/api/job", post(api::jobs::submit_job))
         .route("/api/cancel", post(api::jobs::cancel_job))

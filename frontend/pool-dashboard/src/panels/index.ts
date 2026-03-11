@@ -24,7 +24,7 @@ export {
 export { EventLogPanel, FailuresPanel } from './logs';
 
 // Domain-specific panels
-export { PhenotypeBatchPanel } from './domain';
+export { PhenotypeBatchPanel, PhenotypeLibraryPanel } from './domain';
 
 // History panels
 export { JobHistoryPanel } from './history';

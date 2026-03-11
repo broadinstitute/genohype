@@ -14,67 +14,23 @@ pub fn run_ingest_command(command: IngestCommands) -> Result<()> {
             println!("  ClickHouse: {}", args.clickhouse_url);
             println!("  Database: {}", args.database);
 
-            // Discover phenotypes using gsutil
-            let output = std::process::Command::new("gsutil")
-                .args([
-                    "-m",
-                    "ls",
-                    "-r",
-                    &format!("{}/**/manifest.json", args.input_dir.trim_end_matches('/')),
-                ])
-                .output()
-                .map_err(|e| {
-                    genohype_core::HailError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Failed to run gsutil: {}", e),
-                    ))
-                })?;
+            // Discover phenotypes
+            let phenotypes = crate::distributed::coordinator::services::discover_phenotypes_for_ingestion(&args.input_dir, None)?;
 
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                if !stderr.contains("matched no objects") {
-                    return Err(genohype_core::HailError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("gsutil failed: {}", stderr),
-                    )));
-                }
+            if phenotypes.is_empty() {
                 println!("No phenotypes found in {}", args.input_dir);
                 return Ok(());
             }
 
-            let stdout = String::from_utf8_lossy(&output.stdout);
             let mut total_rows = 0;
-            let mut count = 0;
+            let count = phenotypes.len();
 
-            for line in stdout.lines() {
-                let line = line.trim();
-                if !line.ends_with("/manifest.json") {
-                    continue;
-                }
-
-                let base_path = line.trim_end_matches("/manifest.json");
-                let segments: Vec<&str> = base_path.split('/').collect();
-                if segments.len() < 2 {
-                    continue;
-                }
-
-                let phenotype_id = segments[segments.len() - 1].to_string();
-                let ancestry = segments[segments.len() - 2].to_string();
-
-                if ancestry.is_empty() || phenotype_id.is_empty() {
-                    continue;
-                }
-
-                count += 1;
-                println!(
-                    "Ingesting {}/{} ({})...",
-                    ancestry, phenotype_id, base_path
-                );
-
+            for (phenotype_id, ancestry, base_path) in phenotypes {
+                println!("Ingesting {}/{} ({})...", ancestry, phenotype_id, base_path);
                 match run_ingest_task(
                     &phenotype_id,
                     &ancestry,
-                    base_path,
+                    &base_path,
                     &args.clickhouse_url,
                     &args.database,
                 ) {

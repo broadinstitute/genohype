@@ -17,6 +17,7 @@ import {
   EventLogPanel,
   FailuresPanel,
   PhenotypeBatchPanel,
+  PhenotypeLibraryPanel,
   JobHistoryPanel,
 } from './panels';
 
@@ -33,6 +34,7 @@ const components: Record<string, React.FC> = {
   eventLog: EventLogPanel,
   failures: FailuresPanel,
   phenotypeBatch: PhenotypeBatchPanel,
+  phenotypeLibrary: PhenotypeLibraryPanel,
   jobHistory: JobHistoryPanel,
 };
 
@@ -69,13 +71,21 @@ export const applyOverviewLayout = (api: DockviewApi, isBatchJob: boolean) => {
     position: { direction: 'right', referencePanel: summary.id },
   });
 
-  // Dynamically add domain-specific panels if the job requires them
+  // Always add Library to let user enqueue jobs dynamically
+  const library = api.addPanel({
+    id: 'phenotype_library',
+    component: 'phenotypeLibrary',
+    title: 'Phenotype Library',
+    position: { direction: 'within', referencePanel: fleet.id },
+  });
+
+  // Dynamically add domain-specific batch panel if the job requires them
   if (isBatchJob) {
     api.addPanel({
       id: 'phenotype_batch',
       component: 'phenotypeBatch',
       title: 'Phenotype Batch',
-      position: { direction: 'within', referencePanel: fleet.id },
+      position: { direction: 'within', referencePanel: library.id },
     });
   }
 

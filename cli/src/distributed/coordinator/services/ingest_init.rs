@@ -12,6 +12,7 @@ use std::collections::HashMap;
 /// Returns: Vec of (phenotype_id, ancestry, base_path)
 pub fn discover_phenotypes_for_ingestion(
     input_dir: &str,
+    filter: Option<&[(String, String)]>,
 ) -> crate::Result<Vec<(String, String, String)>> {
     use std::process::Command;
 
@@ -67,6 +68,13 @@ pub fn discover_phenotypes_for_ingestion(
         // Skip if ancestry looks like a bucket or path component
         if ancestry.is_empty() || phenotype_id.is_empty() {
             continue;
+        }
+
+        // If a filter is provided, ensure this phenotype is in it
+        if let Some(f) = filter {
+            if !f.iter().any(|(id, anc)| id == &phenotype_id && anc == &ancestry) {
+                continue;
+            }
         }
 
         phenotypes.push((phenotype_id, ancestry, base_path.to_string()));

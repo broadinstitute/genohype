@@ -21,7 +21,7 @@ pub struct AssetEntry {
 }
 
 /// A grouped phenotype ready to be converted to a spec.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PhenotypeInput {
     pub ancestry: String,
     pub id: String,

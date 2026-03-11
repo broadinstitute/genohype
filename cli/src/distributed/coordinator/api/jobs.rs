@@ -250,6 +250,7 @@ pub(crate) async fn submit_job(
         ref clickhouse_url,
         ref database,
         ref init_strategy,
+        ref phenotypes,
     } = req.job_spec
     {
         // Clear standard partition tracking - ingestion uses its own state
@@ -273,7 +274,7 @@ pub(crate) async fn submit_job(
 
         // Discover phenotypes by scanning for manifest.json files
         // Structure: {input_dir}/{ancestry}/{phenotype_id}/manifest.json
-        match services::discover_phenotypes_for_ingestion(input_dir) {
+        match services::discover_phenotypes_for_ingestion(input_dir, phenotypes.as_deref()) {
             Ok(phenotypes) => {
                 let total = phenotypes.len();
                 println!("  Discovered {} phenotypes for ingestion", total);

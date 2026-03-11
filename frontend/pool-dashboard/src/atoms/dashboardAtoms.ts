@@ -37,6 +37,9 @@ export const eventsAtom = atom<JobEvent[]>([]);
 /** Task failure records with error details */
 export const failuresAtom = atom<FailureRecord[]>([]);
 
+/** Catalog of available phenotypes */
+export const catalogAtom = atom<import('../types').CatalogEntry[]>([]);
+
 // ============================================================================
 // UI Preference Atoms (persisted to localStorage)
 // ============================================================================
@@ -116,7 +119,7 @@ export const fetchDashboardDataAtom = atom(null, async (get, set) => {
   const failuresPath = isHistoryView ? `/api/history/jobs/${jobId}/failures` : '/api/failures';
 
   // Fetch all endpoints concurrently
-  const [summary, workers, metrics, bottleneck, batch, eventsResp, failuresResp, jobsList] =
+  const [summary, workers, metrics, bottleneck, batch, eventsResp, failuresResp, jobsList, catalogList] =
     await Promise.all([
       fetchJson<DashboardSummary>(`${basePath}/summary`),
       // Workers endpoint doesn't exist for history (workers are transient)
@@ -129,6 +132,8 @@ export const fetchDashboardDataAtom = atom(null, async (get, set) => {
       fetchJson<{ failures: FailureRecord[] }>(failuresPath),
       // Always fetch jobs list for the history panel
       fetchJson<JobRecord[]>('/api/history/jobs'),
+      // Fetch catalog (only for live view)
+      isHistoryView ? Promise.resolve([]) : fetchJson<import('../types').CatalogEntry[]>('/api/catalog'),
     ]);
 
   // Update atoms with fetched data (only if fetch succeeded)
@@ -140,6 +145,7 @@ export const fetchDashboardDataAtom = atom(null, async (get, set) => {
   if (eventsResp !== null) set(eventsAtom, eventsResp.events);
   if (failuresResp !== null) set(failuresAtom, failuresResp.failures);
   if (jobsList !== null) set(jobsListAtom, jobsList);
+  if (catalogList !== null) set(catalogAtom, catalogList);
 });
 
 // ============================================================================

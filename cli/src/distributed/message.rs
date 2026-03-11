@@ -203,6 +203,9 @@ pub enum JobSpec {
         /// Table initialization strategy (create, replace, append)
         #[serde(default)]
         init_strategy: InitStrategy,
+        /// Optional list of specific (phenotype_id, ancestry) to ingest. If None, ingest all found.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phenotypes: Option<Vec<(String, String)>>,
     },
     /// Ingest a specific phenotype into ClickHouse (Worker task)
     IngestManhattanTask {
@@ -636,6 +639,14 @@ impl JobSpec {
             JobSpec::IngestManhattan { .. } => "ingest manhattan",
             JobSpec::IngestManhattanTask { .. } => "ingest manhattan task",
             JobSpec::Stress(_) => "synthetic stress test",
+        }
+    }
+
+    /// Extract the phenotypes filter from an IngestManhattan job spec.
+    pub fn phenotypes(&self) -> Option<Vec<(String, String)>> {
+        match self {
+            JobSpec::IngestManhattan { phenotypes, .. } => phenotypes.clone(),
+            _ => None,
         }
     }
 
@@ -1097,4 +1108,33 @@ pub struct DashboardBottleneck {
     pub avg_network_rx_mb: f64,
     /// Average network upload rate across active workers (MB/s)
     pub avg_network_tx_mb: f64,
+}
+
+/// Request to load a TOML configuration and parse the catalog.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LoadCatalogRequest {
+    pub config_path: String,
+}
+
+/// Represents a single phenotype available in the catalog.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CatalogEntry {
+    pub id: String,
+    pub ancestry: String,
+    pub description: Option<String>,
+    pub trait_type: Option<String>,
+    pub n_cases: Option<i32>,
+    pub n_controls: Option<i32>,
+    pub has_exome: bool,
+    pub has_genome: bool,
+    pub has_gene_burden: bool,
+    /// Derived at runtime: "queued", "scanning", "aggregating", "completed", "failed", or "idle"
+    pub status: String,
+}
+
+/// Request to process or ingest selected phenotypes.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ProcessCatalogRequest {
+    /// List of (phenotype_id, ancestry)
+    pub phenotypes: Vec<(String, String)>,
 }
