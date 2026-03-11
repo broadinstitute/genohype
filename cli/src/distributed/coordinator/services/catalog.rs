@@ -82,7 +82,9 @@ fn build_catalog(config: ManhattanJobConfig) -> crate::Result<CatalogState> {
                         };
 
                         if let (Some(id), Some(ancestry)) = (get_str("phenoname"), get_str("ancestry")) {
-                            let key = (id, ancestry);
+                            // Metadata table uses uppercase ancestry (e.g. "META"),
+                            // assets JSON uses lowercase (e.g. "meta"). Normalize.
+                            let key = (id, ancestry.to_lowercase());
                             if let Some(entry) = entries_map.get_mut(&key) {
                                 entry.description = get_str("description");
                                 entry.trait_type = get_str("trait_type");
