@@ -208,3 +208,54 @@ pub(crate) fn check_worker_liveness(state: &SharedState) {
         data.requeue_worker_tasks(&worker_id);
     }
 }
+
+/// Check for CPU/status mismatches and log warnings.
+///
+/// This detects situations where a worker reports "idle" status but has high CPU utilization,
+/// which indicates the worker is actually computing (likely in a synchronous block before
+/// state update). The telemetry provides accurate CPU data even when status is stale.
+///
+/// Also updates worker.effective_status field to reflect actual computational state:
+/// - "computing" if CPU > 70% regardless of reported status
+/// - "idle" if CPU < 20% and status is Idle
+/// - follows reported status otherwise
+pub(crate) fn check_cpu_status_consistency(state: &SharedState) {
+    let mut data = state.lock().unwrap();
+
+    for (worker_id, worker) in data.worker_registry.iter_mut() {
+        if let Some(telemetry) = worker.metrics_history.back() {
+            let cpu = telemetry.cpu_percent.unwrap_or(0.0);
+
+            // Detect mismatch: worker says idle but CPU is high
+            if worker.status == WorkerStatus::Idle && cpu > 70.0 {
+                // Log anomaly (only once per occurrence to avoid spam)
+                if worker.effective_status.as_deref() != Some("computing") {
+                    println!(
+                        "Warning: Worker {} reporting idle but CPU is {:.1}% - likely computing in synchronous block",
+                        worker_id, cpu
+                    );
+                }
+                worker.effective_status = Some("computing".to_string());
+            } else if worker.status == WorkerStatus::Active {
+                // Active workers showing what they're working on
+                let phase = telemetry.current_phase.as_deref().unwrap_or("active");
+                if let Some(phenotype) = telemetry.current_phenotype_id.as_ref() {
+                    let source = telemetry.current_source.as_deref().unwrap_or("");
+                    let source_suffix = if source.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", source)
+                    };
+                    worker.effective_status = Some(format!("{} {}{}", phase, phenotype, source_suffix));
+                } else {
+                    worker.effective_status = Some(phase.to_string());
+                }
+            } else if cpu < 20.0 && worker.status == WorkerStatus::Idle {
+                worker.effective_status = Some("idle".to_string());
+            } else {
+                // Follow reported status
+                worker.effective_status = Some(worker.status.as_str().to_string());
+            }
+        }
+    }
+}

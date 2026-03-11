@@ -304,6 +304,7 @@ pub(crate) async fn get_dashboard_workers(
             tasks_completed: w.partitions_completed,
             current_task: w.current_task.clone(),
             build_version: w.build_version.clone(),
+            effective_status: w.effective_status.clone(),
         })
         .collect();
 

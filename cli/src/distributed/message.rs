@@ -964,6 +964,11 @@ pub struct DashboardWorker {
     /// Git commit hash of the worker binary
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_version: Option<String>,
+    /// Effective status derived from CPU/telemetry data
+    /// More accurate than `status` during heavy compute phases (e.g., shows "computing"
+    /// when CPU is high even if status is "idle" due to stale state updates)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_status: Option<String>,
 }
 
 /// Time-series metrics data for charts.

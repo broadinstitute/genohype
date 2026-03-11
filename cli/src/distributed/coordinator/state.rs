@@ -271,6 +271,9 @@ pub(crate) struct WorkerState {
     pub(crate) max_batch_capacity: Option<usize>,
     /// Git commit hash of the worker binary
     pub(crate) build_version: Option<String>,
+    /// Effective status derived from CPU/telemetry data
+    /// More accurate than reported status during heavy compute phases
+    pub(crate) effective_status: Option<String>,
 }
 
 /// Internal state of the coordinator.
@@ -359,6 +362,7 @@ impl CoordinatorData {
                 current_batch_size: None,
                 max_batch_capacity: None,
                 build_version: None,
+                effective_status: None,
             });
         worker.last_seen = Instant::now();
         if hardware.is_some() {

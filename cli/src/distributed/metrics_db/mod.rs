@@ -278,6 +278,11 @@ impl MetricsDb {
                     core_tasks: None, // Not persisted - real-time only
                     current_batch_size: row.get::<_, Option<i64>>(14)?.map(|v| v as usize),
                     max_batch_capacity: row.get::<_, Option<i64>>(15)?.map(|v| v as usize),
+                    // Phenotype visibility (not persisted - real-time only)
+                    current_phenotype_id: None,
+                    current_phase: None,
+                    current_source: None,
+                    current_ancestry: None,
                 })
             })?
             .collect::<SqliteResult<Vec<_>>>()?;
@@ -330,6 +335,11 @@ impl MetricsDb {
                     core_tasks: None, // Not persisted - real-time only
                     current_batch_size: row.get::<_, Option<i64>>(14)?.map(|v| v as usize),
                     max_batch_capacity: row.get::<_, Option<i64>>(15)?.map(|v| v as usize),
+                    // Phenotype visibility (not persisted - real-time only)
+                    current_phenotype_id: None,
+                    current_phase: None,
+                    current_source: None,
+                    current_ancestry: None,
                 })
             })?
             .collect::<SqliteResult<Vec<_>>>()?;
@@ -757,6 +767,11 @@ impl MetricsDb {
                         core_tasks: None,
                         current_batch_size: row.get::<_, Option<i64>>(12)?.map(|v| v as usize),
                         max_batch_capacity: row.get::<_, Option<i64>>(13)?.map(|v| v as usize),
+                        // Phenotype visibility (not persisted - real-time only)
+                        current_phenotype_id: None,
+                        current_phase: None,
+                        current_source: None,
+                        current_ancestry: None,
                     })
                 })?
                 .collect::<SqliteResult<Vec<_>>>()?;
@@ -804,6 +819,11 @@ mod tests {
             core_tasks: None,
             current_batch_size: Some(24),
             max_batch_capacity: Some(32),
+            // Phenotype visibility
+            current_phenotype_id: Some("test-phenotype".to_string()),
+            current_phase: Some("scan".to_string()),
+            current_source: Some("exome".to_string()),
+            current_ancestry: Some("EUR".to_string()),
         };
 
         db.insert_snapshot("worker-1", &snapshot).unwrap();

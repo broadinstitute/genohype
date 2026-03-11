@@ -80,22 +80,60 @@ pub fn dispatch_job(
             ))
         }
         JobSpec::ManhattanScan(spec) => {
+            // Set phenotype context for visibility tracking
+            if let Some(ref ts) = telemetry {
+                let source = match &spec.source {
+                    crate::distributed::message::ManhattanSource::Exome => "exome",
+                    crate::distributed::message::ManhattanSource::Genome => "genome",
+                };
+                ts.set_scan_phase(&spec.phenotype, source, Some(&spec.ancestry));
+            }
+
             let (rows, engine) = handlers::manhattan::process_manhattan_scan_v2(
                 cached_engine,
                 partitions,
                 spec,
-                telemetry,
+                telemetry.clone(),
             )?;
+
+            // Clear context when done
+            if let Some(ref ts) = telemetry {
+                ts.set_idle();
+            }
+
             Ok((rows, None, engine))
         }
         JobSpec::ManhattanAggregate(spec) => {
+            // Set phenotype context for visibility tracking
+            if let Some(ref ts) = telemetry {
+                let phenotype_id = spec.phenotype_id.as_deref().unwrap_or("unknown");
+                let ancestry = spec.ancestry.as_deref();
+                ts.set_aggregate_phase(phenotype_id, ancestry);
+            }
+
             let (rows, summary) = handlers::manhattan::process_manhattan_aggregate(spec)?;
+
+            // Clear context when done
+            if let Some(ref ts) = telemetry {
+                ts.set_idle();
+            }
+
             Ok((rows, Some(summary), None))
         }
         JobSpec::ManhattanAggregateBatch { specs } => {
             use rayon::prelude::*;
 
             println!("Processing batch of {} aggregation tasks...", specs.len());
+
+            // Set phenotype context to indicate aggregate batch mode
+            if let Some(ref ts) = telemetry {
+                // Use first spec's info as primary context, or show "batch" if multiple
+                if let Some(first) = specs.first() {
+                    let phenotype_id = first.phenotype_id.as_deref().unwrap_or("batch");
+                    let ancestry = first.ancestry.as_deref();
+                    ts.set_aggregate_phase(phenotype_id, ancestry);
+                }
+            }
 
             // Execute all aggregations in parallel using the worker's thread pool
             // This allows nested parallelism:
@@ -128,6 +166,11 @@ pub fn dispatch_job(
             let combined_summary = serde_json::json!({
                 "batch_results": summaries
             });
+
+            // Clear context when done
+            if let Some(ref ts) = telemetry {
+                ts.set_idle();
+            }
 
             Ok((total_rows, Some(combined_summary), None))
         }

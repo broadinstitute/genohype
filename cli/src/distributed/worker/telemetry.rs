@@ -11,6 +11,20 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// Sentinel value for when no partition is being processed.
 pub const NO_ACTIVE_PARTITION: usize = usize::MAX;
 
+/// Phenotype context for visibility tracking.
+/// This provides insight into what phenotype/phase the worker is processing.
+#[derive(Debug, Clone, Default)]
+pub struct PhenotypeContext {
+    /// Currently processing phenotype ID
+    pub phenotype_id: Option<String>,
+    /// Current processing phase: "scan", "aggregate", "ingest", "idle"
+    pub phase: Option<String>,
+    /// Current data source: "exome", "genome"
+    pub source: Option<String>,
+    /// Current ancestry: "meta", "EUR", "AFR", etc.
+    pub ancestry: Option<String>,
+}
+
 /// Shared state between the main worker loop and the telemetry background task.
 pub struct TelemetryState {
     /// Total rows processed so far
@@ -23,6 +37,8 @@ pub struct TelemetryState {
     pub stop: AtomicBool,
     /// Map of Rayon thread ID to currently executing task info
     pub core_tasks: std::sync::Mutex<std::collections::HashMap<usize, CoreTaskInfo>>,
+    /// Current phenotype context for visibility tracking
+    pub phenotype_context: std::sync::Mutex<PhenotypeContext>,
 }
 
 impl TelemetryState {
@@ -34,7 +50,54 @@ impl TelemetryState {
             partitions_completed: AtomicUsize::new(0),
             stop: AtomicBool::new(false),
             core_tasks: std::sync::Mutex::new(std::collections::HashMap::new()),
+            phenotype_context: std::sync::Mutex::new(PhenotypeContext::default()),
         }
+    }
+
+    /// Set the current phenotype context for visibility tracking.
+    pub fn set_phenotype_context(
+        &self,
+        phenotype_id: Option<String>,
+        phase: Option<String>,
+        source: Option<String>,
+        ancestry: Option<String>,
+    ) {
+        if let Ok(mut ctx) = self.phenotype_context.lock() {
+            ctx.phenotype_id = phenotype_id;
+            ctx.phase = phase;
+            ctx.source = source;
+            ctx.ancestry = ancestry;
+        }
+    }
+
+    /// Set the scanning phase with phenotype context.
+    pub fn set_scan_phase(&self, phenotype_id: &str, source: &str, ancestry: Option<&str>) {
+        self.set_phenotype_context(
+            Some(phenotype_id.to_string()),
+            Some("scan".to_string()),
+            Some(source.to_string()),
+            ancestry.map(|s| s.to_string()),
+        );
+    }
+
+    /// Set the aggregation phase with phenotype context.
+    pub fn set_aggregate_phase(&self, phenotype_id: &str, ancestry: Option<&str>) {
+        self.set_phenotype_context(
+            Some(phenotype_id.to_string()),
+            Some("aggregate".to_string()),
+            None,
+            ancestry.map(|s| s.to_string()),
+        );
+    }
+
+    /// Set the idle phase (no active phenotype work).
+    pub fn set_idle(&self) {
+        self.set_phenotype_context(None, Some("idle".to_string()), None, None);
+    }
+
+    /// Clear the phenotype context (for non-phenotype jobs).
+    pub fn clear_phenotype_context(&self) {
+        self.set_phenotype_context(None, None, None, None);
     }
 }
 
@@ -222,6 +285,17 @@ pub fn spawn_telemetry_loop(
                 }
             };
 
+            // Collect phenotype context for visibility
+            let (current_phenotype_id, current_phase, current_source, current_ancestry) = {
+                let ctx = state.phenotype_context.lock().unwrap();
+                (
+                    ctx.phenotype_id.clone(),
+                    ctx.phase.clone(),
+                    ctx.source.clone(),
+                    ctx.ancestry.clone(),
+                )
+            };
+
             let snapshot = TelemetrySnapshot {
                 timestamp_ms,
                 cpu_percent: cpu,
@@ -246,6 +320,11 @@ pub fn spawn_telemetry_loop(
                 core_tasks,
                 current_batch_size: None, // Set by coordinator, not known to worker
                 max_batch_capacity: None, // Set by coordinator, not known to worker
+                // Phenotype visibility fields
+                current_phenotype_id,
+                current_phase,
+                current_source,
+                current_ancestry,
             };
 
             let req = HeartbeatRequest {
