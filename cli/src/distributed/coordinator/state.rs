@@ -366,6 +366,8 @@ pub(crate) struct CoordinatorData {
     pub(crate) completed_phenotypes: HashSet<(String, String)>,
     /// Snapshot of the last completed batch's phenotype statuses
     pub(crate) last_completed_batch: Option<HashMap<String, PhenotypeStatus>>,
+    /// Cached GCP VM list (serialized JSON) with timestamp to avoid spamming gcloud
+    pub(crate) cached_vms: Option<(serde_json::Value, Instant)>,
 }
 
 pub(crate) type SharedState = Arc<Mutex<CoordinatorData>>;

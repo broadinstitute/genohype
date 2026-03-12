@@ -303,6 +303,7 @@ pub async fn run_coordinator(
         ingested_phenotypes: HashSet::new(),
         completed_phenotypes: HashSet::new(),
         last_completed_batch: None,
+        cached_vms: None,
     }));
 
     // Log session ID for debugging

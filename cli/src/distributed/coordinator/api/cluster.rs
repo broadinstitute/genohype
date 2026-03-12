@@ -70,14 +70,29 @@ pub async fn get_config(
     })
 }
 
+/// Minimum seconds between gcloud VM list calls to avoid piling up requests.
+const VM_CACHE_TTL_SECS: u64 = 15;
+
 /// GET /api/cluster/vms - Returns the current GCP VM state
 pub async fn get_vms(
     State(state): State<SharedState>,
 ) -> Json<serde_json::Value> {
-    let pool_name = {
+    let (pool_name, cached) = {
         let data = state.lock().unwrap();
-        data.config.pool_name.clone()
+        let cached = data.cached_vms.as_ref().and_then(|(json, ts)| {
+            if ts.elapsed().as_secs() < VM_CACHE_TTL_SECS {
+                Some(json.clone())
+            } else {
+                None
+            }
+        });
+        (data.config.pool_name.clone(), cached)
     };
+
+    // Return cached result if fresh enough
+    if let Some(cached_json) = cached {
+        return Json(cached_json);
+    }
 
     let pool_name = match pool_name {
         Some(name) => name,
@@ -159,7 +174,15 @@ pub async fn get_vms(
                     }),
                 })
                 .collect();
-            Json(serde_json::json!({ "vms": vm_infos }))
+            let result = serde_json::json!({ "vms": vm_infos });
+
+            // Cache the result
+            {
+                let mut data = state.lock().unwrap();
+                data.cached_vms = Some((result.clone(), std::time::Instant::now()));
+            }
+
+            Json(result)
         }
         Ok(Err(e)) => {
             Json(serde_json::json!({
@@ -363,6 +386,12 @@ pub async fn scale_cluster(
             })
             .collect();
 
+        // Invalidate VM cache so next poll picks up the new worker
+        {
+            let mut data = state.lock().unwrap();
+            data.cached_vms = None;
+        }
+
         // Spawn creation in background
         tokio::task::spawn_blocking(move || {
             let client = crate::cloud::gcp::GcpClient::new();
@@ -396,6 +425,16 @@ pub async fn scale_cluster(
             .take(to_delete)
             .map(|i| i.name.clone())
             .collect();
+
+        // Remove deleted workers from the fleet registry immediately
+        {
+            let mut data = state.lock().unwrap();
+            for name in &names_to_delete {
+                data.worker_registry.remove(name);
+            }
+            // Invalidate VM cache so next poll reflects the change
+            data.cached_vms = None;
+        }
 
         let project = gcp_project.unwrap_or_default();
         let zone_clone = zone.clone();
