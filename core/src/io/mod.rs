@@ -29,8 +29,9 @@ pub mod resolver;
 pub mod writer;
 
 pub use adapter::{
-    get_file_size, get_reader, is_cloud_path, join_path, range_read, read_single_block,
-    BoxedReader, CloudReader, MmapReader, PrefetchingCloudReader,
+    get_file_size, get_prefetch_depth, get_reader, is_cloud_path, join_path, range_read,
+    read_single_block, set_prefetch_depth, BoxedReader, CloudReader, MmapReader,
+    PrefetchingCloudReader,
 };
 #[cfg(feature = "gcp")]
 pub use adapter::get_gcs_client;

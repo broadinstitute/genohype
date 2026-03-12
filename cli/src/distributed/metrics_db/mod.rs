@@ -283,6 +283,7 @@ impl MetricsDb {
                     current_phase: None,
                     current_source: None,
                     current_ancestry: None,
+                    prefetch_depth: None,
                 })
             })?
             .collect::<SqliteResult<Vec<_>>>()?;
@@ -340,6 +341,7 @@ impl MetricsDb {
                     current_phase: None,
                     current_source: None,
                     current_ancestry: None,
+                    prefetch_depth: None,
                 })
             })?
             .collect::<SqliteResult<Vec<_>>>()?;
@@ -772,6 +774,7 @@ impl MetricsDb {
                         current_phase: None,
                         current_source: None,
                         current_ancestry: None,
+                        prefetch_depth: None,
                     })
                 })?
                 .collect::<SqliteResult<Vec<_>>>()?;
@@ -824,6 +827,7 @@ mod tests {
             current_phase: Some("scan".to_string()),
             current_source: Some("exome".to_string()),
             current_ancestry: Some("EUR".to_string()),
+            prefetch_depth: Some(4),
         };
 
         db.insert_snapshot("worker-1", &snapshot).unwrap();

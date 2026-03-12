@@ -21,6 +21,7 @@ use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
 use tracing::trace;
@@ -31,9 +32,24 @@ const DEFAULT_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 /// Prefetch chunk size (32MB) - balances per-request overhead vs memory usage
 const PREFETCH_CHUNK_SIZE: usize = 32 * 1024 * 1024;
 
-/// Number of concurrent in-flight fetches per reader (4 x 32MB = 128MB buffer per reader)
-/// With 48 cores this uses ~6 GB total, leaving plenty of headroom for partition data
-const PREFETCH_DEPTH: usize = 4;
+/// Default concurrent in-flight fetches per reader. Adaptive — adjusted by worker
+/// telemetry based on memory pressure (AIMD: halve on pressure, +1 when stable).
+const DEFAULT_PREFETCH_DEPTH: usize = 4;
+const MIN_PREFETCH_DEPTH: usize = 2;
+const MAX_PREFETCH_DEPTH: usize = 16;
+
+/// Global adaptive prefetch depth, shared by all readers on this worker
+static PREFETCH_DEPTH: AtomicUsize = AtomicUsize::new(DEFAULT_PREFETCH_DEPTH);
+
+/// Get the current adaptive prefetch depth
+pub fn get_prefetch_depth() -> usize {
+    PREFETCH_DEPTH.load(Ordering::Relaxed)
+}
+
+/// Set the adaptive prefetch depth (clamped to [MIN, MAX])
+pub fn set_prefetch_depth(depth: usize) {
+    PREFETCH_DEPTH.store(depth.clamp(MIN_PREFETCH_DEPTH, MAX_PREFETCH_DEPTH), Ordering::Relaxed);
+}
 
 /// Shared Tokio runtime for IO operations
 ///
@@ -302,7 +318,8 @@ impl PrefetchingCloudReader {
         start_offset: u64,
         file_size: u64,
     ) -> (tokio::sync::mpsc::Receiver<std::io::Result<bytes::Bytes>>, tokio::sync::mpsc::Sender<()>) {
-        let (tx, rx) = tokio::sync::mpsc::channel(PREFETCH_DEPTH);
+        let depth = get_prefetch_depth();
+        let (tx, rx) = tokio::sync::mpsc::channel(depth);
         let (cancel_tx, mut cancel_rx) = tokio::sync::mpsc::channel::<()>(1);
 
         IO_RUNTIME.spawn(async move {
@@ -328,7 +345,7 @@ impl PrefetchingCloudReader {
                             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
                     }
                 })
-                .buffered(PREFETCH_DEPTH);
+                .buffered(depth);
 
             loop {
                 tokio::select! {

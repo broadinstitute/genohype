@@ -235,6 +235,31 @@ pub fn spawn_telemetry_loop(
                 )
             };
 
+            // Adaptive prefetch depth: AIMD based on memory pressure
+            // Triggers before batch size AIMD (75% vs 85%) as first line of defense
+            let prefetch_depth = {
+                let current = genohype_core::io::get_prefetch_depth();
+                let next = match (mem_used, mem_total) {
+                    (Some(used), Some(total)) if total > 0 => {
+                        let mem_pct = (used as f64 / total as f64) * 100.0;
+                        if mem_pct > 75.0 {
+                            // Multiplicative decrease: halve on memory pressure
+                            (current / 2).max(2)
+                        } else if mem_pct < 60.0 {
+                            // Additive increase: grow slowly when memory is comfortable
+                            (current + 1).min(16)
+                        } else {
+                            current
+                        }
+                    }
+                    _ => current,
+                };
+                if next != current {
+                    genohype_core::io::set_prefetch_depth(next);
+                }
+                next
+            };
+
             // Collect disk metrics
             let (disk_used, disk_total) = {
                 let mut d = disks.lock().unwrap();
@@ -325,6 +350,7 @@ pub fn spawn_telemetry_loop(
                 current_phase,
                 current_source,
                 current_ancestry,
+                prefetch_depth: Some(prefetch_depth),
             };
 
             let req = HeartbeatRequest {

@@ -324,6 +324,10 @@ pub struct TelemetrySnapshot {
     /// Ancestry being processed (for multi-ancestry jobs): "meta", "EUR", "AFR", etc.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_ancestry: Option<String>,
+
+    /// Current adaptive prefetch depth (concurrent GCS fetches per reader)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefetch_depth: Option<usize>,
 }
 
 /// Heartbeat request from worker to coordinator.
