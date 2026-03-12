@@ -93,7 +93,7 @@ pub(crate) fn complete_manhattan_work(
 }
 
 /// Complete an ingestion task.
-pub(crate) fn complete_ingestion_work(ingestion: &mut IngestionState, req: &CompleteRequest) {
+pub(crate) fn complete_ingestion_work(data: &mut CoordinatorData, ingestion: &mut IngestionState, req: &CompleteRequest) {
     // Extract task ID from tasks list
     let task_id = req.tasks.first().cloned().unwrap_or_default();
 
@@ -101,6 +101,10 @@ pub(crate) fn complete_ingestion_work(ingestion: &mut IngestionState, req: &Comp
     if let Some((phenotype_id, ancestry, _base_path, _worker_id, start_time)) =
         ingestion.active_tasks.remove(&task_id)
     {
+        // Mark as ingested in coordinator state on success
+        if req.error.is_none() {
+            data.ingested_phenotypes.insert((phenotype_id.clone(), ancestry.clone()));
+        }
         let duration = start_time.elapsed();
         ingestion.completed_count += 1;
 
@@ -598,6 +602,7 @@ mod tests {
             current_job_id: Some("test-job".to_string()),
             session_id: "test-session".to_string(),
             catalog: None,
+            ingested_phenotypes: HashSet::new(),
         };
 
         // Insert the active task with UUID as key and all partition_ids
@@ -697,6 +702,7 @@ mod tests {
             current_job_id: Some("test-job".to_string()),
             session_id: "test-session".to_string(),
             catalog: None,
+            ingested_phenotypes: HashSet::new(),
         };
 
         let mut batch = create_test_batch_state();
@@ -766,6 +772,7 @@ mod tests {
             current_job_id: Some("test-job".to_string()),
             session_id: "test-session".to_string(),
             catalog: None,
+            ingested_phenotypes: HashSet::new(),
         };
 
         // Insert aggregate batch task keyed by UUID (as coordinator does)

@@ -1133,13 +1133,14 @@ pub struct CatalogEntry {
     pub id: String,
     pub ancestry: String,
     pub description: Option<String>,
+    pub category: Option<String>,
     pub trait_type: Option<String>,
     pub n_cases: Option<i32>,
     pub n_controls: Option<i32>,
     pub has_exome: bool,
     pub has_genome: bool,
     pub has_gene_burden: bool,
-    /// Derived at runtime: "queued", "scanning", "aggregating", "completed", "failed", or "idle"
+    /// Derived at runtime: "queued", "scanning", "aggregating", "completed", "ingested", "failed", or "idle"
     pub status: String,
 }
 

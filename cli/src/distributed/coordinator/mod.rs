@@ -249,6 +249,7 @@ pub async fn run_coordinator(
         current_job_id: None,
         session_id: Uuid::new_v4().to_string(),
         catalog: None,
+        ingested_phenotypes: HashSet::new(),
     }));
 
     // Log session ID for debugging
@@ -549,6 +550,8 @@ pub async fn run_coordinator(
         .route("/api/dashboard/workers", get(api::dashboard::get_dashboard_workers))
         .route("/api/dashboard/metrics", get(api::dashboard::get_dashboard_metrics))
         .route("/api/dashboard/batch", get(api::dashboard::get_batch_status))
+        // ClickHouse API
+        .route("/api/clickhouse/info", get(api::clickhouse::get_clickhouse_info))
         // Catalog API
         .route("/api/catalog/load", post(api::catalog::load_catalog_api))
         .route("/api/catalog", get(api::catalog::get_catalog_api))
@@ -1137,7 +1140,7 @@ async fn complete_work(
     let current_state = std::mem::take(&mut data.job_state);
     match current_state {
         JobExecutionState::Ingestion(mut ingestion) => {
-            complete_ingestion_work(&mut ingestion, &req);
+            complete_ingestion_work(&mut data, &mut ingestion, &req);
             data.job_state = JobExecutionState::Ingestion(ingestion);
         }
         JobExecutionState::Batch(mut batch) => {

@@ -54,6 +54,7 @@ fn build_catalog(config: ManhattanJobConfig) -> crate::Result<CatalogState> {
             id: input.id.clone(),
             ancestry: input.ancestry.clone(),
             description: None,
+            category: None,
             trait_type: None,
             n_cases: None,
             n_controls: None,
@@ -87,6 +88,7 @@ fn build_catalog(config: ManhattanJobConfig) -> crate::Result<CatalogState> {
                             let key = (id, ancestry.to_lowercase());
                             if let Some(entry) = entries_map.get_mut(&key) {
                                 entry.description = get_str("description");
+                                entry.category = get_str("category").or_else(|| get_str("phecode_category"));
                                 entry.trait_type = get_str("trait_type");
                                 entry.n_cases = get_int("n_cases");
                                 entry.n_controls = get_int("n_controls");

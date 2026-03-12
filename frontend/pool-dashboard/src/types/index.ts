@@ -68,6 +68,7 @@ export interface CatalogEntry {
   id: string;
   ancestry: string;
   description: string | null;
+  category: string | null;
   trait_type: string | null;
   n_cases: number | null;
   n_controls: number | null;
@@ -275,4 +276,35 @@ export interface JobRecord {
   total_tasks: number;
   /** Description of the job type */
   job_type?: string;
+}
+
+export interface TableInfo {
+  table: string;
+  rows: number;
+  bytes_on_disk: number;
+  bytes_uncompressed: number;
+  part_count: number;
+  partition_count: number;
+}
+
+export interface PartitionInfo {
+  table: string;
+  phenotype: string;
+  rows: number;
+  bytes_on_disk: number;
+}
+
+export interface IngestedPhenotype {
+  phenotype: string;
+  ancestry: string;
+  status: string;
+  loci_count: number;
+  significant_variants: number;
+}
+
+export interface ClickHouseInfo {
+  tables: TableInfo[];
+  partitions: PartitionInfo[];
+  ingested_phenotypes: IngestedPhenotype[];
+  error?: string;
 }

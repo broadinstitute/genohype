@@ -73,13 +73,20 @@ pub(crate) async fn get_catalog_api(
         let mut entries = catalog.entries.clone();
 
         // Dynamically compute statuses based on current JobExecutionState
-        if let JobExecutionState::Batch(batch) = &data.job_state {
-            for entry in entries.iter_mut() {
-                // Determine output path to match batch phenotype ID
+        for entry in entries.iter_mut() {
+            // First check if it's currently processing in a batch
+            let mut is_processing = false;
+            if let JobExecutionState::Batch(batch) = &data.job_state {
                 let output_path = format!("{}/{}/{}", catalog.config.job.output_dir.as_deref().unwrap_or(""), entry.ancestry, entry.id);
                 if let Some(status) = batch.phenotype_statuses.get(&output_path) {
                     entry.status = status.stage.clone();
+                    is_processing = true;
                 }
+            }
+
+            // If not processing and it's known to be ingested, set status
+            if !is_processing && data.ingested_phenotypes.contains(&(entry.id.clone(), entry.ancestry.clone())) {
+                entry.status = "ingested".to_string();
             }
         }
         Json(entries)
@@ -111,16 +118,21 @@ fn synthesize_catalog_from_batch(
             }
 
             entries.push(CatalogEntry {
-                id,
-                ancestry,
+                id: id.clone(),
+                ancestry: ancestry.clone(),
                 description: None,
+                category: None,
                 trait_type: None,
                 n_cases: None,
                 n_controls: None,
                 has_exome: spec.exome.is_some(),
                 has_genome: spec.genome.is_some(),
                 has_gene_burden: spec.gene_burden.is_some(),
-                status,
+                status: if status == "idle" && data.ingested_phenotypes.contains(&(id, ancestry)) {
+                    "ingested".to_string()
+                } else {
+                    status
+                },
             });
         }
     }

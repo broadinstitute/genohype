@@ -7,3 +7,4 @@ pub mod dashboard;
 pub mod history;
 pub mod jobs;
 pub mod catalog;
+pub mod clickhouse;

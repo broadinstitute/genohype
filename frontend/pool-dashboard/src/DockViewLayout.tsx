@@ -20,6 +20,7 @@ import {
   PhenotypeLibraryPanel,
   JobConfigPanel,
   JobHistoryPanel,
+  ClickHousePanel,
 } from './panels';
 
 // Map React components to string identifiers for Dockview
@@ -38,6 +39,7 @@ const components: Record<string, React.FC> = {
   phenotypeLibrary: PhenotypeLibraryPanel,
   jobConfig: JobConfigPanel,
   jobHistory: JobHistoryPanel,
+  clickhouse: ClickHousePanel,
 };
 
 /**
@@ -241,6 +243,13 @@ export const applyPhenotypeLayout = (api: DockviewApi) => {
     component: 'phenotypeBatch',
     title: 'Phenotype Batch',
     position: { direction: 'within', referencePanel: library.id },
+  });
+
+  api.addPanel({
+    id: 'clickhouse',
+    component: 'clickhouse',
+    title: 'ClickHouse',
+    position: { direction: 'within', referencePanel: 'phenotype_batch' },
   });
 
   api.addPanel({

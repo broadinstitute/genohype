@@ -19,6 +19,8 @@ export const PhenotypeLibraryPanel: React.FC = () => {
   const [ancestryFilter, setAncestryFilter] = useState<string>('');
   const [traitTypeFilter, setTraitTypeFilter] = useState<string>('');
   const [assetFilter, setAssetFilter] = useState<string>('');
+  const [statusFilter, setStatusFilter] = useState<string>('');
+  const [selectedCategories, setSelectedCategories] = useState<Set<string>>(new Set());
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [assetsPath, setAssetsPath] = useState('');
   const [loading, setLoading] = useState(false);
@@ -27,6 +29,21 @@ export const PhenotypeLibraryPanel: React.FC = () => {
   // Derive unique filter options from catalog
   const ancestries = useMemo(() => [...new Set(catalog.map(c => c.ancestry))].sort(), [catalog]);
   const traitTypes = useMemo(() => [...new Set(catalog.map(c => c.trait_type).filter(Boolean))].sort() as string[], [catalog]);
+
+  const categories = useMemo(() => {
+    const counts: Record<string, number> = {};
+    catalog.forEach(c => {
+      if (c.category) counts[c.category] = (counts[c.category] || 0) + 1;
+    });
+    return Object.entries(counts).sort((a, b) => a[0].localeCompare(b[0]));
+  }, [catalog]);
+
+  const toggleCategory = (cat: string) => {
+    const next = new Set(selectedCategories);
+    if (next.has(cat)) next.delete(cat);
+    else next.add(cat);
+    setSelectedCategories(next);
+  };
 
   const handleLoadAssets = async () => {
     if (!assetsPath.trim()) return;
@@ -83,6 +100,12 @@ export const PhenotypeLibraryPanel: React.FC = () => {
     if (traitTypeFilter) {
       result = result.filter(c => c.trait_type === traitTypeFilter);
     }
+    if (statusFilter) {
+      result = result.filter(c => c.status === statusFilter);
+    }
+    if (selectedCategories.size > 0) {
+      result = result.filter(c => c.category && selectedCategories.has(c.category));
+    }
     if (assetFilter) {
       result = result.filter(c => {
         if (assetFilter === 'exome') return c.has_exome;
@@ -100,7 +123,7 @@ export const PhenotypeLibraryPanel: React.FC = () => {
       );
     }
     return result;
-  }, [catalog, filter, ancestryFilter, traitTypeFilter, assetFilter]);
+  }, [catalog, filter, ancestryFilter, traitTypeFilter, assetFilter, statusFilter, selectedCategories]);
 
   const toggleSelect = (key: string) => {
     const next = new Set(selectedIds);
@@ -168,7 +191,55 @@ export const PhenotypeLibraryPanel: React.FC = () => {
           <option value="both">Exome + Genome</option>
           <option value="burden">Has gene burden</option>
         </select>
+        <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)} style={selectStyle}>
+          <option value="">All statuses</option>
+          <option value="idle">Idle</option>
+          <option value="queued">Queued</option>
+          <option value="scanning">Scanning</option>
+          <option value="aggregating">Aggregating</option>
+          <option value="completed">Completed</option>
+          <option value="ingested">Ingested</option>
+          <option value="failed">Failed</option>
+        </select>
       </div>
+
+      {categories.length > 0 && (
+        <div style={{ display: 'flex', gap: '6px', marginBottom: '12px', flexWrap: 'wrap', alignItems: 'center' }}>
+          <span style={{ fontSize: '10px', color: 'var(--text-dim)', marginRight: '4px' }}>
+            Categories ({selectedCategories.size === 0 ? 'All' : `${selectedCategories.size} of ${categories.length}`}):
+          </span>
+          <button
+            style={{ ...selectStyle, padding: '2px 8px', cursor: 'pointer' }}
+            onClick={() => setSelectedCategories(new Set(categories.map(c => c[0])))}
+          >All</button>
+          <button
+            style={{ ...selectStyle, padding: '2px 8px', cursor: 'pointer' }}
+            onClick={() => setSelectedCategories(new Set())}
+          >None</button>
+
+          <div style={{ width: '1px', height: '14px', background: 'var(--border)', margin: '0 4px' }} />
+
+          {categories.map(([cat, count]) => {
+            const isSelected = selectedCategories.size === 0 || selectedCategories.has(cat);
+            return (
+              <button
+                key={cat}
+                onClick={() => toggleCategory(cat)}
+                style={{
+                  ...selectStyle,
+                  background: isSelected ? 'rgba(57, 197, 207, 0.15)' : 'transparent',
+                  borderColor: isSelected ? 'var(--cyan)' : 'var(--border)',
+                  color: isSelected ? 'var(--cyan)' : 'var(--text-dim)',
+                  padding: '2px 8px',
+                  cursor: 'pointer'
+                }}
+              >
+                {cat} <span style={{ opacity: 0.6 }}>({count})</span>
+              </button>
+            );
+          })}
+        </div>
+      )}
 
       {error && (
         <div style={{ padding: '8px', marginBottom: '8px', background: 'rgba(248, 81, 73, 0.1)', color: 'var(--red)', border: '1px solid var(--red)', borderRadius: '4px', fontSize: '11px' }}>
