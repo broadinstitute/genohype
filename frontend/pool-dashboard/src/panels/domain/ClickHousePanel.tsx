@@ -1,7 +1,7 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useMemo } from 'react';
 import { useAtomValue } from 'jotai';
-import { catalogAtom } from '../../atoms/dashboardAtoms';
-import type { ClickHouseInfo, TableInfo, PartitionInfo, IngestedPhenotype } from '../../types';
+import { catalogAtom, clickhouseInfoAtom } from '../../atoms/dashboardAtoms';
+import type { TableInfo, PartitionInfo, IngestedPhenotype } from '../../types';
 import '../panels.css';
 
 const formatBytes = (bytes: number): string => {
@@ -15,31 +15,8 @@ const formatNumber = (n: number): string => n.toLocaleString();
 
 export const ClickHousePanel: React.FC = () => {
   const catalog = useAtomValue(catalogAtom);
-  const [info, setInfo] = useState<ClickHouseInfo | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const info = useAtomValue(clickhouseInfoAtom);
   const [expandedTable, setExpandedTable] = useState<string | null>(null);
-
-  useEffect(() => {
-    const fetchInfo = async () => {
-      try {
-        const res = await fetch('/api/clickhouse/info');
-        const data = await res.json();
-        if (data.error) {
-          setError(data.error);
-          setInfo(null);
-        } else {
-          setInfo(data);
-          setError(null);
-        }
-      } catch {
-        setError('Failed to connect to server');
-      }
-    };
-
-    fetchInfo();
-    const interval = setInterval(fetchInfo, 15000);
-    return () => clearInterval(interval);
-  }, []);
 
   // Cross-reference catalog phenotypes with ClickHouse ingested phenotypes
   const catalogPhenotypes = useMemo(() => {
@@ -48,8 +25,8 @@ export const ClickHousePanel: React.FC = () => {
 
   // Totals for table overview
   const totals = useMemo(() => {
-    if (!info) return null;
-    return info.tables.reduce(
+    if (!info || info.error) return null;
+    return (info.tables || []).reduce(
       (acc, t) => ({
         rows: acc.rows + t.rows,
         bytes_on_disk: acc.bytes_on_disk + t.bytes_on_disk,
@@ -61,12 +38,12 @@ export const ClickHousePanel: React.FC = () => {
     );
   }, [info]);
 
-  if (error) {
+  if (info?.error) {
     return (
       <div className="panel-container">
         <h2 className="panel-title">ClickHouse</h2>
         <div style={{ padding: '16px', color: 'var(--text-dim)', fontSize: '12px' }}>
-          {error}
+          {info.error}
         </div>
       </div>
     );
@@ -100,7 +77,7 @@ export const ClickHousePanel: React.FC = () => {
             </tr>
           </thead>
           <tbody>
-            {info.tables.map((t: TableInfo) => (
+            {(info.tables || []).map((t: TableInfo) => (
               <tr
                 key={t.table}
                 style={{ cursor: 'pointer' }}
@@ -146,7 +123,7 @@ export const ClickHousePanel: React.FC = () => {
               </tr>
             </thead>
             <tbody>
-              {info.partitions
+              {(info.partitions || [])
                 .filter((p: PartitionInfo) => p.table === expandedTable)
                 .map((p: PartitionInfo) => {
                   const inCatalog = catalogPhenotypes.has(`${p.phenotype}::`) || catalog.some(c => c.id === p.phenotype);
@@ -176,10 +153,10 @@ export const ClickHousePanel: React.FC = () => {
       )}
 
       {/* Section 3: Pipeline Status */}
-      {info.ingested_phenotypes.length > 0 && (
+      {(info.ingested_phenotypes || []).length > 0 && (
         <div style={{ flex: 1, overflowY: 'auto' }}>
           <h3 style={{ fontSize: '12px', color: 'var(--text-dim)', marginBottom: '8px' }}>
-            Pipeline Status ({info.ingested_phenotypes.length} phenotypes)
+            Pipeline Status ({(info.ingested_phenotypes || []).length} phenotypes)
           </h3>
           <table className="data-table">
             <thead>
@@ -192,7 +169,7 @@ export const ClickHousePanel: React.FC = () => {
               </tr>
             </thead>
             <tbody>
-              {info.ingested_phenotypes.map((p: IngestedPhenotype) => (
+              {(info.ingested_phenotypes || []).map((p: IngestedPhenotype) => (
                 <tr key={`${p.phenotype}-${p.ancestry}`}>
                   <td style={{ color: 'var(--cyan)' }}>{p.phenotype}</td>
                   <td>{p.ancestry}</td>

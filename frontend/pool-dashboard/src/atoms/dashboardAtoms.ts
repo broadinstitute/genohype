@@ -10,6 +10,7 @@ import type {
   JobEvent,
   FailureRecord,
   JobRecord,
+  ClickHouseInfo,
 } from '../types';
 
 // ============================================================================
@@ -39,6 +40,9 @@ export const failuresAtom = atom<FailureRecord[]>([]);
 
 /** Catalog of available phenotypes */
 export const catalogAtom = atom<import('../types').CatalogEntry[]>([]);
+
+/** ClickHouse storage info */
+export const clickhouseInfoAtom = atom<ClickHouseInfo | null>(null);
 
 // ============================================================================
 // Phenotype Library State Atoms (preserve state across tab switches)
@@ -135,7 +139,7 @@ export const fetchDashboardDataAtom = atom(null, async (get, set) => {
   const failuresPath = isHistoryView ? `/api/history/jobs/${jobId}/failures` : '/api/failures';
 
   // Fetch all endpoints concurrently
-  const [summary, workers, metrics, bottleneck, batch, eventsResp, failuresResp, jobsList, catalogList] =
+  const [summary, workers, metrics, bottleneck, batch, eventsResp, failuresResp, jobsList, catalogList, clickhouseInfo] =
     await Promise.all([
       fetchJson<DashboardSummary>(`${basePath}/summary`),
       // Workers endpoint doesn't exist for history (workers are transient)
@@ -150,6 +154,8 @@ export const fetchDashboardDataAtom = atom(null, async (get, set) => {
       fetchJson<JobRecord[]>('/api/history/jobs'),
       // Fetch catalog (only for live view)
       isHistoryView ? Promise.resolve([]) : fetchJson<import('../types').CatalogEntry[]>('/api/catalog'),
+      // Fetch clickhouse info (only for live view)
+      isHistoryView ? Promise.resolve(null) : fetchJson<ClickHouseInfo>('/api/clickhouse/info'),
     ]);
 
   // Update atoms with fetched data (only if fetch succeeded)
@@ -162,6 +168,7 @@ export const fetchDashboardDataAtom = atom(null, async (get, set) => {
   if (failuresResp !== null) set(failuresAtom, failuresResp.failures);
   if (jobsList !== null) set(jobsListAtom, jobsList);
   if (catalogList !== null) set(catalogAtom, catalogList);
+  if (clickhouseInfo !== null) set(clickhouseInfoAtom, clickhouseInfo);
 });
 
 // ============================================================================

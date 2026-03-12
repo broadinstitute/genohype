@@ -47,7 +47,7 @@ pub struct IngestedPhenotype {
 
 /// Cached response with TTL
 static CACHE: Mutex<Option<(Instant, ClickHouseInfo)>> = Mutex::new(None);
-const CACHE_TTL_SECS: u64 = 30;
+const CACHE_TTL_SECS: u64 = 2;
 
 /// Handler for GET /api/clickhouse/info
 pub(crate) async fn get_clickhouse_info(
