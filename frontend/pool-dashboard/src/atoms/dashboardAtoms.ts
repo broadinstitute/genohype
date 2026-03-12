@@ -41,6 +41,20 @@ export const failuresAtom = atom<FailureRecord[]>([]);
 export const catalogAtom = atom<import('../types').CatalogEntry[]>([]);
 
 // ============================================================================
+// Phenotype Library State Atoms (preserve state across tab switches)
+// ============================================================================
+
+export const libraryFilterAtom = atom<string>('');
+export const libraryAncestryFilterAtom = atom<string>('meta');
+export const libraryTraitTypeFilterAtom = atom<string>('');
+export const libraryAssetFilterAtom = atom<string>('');
+export const libraryStatusFilterAtom = atom<string>('');
+export const librarySelectedCategoriesAtom = atom<Set<string>>(new Set<string>());
+export const librarySelectedIdsAtom = atom<Set<string>>(new Set<string>());
+export const librarySortKeyAtom = atom<'status' | 'id' | 'ancestry' | 'description' | 'trait_type' | 'cases' | 'assets'>('id');
+export const librarySortDirAtom = atom<'asc' | 'desc'>('asc');
+
+// ============================================================================
 // UI Preference Atoms (persisted to localStorage)
 // ============================================================================
 

@@ -251,6 +251,7 @@ pub async fn run_coordinator(
         catalog: None,
         ingested_phenotypes: HashSet::new(),
         completed_phenotypes: HashSet::new(),
+        last_completed_batch: None,
     }));
 
     // Log session ID for debugging
@@ -515,6 +516,11 @@ pub async fn run_coordinator(
                         ) {
                             eprintln!("Warning: failed to update job status in DB: {}", e);
                         }
+                    }
+
+                    // Capture batch state before resetting
+                    if let JobExecutionState::Batch(ref batch) = data.job_state {
+                        data.last_completed_batch = Some(batch.phenotype_statuses.clone());
                     }
 
                     data.pending_partitions.clear();

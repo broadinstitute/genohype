@@ -168,6 +168,7 @@ pub(crate) async fn submit_job(
     data.aggregated_results.clear();
     data.job_state = JobExecutionState::Standard;
     data.active_tasks.clear();
+    data.last_completed_batch = None;
 
     // Reset learned capacity limits for all workers on new job submission.
     // The max_batch_capacity is job-specific (depends on data schema, operation type, etc.)
@@ -246,6 +247,8 @@ pub(crate) async fn submit_job(
         }
 
         if specs.is_empty() {
+            // Idle batch: keep coordinator in idle mode so catalog UI can start jobs
+            data.idle = true;
             println!("Received idle batch request. Catalog is loading in background...");
             return axum::Json(JobConfigResponse {
                 acknowledged: true,
@@ -435,6 +438,7 @@ pub(crate) async fn cancel_job(
     data.processing_partitions.clear();
     data.job_state = JobExecutionState::Standard;
     data.active_tasks.clear();
+    data.last_completed_batch = None;
     data.idle = true;
     // Note: We intentionally keep current_job_id so the dashboard continues
     // to display the cancelled job's metrics until a new job is submitted.

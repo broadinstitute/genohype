@@ -246,6 +246,10 @@ pub(crate) async fn get_history_job_batch(
                 let phenotypes: Vec<PhenotypeStatus> =
                     batch.phenotype_statuses.values().cloned().collect();
                 return axum::Json(BatchStatusResponse { phenotypes });
+            } else if let Some(ref last_batch) = data.last_completed_batch {
+                let phenotypes: Vec<PhenotypeStatus> =
+                    last_batch.values().cloned().collect();
+                return axum::Json(BatchStatusResponse { phenotypes });
             }
         }
     }

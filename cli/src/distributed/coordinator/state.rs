@@ -342,6 +342,8 @@ pub(crate) struct CoordinatorData {
     pub(crate) ingested_phenotypes: HashSet<(String, String)>,
     /// Phenotypes that have been fully processed in storage (id, ancestry)
     pub(crate) completed_phenotypes: HashSet<(String, String)>,
+    /// Snapshot of the last completed batch's phenotype statuses
+    pub(crate) last_completed_batch: Option<HashMap<String, PhenotypeStatus>>,
 }
 
 pub(crate) type SharedState = Arc<Mutex<CoordinatorData>>;

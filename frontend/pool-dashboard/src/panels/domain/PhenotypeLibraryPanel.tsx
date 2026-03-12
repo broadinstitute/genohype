@@ -1,6 +1,18 @@
 import { useState, useMemo } from 'react';
-import { useAtomValue } from 'jotai';
-import { catalogAtom, summaryAtom } from '../../atoms/dashboardAtoms';
+import { useAtom, useAtomValue } from 'jotai';
+import {
+  catalogAtom,
+  summaryAtom,
+  libraryFilterAtom,
+  libraryAncestryFilterAtom,
+  libraryTraitTypeFilterAtom,
+  libraryAssetFilterAtom,
+  libraryStatusFilterAtom,
+  librarySelectedCategoriesAtom,
+  librarySelectedIdsAtom,
+  librarySortKeyAtom,
+  librarySortDirAtom
+} from '../../atoms/dashboardAtoms';
 import '../panels.css';
 
 const selectStyle: React.CSSProperties = {
@@ -12,19 +24,37 @@ const selectStyle: React.CSSProperties = {
   fontSize: '11px',
 };
 
+type SortKey = 'status' | 'id' | 'ancestry' | 'description' | 'trait_type' | 'cases' | 'assets';
+
 export const PhenotypeLibraryPanel: React.FC = () => {
   const catalog = useAtomValue(catalogAtom);
   const summary = useAtomValue(summaryAtom);
-  const [filter, setFilter] = useState('');
-  const [ancestryFilter, setAncestryFilter] = useState<string>('');
-  const [traitTypeFilter, setTraitTypeFilter] = useState<string>('');
-  const [assetFilter, setAssetFilter] = useState<string>('');
-  const [statusFilter, setStatusFilter] = useState<string>('');
-  const [selectedCategories, setSelectedCategories] = useState<Set<string>>(new Set());
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+
+  const [filter, setFilter] = useAtom(libraryFilterAtom);
+  const [ancestryFilter, setAncestryFilter] = useAtom(libraryAncestryFilterAtom);
+  const [traitTypeFilter, setTraitTypeFilter] = useAtom(libraryTraitTypeFilterAtom);
+  const [assetFilter, setAssetFilter] = useAtom(libraryAssetFilterAtom);
+  const [statusFilter, setStatusFilter] = useAtom(libraryStatusFilterAtom);
+  const [selectedCategories, setSelectedCategories] = useAtom(librarySelectedCategoriesAtom);
+  const [selectedIds, setSelectedIds] = useAtom(librarySelectedIdsAtom);
+  const [sortKey, setSortKey] = useAtom(librarySortKeyAtom);
+  const [sortDir, setSortDir] = useAtom(librarySortDirAtom);
+
   const [assetsPath, setAssetsPath] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const handleSort = (key: SortKey) => {
+    if (sortKey === key) {
+      setSortDir(d => d === 'asc' ? 'desc' : 'asc');
+    } else {
+      setSortKey(key);
+      setSortDir('asc');
+    }
+  };
+
+  const sortIndicator = (key: SortKey) =>
+    sortKey === key ? (sortDir === 'asc' ? ' ▲' : ' ▼') : '';
 
   // Derive unique filter options from catalog
   const ancestries = useMemo(() => [...new Set(catalog.map(c => c.ancestry))].sort(), [catalog]);
@@ -122,8 +152,57 @@ export const PhenotypeLibraryPanel: React.FC = () => {
         (c.description && c.description.toLowerCase().includes(lower))
       );
     }
-    return result;
-  }, [catalog, filter, ancestryFilter, traitTypeFilter, assetFilter, statusFilter, selectedCategories]);
+
+    // Sort — active statuses always float to top
+    const statusPriority = (s: string) => {
+      switch (s) {
+        case 'scanning': return 0;
+        case 'aggregating': return 1;
+        case 'queued': return 2;
+        case 'failed': return 3;
+        case 'completed': return 4;
+        case 'ingested': return 5;
+        default: return 6; // idle
+      }
+    };
+
+    const sorted = [...result].sort((a, b) => {
+      // Active statuses first, always
+      const pa = statusPriority(a.status);
+      const pb = statusPriority(b.status);
+      if (pa !== pb) return pa - pb;
+
+      let cmp = 0;
+      switch (sortKey) {
+        case 'status':
+          cmp = 0; // already sorted by priority above
+          break;
+        case 'id':
+          cmp = a.id.localeCompare(b.id);
+          break;
+        case 'ancestry':
+          cmp = a.ancestry.localeCompare(b.ancestry);
+          break;
+        case 'description':
+          cmp = (a.description || '').localeCompare(b.description || '');
+          break;
+        case 'trait_type':
+          cmp = (a.trait_type || '').localeCompare(b.trait_type || '');
+          break;
+        case 'cases':
+          cmp = (a.n_cases || 0) - (b.n_cases || 0);
+          break;
+        case 'assets': {
+          const assetCount = (e: typeof a) => (e.has_exome ? 1 : 0) + (e.has_genome ? 1 : 0) + (e.has_gene_burden ? 1 : 0);
+          cmp = assetCount(a) - assetCount(b);
+          break;
+        }
+      }
+      return sortDir === 'asc' ? cmp : -cmp;
+    });
+
+    return sorted;
+  }, [catalog, filter, ancestryFilter, traitTypeFilter, assetFilter, statusFilter, selectedCategories, sortKey, sortDir]);
 
   const toggleSelect = (key: string) => {
     const next = new Set(selectedIds);
@@ -141,6 +220,8 @@ export const PhenotypeLibraryPanel: React.FC = () => {
   };
 
   const isBusy = summary && !summary.idle;
+
+  const thStyle: React.CSSProperties = { cursor: 'pointer', userSelect: 'none', whiteSpace: 'nowrap' };
 
   return (
     <div className="panel-container" style={{ display: 'flex', flexDirection: 'column' }}>
@@ -254,13 +335,13 @@ export const PhenotypeLibraryPanel: React.FC = () => {
               <th style={{ width: '30px', textAlign: 'center' }}>
                 <input type="checkbox" checked={selectedIds.size > 0 && selectedIds.size === filteredCatalog.length} onChange={toggleAll} />
               </th>
-              <th>Status</th>
-              <th>Phenotype ID</th>
-              <th>Ancestry</th>
-              <th>Description</th>
-              <th>Trait Type</th>
-              <th>Cases / Controls</th>
-              <th>Assets</th>
+              <th style={thStyle} onClick={() => handleSort('status')}>Status{sortIndicator('status')}</th>
+              <th style={thStyle} onClick={() => handleSort('id')}>Phenotype ID{sortIndicator('id')}</th>
+              <th style={thStyle} onClick={() => handleSort('ancestry')}>Ancestry{sortIndicator('ancestry')}</th>
+              <th style={thStyle} onClick={() => handleSort('description')}>Description{sortIndicator('description')}</th>
+              <th style={thStyle} onClick={() => handleSort('trait_type')}>Trait Type{sortIndicator('trait_type')}</th>
+              <th style={thStyle} onClick={() => handleSort('cases')}>Cases / Controls{sortIndicator('cases')}</th>
+              <th style={thStyle} onClick={() => handleSort('assets')}>Assets{sortIndicator('assets')}</th>
             </tr>
           </thead>
           <tbody>

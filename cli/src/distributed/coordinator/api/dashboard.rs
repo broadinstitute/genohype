@@ -121,6 +121,17 @@ pub(crate) fn build_dashboard_summary(data: &CoordinatorData) -> DashboardSummar
             completed: batch.completed_count,
             failed: batch.failed_count,
         })
+    } else if let Some(ref last_batch) = data.last_completed_batch {
+        let completed = last_batch.values().filter(|s| s.stage == "completed").count();
+        let failed = last_batch.values().filter(|s| s.stage == "failed").count();
+        Some(DashboardBatchProgress {
+            total: last_batch.len(),
+            queued: 0,
+            active_scan: 0,
+            active_aggregate: 0,
+            completed,
+            failed,
+        })
     } else {
         None
     };
@@ -351,6 +362,10 @@ pub(crate) async fn get_batch_status(
     let phenotypes = if let JobExecutionState::Batch(batch) = &data.job_state {
         let mut list: Vec<PhenotypeStatus> = batch.phenotype_statuses.values().cloned().collect();
         // Sort by ID for stability
+        list.sort_by(|a, b| a.id.cmp(&b.id));
+        list
+    } else if let Some(ref last_batch) = data.last_completed_batch {
+        let mut list: Vec<PhenotypeStatus> = last_batch.values().cloned().collect();
         list.sort_by(|a, b| a.id.cmp(&b.id));
         list
     } else {

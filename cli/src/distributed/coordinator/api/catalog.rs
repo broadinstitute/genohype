@@ -123,6 +123,10 @@ fn synthesize_catalog_from_batch(
                 if let Some(ps) = batch.phenotype_statuses.get(&spec.output_path) {
                     status = ps.stage.clone();
                 }
+            } else if let Some(ref last_batch) = data.last_completed_batch {
+                if let Some(ps) = last_batch.get(&spec.output_path) {
+                    status = ps.stage.clone();
+                }
             }
 
             let final_status = if status == "idle" {
@@ -231,6 +235,7 @@ pub(crate) async fn process_catalog_api(
         data.config.input_path = primary_input;
         data.config.job_spec = Some(job_spec.clone());
         data.idle = false;
+        data.last_completed_batch = None;
         data.job_state = JobExecutionState::Standard; // Will be overwritten below
 
         let batch_state = crate::distributed::coordinator::services::init_batch_state(
@@ -357,6 +362,7 @@ pub(crate) async fn ingest_catalog_api(
     data.config.input_path = input_dir;
     data.config.job_spec = Some(job_spec.clone());
     data.idle = false;
+    data.last_completed_batch = None;
 
     #[cfg(feature = "clickhouse")]
     {
