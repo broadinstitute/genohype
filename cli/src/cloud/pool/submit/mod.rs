@@ -869,10 +869,9 @@ EOF
             }
         }
 
-        // For ManhattanBatch jobs, compute layout and partition counts for all unique tables
+        // For ManhattanBatch jobs, compute partition counts for all unique tables
+        // (Layout enrichment is handled by the coordinator via enrich_specs)
         if let crate::distributed::message::JobSpec::ManhattanBatch { ref mut specs, ref config, .. } = job_spec {
-            use crate::manhattan::layout::{ChromosomeLayout, YScale};
-            use crate::manhattan::reference::get_contig_lengths;
             use std::collections::HashMap;
 
             let is_idle_batch = config.as_ref().map(|c| c.job.idle).unwrap_or(false);
@@ -884,18 +883,6 @@ EOF
                         "ManhattanBatch has no specs",
                     )));
                 }
-
-            // Get first available width/height for layout
-            let first_spec = &specs[0];
-            let width = first_spec.width;
-            let height = first_spec.height;
-
-            // Compute layout from the first available table
-            println!("  {} Computing chromosome layout...", "Setup:".cyan());
-            let contigs = get_contig_lengths(engine.as_ref().unwrap());
-            let contig_map: HashMap<String, u32> = contigs.iter().cloned().collect();
-            let layout = ChromosomeLayout::new(&contigs, width, 4);
-            let y_scale = YScale::new(height, 300.0);
 
             // Collect all unique table paths
             let mut exome_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -937,12 +924,8 @@ EOF
                 }
             }
 
-            // Apply layout and partition counts to all specs
+            // Apply partition counts to all specs
             for spec in specs.iter_mut() {
-                spec.layout = Some(layout.clone());
-                spec.y_scale = Some(y_scale.clone());
-                spec.contig_lengths = Some(contig_map.clone());
-
                 if let Some(ref exome_path) = spec.exome {
                     if let Some(&parts) = partition_cache.get(exome_path) {
                         spec.exome_partitions = Some(parts);
@@ -1295,18 +1278,65 @@ EOF
         println!("  {} {}", "Workers:".cyan(), workers.len());
         println!("  {} {}", "Total partitions:".cyan(), total_partitions);
         println!();
-        println!("{}", "Streaming coordinator logs (Ctrl+C to exit)...".dimmed());
+        println!("{}", "Streaming coordinator logs (will exit on job completion)...".dimmed());
         println!();
 
-        // Stream coordinator logs, exiting when the coordinator process exits
+        // Stream coordinator logs, detecting job completion to exit automatically
         let mut log_cmd = self.provider.get_ssh_command(
             &coordinator.name,
             zone,
             "journalctl -u genohype-coordinator -f --no-pager",
         );
 
-        // This blocks until coordinator exits or user interrupts
-        let _ = log_cmd.status();
+        log_cmd.stdout(std::process::Stdio::piped());
+        log_cmd.stderr(std::process::Stdio::piped());
+
+        let mut child = log_cmd.spawn().map_err(|e| {
+            HailError::Io(std::io::Error::new(
+                e.kind(),
+                format!("Failed to start log streaming: {}", e),
+            ))
+        })?;
+
+        let job_failed = if let Some(stdout) = child.stdout.take() {
+            use std::io::BufRead;
+            let reader = std::io::BufReader::new(stdout);
+            let mut failed = false;
+            for line in reader.lines() {
+                match line {
+                    Ok(line) => {
+                        println!("{}", line);
+                        if line.contains("Job complete. Coordinator returning to idle mode") {
+                            println!();
+                            println!(
+                                "{} Job complete, exiting log stream.",
+                                "OK".green().bold()
+                            );
+                            break;
+                        }
+                        if line.contains("Job finished with") && line.contains("failed") {
+                            failed = true;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            // Kill the SSH/journalctl process since we're done reading
+            let _ = child.kill();
+            let _ = child.wait();
+            failed
+        } else {
+            // Fallback: no stdout captured, just wait (shouldn't happen)
+            let _ = child.wait();
+            false
+        };
+
+        if job_failed {
+            return Err(HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Job completed with failed partitions",
+            )));
+        }
 
         // Fetch and display aggregated results for Summary jobs
         if matches!(job_spec, crate::distributed::message::JobSpec::Summary) {

@@ -239,30 +239,18 @@ pub(crate) async fn process_catalog_api(
         let primary_input = specs.first().and_then(|s| s.primary_input_path()).unwrap_or("batch").to_string();
         let job_spec = JobSpec::ManhattanBatch { specs, mode, config: None };
 
-        data.config.input_path = primary_input;
-        data.config.job_spec = Some(job_spec.clone());
-        data.idle = false;
-        data.last_completed_batch = None;
-        data.job_state = JobExecutionState::Standard; // Will be overwritten below
-
-        let batch_state = crate::distributed::coordinator::services::init_batch_state(
-            match &job_spec { JobSpec::ManhattanBatch { specs, .. } => specs, _ => unreachable!() },
-            mode
-        );
-        data.job_state = JobExecutionState::Batch(batch_state);
-
-        let job_id = uuid::Uuid::new_v4().to_string();
-        data.current_job_id = Some(job_id.clone());
-        let _ = data.metrics_db.insert_job(&crate::distributed::message::JobRecord {
-            job_id,
-            status: "running".to_string(),
-            start_time_ms: crate::distributed::coordinator::state::CoordinatorData::now_ms(),
-            end_time_ms: None,
-            job_spec_json: serde_json::to_value(&job_spec).ok(),
-            input_path: data.config.input_path.clone(),
-            total_tasks: 0,
-            job_type: Some("manhattan batch (catalog)".to_string()),
-        });
+        if let Err(e) = crate::distributed::coordinator::services::start_new_job(
+            &mut data,
+            job_spec,
+            primary_input,
+            0,
+            None,
+            None,
+            vec![],
+            vec![],
+        ) {
+            return Json(serde_json::json!({ "success": false, "error": e }));
+        }
 
         let pheno_names: Vec<String> = req.phenotypes.iter().map(|(id, anc)| format!("{}/{}", anc, id)).collect();
         data.log_event(JobEvent {
@@ -276,36 +264,8 @@ pub(crate) async fn process_catalog_api(
         Json(serde_json::json!({ "success": true, "message": "Started new batch job" }))
     } else {
         // Append to existing batch job
-        let mut appended = Vec::new();
-        if let JobExecutionState::Batch(ref mut batch) = data.job_state {
-            for spec in specs {
-                let id = spec.output_path.clone();
-                if !batch.phenotype_statuses.contains_key(&id) {
-                    batch.phenotype_statuses.insert(id.clone(), crate::distributed::message::PhenotypeStatus {
-                        id: id.clone(),
-                        stage: "queued".to_string(),
-                        partitions_done: 0,
-                        partitions_total: 0,
-                        result: None,
-                        error: None,
-                        duration_secs: None,
-                        cpu_core_secs: None,
-                    });
-                    appended.push(spec.phenotype.clone().unwrap_or_default());
-                    batch.pending_queue.push_back(spec);
-                    batch.total_phenotypes += 1;
-                }
-            }
-            crate::distributed::coordinator::scheduler::assignment::activate_next_phenotypes(batch);
-        }
-        if !appended.is_empty() {
-            data.log_event(JobEvent {
-                timestamp_ms: CoordinatorData::now_ms(),
-                event_type: "submitted".to_string(),
-                worker_id: None,
-                phenotype_id: None,
-                details: format!("Appended {} phenotypes to batch: {}", appended.len(), appended.join(", ")),
-            });
+        if let Err(e) = crate::distributed::coordinator::services::append_to_batch(&mut data, specs) {
+            return Json(serde_json::json!({ "success": false, "error": e }));
         }
         Json(serde_json::json!({ "success": true, "message": "Appended to running batch job" }))
     }

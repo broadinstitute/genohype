@@ -12,6 +12,11 @@ use genohype_core::query::QueryEngine;
 pub fn get_contig_lengths(_engine: &QueryEngine) -> Vec<(String, u32)> {
     // TODO: Try to extract from engine globals / reference genome metadata.
     // For now, fall back to GRCh38 standard lengths.
+    get_default_contig_lengths()
+}
+
+/// Get default contig lengths for GRCh38 without requiring a QueryEngine.
+pub fn get_default_contig_lengths() -> Vec<(String, u32)> {
     get_grch38_autosomes_and_x()
 }
 

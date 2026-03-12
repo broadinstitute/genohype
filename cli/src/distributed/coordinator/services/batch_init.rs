@@ -7,6 +7,7 @@ use crate::distributed::coordinator::state::BatchState;
 use crate::distributed::message::{
     ExecutionMode, ManhattanAggregateSpec, ManhattanSpec, PhenotypeStatus,
 };
+use crate::manhattan::layout::{ChromosomeLayout, YScale};
 use std::collections::{HashMap, VecDeque};
 
 /// Initialize batch state from Manhattan specs.
@@ -71,6 +72,27 @@ pub fn init_batch_state(specs: &[ManhattanSpec], mode: ExecutionMode) -> BatchSt
     }
 
     batch_state
+}
+
+/// Apply default chromosome layouts and scales to any specs that are missing them.
+///
+/// This ensures workers can render Manhattan plot points regardless of how the job
+/// was submitted (CLI or UI). Without a layout, `layout.get_x()` returns `None` for
+/// every variant, producing blank plots.
+pub fn enrich_specs(specs: &mut [ManhattanSpec]) {
+    let contigs = crate::manhattan::reference::get_default_contig_lengths();
+    let contig_map: HashMap<String, u32> = contigs.iter().cloned().collect();
+
+    for spec in specs.iter_mut() {
+        if spec.layout.is_none() {
+            let layout = ChromosomeLayout::new(&contigs, spec.width, 4);
+            let y_scale = YScale::new(spec.height, 300.0);
+
+            spec.layout = Some(layout);
+            spec.y_scale = Some(y_scale);
+            spec.contig_lengths = Some(contig_map.clone());
+        }
+    }
 }
 
 /// Create a ManhattanAggregateSpec from a ManhattanSpec.

@@ -5,17 +5,13 @@
 
 use crate::distributed::coordinator::services;
 use crate::distributed::coordinator::state::{
-    CoordinatorData, JobExecutionState, ManhattanPhase, ManhattanPipelineState,
-    SharedState, WorkerStatus, BATCH_ACTIVE_LIMIT,
+    CoordinatorData, JobExecutionState, SharedState, WorkerStatus,
 };
 use crate::distributed::message::{
     CancelRequest, CancelResponse, EventsResponse, ExportMetricsRequest, ExportMetricsResponse,
-    FailuresResponse, JobConfigRequest, JobConfigResponse, JobRecord, JobResultResponse,
+    FailuresResponse, JobConfigRequest, JobConfigResponse, JobResultResponse,
     JobSpec, UpdateFleetRequest,
 };
-use std::collections::{HashMap, HashSet};
-use std::time::Instant;
-use uuid::Uuid;
 
 /// Query parameters for GET /api/events
 #[derive(serde::Deserialize)]
@@ -131,7 +127,7 @@ pub(crate) async fn submit_job(
         });
     }
 
-    // ManhattanBatch, Manhattan, IngestManhattan, and Stress jobs don't require input_path (they use per-spec paths)
+    // ManhattanBatch, Manhattan, IngestManhattan, and Stress jobs don't require input_path
     let needs_input_path = !is_batch_job
         && !is_ingest_job
         && !matches!(&req.job_spec, JobSpec::Manhattan { .. })
@@ -143,90 +139,10 @@ pub(crate) async fn submit_job(
         });
     }
 
-    // Configure the job
-    data.config.input_path = req.input_path.clone();
-    data.config.job_spec = Some(req.job_spec.clone());
-    data.config.total_tasks = req.total_tasks;
-    data.config.filters = req.filters.clone();
-    data.config.intervals = req.intervals.clone();
-    data.config.memory_weight_mb = req.memory_weight_mb;
-    if let Some(batch_size) = req.batch_size {
-        data.config.batch_size = batch_size;
-    }
-
-    // Fill pending queue with partition indices
-    data.pending_partitions = (0..req.total_tasks).collect();
-
-    // Reset job state
-    data.completed_tasks.clear();
-    data.processing_partitions.clear();
-    data.failed_partitions.clear();
-    data.retry_counts.clear();
-    data.total_rows = 0;
-    data.job_start_time = Instant::now();
-    data.last_progress_time = Instant::now();
-    data.aggregated_results.clear();
-    data.job_state = JobExecutionState::Standard;
-    data.active_tasks.clear();
-    data.last_completed_batch = None;
-
-    // Reset learned capacity limits for all workers on new job submission.
-    // The max_batch_capacity is job-specific (depends on data schema, operation type, etc.)
-    // so we wipe it to prevent "ghost constraints" from previous jobs.
-    for worker in data.worker_registry.values_mut() {
-        worker.max_batch_capacity = None;
-        worker.current_batch_size = None;
-    }
-
-    // Don't clear worker registry on resubmission/superseding, as we want to keep connected workers
-    // Only clear if this is a fresh start and we want to purge stale workers
-    // data.worker_registry.clear();
-
-    // Don't clear metrics database - preserve historical telemetry across jobs
-    // This allows restore from GCS backup to accumulate data over time
-
-    // Clear in-memory event/failure buffers for the new job (historical data is in DB)
-    data.events.clear();
-    data.failures.clear();
-
-    // Generate a unique job ID and persist to database
-    let job_id = Uuid::new_v4().to_string();
-    data.current_job_id = Some(job_id.clone());
-
-    let job_record = JobRecord {
-        job_id: job_id.clone(),
-        status: "running".to_string(),
-        start_time_ms: CoordinatorData::now_ms(),
-        end_time_ms: None,
-        job_spec_json: serde_json::to_value(&req.job_spec).ok(),
-        input_path: req.input_path.clone(),
-        total_tasks: req.total_tasks,
-        job_type: Some(req.job_spec.description().to_string()),
-    };
-
-    if let Err(e) = data.metrics_db.insert_job(&job_record) {
-        eprintln!("Warning: failed to persist job to DB: {}", e);
-    }
-
-    // Mark as no longer idle
-    data.idle = false;
-
-    // Handle ManhattanBatch jobs (batch scheduling mode)
-    if let JobSpec::ManhattanBatch { ref specs, mode, ref config } = req.job_spec {
-        let total_phenotypes = specs.len();
-
-        // Clear standard partition tracking - batch mode uses its own
-        data.pending_partitions.clear();
-
-        println!(
-            "Initializing Manhattan batch: {} phenotypes (lazy loading, max {} active, mode={:?})",
-            total_phenotypes, BATCH_ACTIVE_LIMIT, mode
-        );
-
-        // Schedule catalog auto-load in the background (don't block job submission).
-        // Uses a plain OS thread because load_catalog_from_config does sync GCS I/O
-        // via read_gcs_file, which creates its own tokio runtime. spawn_blocking
-        // threads inherit the tokio handle but can't use block_in_place, causing panics.
+    // Schedule catalog auto-load in the background (don't block job submission).
+    // Uses a plain OS thread because load_catalog_from_config does sync GCS I/O
+    // via read_gcs_file, which creates its own tokio runtime.
+    if let JobSpec::ManhattanBatch { ref config, .. } = req.job_spec {
         if let Some(job_config) = config {
             let state_clone = state.clone();
             let cfg = job_config.clone();
@@ -245,7 +161,9 @@ pub(crate) async fn submit_job(
                 }
             });
         }
+    }
 
+    if let JobSpec::ManhattanBatch { ref specs, .. } = req.job_spec {
         if specs.is_empty() {
             // Idle batch: keep coordinator in idle mode so catalog UI can start jobs
             data.idle = true;
@@ -255,30 +173,27 @@ pub(crate) async fn submit_job(
                 error: None,
             });
         }
+    }
 
-        // Use the services layer to initialize batch state
-        let batch_state = services::init_batch_state(specs, mode);
-
-        data.job_state = JobExecutionState::Batch(batch_state);
-
-        let output_desc = specs
-            .first()
-            .map(|s| s.output_path.clone())
-            .unwrap_or_else(|| "(no output)".to_string());
-        println!(
-            "Job submitted: {} ({} phenotypes, output={})",
-            req.job_spec.description(),
-            total_phenotypes,
-            output_desc
-        );
-
+    // Use the central job service to reset queues, persist to DB, and build states
+    if let Err(e) = services::start_new_job(
+        &mut data,
+        req.job_spec.clone(),
+        req.input_path.clone(),
+        req.total_tasks,
+        req.batch_size,
+        req.memory_weight_mb,
+        req.filters.clone(),
+        req.intervals.clone(),
+    ) {
         return axum::Json(JobConfigResponse {
-            acknowledged: true,
-            error: None,
+            acknowledged: false,
+            error: Some(e),
         });
     }
 
     // Handle IngestManhattan jobs (discover phenotypes and queue ingestion tasks)
+    // We do this after start_new_job because it requires blocking I/O scanning GCS.
     if let JobSpec::IngestManhattan {
         ref input_dir,
         ref clickhouse_url,
@@ -287,9 +202,6 @@ pub(crate) async fn submit_job(
         ref phenotypes,
     } = req.job_spec
     {
-        // Clear standard partition tracking - ingestion uses its own state
-        data.pending_partitions.clear();
-
         println!(
             "Initializing Manhattan ingestion from {} to ClickHouse {} (init_strategy: {:?})",
             input_dir, clickhouse_url, init_strategy
@@ -306,8 +218,6 @@ pub(crate) async fn submit_job(
             }
         }
 
-        // Discover phenotypes by scanning for manifest.json files
-        // Structure: {input_dir}/{ancestry}/{phenotype_id}/manifest.json
         match services::discover_phenotypes_for_ingestion(input_dir, phenotypes.as_deref()) {
             Ok(phenotypes) => {
                 let total = phenotypes.len();
@@ -321,11 +231,6 @@ pub(crate) async fn submit_job(
                         database,
                     ));
                 }
-
-                return axum::Json(JobConfigResponse {
-                    acknowledged: true,
-                    error: None,
-                });
             }
             Err(e) => {
                 return axum::Json(JobConfigResponse {
@@ -336,71 +241,32 @@ pub(crate) async fn submit_job(
         }
     }
 
-    // Initialize Manhattan pipeline state if this is a single Manhattan job
-    if let JobSpec::Manhattan { ref spec, mode } = req.job_spec {
-        // For Manhattan jobs, we manage exome/genome partitions separately
-        // Use partition counts from spec if available, otherwise fall back to total_tasks
-        let exome_partitions = spec.exome_partitions.unwrap_or_else(|| {
-            if spec.exome.is_some() {
-                req.total_tasks
-            } else {
-                0
-            }
-        });
-        let genome_partitions = spec.genome_partitions.unwrap_or_else(|| {
-            if spec.genome.is_some() && spec.exome.is_none() {
-                req.total_tasks
-            } else {
-                0
-            }
-        });
-
-        // Clear the standard partition tracking since Manhattan uses its own
-        data.pending_partitions.clear();
-
-        let initial_phase = if mode == crate::distributed::message::ExecutionMode::AggregateOnly {
-            ManhattanPhase::Aggregate
-        } else {
-            ManhattanPhase::Scan
-        };
-
+    // Log submission details
+    if let JobSpec::ManhattanBatch { ref specs, .. } = req.job_spec {
+        let output_desc = specs
+            .first()
+            .map(|s| s.output_path.clone())
+            .unwrap_or_else(|| "(no output)".to_string());
         println!(
-            "Initializing Manhattan pipeline: {} exome partitions, {} genome partitions (mode={:?})",
-            exome_partitions, genome_partitions, mode
+            "Job submitted: {} ({} phenotypes, output={})",
+            req.job_spec.description(),
+            specs.len(),
+            output_desc
         );
-
-        data.job_state = JobExecutionState::Manhattan(ManhattanPipelineState {
-            mode,
-            phase: initial_phase,
-            original_spec: spec.clone(),
-            layout: spec.layout.clone(),
-            y_scale: spec.y_scale.clone(),
-            contig_lengths: spec.contig_lengths.clone().unwrap_or_default(),
-            exome_total_tasks: exome_partitions,
-            exome_pending: (0..exome_partitions).collect(),
-            exome_processing: HashMap::new(),
-            exome_completed: HashSet::new(),
-            genome_total_tasks: genome_partitions,
-            genome_pending: (0..genome_partitions).collect(),
-            genome_processing: HashMap::new(),
-            genome_completed: HashSet::new(),
-            aggregate_dispatched: false,
-            aggregate_complete: false,
-        });
+    } else {
+        let output_desc = req
+            .job_spec
+            .output_path()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "(no output)".to_string());
+        println!(
+            "Job submitted: {} ({} partitions, input={}, output={})",
+            req.job_spec.description(),
+            req.total_tasks,
+            req.input_path,
+            output_desc
+        );
     }
-
-    let output_desc = req
-        .job_spec
-        .output_path()
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "(no output)".to_string());
-    println!(
-        "Job submitted: {} ({} partitions, input={}, output={})",
-        req.job_spec.description(),
-        req.total_tasks,
-        req.input_path,
-        output_desc
-    );
 
     axum::Json(JobConfigResponse {
         acknowledged: true,
