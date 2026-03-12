@@ -518,9 +518,42 @@ pub async fn run_coordinator(
                         }
                     }
 
-                    // Capture batch state before resetting
+                    // Capture batch state before resetting and transfer completed phenotypes
+                    // Collect completed phenotypes first to avoid borrow conflicts
+                    let completed: Vec<(String, String)> = match &data.job_state {
+                        JobExecutionState::Batch(batch) => {
+                            let mut result = Vec::new();
+                            if let Some(crate::distributed::message::JobSpec::ManhattanBatch { ref specs, .. }) = data.config.job_spec {
+                                for spec in specs {
+                                    if let Some(status) = batch.phenotype_statuses.get(&spec.output_path) {
+                                        if status.stage == "completed" {
+                                            if let (Some(id), Some(ancestry)) = (&spec.phenotype, &spec.ancestry) {
+                                                result.push((id.clone(), ancestry.clone()));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            result
+                        }
+                        JobExecutionState::Manhattan(m) if m.phase == ManhattanPhase::Complete => {
+                            let mut result = Vec::new();
+                            if let Some(crate::distributed::message::JobSpec::Manhattan { ref spec, .. }) = data.config.job_spec {
+                                if let (Some(id), Some(ancestry)) = (&spec.phenotype, &spec.ancestry) {
+                                    result.push((id.clone(), ancestry.clone()));
+                                }
+                            }
+                            result
+                        }
+                        _ => Vec::new(),
+                    };
+
                     if let JobExecutionState::Batch(ref batch) = data.job_state {
                         data.last_completed_batch = Some(batch.phenotype_statuses.clone());
+                    }
+
+                    for (id, ancestry) in completed {
+                        data.completed_phenotypes.insert((id, ancestry));
                     }
 
                     data.pending_partitions.clear();

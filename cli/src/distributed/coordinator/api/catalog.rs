@@ -80,15 +80,22 @@ pub(crate) async fn get_catalog_api(
         for entry in entries.iter_mut() {
             // First check if it's currently processing in a batch
             let mut is_processing = false;
+            let base_dir = catalog.config.job.output_dir.as_deref().unwrap_or("").trim_end_matches('/');
+            let output_path = format!("{}/{}/{}", base_dir, entry.ancestry, entry.id);
+
             if let JobExecutionState::Batch(batch) = &data.job_state {
-                let output_path = format!("{}/{}/{}", catalog.config.job.output_dir.as_deref().unwrap_or(""), entry.ancestry, entry.id);
                 if let Some(status) = batch.phenotype_statuses.get(&output_path) {
+                    entry.status = status.stage.clone();
+                    is_processing = true;
+                }
+            } else if let Some(ref last_batch) = data.last_completed_batch {
+                if let Some(status) = last_batch.get(&output_path) {
                     entry.status = status.stage.clone();
                     is_processing = true;
                 }
             }
 
-            // If not actively processing, use our pre-loaded states
+            // If not actively processing (or recently completed/failed in the last batch), use our pre-loaded states
             if !is_processing {
                 if data.ingested_phenotypes.contains(&(entry.id.clone(), entry.ancestry.clone())) {
                     entry.status = "ingested".to_string();
