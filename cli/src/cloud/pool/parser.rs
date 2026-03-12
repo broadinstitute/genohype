@@ -432,6 +432,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         let mut y_field: Option<String> = None;
         let mut scan_only = false;
         let mut aggregate_only = false;
+        let mut idle = false;
 
         let mut i = 0;
         while i < args.len() {
@@ -598,6 +599,10 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                     aggregate_only = true;
                     i += 1;
                 }
+                "--idle" => {
+                    idle = true;
+                    i += 1;
+                }
                 _ => {
                     i += 1;
                 }
@@ -703,6 +708,20 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
 
         let scan_only = scan_only || job_config.job.scan_only;
         let aggregate_only = aggregate_only || job_config.job.aggregate_only;
+        let idle = idle || job_config.job.idle;
+
+        let mut job_config = job_config;
+        job_config.job.idle = idle;
+
+        if idle {
+            // Idle mode: skip asset loading entirely, return empty specs
+            return Ok((
+                "idle_batch".to_string(),
+                JobSpec::ManhattanBatch { specs: vec![], mode: crate::distributed::message::ExecutionMode::Full, config: Some(job_config) },
+                Vec::new(),
+                Vec::new()
+            ));
+        }
 
         let mode = if scan_only {
             crate::distributed::message::ExecutionMode::ScanOnly

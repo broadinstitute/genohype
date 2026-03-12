@@ -18,9 +18,11 @@ pub(crate) async fn load_catalog_api(
     };
 
     match result {
-        Ok(cat) => {
+        Ok((cat, completed, ingested)) => {
             let count = cat.entries.len();
             let mut data = state.lock().expect("state lock poisoned");
+            data.completed_phenotypes.extend(completed);
+            data.ingested_phenotypes.extend(ingested);
             data.catalog = Some(cat);
             Json(serde_json::json!({ "success": true, "count": count }))
         }
@@ -50,9 +52,9 @@ pub(crate) async fn get_catalog_api(
     // Phase 2: do the expensive I/O outside the lock
     let loaded_catalog = if let Some(cfg) = pending_config {
         match crate::distributed::coordinator::services::catalog::load_catalog_from_config(cfg) {
-            Ok(catalog) => {
-                println!("Lazy-loaded catalog with {} phenotypes", catalog.entries.len());
-                Some(catalog)
+            Ok(res) => {
+                println!("Lazy-loaded catalog with {} phenotypes", res.0.entries.len());
+                Some(res)
             }
             Err(e) => {
                 println!("Warning: Failed to lazy-load catalog: {}", e);
@@ -65,7 +67,9 @@ pub(crate) async fn get_catalog_api(
 
     // Phase 3: re-acquire lock to update state and formulate response
     let mut data = state.lock().expect("state lock poisoned");
-    if let Some(cat) = loaded_catalog {
+    if let Some((cat, completed, ingested)) = loaded_catalog {
+        data.completed_phenotypes.extend(completed);
+        data.ingested_phenotypes.extend(ingested);
         data.catalog = Some(cat);
     }
 
@@ -84,9 +88,13 @@ pub(crate) async fn get_catalog_api(
                 }
             }
 
-            // If not processing and it's known to be ingested, set status
-            if !is_processing && data.ingested_phenotypes.contains(&(entry.id.clone(), entry.ancestry.clone())) {
-                entry.status = "ingested".to_string();
+            // If not actively processing, use our pre-loaded states
+            if !is_processing {
+                if data.ingested_phenotypes.contains(&(entry.id.clone(), entry.ancestry.clone())) {
+                    entry.status = "ingested".to_string();
+                } else if data.completed_phenotypes.contains(&(entry.id.clone(), entry.ancestry.clone())) {
+                    entry.status = "completed".to_string();
+                }
             }
         }
         Json(entries)
@@ -117,6 +125,18 @@ fn synthesize_catalog_from_batch(
                 }
             }
 
+            let final_status = if status == "idle" {
+                if data.ingested_phenotypes.contains(&(id.clone(), ancestry.clone())) {
+                    "ingested".to_string()
+                } else if data.completed_phenotypes.contains(&(id.clone(), ancestry.clone())) {
+                    "completed".to_string()
+                } else {
+                    status
+                }
+            } else {
+                status
+            };
+
             entries.push(CatalogEntry {
                 id: id.clone(),
                 ancestry: ancestry.clone(),
@@ -128,11 +148,7 @@ fn synthesize_catalog_from_batch(
                 has_exome: spec.exome.is_some(),
                 has_genome: spec.genome.is_some(),
                 has_gene_burden: spec.gene_burden.is_some(),
-                status: if status == "idle" && data.ingested_phenotypes.contains(&(id, ancestry)) {
-                    "ingested".to_string()
-                } else {
-                    status
-                },
+                status: final_status,
             });
         }
     }

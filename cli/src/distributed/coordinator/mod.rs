@@ -250,6 +250,7 @@ pub async fn run_coordinator(
         session_id: Uuid::new_v4().to_string(),
         catalog: None,
         ingested_phenotypes: HashSet::new(),
+        completed_phenotypes: HashSet::new(),
     }));
 
     // Log session ID for debugging

@@ -233,6 +233,10 @@ pub struct ManhattanBatchArgs {
 
     // Styling Options
 
+    /// Start coordinator in idle mode without automatically queueing phenotypes
+    #[arg(long)]
+    pub idle: bool,
+
     /// Path to TOML configuration file for styling
     #[arg(long)]
     pub style_config: Option<String>,

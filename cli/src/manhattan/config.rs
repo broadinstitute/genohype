@@ -136,6 +136,10 @@ pub struct JobSettings {
     /// Run only the memory-intensive aggregate phase
     #[serde(default)]
     pub aggregate_only: bool,
+
+    /// Start coordinator in idle mode without queueing phenotypes
+    #[serde(default)]
+    pub idle: bool,
 }
 
 /// Settings for ClickHouse ingestion.

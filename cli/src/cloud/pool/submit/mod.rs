@@ -861,17 +861,20 @@ EOF
         }
 
         // For ManhattanBatch jobs, compute layout and partition counts for all unique tables
-        if let crate::distributed::message::JobSpec::ManhattanBatch { ref mut specs, .. } = job_spec {
+        if let crate::distributed::message::JobSpec::ManhattanBatch { ref mut specs, ref config, .. } = job_spec {
             use crate::manhattan::layout::{ChromosomeLayout, YScale};
             use crate::manhattan::reference::get_contig_lengths;
             use std::collections::HashMap;
 
-            if specs.is_empty() {
-                return Err(HailError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "ManhattanBatch has no specs",
-                )));
-            }
+            let is_idle_batch = config.as_ref().map(|c| c.job.idle).unwrap_or(false);
+
+            if !is_idle_batch {
+                if specs.is_empty() {
+                    return Err(HailError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "ManhattanBatch has no specs",
+                    )));
+                }
 
             // Get first available width/height for layout
             let first_spec = &specs[0];
@@ -1007,6 +1010,8 @@ EOF
                 );
                 return Ok(());
             }
+
+            } // End of if !is_idle_batch
         }
 
         drop(engine);  // Drop the QueryEngine if it exists (Option<QueryEngine>)

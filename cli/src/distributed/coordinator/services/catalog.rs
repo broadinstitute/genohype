@@ -3,7 +3,7 @@ use crate::manhattan::batch::PhenotypeInput;
 use crate::manhattan::config::ManhattanJobConfig;
 use genohype_core::codec::EncodedValue;
 use genohype_core::query::QueryEngine;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct CatalogState {
@@ -12,8 +12,10 @@ pub struct CatalogState {
     pub inputs: HashMap<(String, String), PhenotypeInput>,
 }
 
+pub type CatalogLoadResult = (CatalogState, HashSet<(String, String)>, HashSet<(String, String)>);
+
 /// Load catalog from a TOML config file path.
-pub fn load_catalog(config_path: &str) -> crate::Result<CatalogState> {
+pub fn load_catalog(config_path: &str) -> crate::Result<CatalogLoadResult> {
     println!("Loading catalog from config: {}", config_path);
     let path = std::path::Path::new(config_path);
     let config = ManhattanJobConfig::load(path)?;
@@ -21,24 +23,79 @@ pub fn load_catalog(config_path: &str) -> crate::Result<CatalogState> {
 }
 
 /// Load catalog from an already-parsed config (e.g. embedded in a job spec).
-pub fn load_catalog_from_config(config: ManhattanJobConfig) -> crate::Result<CatalogState> {
+pub fn load_catalog_from_config(config: ManhattanJobConfig) -> crate::Result<CatalogLoadResult> {
     println!("Loading catalog from embedded config");
     build_catalog(config)
 }
 
 /// Load catalog from just an assets JSON path (no TOML config needed).
 /// Uses default settings - suitable for browsing the full phenotype list.
-pub fn load_catalog_from_assets(assets_json: &str) -> crate::Result<CatalogState> {
+pub fn load_catalog_from_assets(assets_json: &str) -> crate::Result<CatalogLoadResult> {
     println!("Loading catalog from assets JSON: {}", assets_json);
     let mut config = ManhattanJobConfig::default();
     config.job.assets_json = Some(assets_json.to_string());
     build_catalog(config)
 }
 
-fn build_catalog(config: ManhattanJobConfig) -> crate::Result<CatalogState> {
+fn fetch_clickhouse_status(url: &str) -> HashSet<(String, String)> {
+    let mut set = HashSet::new();
+
+    #[cfg(feature = "clickhouse")]
+    {
+        let query = "SELECT phenotype, ancestry FROM pipeline_status WHERE status IN ('INGESTED', 'COMPLETED') FORMAT JSON";
+        let formatted_url = format!("{}/?default_format=JSON", url.trim_end_matches('/'));
+
+        if let Ok(resp) = reqwest::blocking::Client::new().post(&formatted_url).body(query).send() {
+            if let Ok(json) = resp.json::<serde_json::Value>() {
+                if let Some(arr) = json.get("data").and_then(|d| d.as_array()) {
+                    for row in arr {
+                        if let (Some(p), Some(a)) = (
+                            row.get("phenotype").and_then(|v| v.as_str()),
+                            row.get("ancestry").and_then(|v| v.as_str()),
+                        ) {
+                            set.insert((p.to_string(), a.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(not(feature = "clickhouse"))]
+    let _ = url;
+
+    set
+}
+
+fn build_catalog(config: ManhattanJobConfig) -> crate::Result<CatalogLoadResult> {
     let assets_json = config.job.assets_json.as_ref().ok_or_else(|| {
         crate::HailError::InvalidFormat("job.assets_json is required in config".to_string())
     })?;
+
+    // Perform storage & ClickHouse scans to detect pre-existing progress
+    let mut completed_phenos = HashSet::new();
+    if let Some(ref output_dir) = config.job.output_dir {
+        let completed_path = format!("{}/.completed", output_dir.trim_end_matches('/'));
+        if let Ok(completed_set) = crate::cloud::pool::read_completed_checkpoint(&completed_path) {
+            for rel_path in completed_set {
+                let parts: Vec<&str> = rel_path.split('/').collect();
+                if parts.len() >= 2 {
+                    completed_phenos.insert((parts[1].to_string(), parts[0].to_string()));
+                }
+            }
+            if !completed_phenos.is_empty() {
+                println!("  Storage scan: found {} completed phenotypes", completed_phenos.len());
+            }
+        }
+    }
+
+    let mut ingested_phenos = HashSet::new();
+    if let Some(ref ch_url) = config.ingest.clickhouse_url {
+        ingested_phenos = fetch_clickhouse_status(ch_url);
+        if !ingested_phenos.is_empty() {
+            println!("  ClickHouse scan: found {} ingested phenotypes", ingested_phenos.len());
+        }
+    }
 
     // Load ALL assets (no filters) to populate the catalog
     let raw_inputs = crate::manhattan::batch::load_and_group_assets(
@@ -50,6 +107,15 @@ fn build_catalog(config: ManhattanJobConfig) -> crate::Result<CatalogState> {
 
     for input in raw_inputs {
         let key = (input.id.clone(), input.ancestry.clone());
+
+        let status = if ingested_phenos.contains(&key) {
+            "ingested".to_string()
+        } else if completed_phenos.contains(&key) {
+            "completed".to_string()
+        } else {
+            "idle".to_string()
+        };
+
         let entry = CatalogEntry {
             id: input.id.clone(),
             ancestry: input.ancestry.clone(),
@@ -61,7 +127,7 @@ fn build_catalog(config: ManhattanJobConfig) -> crate::Result<CatalogState> {
             has_exome: input.exome_path.is_some(),
             has_genome: input.genome_path.is_some(),
             has_gene_burden: input.gene_burden_path.is_some(),
-            status: "idle".to_string(),
+            status,
         };
         entries_map.insert(key.clone(), entry);
         inputs_map.insert(key, input);
@@ -109,9 +175,9 @@ fn build_catalog(config: ManhattanJobConfig) -> crate::Result<CatalogState> {
 
     println!("Catalog loaded with {} phenotypes.", entries.len());
 
-    Ok(CatalogState {
+    Ok((CatalogState {
         config,
         entries,
         inputs: inputs_map,
-    })
+    }, completed_phenos, ingested_phenos))
 }

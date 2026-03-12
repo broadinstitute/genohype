@@ -231,15 +231,25 @@ pub(crate) async fn submit_job(
             let cfg = job_config.clone();
             std::thread::spawn(move || {
                 match services::catalog::load_catalog_from_config(cfg) {
-                    Ok(catalog) => {
+                    Ok((catalog, completed, ingested)) => {
                         println!("Auto-loaded catalog with {} phenotypes", catalog.entries.len());
                         let mut data = state_clone.lock().expect("state lock poisoned");
+                        data.completed_phenotypes.extend(completed);
+                        data.ingested_phenotypes.extend(ingested);
                         data.catalog = Some(catalog);
                     }
                     Err(e) => {
                         println!("Warning: Failed to auto-load catalog: {}", e);
                     }
                 }
+            });
+        }
+
+        if specs.is_empty() {
+            println!("Received idle batch request. Catalog is loading in background...");
+            return axum::Json(JobConfigResponse {
+                acknowledged: true,
+                error: None,
             });
         }
 

@@ -340,6 +340,8 @@ pub(crate) struct CoordinatorData {
     pub(crate) catalog: Option<crate::distributed::coordinator::services::CatalogState>,
     /// Phenotypes that have been successfully ingested into ClickHouse (id, ancestry)
     pub(crate) ingested_phenotypes: HashSet<(String, String)>,
+    /// Phenotypes that have been fully processed in storage (id, ancestry)
+    pub(crate) completed_phenotypes: HashSet<(String, String)>,
 }
 
 pub(crate) type SharedState = Arc<Mutex<CoordinatorData>>;

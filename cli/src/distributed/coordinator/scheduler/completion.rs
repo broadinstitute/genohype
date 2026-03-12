@@ -603,6 +603,7 @@ mod tests {
             session_id: "test-session".to_string(),
             catalog: None,
             ingested_phenotypes: HashSet::new(),
+            completed_phenotypes: HashSet::new(),
         };
 
         // Insert the active task with UUID as key and all partition_ids
@@ -703,6 +704,7 @@ mod tests {
             session_id: "test-session".to_string(),
             catalog: None,
             ingested_phenotypes: HashSet::new(),
+            completed_phenotypes: HashSet::new(),
         };
 
         let mut batch = create_test_batch_state();
@@ -773,6 +775,7 @@ mod tests {
             session_id: "test-session".to_string(),
             catalog: None,
             ingested_phenotypes: HashSet::new(),
+            completed_phenotypes: HashSet::new(),
         };
 
         // Insert aggregate batch task keyed by UUID (as coordinator does)
