@@ -28,12 +28,12 @@ use tracing::trace;
 /// Default chunk size for cloud reads (8MB) - used by non-prefetching reader
 const DEFAULT_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
-/// Prefetch chunk size (64MB) - large chunks minimize per-request overhead
-const PREFETCH_CHUNK_SIZE: usize = 64 * 1024 * 1024;
+/// Prefetch chunk size (32MB) - balances per-request overhead vs memory usage
+const PREFETCH_CHUNK_SIZE: usize = 32 * 1024 * 1024;
 
-/// Number of concurrent in-flight fetches per reader (16 x 64MB = 1GB buffer per reader)
-/// With 48 cores this uses ~48 GB total, leaving ~48 GB free on c4-highcpu-48 (96 GB)
-const PREFETCH_DEPTH: usize = 16;
+/// Number of concurrent in-flight fetches per reader (4 x 32MB = 128MB buffer per reader)
+/// With 48 cores this uses ~6 GB total, leaving plenty of headroom for partition data
+const PREFETCH_DEPTH: usize = 4;
 
 /// Shared Tokio runtime for IO operations
 ///
@@ -256,9 +256,9 @@ impl Seek for CloudReader {
 /// the next chunks, ensuring the CPU never waits for network I/O.
 pub struct PrefetchingCloudReader {
     /// Channel receiver for prefetched chunks
-    rx: tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    rx: tokio::sync::mpsc::Receiver<std::io::Result<bytes::Bytes>>,
     /// Current chunk being consumed
-    current_chunk: Vec<u8>,
+    current_chunk: bytes::Bytes,
     /// Position within current chunk
     chunk_pos: usize,
     /// Logical file position
@@ -281,7 +281,7 @@ impl PrefetchingCloudReader {
 
         PrefetchingCloudReader {
             rx,
-            current_chunk: Vec::new(),
+            current_chunk: bytes::Bytes::new(),
             chunk_pos: 0,
             position: 0,
             file_size,
@@ -301,7 +301,7 @@ impl PrefetchingCloudReader {
         path: ObjPath,
         start_offset: u64,
         file_size: u64,
-    ) -> (tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>, tokio::sync::mpsc::Sender<()>) {
+    ) -> (tokio::sync::mpsc::Receiver<std::io::Result<bytes::Bytes>>, tokio::sync::mpsc::Sender<()>) {
         let (tx, rx) = tokio::sync::mpsc::channel(PREFETCH_DEPTH);
         let (cancel_tx, mut cancel_rx) = tokio::sync::mpsc::channel::<()>(1);
 
@@ -325,7 +325,6 @@ impl PrefetchingCloudReader {
                         let result = store.get_range(&path, range).await;
                         trace!("PrefetchingCloudReader: fetch completed in {:?}", start_time.elapsed());
                         result
-                            .map(|b| b.to_vec())
                             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
                     }
                 })
@@ -428,7 +427,7 @@ impl Seek for PrefetchingCloudReader {
 
             self.rx = rx;
             self._cancel_tx = Some(cancel_tx);
-            self.current_chunk.clear();
+            self.current_chunk = bytes::Bytes::new();
             self.chunk_pos = 0;
             self.position = new_position;
         }
