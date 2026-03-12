@@ -13,6 +13,8 @@ import {
   librarySelectedIdsAtom,
   librarySortKeyAtom,
   librarySortDirAtom,
+  libraryRandomSampleAtom,
+  libraryLimitCountAtom,
   fetchDashboardDataAtom
 } from '../../atoms/dashboardAtoms';
 import '../panels.css';
@@ -41,6 +43,8 @@ export const PhenotypeLibraryPanel: React.FC = () => {
   const [selectedIds, setSelectedIds] = useAtom(librarySelectedIdsAtom);
   const [sortKey, setSortKey] = useAtom(librarySortKeyAtom);
   const [sortDir, setSortDir] = useAtom(librarySortDirAtom);
+  const [randomSamplePct, setRandomSamplePct] = useAtom(libraryRandomSampleAtom);
+  const [limitCount, setLimitCount] = useAtom(libraryLimitCountAtom);
 
   const fetchDashboardData = useSetAtom(fetchDashboardDataAtom);
 
@@ -206,8 +210,28 @@ export const PhenotypeLibraryPanel: React.FC = () => {
       return sortDir === 'asc' ? cmp : -cmp;
     });
 
-    return sorted;
-  }, [catalog, filter, ancestryFilter, traitTypeFilter, assetFilter, statusFilter, selectedCategories, sortKey, sortDir]);
+    // Apply Random % Sample
+    let sampled = sorted;
+    if (randomSamplePct < 100) {
+      sampled = sorted.filter(c => {
+        let hash = 0;
+        const str = `${c.id}::${c.ancestry}`;
+        for (let i = 0; i < str.length; i++) {
+          hash = ((hash << 5) - hash) + str.charCodeAt(i);
+          hash |= 0; // Convert to 32bit integer
+        }
+        return (Math.abs(hash) % 100) < randomSamplePct;
+      });
+    }
+
+    // Apply Limit
+    const parsedLimit = parseInt(limitCount, 10);
+    if (!isNaN(parsedLimit) && parsedLimit > 0) {
+      sampled = sampled.slice(0, parsedLimit);
+    }
+
+    return sampled;
+  }, [catalog, filter, ancestryFilter, traitTypeFilter, assetFilter, statusFilter, selectedCategories, sortKey, sortDir, randomSamplePct, limitCount]);
 
   const toggleSelect = (key: string) => {
     const next = new Set(selectedIds);
@@ -216,8 +240,10 @@ export const PhenotypeLibraryPanel: React.FC = () => {
     setSelectedIds(next);
   };
 
+  const allVisibleSelected = filteredCatalog.length > 0 && filteredCatalog.every(c => selectedIds.has(`${c.id}::${c.ancestry}`));
+
   const toggleAll = () => {
-    if (selectedIds.size === filteredCatalog.length) {
+    if (allVisibleSelected) {
       setSelectedIds(new Set());
     } else {
       setSelectedIds(new Set(filteredCatalog.map(c => `${c.id}::${c.ancestry}`)));
@@ -342,6 +368,36 @@ export const PhenotypeLibraryPanel: React.FC = () => {
         </div>
       )}
 
+      {/* Subsetting controls for progressive scale-up */}
+      <div style={{ display: 'flex', gap: '16px', marginBottom: '12px', alignItems: 'center', background: 'rgba(255, 255, 255, 0.02)', padding: '6px 12px', borderRadius: '4px', border: '1px solid var(--border)' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <span style={{ fontSize: '11px', color: 'var(--text-dim)' }}>Random Sample:</span>
+          <input
+            type="range"
+            min="1"
+            max="100"
+            value={randomSamplePct}
+            onChange={e => setRandomSamplePct(Number(e.target.value))}
+            style={{ width: '100px', cursor: 'pointer' }}
+          />
+          <span style={{ fontSize: '11px', width: '32px', textAlign: 'right', color: 'var(--cyan)' }}>{randomSamplePct}%</span>
+        </div>
+
+        <div style={{ width: '1px', height: '14px', background: 'var(--border)' }} />
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <span style={{ fontSize: '11px', color: 'var(--text-dim)' }}>Limit:</span>
+          <input
+            type="number"
+            min="1"
+            placeholder="No limit"
+            value={limitCount}
+            onChange={e => setLimitCount(e.target.value)}
+            style={{ ...selectStyle, width: '80px', padding: '2px 6px' }}
+          />
+        </div>
+      </div>
+
       {error && (
         <div style={{ padding: '8px', marginBottom: '8px', background: 'rgba(248, 81, 73, 0.1)', color: 'var(--red)', border: '1px solid var(--red)', borderRadius: '4px', fontSize: '11px' }}>
           {error}
@@ -353,7 +409,7 @@ export const PhenotypeLibraryPanel: React.FC = () => {
           <thead style={{ position: 'sticky', top: 0, zIndex: 1, backgroundColor: 'var(--surface)' }}>
             <tr>
               <th style={{ width: '30px', textAlign: 'center' }}>
-                <input type="checkbox" checked={selectedIds.size > 0 && selectedIds.size === filteredCatalog.length} onChange={toggleAll} />
+                <input type="checkbox" checked={allVisibleSelected} onChange={toggleAll} />
               </th>
               <th style={thStyle} onClick={() => handleSort('status')}>Status{sortIndicator('status')}</th>
               <th style={thStyle} onClick={() => handleSort('id')}>Phenotype ID{sortIndicator('id')}</th>

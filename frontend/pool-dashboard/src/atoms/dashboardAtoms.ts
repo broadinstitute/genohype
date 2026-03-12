@@ -53,6 +53,8 @@ export const librarySelectedCategoriesAtom = atom<Set<string>>(new Set<string>()
 export const librarySelectedIdsAtom = atom<Set<string>>(new Set<string>());
 export const librarySortKeyAtom = atom<'status' | 'id' | 'ancestry' | 'description' | 'trait_type' | 'cases' | 'assets'>('id');
 export const librarySortDirAtom = atom<'asc' | 'desc'>('asc');
+export const libraryRandomSampleAtom = atom<number>(100);
+export const libraryLimitCountAtom = atom<string>('');
 
 // ============================================================================
 // UI Preference Atoms (persisted to localStorage)
