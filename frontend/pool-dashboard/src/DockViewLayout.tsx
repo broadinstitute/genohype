@@ -225,17 +225,10 @@ export const applyFleetLayout = (api: DockviewApi) => {
 export const applyPhenotypeLayout = (api: DockviewApi) => {
   clearPanels(api);
 
-  const config = api.addPanel({
-    id: 'job_config',
-    component: 'jobConfig',
-    title: 'Job Config',
-  });
-
   const library = api.addPanel({
     id: 'phenotype_library',
     component: 'phenotypeLibrary',
     title: 'Phenotype Library',
-    position: { direction: 'right', referencePanel: config.id },
   });
 
   api.addPanel({
@@ -246,18 +239,27 @@ export const applyPhenotypeLayout = (api: DockviewApi) => {
   });
 
   api.addPanel({
+    id: 'job_config',
+    component: 'jobConfig',
+    title: 'Job Config',
+    position: { direction: 'within', referencePanel: library.id },
+  });
+
+  api.addPanel({
     id: 'clickhouse',
     component: 'clickhouse',
     title: 'ClickHouse',
-    position: { direction: 'within', referencePanel: 'phenotype_batch' },
+    position: { direction: 'within', referencePanel: library.id },
   });
 
   api.addPanel({
     id: 'event_log',
     component: 'eventLog',
     title: 'Event Log',
-    position: { direction: 'below', referencePanel: library.id },
+    position: { direction: 'within', referencePanel: library.id },
   });
+
+  library.api.setActive();
 };
 
 /**
