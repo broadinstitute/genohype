@@ -48,7 +48,7 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
                 .unwrap_or(0);
             let resolved_machine_type = machine_type
                 .or_else(|| profile.as_ref().map(|p| p.machine_type.clone()))
-                .unwrap_or_else(|| "c3-highcpu-22".to_string());
+                .unwrap_or_else(|| "n1-standard-4".to_string());
             let resolved_zone = resolve_zone(zone, &name, app_config);
             let resolved_spot = spot
                 .or_else(|| profile.as_ref().map(|p| p.spot))

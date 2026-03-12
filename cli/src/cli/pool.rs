@@ -18,7 +18,7 @@ pub enum PoolCommands {
         #[arg(long)]
         workers: Option<usize>,
 
-        /// GCP machine type (default: c3-highcpu-22, or from config profile)
+        /// GCP machine type (default: n1-standard-4, or from config profile)
         #[arg(long)]
         machine_type: Option<String>,
 

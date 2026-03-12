@@ -36,7 +36,7 @@ pub struct PoolConfig {
     pub name: String,
     /// Number of worker VMs to create
     pub worker_count: usize,
-    /// GCP machine type (e.g., "c3-highcpu-22")
+    /// GCP machine type (e.g., "n1-standard-4")
     pub machine_type: String,
     /// GCP zone (e.g., "us-central1-a")
     pub zone: String,
@@ -117,7 +117,7 @@ impl Instance {
 pub struct InstanceSetup {
     /// Instance name (e.g., "mypool-worker-3")
     pub name: String,
-    /// GCP machine type (e.g., "c3-highcpu-22")
+    /// GCP machine type (e.g., "n1-standard-4")
     pub machine_type: String,
     /// GCP zone (e.g., "us-central1-a")
     pub zone: String,

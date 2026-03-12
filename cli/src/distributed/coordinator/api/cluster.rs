@@ -325,7 +325,7 @@ pub async fn scale_cluster(
     }
 
     let zone = gcp_zone.unwrap_or_else(|| "us-central1-b".to_string());
-    let machine_type = machine_type.unwrap_or_else(|| "c4-highcpu-48".to_string());
+    let machine_type = machine_type.unwrap_or_else(|| "n1-standard-4".to_string());
     let spot = spot.unwrap_or(true);
 
     if target > current_count {

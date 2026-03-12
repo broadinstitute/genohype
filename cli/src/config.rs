@@ -94,7 +94,7 @@ pub struct ClickHouseDefaults {
 /// A named pool profile with machine and network configuration.
 #[derive(Debug, Deserialize, Clone)]
 pub struct PoolProfile {
-    /// GCP machine type (e.g., "c3-highcpu-22")
+    /// GCP machine type (e.g., "n1-standard-4")
     pub machine_type: Option<String>,
     /// Number of workers to create initially (default: 0)
     pub starting_workers: Option<usize>,
@@ -385,7 +385,7 @@ impl Config {
                 machine_type: profile
                     .machine_type
                     .clone()
-                    .unwrap_or_else(|| "c3-highcpu-22".to_string()),
+                    .unwrap_or_else(|| "n1-standard-4".to_string()),
                 starting_workers: profile.starting_workers.unwrap_or(0),
                 workers: profile.workers.unwrap_or(4),
                 spot: profile.spot.unwrap_or(false),
@@ -714,7 +714,7 @@ workers = 8
         let resolved = config.get_pool("test").unwrap();
 
         assert_eq!(resolved.name, "test");
-        assert_eq!(resolved.machine_type, "c3-highcpu-22"); // default
+        assert_eq!(resolved.machine_type, "n1-standard-4"); // default
         assert_eq!(resolved.starting_workers, 2);
         assert_eq!(resolved.workers, 8); // autoscale target
         assert!(!resolved.spot); // default
