@@ -3,6 +3,45 @@
 use crate::HailError;
 use crate::Result;
 
+/// Run a future, using the current tokio runtime if available, or creating a new one.
+/// This avoids "Cannot start a runtime from within a runtime" panics when called
+/// from the coordinator (which runs inside tokio).
+fn block_on_async<F, T>(future: F) -> Result<T>
+where
+    F: std::future::Future<Output = T> + Send,
+    T: Send,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            // We're inside a tokio runtime — use spawn_blocking + block_on to avoid nesting
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    tokio::runtime::Runtime::new()
+                        .map_err(|e| {
+                            HailError::Io(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                e.to_string(),
+                            ))
+                        })
+                        .map(|rt| rt.block_on(future))
+                })
+                .join()
+                .expect("thread panicked")
+            })
+        }
+        Err(_) => {
+            // No runtime — create one
+            let rt = tokio::runtime::Runtime::new().map_err(|e| {
+                HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                ))
+            })?;
+            Ok(rt.block_on(future))
+        }
+    }
+}
+
 /// Read the checkpoint file listing completed phenotypes.
 ///
 /// The checkpoint file is a simple newline-delimited list of relative paths
@@ -41,22 +80,12 @@ pub fn read_completed_checkpoint(checkpoint_path: &str) -> Result<std::collectio
         }
     };
 
-    // Read the file contents
-    let rt = tokio::runtime::Runtime::new().map_err(|e| {
+    let bytes = block_on_async(async { store.get(&path).await?.bytes().await })?.map_err(|e| {
         HailError::Io(std::io::Error::new(
             std::io::ErrorKind::Other,
-            e.to_string(),
+            format!("Failed to read checkpoint: {}", e),
         ))
     })?;
-
-    let bytes = rt
-        .block_on(async { store.get(&path).await?.bytes().await })
-        .map_err(|e| {
-            HailError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to read checkpoint: {}", e),
-            ))
-        })?;
 
     // Parse as newline-delimited list
     let content = String::from_utf8_lossy(&bytes);
@@ -108,32 +137,24 @@ pub fn list_completed_markers(dir_url: &str) -> Result<Vec<String>> {
         }
     };
 
-    let rt = tokio::runtime::Runtime::new().map_err(|e| {
-        HailError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            e.to_string(),
-        ))
-    })?;
-
-    let markers = rt
-        .block_on(async {
-            let mut markers = Vec::new();
-            let mut list_stream = store.list(Some(&prefix));
-            while let Some(meta) = list_stream.try_next().await? {
-                if let Some(filename) = meta.location.filename() {
-                    if !filename.is_empty() {
-                        markers.push(filename.to_string());
-                    }
+    let markers = block_on_async(async {
+        let mut markers = Vec::new();
+        let mut list_stream = store.list(Some(&prefix));
+        while let Some(meta) = list_stream.try_next().await? {
+            if let Some(filename) = meta.location.filename() {
+                if !filename.is_empty() {
+                    markers.push(filename.to_string());
                 }
             }
-            Ok::<Vec<String>, object_store::Error>(markers)
-        })
-        .map_err(|e| {
-            HailError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to list markers: {}", e),
-            ))
-        })?;
+        }
+        Ok::<Vec<String>, object_store::Error>(markers)
+    })?
+    .map_err(|e| {
+        HailError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Failed to list markers: {}", e),
+        ))
+    })?;
 
     Ok(markers)
 }
