@@ -323,40 +323,46 @@ pub(crate) async fn ingest_catalog_api(
         }));
     }
 
-    let mut data = state.lock().expect("state lock poisoned");
+    // Phase 1: Extract config from state (short lock)
+    let (catalog, input_dir, clickhouse_url, init_strategy, job_spec) = {
+        let data = state.lock().expect("state lock poisoned");
 
-    if !data.idle {
-        return Json(serde_json::json!({ "success": false, "error": "Coordinator is busy. Wait for job to finish." }));
-    }
+        if !data.idle {
+            return Json(serde_json::json!({ "success": false, "error": "Coordinator is busy. Wait for job to finish." }));
+        }
 
-    let catalog = if let Some(cat) = &data.catalog {
-        cat.clone()
-    } else {
-        return Json(serde_json::json!({ "success": false, "error": "Catalog not loaded" }));
+        let catalog = if let Some(cat) = &data.catalog {
+            cat.clone()
+        } else {
+            return Json(serde_json::json!({ "success": false, "error": "Catalog not loaded" }));
+        };
+
+        let input_dir = catalog.config.ingest_input_dir().unwrap_or_default();
+        let clickhouse_url = catalog.config.ingest.clickhouse_url.clone().unwrap_or_default();
+
+        if input_dir.is_empty() || clickhouse_url.is_empty() {
+            return Json(serde_json::json!({ "success": false, "error": "ingest.input_dir and clickhouse_url must be set in config" }));
+        }
+
+        let init_strategy = match catalog.config.ingest.init_strategy.to_lowercase().as_str() {
+            "replace" => crate::distributed::message::InitStrategy::Replace,
+            "append" => crate::distributed::message::InitStrategy::Append,
+            _ => crate::distributed::message::InitStrategy::Create,
+        };
+
+        let job_spec = JobSpec::IngestManhattan {
+            input_dir: input_dir.clone(),
+            clickhouse_url: clickhouse_url.clone(),
+            database: catalog.config.ingest.database.clone(),
+            init_strategy,
+            phenotypes: Some(req.phenotypes),
+        };
+
+        (catalog, input_dir, clickhouse_url, init_strategy, job_spec)
     };
+    // Lock is dropped here — expensive I/O below won't block the coordinator
 
-    let input_dir = catalog.config.ingest_input_dir().unwrap_or_default();
-    let clickhouse_url = catalog.config.ingest.clickhouse_url.clone().unwrap_or_default();
-
-    if input_dir.is_empty() || clickhouse_url.is_empty() {
-        return Json(serde_json::json!({ "success": false, "error": "ingest.input_dir and clickhouse_url must be set in config" }));
-    }
-
-    let init_strategy = match catalog.config.ingest.init_strategy.to_lowercase().as_str() {
-        "replace" => crate::distributed::message::InitStrategy::Replace,
-        "append" => crate::distributed::message::InitStrategy::Append,
-        _ => crate::distributed::message::InitStrategy::Create,
-    };
-
-    let job_spec = JobSpec::IngestManhattan {
-        input_dir: input_dir.clone(),
-        clickhouse_url: clickhouse_url.clone(),
-        database: catalog.config.ingest.database.clone(),
-        init_strategy,
-        phenotypes: Some(req.phenotypes),
-    };
-
-    // Execute DDL based on init_strategy
+    // Phase 2: Execute DDL and discover phenotypes (no lock held)
     #[cfg(feature = "clickhouse")]
     {
         if let Err(e) = crate::distributed::coordinator::services::init_clickhouse_tables(&clickhouse_url, &init_strategy) {
@@ -372,6 +378,14 @@ pub(crate) async fn ingest_catalog_api(
 
     if phenotypes.is_empty() {
         return Json(serde_json::json!({ "success": false, "error": "No matching phenotypes found in output directory" }));
+    }
+
+    // Phase 3: Re-acquire lock and update state
+    let mut data = state.lock().expect("state lock poisoned");
+
+    // Re-check idle in case another request snuck in while we were doing I/O
+    if !data.idle {
+        return Json(serde_json::json!({ "success": false, "error": "Coordinator became busy during ingestion setup" }));
     }
 
     data.config.input_path = input_dir;
