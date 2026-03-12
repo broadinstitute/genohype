@@ -59,6 +59,8 @@ export interface TelemetrySnapshot {
   current_batch_size?: number;
   /** Learned maximum batch capacity (caps AIMD growth) */
   max_batch_capacity?: number;
+  /** Current adaptive prefetch depth (concurrent GCS fetches per reader) */
+  prefetch_depth?: number;
 }
 
 /**

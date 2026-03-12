@@ -424,6 +424,7 @@ const WorkerCard: React.FC<{ worker: DashboardWorker; coordinatorVersion?: strin
               partitionsCompleted={t.partitions_completed}
               currentBatch={worker.current_batch_size}
               maxBatchCapacity={worker.max_batch_capacity}
+              prefetchDepth={t.prefetch_depth}
             />
           </>
         ) : (
@@ -579,7 +580,8 @@ const WorkerStats: React.FC<{
   partitionsCompleted: number;
   currentBatch?: number;
   maxBatchCapacity?: number;
-}> = ({ workerId, telemetry, partitionsCompleted, currentBatch, maxBatchCapacity }) => {
+  prefetchDepth?: number;
+}> = ({ workerId, telemetry, partitionsCompleted, currentBatch, maxBatchCapacity, prefetchDepth }) => {
   const handleResetCapacity = async () => {
     try {
       await fetch(`/api/workers/${workerId}/reset-capacity`, { method: 'POST' });
@@ -664,10 +666,20 @@ const WorkerStats: React.FC<{
         )}
       </div>
 
-      {/* Partitions Done */}
-      <div>
-        <span style={{ color: 'var(--text-dim)' }}>Parts Done: </span>
-        <span style={{ color: 'var(--green)' }}>{partitionsCompleted}</span>
+      {/* Batch + Prefetch on same line */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+        <div>
+          <span style={{ color: 'var(--text-dim)' }}>Parts Done: </span>
+          <span style={{ color: 'var(--green)' }}>{partitionsCompleted}</span>
+        </div>
+        {prefetchDepth != null && (
+          <div>
+            <span style={{ color: 'var(--text-dim)' }}>Prefetch: </span>
+            <span style={{ color: prefetchDepth <= 2 ? 'var(--yellow)' : 'var(--cyan)' }}>
+              {prefetchDepth}
+            </span>
+          </div>
+        )}
       </div>
 
       {/* Network RX */}
