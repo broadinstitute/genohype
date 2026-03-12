@@ -28,12 +28,12 @@ use tracing::trace;
 /// Default chunk size for cloud reads (8MB) - used by non-prefetching reader
 const DEFAULT_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
-/// Prefetch chunk size (32MB) - larger chunks amortize per-request latency
-const PREFETCH_CHUNK_SIZE: usize = 32 * 1024 * 1024;
+/// Prefetch chunk size (64MB) - large chunks minimize per-request overhead
+const PREFETCH_CHUNK_SIZE: usize = 64 * 1024 * 1024;
 
-/// Number of concurrent in-flight fetches per reader (8 x 32MB = 256MB buffer)
-/// With 48 cores this uses ~12 GB total, well within c4-highcpu-48's 96 GB RAM
-const PREFETCH_DEPTH: usize = 8;
+/// Number of concurrent in-flight fetches per reader (16 x 64MB = 1GB buffer per reader)
+/// With 48 cores this uses ~48 GB total, leaving ~48 GB free on c4-highcpu-48 (96 GB)
+const PREFETCH_DEPTH: usize = 16;
 
 /// Shared Tokio runtime for IO operations
 ///
@@ -89,9 +89,9 @@ pub fn get_gcs_client(bucket: &str) -> Result<Arc<dyn ObjectStore>> {
     };
     builder = builder.with_retry(retry_config);
 
-    // Large connection pool for high-concurrency prefetch (48 cores × 8 in-flight = 384 streams)
+    // Large connection pool for high-concurrency prefetch (48 cores × 16 in-flight = 768 streams)
     let client_options = object_store::ClientOptions::new()
-        .with_pool_max_idle_per_host(512)
+        .with_pool_max_idle_per_host(1024)
         .with_http2_keep_alive_interval(std::time::Duration::from_secs(30))
         .with_http2_keep_alive_while_idle();
     builder = builder.with_client_options(client_options);
