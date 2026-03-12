@@ -104,6 +104,13 @@ pub(crate) fn complete_ingestion_work(data: &mut CoordinatorData, ingestion: &mu
         // Mark as ingested in coordinator state on success
         if req.error.is_none() {
             data.ingested_phenotypes.insert((phenotype_id.clone(), ancestry.clone()));
+            data.log_event(crate::distributed::message::JobEvent {
+                timestamp_ms: crate::distributed::coordinator::state::CoordinatorData::now_ms(),
+                event_type: "success".to_string(),
+                worker_id: Some(req.worker_id.clone()),
+                phenotype_id: Some(format!("{}/{}", ancestry, phenotype_id)),
+                details: format!("Ingested into ClickHouse: {} rows in {:.1}s", req.items_processed, start_time.elapsed().as_secs_f64()),
+            });
         }
         let duration = start_time.elapsed();
         ingestion.completed_count += 1;

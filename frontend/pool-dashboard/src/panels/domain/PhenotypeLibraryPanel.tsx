@@ -1,6 +1,6 @@
 import { useState, useMemo, useRef } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { useAtom, useAtomValue } from 'jotai';
+import { useAtom, useAtomValue, useSetAtom } from 'jotai';
 import {
   catalogAtom,
   summaryAtom,
@@ -12,7 +12,8 @@ import {
   librarySelectedCategoriesAtom,
   librarySelectedIdsAtom,
   librarySortKeyAtom,
-  librarySortDirAtom
+  librarySortDirAtom,
+  fetchDashboardDataAtom
 } from '../../atoms/dashboardAtoms';
 import '../panels.css';
 
@@ -40,6 +41,8 @@ export const PhenotypeLibraryPanel: React.FC = () => {
   const [selectedIds, setSelectedIds] = useAtom(librarySelectedIdsAtom);
   const [sortKey, setSortKey] = useAtom(librarySortKeyAtom);
   const [sortDir, setSortDir] = useAtom(librarySortDirAtom);
+
+  const fetchDashboardData = useSetAtom(fetchDashboardDataAtom);
 
   const [assetsPath, setAssetsPath] = useState('');
   const [loading, setLoading] = useState(false);
@@ -114,6 +117,7 @@ export const PhenotypeLibraryPanel: React.FC = () => {
       const data = await res.json();
       if (data.success) {
         setSelectedIds(new Set());
+        fetchDashboardData();
       } else {
         setError('Action failed: ' + data.error);
       }

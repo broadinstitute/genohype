@@ -315,6 +315,14 @@ pub(crate) async fn ingest_catalog_api(
     State(state): State<SharedState>,
     Json(req): Json<ProcessCatalogRequest>,
 ) -> Json<serde_json::Value> {
+    #[cfg(not(feature = "clickhouse"))]
+    {
+        return Json(serde_json::json!({
+            "success": false,
+            "error": "The 'clickhouse' feature was not enabled when building the coordinator."
+        }));
+    }
+
     let mut data = state.lock().expect("state lock poisoned");
 
     if !data.idle {
@@ -371,6 +379,15 @@ pub(crate) async fn ingest_catalog_api(
     data.idle = false;
     data.last_completed_batch = None;
 
+    data.pending_partitions.clear();
+    data.processing_partitions.clear();
+    data.completed_tasks.clear();
+    data.failed_partitions.clear();
+    data.retry_counts.clear();
+
+    let pheno_count = phenotypes.len();
+    let pheno_names: Vec<String> = phenotypes.iter().map(|(id, anc, _)| format!("{}/{}", anc, id)).collect();
+
     #[cfg(feature = "clickhouse")]
     {
         data.job_state = JobExecutionState::Ingestion(
@@ -393,6 +410,14 @@ pub(crate) async fn ingest_catalog_api(
         input_path: data.config.input_path.clone(),
         total_tasks: 0,
         job_type: Some("ingest manhattan (catalog)".to_string()),
+    });
+
+    data.log_event(crate::distributed::message::JobEvent {
+        timestamp_ms: crate::distributed::coordinator::state::CoordinatorData::now_ms(),
+        event_type: "submitted".to_string(),
+        worker_id: None,
+        phenotype_id: None,
+        details: format!("Started ingestion for {} phenotypes ({})", pheno_count, pheno_names.join(", ")),
     });
 
     Json(serde_json::json!({ "success": true, "message": "Started ingestion job" }))

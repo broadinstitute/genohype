@@ -153,6 +153,14 @@ pub(crate) fn get_ingestion_work(
             w.status = WorkerStatus::Active;
         }
 
+        data.log_event(crate::distributed::message::JobEvent {
+            timestamp_ms: crate::distributed::coordinator::state::CoordinatorData::now_ms(),
+            event_type: "assigned".to_string(),
+            worker_id: Some(worker_id.to_string()),
+            phenotype_id: Some(format!("{}/{}", ancestry, phenotype_id)),
+            details: format!("Started ingesting {}/{}", ancestry, phenotype_id),
+        });
+
         println!(
             "Assigned 1 ingest task to {} [{}/{}] ({} pending, {} active, {} done)",
             worker_id,
