@@ -190,15 +190,8 @@ pub async fn scale_cluster(
             data.config.gcp_project.clone(),
             data.config.network.clone(),
             data.config.subnet.clone(),
-            // We need the binary GCS URL for startup scripts - derive from backup_path pattern
-            data.config.backup_path.as_ref().and_then(|bp| {
-                // Extract bucket from backup path like gs://bucket/pool-logs/xxx/ops.db
-                bp.strip_prefix("gs://").and_then(|rest| {
-                    rest.split('/').next().map(|bucket| {
-                        format!("gs://{}/binaries/genohype", bucket)
-                    })
-                })
-            }),
+            // Use the actual staged binary URL from the last update-binary call
+            data.update_fleet_url.clone(),
             data.config.machine_type.clone(),
             data.config.spot,
         )
@@ -338,8 +331,12 @@ pub async fn scale_cluster(
         }
 
         let pool_name_for_script = pool_name.clone();
+        // Use GCS URL if available, otherwise fall back to downloading from coordinator HTTP
+        let effective_binary_url = binary_gcs_url.or_else(|| {
+            Some(format!("http://{}-coordinator:3000/api/binary", pool_name_for_script))
+        });
         let startup_script = crate::cloud::startup::generate_worker_startup_script(
-            binary_gcs_url.as_deref(),
+            effective_binary_url.as_deref(),
             &pool_name_for_script,
         );
 

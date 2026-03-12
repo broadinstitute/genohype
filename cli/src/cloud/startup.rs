@@ -17,12 +17,18 @@ use super::WireGuardConfig;
 /// via internal DNS (`{pool_name}-coordinator:3000`). This achieves "zero-SSH"
 /// deployment for distributed jobs.
 pub fn generate_worker_startup_script(binary_gcs_url: Option<&str>, pool_name: &str) -> String {
-    let binary_download = if let Some(gcs_url) = binary_gcs_url {
+    let binary_download = if let Some(binary_url) = binary_gcs_url {
+        let download_cmd = if binary_url.starts_with("gs://") {
+            format!("gsutil cp {} /tmp/genohype", binary_url)
+        } else {
+            // HTTP URL (e.g., from coordinator /api/binary) - retry since coordinator may still be booting
+            format!("curl -sL --retry 10 --retry-delay 5 --retry-all-errors -o /tmp/genohype {}", binary_url)
+        };
         format!(
             r#"
-# Download binary from GCS (pre-staged)
-echo "Downloading binary from GCS..."
-gsutil cp {} /tmp/genohype
+# Download binary
+echo "Downloading binary from {}..."
+{}
 chmod +x /tmp/genohype
 mv /tmp/genohype /usr/local/bin/genohype
 echo "Binary installed at /usr/local/bin/genohype"
@@ -54,7 +60,7 @@ systemctl daemon-reload
 systemctl enable --now genohype-worker
 echo "Worker service started via systemd"
 "#,
-            gcs_url, pool_name, pool_name
+            binary_url, download_cmd, pool_name, pool_name
         )
     } else {
         String::new()
