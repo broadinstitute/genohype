@@ -73,6 +73,16 @@ pub struct Instance {
     /// Machine type (full GCP resource URL)
     #[serde(rename = "machineType", default)]
     pub machine_type: Option<String>,
+    /// Scheduling info (for spot instances)
+    #[serde(default)]
+    pub scheduling: Option<Scheduling>,
+}
+
+/// Scheduling information.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct Scheduling {
+    #[serde(rename = "provisioningModel")]
+    pub provisioning_model: Option<String>,
 }
 
 /// Network interface information.
@@ -81,6 +91,10 @@ pub struct NetworkInterface {
     /// Internal IP address
     #[serde(rename = "networkIP")]
     pub network_ip: String,
+    /// VPC network
+    pub network: Option<String>,
+    /// Subnetwork
+    pub subnetwork: Option<String>,
 }
 
 impl Instance {

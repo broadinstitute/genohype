@@ -328,7 +328,7 @@ impl CloudProvider for GcpClient {
                 "--filter",
                 &format!("tags.items:pool-{}", pool_name),
                 "--format",
-                "json(name,zone,status,networkInterfaces[].networkIP,machineType)",
+                "json(name,zone,status,networkInterfaces[].networkIP,networkInterfaces[].network,networkInterfaces[].subnetwork,machineType,scheduling.provisioningModel)",
             ])
             .output()
             .map_err(HailError::Io)?;
@@ -544,8 +544,12 @@ mod tests {
             zone: "us-central1-a".to_string(),
             network_interfaces: vec![NetworkInterface {
                 network_ip: "10.0.0.1".to_string(),
+                network: None,
+                subnetwork: None,
             }],
             status: "RUNNING".to_string(),
+            machine_type: None,
+            scheduling: None,
         };
 
         assert_eq!(instance.ip(), Some("10.0.0.1"));

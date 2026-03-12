@@ -90,14 +90,55 @@ pub async fn get_vms(
     };
 
     // Run gcloud list in a blocking task to avoid blocking the async runtime
-    let vms = tokio::task::spawn_blocking(move || {
+    let current_vms = tokio::task::spawn_blocking(move || {
         let client = crate::cloud::gcp::GcpClient::new();
         client.list_instances(&pool_name)
     })
     .await;
 
-    match vms {
+    match current_vms {
         Ok(Ok(instances)) => {
+            // Derive missing config from existing VMs
+            {
+                let mut data = state.lock().unwrap();
+                let worker_instances: Vec<_> = instances.iter().filter(|i| i.name.contains("-worker-")).collect();
+
+                if let Some(template_vm) = worker_instances.first().copied().or(instances.first()) {
+                    if data.config.gcp_zone.is_none() {
+                        data.config.gcp_zone = Some(template_vm.zone.rsplit('/').next().unwrap_or(&template_vm.zone).to_string());
+                    }
+                    if data.config.network.is_none() {
+                        if let Some(ni) = template_vm.network_interfaces.first() {
+                            if let Some(net) = &ni.network {
+                                data.config.network = Some(net.rsplit('/').next().unwrap_or(net).to_string());
+                            }
+                        }
+                    }
+                    if data.config.subnet.is_none() {
+                        if let Some(ni) = template_vm.network_interfaces.first() {
+                            if let Some(sub) = &ni.subnetwork {
+                                data.config.subnet = Some(sub.rsplit('/').next().unwrap_or(sub).to_string());
+                            }
+                        }
+                    }
+                }
+
+                if let Some(worker_vm) = worker_instances.first() {
+                    if data.config.machine_type.is_none() {
+                        if let Some(mt) = &worker_vm.machine_type {
+                            data.config.machine_type = Some(mt.rsplit('/').next().unwrap_or(mt).to_string());
+                        }
+                    }
+                    if data.config.spot.is_none() {
+                        if let Some(sched) = &worker_vm.scheduling {
+                            if let Some(model) = &sched.provisioning_model {
+                                data.config.spot = Some(model == "SPOT");
+                            }
+                        }
+                    }
+                }
+            }
+
             let vm_infos: Vec<VmInfo> = instances
                 .into_iter()
                 .map(|inst| VmInfo {
@@ -141,7 +182,7 @@ pub async fn scale_cluster(
     Json(req): Json<ScaleRequest>,
 ) -> Json<ScaleResponse> {
     // Extract config from state
-    let (pool_name, gcp_zone, gcp_project, network, subnet, binary_gcs_url) = {
+    let (pool_name, mut gcp_zone, gcp_project, mut network, mut subnet, binary_gcs_url, mut machine_type, mut spot) = {
         let data = state.lock().unwrap();
         (
             data.config.pool_name.clone(),
@@ -158,6 +199,8 @@ pub async fn scale_cluster(
                     })
                 })
             }),
+            data.config.machine_type.clone(),
+            data.config.spot,
         )
     };
 
@@ -173,7 +216,6 @@ pub async fn scale_cluster(
         }
     };
 
-    let zone = gcp_zone.unwrap_or_else(|| "us-central1-b".to_string());
     let target = req.target_workers;
 
     // Get current worker VMs
@@ -211,6 +253,52 @@ pub async fn scale_cluster(
         .collect();
     let current_count = worker_instances.len();
 
+    // Derive missing config from existing worker VMs
+    if let Some(template_vm) = worker_instances.first().copied().or(instances.first()) {
+        if gcp_zone.is_none() {
+            gcp_zone = Some(template_vm.zone.rsplit('/').next().unwrap_or(&template_vm.zone).to_string());
+        }
+        if network.is_none() {
+            if let Some(ni) = template_vm.network_interfaces.first() {
+                if let Some(net) = &ni.network {
+                    network = Some(net.rsplit('/').next().unwrap_or(net).to_string());
+                }
+            }
+        }
+        if subnet.is_none() {
+            if let Some(ni) = template_vm.network_interfaces.first() {
+                if let Some(sub) = &ni.subnetwork {
+                    subnet = Some(sub.rsplit('/').next().unwrap_or(sub).to_string());
+                }
+            }
+        }
+    }
+
+    if let Some(worker_vm) = worker_instances.first() {
+        if machine_type.is_none() {
+            if let Some(mt) = &worker_vm.machine_type {
+                machine_type = Some(mt.rsplit('/').next().unwrap_or(mt).to_string());
+            }
+        }
+        if spot.is_none() {
+            if let Some(sched) = &worker_vm.scheduling {
+                if let Some(model) = &sched.provisioning_model {
+                    spot = Some(model == "SPOT");
+                }
+            }
+        }
+    }
+
+    // Persist derived config back to state for UI
+    {
+        let mut data = state.lock().unwrap();
+        if data.config.gcp_zone.is_none() { data.config.gcp_zone = gcp_zone.clone(); }
+        if data.config.network.is_none() { data.config.network = network.clone(); }
+        if data.config.subnet.is_none() { data.config.subnet = subnet.clone(); }
+        if data.config.machine_type.is_none() { data.config.machine_type = machine_type.clone(); }
+        if data.config.spot.is_none() { data.config.spot = spot; }
+    }
+
     if target == current_count {
         return Json(ScaleResponse {
             success: true,
@@ -220,14 +308,9 @@ pub async fn scale_cluster(
         });
     }
 
-    let machine_type = {
-        let data = state.lock().unwrap();
-        data.config.machine_type.clone().unwrap_or_else(|| "c4-highcpu-48".to_string())
-    };
-    let spot = {
-        let data = state.lock().unwrap();
-        data.config.spot.unwrap_or(true)
-    };
+    let zone = gcp_zone.unwrap_or_else(|| "us-central1-b".to_string());
+    let machine_type = machine_type.unwrap_or_else(|| "c4-highcpu-48".to_string());
+    let spot = spot.unwrap_or(true);
 
     if target > current_count {
         // Scale UP: create new workers
