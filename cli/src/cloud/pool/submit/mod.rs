@@ -4,7 +4,7 @@ mod legacy_runner;
 mod preflight;
 
 pub use legacy_runner::WorkerMessage;
-pub use preflight::read_completed_checkpoint;
+pub use preflight::{list_completed_markers, read_completed_checkpoint};
 
 use super::PoolManager;
 use crate::benchmark::BenchmarkReport;

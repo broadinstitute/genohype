@@ -75,17 +75,32 @@ fn build_catalog(config: ManhattanJobConfig) -> crate::Result<CatalogLoadResult>
     // Perform storage & ClickHouse scans to detect pre-existing progress
     let mut completed_phenos = HashSet::new();
     if let Some(ref output_dir) = config.job.output_dir {
-        let completed_path = format!("{}/.completed", output_dir.trim_end_matches('/'));
-        if let Ok(completed_set) = crate::cloud::pool::read_completed_checkpoint(&completed_path) {
+        let base_dir = output_dir.trim_end_matches('/');
+
+        // 1. Read legacy .completed file (backwards compatibility)
+        let legacy_path = format!("{}/.completed", base_dir);
+        if let Ok(completed_set) = crate::cloud::pool::read_completed_checkpoint(&legacy_path) {
             for rel_path in completed_set {
                 let parts: Vec<&str> = rel_path.split('/').collect();
                 if parts.len() >= 2 {
                     completed_phenos.insert((parts[1].to_string(), parts[0].to_string()));
                 }
             }
-            if !completed_phenos.is_empty() {
-                println!("  Storage scan: found {} completed phenotypes", completed_phenos.len());
+        }
+
+        // 2. Read new .completed_phenos/ marker files (race-free)
+        let markers_dir = format!("{}/.completed_phenos", base_dir);
+        if let Ok(markers) = crate::cloud::pool::list_completed_markers(&markers_dir) {
+            for marker in markers {
+                // Marker format: ancestry_id (e.g., "meta_1740556")
+                if let Some((ancestry, id)) = marker.split_once('_') {
+                    completed_phenos.insert((id.to_string(), ancestry.to_string()));
+                }
             }
+        }
+
+        if !completed_phenos.is_empty() {
+            println!("  Storage scan: found {} completed phenotypes", completed_phenos.len());
         }
     }
 

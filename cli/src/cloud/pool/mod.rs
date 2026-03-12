@@ -14,7 +14,7 @@ pub mod parser;
 pub mod submit;
 
 // Re-export helper types
-pub use submit::{read_completed_checkpoint, WorkerMessage};
+pub use submit::{list_completed_markers, read_completed_checkpoint, WorkerMessage};
 
 use crate::cloud::CloudProvider;
 

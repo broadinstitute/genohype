@@ -405,34 +405,18 @@ fn verify_and_checkpoint(spec: &ManhattanAggregateSpec) -> Result<()> {
 
         let phenotype_rel = format!("{}/{}", parts[1], parts[0]); // ancestry/id
         let base_dir = parts[2]; // everything before ancestry
-        let checkpoint_path = ObjPath::from(format!("{}/.completed", base_dir));
 
-        // Append to checkpoint file (read-modify-write with newline)
-        let append_content = format!("{}\n", phenotype_rel);
+        // Write empty marker file to .completed_phenos/ directory to avoid GCS concurrency overwrites
+        let phenotype_marker = format!("{}_{}", parts[1], parts[0]); // ancestry_id
+        let marker_path = ObjPath::from(format!("{}/.completed_phenos/{}", base_dir, phenotype_marker));
 
         rt.block_on(async {
-            // Try to read existing content
-            let existing = match store.get(&checkpoint_path).await {
-                Ok(result) => {
-                    let bytes = result.bytes().await.unwrap_or_default();
-                    String::from_utf8_lossy(&bytes).to_string()
-                }
-                Err(_) => String::new(),
-            };
-
-            // Check if already in checkpoint (idempotent)
-            if existing.lines().any(|line| line.trim() == phenotype_rel) {
-                return Ok::<(), object_store::Error>(());
-            }
-
-            // Append and write back
-            let new_content = format!("{}{}", existing, append_content);
-            store.put(&checkpoint_path, new_content.into()).await?;
-            Ok(())
+            store.put(&marker_path, bytes::Bytes::new().into()).await?;
+            Ok::<(), object_store::Error>(())
         }).map_err(|e| {
             crate::HailError::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("Failed to update checkpoint: {}", e),
+                format!("Failed to write checkpoint marker: {}", e),
             ))
         })?;
 
