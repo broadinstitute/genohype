@@ -89,6 +89,13 @@ pub fn get_gcs_client(bucket: &str) -> Result<Arc<dyn ObjectStore>> {
     };
     builder = builder.with_retry(retry_config);
 
+    // Large connection pool for high-concurrency prefetch (48 cores × 8 in-flight = 384 streams)
+    let client_options = object_store::ClientOptions::new()
+        .with_pool_max_idle_per_host(512)
+        .with_http2_keep_alive_interval(std::time::Duration::from_secs(30))
+        .with_http2_keep_alive_while_idle();
+    builder = builder.with_client_options(client_options);
+
     let client: Arc<dyn ObjectStore> = Arc::new(
         builder
             .build()
