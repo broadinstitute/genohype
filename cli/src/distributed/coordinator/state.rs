@@ -368,18 +368,25 @@ pub(crate) struct CoordinatorData {
     pub(crate) last_completed_batch: Option<HashMap<String, PhenotypeStatus>>,
     /// Cached GCP VM list (serialized JSON) with timestamp to avoid spamming gcloud
     pub(crate) cached_vms: Option<(serde_json::Value, Instant)>,
+    /// Workers intentionally deleted by scale-down (reject their heartbeats)
+    pub(crate) deleted_workers: HashSet<String>,
 }
 
 pub(crate) type SharedState = Arc<Mutex<CoordinatorData>>;
 
 impl CoordinatorData {
     /// Ensure a worker exists in the registry and update last_seen.
+    /// Ignores heartbeats from workers that were intentionally deleted by scale-down.
     pub(crate) fn touch_worker(
         &mut self,
         worker_id: &str,
         hardware: Option<HardwareSpec>,
         build_version: Option<String>,
     ) {
+        // Reject heartbeats from intentionally deleted workers
+        if self.deleted_workers.contains(worker_id) {
+            return;
+        }
         use std::time::Instant;
         let worker = self
             .worker_registry

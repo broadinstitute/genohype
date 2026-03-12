@@ -426,11 +426,12 @@ pub async fn scale_cluster(
             .map(|i| i.name.clone())
             .collect();
 
-        // Remove deleted workers from the fleet registry immediately
+        // Remove deleted workers from the fleet registry and block future heartbeats
         {
             let mut data = state.lock().unwrap();
             for name in &names_to_delete {
                 data.worker_registry.remove(name);
+                data.deleted_workers.insert(name.clone());
             }
             // Invalidate VM cache so next poll reflects the change
             data.cached_vms = None;
