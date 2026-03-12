@@ -308,3 +308,34 @@ export interface ClickHouseInfo {
   ingested_phenotypes: IngestedPhenotype[];
   error?: string;
 }
+
+export interface ClusterConfig {
+  pool_name: string | null;
+  gcp_project: string | null;
+  gcp_zone: string | null;
+  machine_type: string | null;
+  spot: boolean | null;
+  network: string | null;
+  subnet: string | null;
+}
+
+export interface GcpVm {
+  name: string;
+  zone: string;
+  status: string;
+  networkInterfaces: Array<{ networkIP: string }>;
+  machine_type?: string;
+}
+
+export interface ScaleRequest {
+  target_workers: number;
+  machine_type?: string;
+  spot?: boolean;
+}
+
+export interface ScaleResponse {
+  success: boolean;
+  message: string;
+  previous_workers: number;
+  target_workers: number;
+}

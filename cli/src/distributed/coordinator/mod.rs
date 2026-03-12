@@ -80,6 +80,13 @@ pub async fn start_coordinator(config: CoordinatorConfig) -> Result<()> {
         config.total_tasks,
         config.batch_size,
         config.timeout_secs,
+        config.pool_name,
+        config.gcp_project,
+        config.gcp_zone,
+        config.machine_type,
+        config.spot,
+        config.network,
+        config.subnet,
     )
     .await
 }
@@ -88,6 +95,7 @@ pub async fn start_coordinator(config: CoordinatorConfig) -> Result<()> {
 ///
 /// Note: For backward compatibility, `output_path` is converted to a default
 /// ExportParquet JobSpec. New code should use the API endpoint with JobSpec directly.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_coordinator(
     port: u16,
     db_path: String,
@@ -97,6 +105,13 @@ pub async fn run_coordinator(
     total_tasks: usize,
     batch_size: usize,
     timeout_secs: u64,
+    pool_name: Option<String>,
+    gcp_project: Option<String>,
+    gcp_zone: Option<String>,
+    machine_type: Option<String>,
+    spot: Option<bool>,
+    network: Option<String>,
+    subnet: Option<String>,
 ) -> Result<()> {
     use axum::{routing::{delete, get, post}, Router};
     use tokio::net::TcpListener;
@@ -224,6 +239,42 @@ pub async fn run_coordinator(
             memory_weight_mb: None,
             db_path: db_path.clone(),
             backup_path: backup_path.clone(),
+            pool_name: pool_name.or_else(|| {
+                // Auto-detect pool name from hostname (e.g., "heavy-coordinator" -> "heavy")
+                std::process::Command::new("hostname")
+                    .output()
+                    .ok()
+                    .and_then(|o| {
+                        let h = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                        h.strip_suffix("-coordinator").map(String::from)
+                    })
+            }),
+            gcp_project: gcp_project.or_else(|| {
+                // Auto-detect from gcloud config
+                std::process::Command::new("gcloud")
+                    .args(["config", "get-value", "project"])
+                    .output()
+                    .ok()
+                    .and_then(|o| {
+                        let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                        if s.is_empty() { None } else { Some(s) }
+                    })
+            }),
+            gcp_zone: gcp_zone.or_else(|| {
+                // Auto-detect from gcloud config or instance metadata
+                std::process::Command::new("gcloud")
+                    .args(["config", "get-value", "compute/zone"])
+                    .output()
+                    .ok()
+                    .and_then(|o| {
+                        let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                        if s.is_empty() { None } else { Some(s) }
+                    })
+            }),
+            machine_type,
+            spot,
+            network,
+            subnet,
         },
         total_rows: 0,
         scan_cpu_secs: 0.0,
@@ -590,6 +641,10 @@ pub async fn run_coordinator(
         .route("/api/dashboard/workers", get(api::dashboard::get_dashboard_workers))
         .route("/api/dashboard/metrics", get(api::dashboard::get_dashboard_metrics))
         .route("/api/dashboard/batch", get(api::dashboard::get_batch_status))
+        // Cluster management API
+        .route("/api/cluster/config", get(api::cluster::get_config))
+        .route("/api/cluster/vms", get(api::cluster::get_vms))
+        .route("/api/cluster/scale", post(api::cluster::scale_cluster))
         // ClickHouse API
         .route("/api/clickhouse/info", get(api::clickhouse::get_clickhouse_info))
         // Catalog API

@@ -21,6 +21,7 @@ import {
   JobConfigPanel,
   JobHistoryPanel,
   ClickHousePanel,
+  ClusterManagerPanel,
 } from './panels';
 
 // Map React components to string identifiers for Dockview
@@ -40,6 +41,7 @@ const components: Record<string, React.FC> = {
   jobConfig: JobConfigPanel,
   jobHistory: JobHistoryPanel,
   clickhouse: ClickHousePanel,
+  clusterManager: ClusterManagerPanel,
 };
 
 /**
@@ -263,6 +265,20 @@ export const applyPhenotypeLayout = (api: DockviewApi) => {
 };
 
 /**
+ * Applies the Cluster layout preset:
+ * - Full-screen Cluster Manager panel for viewing/scaling the GCP cluster
+ */
+export const applyClusterLayout = (api: DockviewApi) => {
+  clearPanels(api);
+
+  api.addPanel({
+    id: 'cluster_manager',
+    component: 'clusterManager',
+    title: 'Cluster Manager',
+  });
+};
+
+/**
  * Applies the History layout preset:
  * - Full-screen Job History panel for browsing past jobs
  */
@@ -303,6 +319,9 @@ export const DockViewLayout: React.FC = () => {
         break;
       case 'fleet':
         applyFleetLayout(api);
+        break;
+      case 'cluster':
+        applyClusterLayout(api);
         break;
       case 'phenotype':
         applyPhenotypeLayout(api);

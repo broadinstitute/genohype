@@ -278,6 +278,34 @@ pub enum ServiceCommands {
         /// Timeout in seconds before rescheduling stale work
         #[arg(long, default_value = "600")]
         timeout: u64,
+
+        /// Pool name for cluster management (e.g., "heavy")
+        #[arg(long)]
+        pool_name: Option<String>,
+
+        /// GCP project ID for cluster management
+        #[arg(long)]
+        gcp_project: Option<String>,
+
+        /// GCP zone for cluster management (e.g., "us-central1-b")
+        #[arg(long)]
+        gcp_zone: Option<String>,
+
+        /// Machine type for workers (e.g., "c4-highcpu-48")
+        #[arg(long)]
+        cluster_machine_type: Option<String>,
+
+        /// Whether workers use spot instances
+        #[arg(long)]
+        cluster_spot: Option<bool>,
+
+        /// VPC network name
+        #[arg(long)]
+        cluster_network: Option<String>,
+
+        /// Subnet name
+        #[arg(long)]
+        cluster_subnet: Option<String>,
     },
 
     /// Start a worker process (connects to coordinator for work)

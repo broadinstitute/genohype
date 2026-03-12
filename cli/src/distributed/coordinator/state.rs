@@ -77,6 +77,21 @@ pub struct CoordinatorConfig {
     pub db_path: String,
     /// GCS path for backup/restore (e.g., "gs://bucket/pool-ops/dev-pool/ops.db")
     pub backup_path: Option<String>,
+    // --- Cluster Configuration ---
+    /// Pool name (e.g., "heavy")
+    pub pool_name: Option<String>,
+    /// GCP project ID
+    pub gcp_project: Option<String>,
+    /// GCP zone (e.g., "us-central1-b")
+    pub gcp_zone: Option<String>,
+    /// Machine type for workers (e.g., "c4-highcpu-48")
+    pub machine_type: Option<String>,
+    /// Whether workers use spot instances
+    pub spot: Option<bool>,
+    /// VPC network name
+    pub network: Option<String>,
+    /// Subnet name
+    pub subnet: Option<String>,
 }
 
 impl Default for CoordinatorConfig {
@@ -94,6 +109,13 @@ impl Default for CoordinatorConfig {
             memory_weight_mb: None,
             db_path: "/var/lib/genohype/ops.db".to_string(),
             backup_path: None,
+            pool_name: None,
+            gcp_project: None,
+            gcp_zone: None,
+            machine_type: None,
+            spot: None,
+            network: None,
+            subnet: None,
         }
     }
 }

@@ -61,6 +61,9 @@ export const WorkspaceToolbar: React.FC = () => {
       <button onClick={() => handlePresetChange('fleet')} style={getButtonStyle('fleet')}>
         Fleet
       </button>
+      <button onClick={() => handlePresetChange('cluster')} style={getButtonStyle('cluster')}>
+        Cluster
+      </button>
       <button onClick={() => handlePresetChange('phenotype')} style={getButtonStyle('phenotype')}>
         Phenotype
       </button>

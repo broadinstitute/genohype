@@ -11,6 +11,8 @@ import type {
   FailureRecord,
   JobRecord,
   ClickHouseInfo,
+  ClusterConfig,
+  GcpVm,
 } from '../types';
 
 // ============================================================================
@@ -43,6 +45,12 @@ export const catalogAtom = atom<import('../types').CatalogEntry[]>([]);
 
 /** ClickHouse storage info */
 export const clickhouseInfoAtom = atom<ClickHouseInfo | null>(null);
+
+/** Cluster configuration from coordinator */
+export const clusterConfigAtom = atom<ClusterConfig | null>(null);
+
+/** GCP VM instances in the cluster */
+export const clusterVmsAtom = atom<GcpVm[]>([]);
 
 // ============================================================================
 // Phenotype Library State Atoms (preserve state across tab switches)
@@ -139,7 +147,7 @@ export const fetchDashboardDataAtom = atom(null, async (get, set) => {
   const failuresPath = isHistoryView ? `/api/history/jobs/${jobId}/failures` : '/api/failures';
 
   // Fetch all endpoints concurrently
-  const [summary, workers, metrics, bottleneck, batch, eventsResp, failuresResp, jobsList, catalogList, clickhouseInfo] =
+  const [summary, workers, metrics, bottleneck, batch, eventsResp, failuresResp, jobsList, catalogList, clickhouseInfo, clusterConfig, clusterVmsResp] =
     await Promise.all([
       fetchJson<DashboardSummary>(`${basePath}/summary`),
       // Workers endpoint doesn't exist for history (workers are transient)
@@ -156,6 +164,10 @@ export const fetchDashboardDataAtom = atom(null, async (get, set) => {
       isHistoryView ? Promise.resolve([]) : fetchJson<import('../types').CatalogEntry[]>('/api/catalog'),
       // Fetch clickhouse info (only for live view)
       isHistoryView ? Promise.resolve(null) : fetchJson<ClickHouseInfo>('/api/clickhouse/info'),
+      // Fetch cluster config (only for live view)
+      isHistoryView ? Promise.resolve(null) : fetchJson<ClusterConfig>('/api/cluster/config'),
+      // Fetch cluster VMs (only for live view)
+      isHistoryView ? Promise.resolve(null) : fetchJson<{ vms: GcpVm[] }>('/api/cluster/vms'),
     ]);
 
   // Update atoms with fetched data (only if fetch succeeded)
@@ -169,6 +181,8 @@ export const fetchDashboardDataAtom = atom(null, async (get, set) => {
   if (jobsList !== null) set(jobsListAtom, jobsList);
   if (catalogList !== null) set(catalogAtom, catalogList);
   if (clickhouseInfo !== null) set(clickhouseInfoAtom, clickhouseInfo);
+  if (clusterConfig !== null) set(clusterConfigAtom, clusterConfig);
+  if (clusterVmsResp !== null) set(clusterVmsAtom, clusterVmsResp.vms ?? []);
 });
 
 // ============================================================================

@@ -28,3 +28,6 @@ export { PhenotypeBatchPanel, PhenotypeLibraryPanel, JobConfigPanel, ClickHouseP
 
 // History panels
 export { JobHistoryPanel } from './history';
+
+// Cluster management panel
+export { ClusterManagerPanel } from './cluster';

@@ -22,6 +22,13 @@ pub fn run_service_command(command: ServiceCommands) -> Result<()> {
             total_partitions,
             batch_size,
             timeout,
+            pool_name,
+            gcp_project,
+            gcp_zone,
+            cluster_machine_type,
+            cluster_spot,
+            cluster_network,
+            cluster_subnet,
         } => {
             // If no job parameters provided, start in idle mode (0 partitions)
             // Job can be submitted later via POST /api/job
@@ -34,6 +41,13 @@ pub fn run_service_command(command: ServiceCommands) -> Result<()> {
                 total_partitions.unwrap_or(0),
                 batch_size,
                 timeout,
+                pool_name,
+                gcp_project,
+                gcp_zone,
+                cluster_machine_type,
+                cluster_spot,
+                cluster_network,
+                cluster_subnet,
             ))
         }
         ServiceCommands::StartWorker {
