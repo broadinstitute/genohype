@@ -11,6 +11,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@tanstack/react-virtual": "^3.13.21",
     "chart.js": "^4.5.1",
     "chartjs-plugin-zoom": "^2.0.1",
     "dockview": "^3.0.0",

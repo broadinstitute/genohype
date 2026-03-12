@@ -1,4 +1,5 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useRef } from 'react';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import { useAtom, useAtomValue } from 'jotai';
 import {
   catalogAtom,
@@ -223,6 +224,21 @@ export const PhenotypeLibraryPanel: React.FC = () => {
 
   const thStyle: React.CSSProperties = { cursor: 'pointer', userSelect: 'none', whiteSpace: 'nowrap' };
 
+  const parentRef = useRef<HTMLDivElement>(null);
+
+  const rowVirtualizer = useVirtualizer({
+    count: filteredCatalog.length,
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => 35,
+    overscan: 10,
+  });
+
+  const virtualItems = rowVirtualizer.getVirtualItems();
+  const paddingTop = virtualItems.length > 0 ? virtualItems[0].start : 0;
+  const paddingBottom = virtualItems.length > 0
+    ? rowVirtualizer.getTotalSize() - virtualItems[virtualItems.length - 1].end
+    : 0;
+
   return (
     <div className="panel-container" style={{ display: 'flex', flexDirection: 'column' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px', alignItems: 'center' }}>
@@ -328,9 +344,9 @@ export const PhenotypeLibraryPanel: React.FC = () => {
         </div>
       )}
 
-      <div style={{ flex: 1, overflowY: 'auto' }}>
+      <div ref={parentRef} style={{ flex: 1, overflowY: 'auto' }}>
         <table className="data-table">
-          <thead>
+          <thead style={{ position: 'sticky', top: 0, zIndex: 1, backgroundColor: 'var(--surface)' }}>
             <tr>
               <th style={{ width: '30px', textAlign: 'center' }}>
                 <input type="checkbox" checked={selectedIds.size > 0 && selectedIds.size === filteredCatalog.length} onChange={toggleAll} />
@@ -345,12 +361,24 @@ export const PhenotypeLibraryPanel: React.FC = () => {
             </tr>
           </thead>
           <tbody>
-            {filteredCatalog.map(entry => {
+            {paddingTop > 0 && (
+              <tr>
+                <td colSpan={8} style={{ height: paddingTop, padding: 0, border: 0 }}></td>
+              </tr>
+            )}
+            {virtualItems.map(virtualRow => {
+              const entry = filteredCatalog[virtualRow.index];
               const key = `${entry.id}::${entry.ancestry}`;
               const isSelected = selectedIds.has(key);
 
               return (
-                <tr key={key} style={{ background: isSelected ? 'rgba(88, 166, 255, 0.1)' : undefined }} onClick={() => toggleSelect(key)}>
+                <tr
+                  key={key}
+                  data-index={virtualRow.index}
+                  ref={rowVirtualizer.measureElement}
+                  style={{ background: isSelected ? 'rgba(88, 166, 255, 0.1)' : undefined }}
+                  onClick={() => toggleSelect(key)}
+                >
                   <td style={{ textAlign: 'center' }} onClick={e => e.stopPropagation()}>
                     <input type="checkbox" checked={isSelected} onChange={() => toggleSelect(key)} />
                   </td>
@@ -374,6 +402,11 @@ export const PhenotypeLibraryPanel: React.FC = () => {
                 </tr>
               );
             })}
+            {paddingBottom > 0 && (
+              <tr>
+                <td colSpan={8} style={{ height: paddingBottom, padding: 0, border: 0 }}></td>
+              </tr>
+            )}
           </tbody>
         </table>
         {filteredCatalog.length === 0 && catalog.length === 0 && (
