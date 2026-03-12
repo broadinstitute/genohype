@@ -343,10 +343,10 @@ fn verify_and_checkpoint(spec: &ManhattanAggregateSpec) -> Result<()> {
     // so we don't require them here. The manifest.json and PNG files are always created.
     let mut expected = vec!["manifest.json"];
     if spec.exome_results.is_some() {
-        expected.push("exome_manhattan.png");
+        expected.push("plots/exome_manhattan.png");
     }
     if spec.genome_results.is_some() {
-        expected.push("genome_manhattan.png");
+        expected.push("plots/genome_manhattan.png");
     }
 
     let url = url::Url::parse(&spec.output_path).map_err(|e| {
