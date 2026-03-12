@@ -800,7 +800,16 @@ EOF
 
         // For IngestManhattan jobs, we don't read Hail table metadata
         // The coordinator discovers phenotypes at runtime
-        let (total_partitions, engine) = if matches!(job_spec, crate::distributed::message::JobSpec::IngestManhattan { .. }) {
+        let is_idle_batch = if let crate::distributed::message::JobSpec::ManhattanBatch { ref config, .. } = job_spec {
+            config.as_ref().map(|c| c.job.idle).unwrap_or(false)
+        } else {
+            false
+        };
+
+        let (total_partitions, engine) = if is_idle_batch {
+            println!("Idle batch: skipping metadata read, coordinator will load catalog");
+            (0, None)
+        } else if matches!(job_spec, crate::distributed::message::JobSpec::IngestManhattan { .. }) {
             println!("Ingestion job: phenotypes will be discovered by coordinator");
             (0, None)  // Coordinator will set this after discovering phenotypes
         } else if let crate::distributed::message::JobSpec::Stress(ref spec) = job_spec {
