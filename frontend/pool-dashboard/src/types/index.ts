@@ -329,8 +329,6 @@ export interface GcpVm {
 
 export interface ScaleRequest {
   target_workers: number;
-  machine_type?: string;
-  spot?: boolean;
 }
 
 export interface ScaleResponse {

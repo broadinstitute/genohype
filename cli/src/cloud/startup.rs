@@ -101,16 +101,50 @@ echo "=== Worker VM initialized ==="
 /// The `secret:` prefix pattern allows storing sensitive values (like private keys)
 /// in Google Secret Manager. The VM uses its service account identity to fetch
 /// secrets at boot time, avoiding exposure in metadata or logs.
+/// Optional cluster configuration to pass to the coordinator startup.
+pub struct CoordinatorClusterConfig<'a> {
+    pub machine_type: Option<&'a str>,
+    pub spot: Option<bool>,
+    pub network: Option<&'a str>,
+    pub subnet: Option<&'a str>,
+}
+
 pub fn generate_coordinator_startup_script(
     wireguard: Option<&WireGuardConfig>,
     binary_gcs_url: Option<&str>,
     pool_db_path: Option<&str>,
+) -> String {
+    generate_coordinator_startup_script_with_cluster(wireguard, binary_gcs_url, pool_db_path, None)
+}
+
+pub fn generate_coordinator_startup_script_with_cluster(
+    wireguard: Option<&WireGuardConfig>,
+    binary_gcs_url: Option<&str>,
+    pool_db_path: Option<&str>,
+    cluster_config: Option<&CoordinatorClusterConfig>,
 ) -> String {
     let binary_download = if let Some(gcs_url) = binary_gcs_url {
         let db_arg = match pool_db_path {
             Some(path) => format!("--backup-path {}", path),
             None => String::new(),
         };
+
+        // Build cluster flags
+        let mut cluster_args = String::new();
+        if let Some(cc) = cluster_config {
+            if let Some(mt) = cc.machine_type {
+                cluster_args.push_str(&format!(" --cluster-machine-type {}", mt));
+            }
+            if let Some(spot) = cc.spot {
+                cluster_args.push_str(&format!(" --cluster-spot {}", spot));
+            }
+            if let Some(net) = cc.network {
+                cluster_args.push_str(&format!(" --cluster-network {}", net));
+            }
+            if let Some(sub) = cc.subnet {
+                cluster_args.push_str(&format!(" --cluster-subnet {}", sub));
+            }
+        }
 
         format!(
             r#"
@@ -131,7 +165,7 @@ After=network.target
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/local/bin/genohype service start-coordinator --port 3000 --db-path /var/lib/genohype/ops.db {}
+ExecStart=/usr/local/bin/genohype service start-coordinator --port 3000 --db-path /var/lib/genohype/ops.db {}{}
 Restart=always
 RestartSec=3
 StartLimitIntervalSec=0
@@ -144,7 +178,7 @@ systemctl daemon-reload
 systemctl enable --now genohype-coordinator
 echo "Coordinator service started via systemd"
 "#,
-            gcs_url, db_arg
+            gcs_url, db_arg, cluster_args
         )
     } else {
         String::new()

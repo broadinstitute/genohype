@@ -189,10 +189,17 @@ impl CloudProvider for GcpClient {
             &config.name,
         );
         // Coordinator auto-starts if binary is provided
-        let coordinator_script = super::startup::generate_coordinator_startup_script(
+        let cluster_cfg = super::startup::CoordinatorClusterConfig {
+            machine_type: Some(&config.machine_type),
+            spot: Some(config.spot),
+            network: config.network.as_deref(),
+            subnet: config.subnet.as_deref(),
+        };
+        let coordinator_script = super::startup::generate_coordinator_startup_script_with_cluster(
             config.wireguard.as_ref(),
             config.binary_gcs_url.as_deref(),
             config.pool_db_path.as_deref(),
+            Some(&cluster_cfg),
         );
 
         // Build list of instances to create: coordinator (optional) + workers
@@ -321,7 +328,7 @@ impl CloudProvider for GcpClient {
                 "--filter",
                 &format!("tags.items:pool-{}", pool_name),
                 "--format",
-                "json(name,zone,status,networkInterfaces[].networkIP)",
+                "json(name,zone,status,networkInterfaces[].networkIP,machineType)",
             ])
             .output()
             .map_err(HailError::Io)?;

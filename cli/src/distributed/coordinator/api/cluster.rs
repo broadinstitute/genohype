@@ -43,8 +43,6 @@ pub struct NetworkInterfaceInfo {
 #[derive(Deserialize)]
 pub struct ScaleRequest {
     pub target_workers: usize,
-    pub machine_type: Option<String>,
-    pub spot: Option<bool>,
 }
 
 /// Response for POST /api/cluster/scale
@@ -113,7 +111,11 @@ pub async fn get_vms(
                             network_ip: ni.network_ip,
                         })
                         .collect(),
-                    machine_type: None,
+                    machine_type: inst.machine_type.as_ref().map(|mt| {
+                        // Extract short name from full URL like
+                        // "https://www.googleapis.com/.../machineTypes/c4-highcpu-48"
+                        mt.rsplit('/').next().unwrap_or(mt).to_string()
+                    }),
                 })
                 .collect();
             Json(serde_json::json!({ "vms": vm_infos }))
@@ -138,18 +140,9 @@ pub async fn scale_cluster(
     State(state): State<SharedState>,
     Json(req): Json<ScaleRequest>,
 ) -> Json<ScaleResponse> {
-    // Extract config from state and optionally update it
+    // Extract config from state
     let (pool_name, gcp_zone, gcp_project, network, subnet, binary_gcs_url) = {
-        let mut data = state.lock().unwrap();
-
-        // Update config if new values provided
-        if let Some(ref mt) = req.machine_type {
-            data.config.machine_type = Some(mt.clone());
-        }
-        if let Some(spot) = req.spot {
-            data.config.spot = Some(spot);
-        }
-
+        let data = state.lock().unwrap();
         (
             data.config.pool_name.clone(),
             data.config.gcp_zone.clone(),

@@ -70,6 +70,9 @@ pub struct Instance {
     pub network_interfaces: Vec<NetworkInterface>,
     /// Instance status (RUNNING, TERMINATED, etc.)
     pub status: String,
+    /// Machine type (full GCP resource URL)
+    #[serde(rename = "machineType", default)]
+    pub machine_type: Option<String>,
 }
 
 /// Network interface information.
