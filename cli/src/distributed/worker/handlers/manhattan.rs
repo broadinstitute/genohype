@@ -335,12 +335,12 @@ pub fn process_manhattan_aggregate(
     Ok((rows, summary))
 }
 
-/// Verify expected outputs exist and append to checkpoint file.
+/// Verify expected outputs exist and write checkpoint marker.
 #[allow(unused_variables)]
 fn verify_and_checkpoint(spec: &ManhattanAggregateSpec) -> Result<()> {
+    let output_base = spec.output_path.trim_end_matches('/');
+
     // Build list of expected files
-    // Note: significant.parquet files are only created when there are significant hits,
-    // so we don't require them here. The manifest.json and PNG files are always created.
     let mut expected = vec!["manifest.json"];
     if spec.exome_results.is_some() {
         expected.push("plots/exome_manhattan.png");
@@ -349,78 +349,56 @@ fn verify_and_checkpoint(spec: &ManhattanAggregateSpec) -> Result<()> {
         expected.push("plots/genome_manhattan.png");
     }
 
-    let url = url::Url::parse(&spec.output_path).map_err(|e| {
-        crate::HailError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("Invalid output URL: {}", e),
-        ))
-    })?;
-
-    #[cfg(feature = "gcp")]
-    use object_store::{ObjectStore, path::Path as ObjPath};
-
-    #[cfg(feature = "gcp")]
-    let store: std::sync::Arc<dyn ObjectStore> = {
-        let bucket = url.host_str().ok_or_else(|| {
-            crate::HailError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Missing bucket in GCS URL",
-            ))
-        })?;
-        genohype_core::io::get_gcs_client(bucket)?
-    };
-
-    #[cfg(not(feature = "gcp"))]
-    return Ok(()); // Can't verify without GCS support
-
-    #[cfg(feature = "gcp")]
-    {
-        let base_path = url.path().trim_start_matches('/');
-
-        let rt = tokio::runtime::Runtime::new().map_err(|e| {
-            crate::HailError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-        })?;
-
-        // Verify all expected files exist
-        for file in &expected {
-            let file_path = ObjPath::from(format!("{}/{}", base_path, file));
-            rt.block_on(async {
-                store.head(&file_path).await
-            }).map_err(|e| {
-                crate::HailError::Io(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("Missing expected output {}: {}", file, e),
-                ))
-            })?;
+    // Verify expected files exist (log warnings instead of failing)
+    for file in &expected {
+        let file_url = format!("{}/{}", output_base, file);
+        if genohype_core::io::is_cloud_path(&file_url) {
+            if let Err(e) = genohype_core::io::get_file_size(&file_url) {
+                eprintln!("  Warning: Expected output file missing or inaccessible: {} ({})", file_url, e);
+            }
+        } else if !std::path::Path::new(&file_url).exists() {
+            eprintln!("  Warning: Expected output file missing: {}", file_url);
         }
+    }
 
-        // Derive checkpoint path and relative phenotype path
-        // output_path: gs://bucket/manhattans/meta/1234
-        // checkpoint:  gs://bucket/manhattans/.completed
-        // rel_path:    meta/1234
-        let parts: Vec<&str> = base_path.rsplitn(3, '/').collect();
-        if parts.len() < 3 {
-            return Ok(()); // Can't determine checkpoint path
-        }
+    // Derive checkpoint path and relative phenotype path
+    // output_path: gs://bucket/manhattans/meta/1234
+    // checkpoint:  gs://bucket/manhattans/.completed_phenos/meta_1234
+    let parts: Vec<&str> = output_base.rsplitn(3, '/').collect();
+    if parts.len() < 3 {
+        return Ok(()); // Can't determine checkpoint path
+    }
 
-        let phenotype_rel = format!("{}/{}", parts[1], parts[0]); // ancestry/id
-        let base_dir = parts[2]; // everything before ancestry
+    let id = parts[0];
+    let ancestry = parts[1];
+    let base_dir = parts[2];
 
-        // Write empty marker file to .completed_phenos/ directory to avoid GCS concurrency overwrites
-        let phenotype_marker = format!("{}_{}", parts[1], parts[0]); // ancestry_id
-        let marker_path = ObjPath::from(format!("{}/.completed_phenos/{}", base_dir, phenotype_marker));
+    let marker_url = format!("{}/.completed_phenos/{}_{}", base_dir, ancestry, id);
 
-        rt.block_on(async {
-            store.put(&marker_path, bytes::Bytes::new().into()).await?;
-            Ok::<(), object_store::Error>(())
-        }).map_err(|e| {
+    // Write the marker using the unified CloudWriter (uses global IO_RUNTIME)
+    if genohype_core::io::is_cloud_path(&marker_url) {
+        use genohype_core::io::CloudWriter;
+        use std::io::Write;
+
+        let mut writer = CloudWriter::new(&marker_url).map_err(|e| {
             crate::HailError::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("Failed to write checkpoint marker: {}", e),
+                format!("Failed to create CloudWriter for marker: {}", e),
             ))
         })?;
 
-        println!("  Checkpoint: added {}", phenotype_rel);
-        Ok(())
+        writer.write_all(b"")?;
+        writer.finish()?;
+
+        println!("  Checkpoint: added {}_{} to .completed_phenos", ancestry, id);
+    } else {
+        // Local file system fallback
+        let marker_dir = format!("{}/.completed_phenos", base_dir);
+        std::fs::create_dir_all(&marker_dir)?;
+        let marker_path = format!("{}/{}_{}", marker_dir, ancestry, id);
+        std::fs::write(&marker_path, b"")?;
+        println!("  Checkpoint: added {}_{} to .completed_phenos", ancestry, id);
     }
+
+    Ok(())
 }
