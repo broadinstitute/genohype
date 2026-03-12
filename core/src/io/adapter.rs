@@ -14,7 +14,7 @@
 //! without requiring local disk staging.
 
 use crate::{HailError, Result};
-use crossbeam_channel::{bounded, Receiver, Sender};
+use futures::StreamExt;
 use object_store::path::Path as ObjPath;
 use object_store::ObjectStore;
 use once_cell::sync::Lazy;
@@ -28,11 +28,12 @@ use tracing::trace;
 /// Default chunk size for cloud reads (8MB) - used by non-prefetching reader
 const DEFAULT_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
-/// Prefetch chunk size (16MB) - larger for high-bandwidth connections
-const PREFETCH_CHUNK_SIZE: usize = 16 * 1024 * 1024;
+/// Prefetch chunk size (32MB) - larger chunks amortize per-request latency
+const PREFETCH_CHUNK_SIZE: usize = 32 * 1024 * 1024;
 
-/// Number of chunks to prefetch ahead (4 x 16MB = 64MB buffer)
-const PREFETCH_DEPTH: usize = 4;
+/// Number of concurrent in-flight fetches per reader (8 x 32MB = 256MB buffer)
+/// With 48 cores this uses ~12 GB total, well within c4-highcpu-48's 96 GB RAM
+const PREFETCH_DEPTH: usize = 8;
 
 /// Shared Tokio runtime for IO operations
 ///
@@ -248,7 +249,7 @@ impl Seek for CloudReader {
 /// the next chunks, ensuring the CPU never waits for network I/O.
 pub struct PrefetchingCloudReader {
     /// Channel receiver for prefetched chunks
-    rx: Receiver<std::io::Result<Vec<u8>>>,
+    rx: tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
     /// Current chunk being consumed
     current_chunk: Vec<u8>,
     /// Position within current chunk
@@ -260,8 +261,8 @@ pub struct PrefetchingCloudReader {
     /// Store and path for seek operations
     store: Arc<dyn ObjectStore>,
     path: ObjPath,
-    /// Sender to signal prefetch task to stop (dropped on seek)
-    _cancel_tx: Option<Sender<()>>,
+    /// Dropped to signal prefetch task to stop via channel closure
+    _cancel_tx: Option<tokio::sync::mpsc::Sender<()>>,
 }
 
 impl PrefetchingCloudReader {
@@ -284,44 +285,59 @@ impl PrefetchingCloudReader {
     }
 
     /// Start or restart the prefetch background task
+    ///
+    /// Launches PREFETCH_DEPTH concurrent range fetches using `futures::stream::buffered`,
+    /// so multiple HTTP requests are in-flight simultaneously. This saturates the network
+    /// link instead of waiting sequentially for each chunk.
     fn start_prefetch(
         store: Arc<dyn ObjectStore>,
         path: ObjPath,
         start_offset: u64,
         file_size: u64,
-    ) -> (Receiver<std::io::Result<Vec<u8>>>, Sender<()>) {
-        let (tx, rx) = bounded(PREFETCH_DEPTH);
-        let (cancel_tx, cancel_rx) = bounded::<()>(1);
+    ) -> (tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>, tokio::sync::mpsc::Sender<()>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(PREFETCH_DEPTH);
+        let (cancel_tx, mut cancel_rx) = tokio::sync::mpsc::channel::<()>(1);
 
         IO_RUNTIME.spawn(async move {
-            let mut offset = start_offset;
+            // Build a stream of chunk offsets, then fetch them concurrently
+            let chunk_count = ((file_size - start_offset) as usize + PREFETCH_CHUNK_SIZE - 1) / PREFETCH_CHUNK_SIZE;
 
-            while offset < file_size {
-                // Check for cancellation
-                if cancel_rx.try_recv().is_ok() {
-                    break;
+            let store_ref = &store;
+            let path_ref = &path;
+
+            let mut fetch_stream = futures::stream::iter(0..chunk_count)
+                .map(|i| {
+                    let offset = start_offset + (i as u64 * PREFETCH_CHUNK_SIZE as u64);
+                    let len = std::cmp::min(PREFETCH_CHUNK_SIZE as u64, file_size - offset) as usize;
+                    let range = offset as usize..(offset as usize + len);
+                    let store = store_ref.clone();
+                    let path = path_ref.clone();
+                    async move {
+                        trace!("PrefetchingCloudReader: fetching range {}..{}", offset, offset + len as u64);
+                        let start_time = std::time::Instant::now();
+                        let result = store.get_range(&path, range).await;
+                        trace!("PrefetchingCloudReader: fetch completed in {:?}", start_time.elapsed());
+                        result
+                            .map(|b| b.to_vec())
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                    }
+                })
+                .buffered(PREFETCH_DEPTH);
+
+            loop {
+                tokio::select! {
+                    _ = cancel_rx.recv() => break,
+                    chunk = fetch_stream.next() => {
+                        match chunk {
+                            Some(result) => {
+                                if tx.send(result).await.is_err() {
+                                    break; // Receiver dropped
+                                }
+                            }
+                            None => break, // Stream exhausted
+                        }
+                    }
                 }
-
-                let len = std::cmp::min(PREFETCH_CHUNK_SIZE as u64, file_size - offset) as usize;
-                let range = offset as usize..(offset as usize + len);
-
-                trace!("PrefetchingCloudReader: fetching range {}..{}", offset, offset + len as u64);
-                let start_time = std::time::Instant::now();
-
-                let result = store.get_range(&path, range).await;
-
-                trace!("PrefetchingCloudReader: fetch completed in {:?}", start_time.elapsed());
-
-                let chunk_result = result
-                    .map(|b| b.to_vec())
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()));
-
-                // If send fails, receiver was dropped (reader closed)
-                if tx.send(chunk_result).is_err() {
-                    break;
-                }
-
-                offset += len as u64;
             }
         });
 
@@ -335,14 +351,14 @@ impl PrefetchingCloudReader {
             return Ok(true);
         }
 
-        // Try to get next chunk from channel
-        match self.rx.recv() {
-            Ok(result) => {
+        // Try to get next chunk from channel (blocking — called from rayon threads)
+        match self.rx.blocking_recv() {
+            Some(result) => {
                 self.current_chunk = result?;
                 self.chunk_pos = 0;
                 Ok(!self.current_chunk.is_empty())
             }
-            Err(_) => {
+            None => {
                 // Channel closed, no more data
                 Ok(false)
             }
