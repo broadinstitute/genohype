@@ -28,8 +28,23 @@ pub fn process_parquet_export(
 
     let output_is_cloud = is_cloud_path(output_path);
 
+    let engine = if let Some((cached_path, cached_eng)) = _cached_engine {
+        if cached_path == input_path {
+            cached_eng
+        } else {
+            QueryEngine::open_path(input_path)?
+        }
+    } else {
+        QueryEngine::open_path(input_path)?
+    };
+    let engine_ref = &engine;
+
+    let row_type = engine_ref.row_type().clone();
+    let arrow_schema = Arc::new(genohype_core::parquet::schema::create_schema(&row_type)?);
+    let row_type_ref = &row_type;
+    let arrow_schema_ref = &arrow_schema;
+
     // Clone refs for the parallel closure
-    let input_path = input_path.to_string();
     let output_path = output_path.to_string();
     let filters = filters.to_vec();
     let intervals = intervals.cloned();
@@ -40,11 +55,6 @@ pub fn process_parquet_export(
         .map(|&partition_id| {
             // Track the active partition for this Rayon thread (RAII guard)
             let _core_guard = telemetry.as_ref().map(|ts| CoreTaskGuard::partition(ts, partition_id));
-
-            // Each thread opens its own QueryEngine (they share underlying caches)
-            let engine = QueryEngine::open_path(&input_path)?;
-            let row_type = engine.row_type().clone();
-            let arrow_schema = Arc::new(genohype_core::parquet::schema::create_schema(&row_type)?);
 
             // Determine the output file path
             let output_file = if output_is_cloud {
@@ -59,7 +69,7 @@ pub fn process_parquet_export(
             let mut partition_rows = 0;
 
             // Stream rows from this partition with filters
-            let iter = engine.scan_partition_iter(partition_id, &filters)?;
+            let iter = engine_ref.scan_partition_iter(partition_id, &filters)?;
 
             // Clone telemetry for this thread
             let ts = telemetry.clone();
@@ -82,7 +92,7 @@ pub fn process_parquet_export(
                         batch_rows.push(row);
 
                         if batch_rows.len() >= BATCH_SIZE {
-                            let batch = build_record_batch(&batch_rows, &row_type, arrow_schema.clone())?;
+                            let batch = build_record_batch(&batch_rows, row_type_ref, arrow_schema_ref.clone())?;
                             writer.write_batch(&batch)?;
                             partition_rows += batch_rows.len();
                             // Update telemetry row count
@@ -95,7 +105,7 @@ pub fn process_parquet_export(
 
                     // Write remaining rows
                     if !batch_rows.is_empty() {
-                        let batch = build_record_batch(&batch_rows, &row_type, arrow_schema.clone())?;
+                        let batch = build_record_batch(&batch_rows, row_type_ref, arrow_schema_ref.clone())?;
                         writer.write_batch(&batch)?;
                         partition_rows += batch_rows.len();
                         if let Some(ref t) = ts {
@@ -109,12 +119,12 @@ pub fn process_parquet_export(
 
             if output_is_cloud {
                 let cloud_writer = StreamingCloudWriter::new(&output_file)?;
-                let writer = ParquetWriter::from_writer(cloud_writer, &row_type)?;
+                let writer = ParquetWriter::from_writer(cloud_writer, row_type_ref)?;
                 let writer = process_with_writer!(writer);
                 let cloud_writer = writer.into_inner()?;
                 cloud_writer.finish()?;
             } else {
-                let writer = ParquetWriter::new(&output_file, &row_type)?;
+                let writer = ParquetWriter::new(&output_file, row_type_ref)?;
                 let writer = process_with_writer!(writer);
                 writer.close()?;
             }
@@ -140,8 +150,7 @@ pub fn process_parquet_export(
 
     let total: usize = results.iter().filter_map(|r| r.as_ref().ok()).sum();
 
-    // Don't return cached engine since we opened multiple in parallel
-    Ok((total, None))
+    Ok((total, Some((input_path.to_string(), engine))))
 }
 
 /// Process partitions and write to JSON output (NDJSON format).
@@ -164,8 +173,18 @@ pub fn process_json_export(
 
     let output_is_cloud = is_cloud_path(output_path);
 
+    let engine = if let Some((cached_path, cached_eng)) = _cached_engine {
+        if cached_path == input_path {
+            cached_eng
+        } else {
+            QueryEngine::open_path(input_path)?
+        }
+    } else {
+        QueryEngine::open_path(input_path)?
+    };
+    let engine_ref = &engine;
+
     // Clone refs for the parallel closure
-    let input_path = input_path.to_string();
     let output_path = output_path.to_string();
     let filters = filters.to_vec();
     let intervals = intervals.cloned();
@@ -177,8 +196,6 @@ pub fn process_json_export(
             // Track the active partition for this Rayon thread (RAII guard)
             let _core_guard = telemetry.as_ref().map(|ts| CoreTaskGuard::partition(ts, partition_id));
 
-            let engine = QueryEngine::open_path(&input_path)?;
-
             let output_file = if output_is_cloud {
                 let base = output_path.trim_end_matches('/');
                 format!("{}/part-{:05}.json", base, partition_id)
@@ -189,7 +206,7 @@ pub fn process_json_export(
             let mut partition_rows = 0;
 
             // Stream rows from this partition with filters
-            let iter = engine.scan_partition_iter(partition_id, &filters)?;
+            let iter = engine_ref.scan_partition_iter(partition_id, &filters)?;
 
             let ts = telemetry.clone();
 
@@ -250,7 +267,7 @@ pub fn process_json_export(
     }
 
     let total: usize = results.iter().filter_map(|r| r.as_ref().ok()).sum();
-    Ok((total, None))
+    Ok((total, Some((input_path.to_string(), engine))))
 }
 
 /// Process partitions and collect summary statistics.
@@ -266,7 +283,16 @@ pub fn process_summary(
 
     println!("Processing {} partitions for summary...", partitions.len());
 
-    let input_path = input_path.to_string();
+    let engine = if let Some((cached_path, cached_eng)) = _cached_engine {
+        if cached_path == input_path {
+            cached_eng
+        } else {
+            QueryEngine::open_path(input_path)?
+        }
+    } else {
+        QueryEngine::open_path(input_path)?
+    };
+    let engine_ref = &engine;
 
     // Process partitions in parallel using rayon's fold/reduce
     // Each thread gets its own StatsAccumulator and they are merged at the end
@@ -278,41 +304,34 @@ pub fn process_summary(
                 // Track the active partition for this Rayon thread (RAII guard)
                 let _core_guard = telemetry.as_ref().map(|ts| CoreTaskGuard::partition(ts, partition_id));
 
-                match QueryEngine::open_path(&input_path) {
-                    Ok(engine) => {
-                        match engine.scan_partition_iter(partition_id, &[]) {
-                            Ok(iter) => {
-                                for row_result in iter {
-                                    match row_result {
-                                        Ok(row) => {
-                                            acc.process_row(&row);
-                                            rows += 1;
+                match engine_ref.scan_partition_iter(partition_id, &[]) {
+                    Ok(iter) => {
+                        for row_result in iter {
+                            match row_result {
+                                Ok(row) => {
+                                    acc.process_row(&row);
+                                    rows += 1;
 
-                                            // Update telemetry
-                                            if let Some(ref t) = telemetry {
-                                                t.total_rows.fetch_add(1, Ordering::Relaxed);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            eprintln!(
-                                                "Warning: Error reading row in partition {}: {}",
-                                                partition_id, e
-                                            );
-                                            break;
-                                        }
+                                    // Update telemetry
+                                    if let Some(ref t) = telemetry {
+                                        t.total_rows.fetch_add(1, Ordering::Relaxed);
                                     }
                                 }
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "Warning: Failed to scan partition {}: {}",
-                                    partition_id, e
-                                );
+                                Err(e) => {
+                                    eprintln!(
+                                        "Warning: Error reading row in partition {}: {}",
+                                        partition_id, e
+                                    );
+                                    break;
+                                }
                             }
                         }
                     }
                     Err(e) => {
-                        eprintln!("Warning: Failed to open engine for partition {}: {}", partition_id, e);
+                        eprintln!(
+                            "Warning: Failed to scan partition {}: {}",
+                            partition_id, e
+                        );
                     }
                 }
                 (rows, acc)
@@ -328,6 +347,5 @@ pub fn process_summary(
 
     println!("Summary complete: {} rows processed, {} fields tracked", total_rows, stats.stats.len());
 
-    // Don't cache engine since we opened multiple in parallel
-    Ok((total_rows, stats, None))
+    Ok((total_rows, stats, Some((input_path.to_string(), engine))))
 }

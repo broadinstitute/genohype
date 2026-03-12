@@ -94,8 +94,23 @@ pub fn process_clickhouse_export(
     // Semaphore to limit concurrent partition processing
     let semaphore = Semaphore::new(max_concurrent);
 
+    let engine = if let Some((cached_path, cached_eng)) = _cached_engine {
+        if cached_path == input_path {
+            cached_eng
+        } else {
+            QueryEngine::open_path(input_path)?
+        }
+    } else {
+        QueryEngine::open_path(input_path)?
+    };
+    let engine_ref = &engine;
+
+    let row_type = engine.row_type().clone();
+    let arrow_schema = Arc::new(genohype_core::parquet::schema::create_schema(&row_type)?);
+    let row_type_ref = &row_type;
+    let arrow_schema_ref = &arrow_schema;
+
     // Clone refs for the parallel closure
-    let input_path = input_path.to_string();
     let url = url.to_string();
     let table = table.to_string();
 
@@ -113,103 +128,94 @@ pub fn process_clickhouse_export(
             // If ClickHouse uploads are slow, reader thread will block
             let (tx, rx) = bounded::<Result<Vec<genohype_core::codec::EncodedValue>>>(2);
 
-            let input_path_clone = input_path.clone();
             let chunk_size_clone = chunk_size;
+            let url_clone = url.clone();
+            let table_clone = table.clone();
+            let telemetry_clone = telemetry.clone();
 
-            // Spawn reader thread: reads rows and sends chunks through channel
-            std::thread::spawn(move || {
-                let engine_res = QueryEngine::open_path(&input_path_clone);
-                match engine_res {
-                    Ok(engine) => {
-                        match engine.scan_partition_iter(partition_id, &[]) {
-                            Ok(iter) => {
-                                let mut batch = Vec::with_capacity(chunk_size_clone);
-                                for row_res in iter {
-                                    match row_res {
-                                        Ok(row) => {
-                                            batch.push(row);
-                                            if batch.len() >= chunk_size_clone {
-                                                // Send chunk - blocks if channel is full (backpressure)
-                                                if tx.send(Ok(std::mem::replace(
-                                                    &mut batch,
-                                                    Vec::with_capacity(chunk_size_clone),
-                                                ))).is_err() {
-                                                    // Receiver dropped, stop reading
-                                                    break;
-                                                }
+            std::thread::scope(|s| {
+                // Spawn reader thread: reads rows and sends chunks through channel
+                s.spawn(move || {
+                    match engine_ref.scan_partition_iter(partition_id, &[]) {
+                        Ok(iter) => {
+                            let mut batch = Vec::with_capacity(chunk_size_clone);
+                            for row_res in iter {
+                                match row_res {
+                                    Ok(row) => {
+                                        batch.push(row);
+                                        if batch.len() >= chunk_size_clone {
+                                            // Send chunk - blocks if channel is full (backpressure)
+                                            if tx.send(Ok(std::mem::replace(
+                                                &mut batch,
+                                                Vec::with_capacity(chunk_size_clone),
+                                            ))).is_err() {
+                                                // Receiver dropped, stop reading
+                                                break;
                                             }
                                         }
-                                        Err(e) => {
-                                            let _ = tx.send(Err(e));
-                                            return;
-                                        }
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(Err(e));
+                                        return;
                                     }
                                 }
-                                // Send remaining rows
-                                if !batch.is_empty() {
-                                    let _ = tx.send(Ok(batch));
-                                }
                             }
-                            Err(e) => {
-                                let _ = tx.send(Err(e));
+                            // Send remaining rows
+                            if !batch.is_empty() {
+                                let _ = tx.send(Ok(batch));
                             }
                         }
+                        Err(e) => {
+                            let _ = tx.send(Err(e));
+                        }
                     }
-                    Err(e) => {
-                        let _ = tx.send(Err(e));
+                    // tx is dropped here, closing the channel
+                });
+
+                // Consumer: receive chunks and upload to ClickHouse
+                let client = ClickHouseClient::new(&url_clone);
+                let ts = telemetry_clone;
+
+                let mut partition_rows = 0;
+                let mut chunks_uploaded = 0;
+                const BATCH_SIZE: usize = 4096; // Internal batching for Parquet writing
+
+                // Receive and upload chunks until channel closes
+                for batch_res in rx {
+                    let batch = batch_res?;
+
+                    let uploaded = upload_chunk_to_clickhouse(
+                        &client,
+                        &table_clone,
+                        &batch,
+                        row_type_ref,
+                        arrow_schema_ref.clone(),
+                        BATCH_SIZE,
+                    )?;
+
+                    partition_rows += uploaded;
+                    chunks_uploaded += 1;
+
+                    if let Some(ref t) = ts {
+                        t.total_rows.fetch_add(uploaded, Ordering::Relaxed);
+                    }
+
+                    // Log progress every 10 chunks
+                    if chunks_uploaded % 10 == 0 {
+                        println!(
+                            "    Partition {} progress: {} rows in {} chunks",
+                            partition_id, partition_rows, chunks_uploaded
+                        );
                     }
                 }
-                // tx is dropped here, closing the channel
-            });
 
-            // Consumer: receive chunks and upload to ClickHouse
-            // Open engine to get schema (metadata read is cheap)
-            let engine = QueryEngine::open_path(&input_path)?;
-            let row_type = engine.row_type().clone();
-            let arrow_schema = Arc::new(genohype_core::parquet::schema::create_schema(&row_type)?);
+                println!(
+                    "  Partition {} complete: {} rows in {} chunk(s) uploaded to ClickHouse",
+                    partition_id, partition_rows, chunks_uploaded
+                );
 
-            let client = ClickHouseClient::new(&url);
-            let ts = telemetry.clone();
-
-            let mut partition_rows = 0;
-            let mut chunks_uploaded = 0;
-            const BATCH_SIZE: usize = 4096; // Internal batching for Parquet writing
-
-            // Receive and upload chunks until channel closes
-            for batch_res in rx {
-                let batch = batch_res?;
-
-                let uploaded = upload_chunk_to_clickhouse(
-                    &client,
-                    &table,
-                    &batch,
-                    &row_type,
-                    arrow_schema.clone(),
-                    BATCH_SIZE,
-                )?;
-
-                partition_rows += uploaded;
-                chunks_uploaded += 1;
-
-                if let Some(ref t) = ts {
-                    t.total_rows.fetch_add(uploaded, Ordering::Relaxed);
-                }
-
-                // Log progress every 10 chunks
-                if chunks_uploaded % 10 == 0 {
-                    println!(
-                        "    Partition {} progress: {} rows in {} chunks",
-                        partition_id, partition_rows, chunks_uploaded
-                    );
-                }
-            }
-
-            println!(
-                "  Partition {} complete: {} rows in {} chunk(s) uploaded to ClickHouse",
-                partition_id, partition_rows, chunks_uploaded
-            );
-
-            Ok(partition_rows)
+                Ok(partition_rows)
+            })
         })
         .collect();
 
@@ -224,7 +230,7 @@ pub fn process_clickhouse_export(
     }
 
     let total: usize = results.iter().filter_map(|r| r.as_ref().ok()).sum();
-    Ok((total, None))
+    Ok((total, Some((input_path.to_string(), engine))))
 }
 
 /// Upload a chunk of rows to ClickHouse as an in-memory Parquet buffer.

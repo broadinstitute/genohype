@@ -19,7 +19,7 @@ use std::sync::Arc;
 /// - {output_path}/{source}/part-{id}.png
 /// - {output_path}/{source}/part-{id}-sig.parquet
 pub fn process_manhattan_scan_v2(
-    _cached_engine: Option<(String, QueryEngine)>,
+    cached_engine: Option<(String, QueryEngine)>,
     partitions: &[usize],
     spec: &ManhattanScanSpec,
     telemetry: Option<Arc<TelemetryState>>,
@@ -51,6 +51,17 @@ pub fn process_manhattan_scan_v2(
     let layout = &spec.layout;
     let y_scale = &spec.y_scale;
     let table_path = &spec.table_path;
+
+    let engine = if let Some((cached_path, cached_eng)) = cached_engine {
+        if cached_path == *table_path {
+            cached_eng
+        } else {
+            QueryEngine::open_path(table_path)?
+        }
+    } else {
+        QueryEngine::open_path(table_path)?
+    };
+    let engine_ref = &engine;
     let output_base = format!("{}/{}", spec.output_path.trim_end_matches('/'), source_name);
     let width = spec.width;
     let height = spec.height;
@@ -83,8 +94,7 @@ pub fn process_manhattan_scan_v2(
                 })
             });
 
-            let engine = QueryEngine::open_path(table_path)?;
-            let iter = engine.scan_partition_iter(partition_id, &[])?;
+            let iter = engine_ref.scan_partition_iter(partition_id, &[])?;
 
             // Each thread has its own renderer with transparent background
             let mut renderer = ManhattanRenderer::new_transparent(width, height);
@@ -249,7 +259,7 @@ pub fn process_manhattan_scan_v2(
         source_name, partitions, total_rows
     );
 
-    Ok((total_rows, None))
+    Ok((total_rows, Some((spec.table_path.clone(), engine))))
 }
 
 
