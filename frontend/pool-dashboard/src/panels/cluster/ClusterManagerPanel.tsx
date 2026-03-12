@@ -13,7 +13,7 @@ export const ClusterManagerPanel: React.FC = () => {
   const vms = useAtomValue(clusterVmsAtom);
   const workers = useAtomValue(workersAtom);
 
-  const [targetWorkers, setTargetWorkers] = useState<number>(0);
+  const [targetWorkers, setTargetWorkers] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
 
@@ -27,12 +27,14 @@ export const ClusterManagerPanel: React.FC = () => {
     : config?.machine_type ?? '—';
   const isSpot = config?.spot ?? true;
 
-  // Initialize target from current VM count
+  // Initialize target from current VM count (only once when data first arrives)
   useEffect(() => {
-    if (config) {
+    if (targetWorkers === null && workerVms.length > 0) {
       setTargetWorkers(workerVms.length);
     }
-  }, [config?.pool_name]); // Only re-init when pool changes
+  }, [workerVms.length, targetWorkers]);
+
+  const effectiveTarget = targetWorkers ?? workerVms.length;
 
   function shortName(fullPath: string) {
     const parts = fullPath.split('/');
@@ -51,7 +53,7 @@ export const ClusterManagerPanel: React.FC = () => {
       const response = await fetch('/api/cluster/scale', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ target_workers: targetWorkers }),
+        body: JSON.stringify({ target_workers: effectiveTarget }),
       });
       const result: ScaleResponse = await response.json();
       setStatusMessage(result.message);
@@ -103,7 +105,7 @@ export const ClusterManagerPanel: React.FC = () => {
             type="number"
             min={0}
             max={50}
-            value={targetWorkers}
+            value={effectiveTarget}
             onChange={(e) => setTargetWorkers(parseInt(e.target.value) || 0)}
             style={{
               width: '100%',
@@ -120,7 +122,7 @@ export const ClusterManagerPanel: React.FC = () => {
         <button
           className="btn-primary"
           onClick={handleApply}
-          disabled={loading || targetWorkers === workerVms.length}
+          disabled={loading || effectiveTarget === workerVms.length}
           style={{
             width: '100%',
             padding: '8px',
@@ -129,16 +131,16 @@ export const ClusterManagerPanel: React.FC = () => {
             cursor: loading ? 'wait' : 'pointer',
             fontSize: '12px',
             fontWeight: 600,
-            opacity: loading || targetWorkers === workerVms.length ? 0.6 : 1,
+            opacity: loading || effectiveTarget === workerVms.length ? 0.6 : 1,
           }}
         >
           {loading
             ? 'Applying...'
-            : targetWorkers === workerVms.length
+            : effectiveTarget === workerVms.length
               ? 'No Change'
-              : targetWorkers > workerVms.length
-                ? `Scale Up (+${targetWorkers - workerVms.length})`
-                : `Scale Down (-${workerVms.length - targetWorkers})`}
+              : effectiveTarget > workerVms.length
+                ? `Scale Up (+${effectiveTarget - workerVms.length})`
+                : `Scale Down (-${workerVms.length - effectiveTarget})`}
         </button>
 
         {statusMessage && (
