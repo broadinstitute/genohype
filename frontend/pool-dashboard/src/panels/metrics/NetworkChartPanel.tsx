@@ -13,7 +13,7 @@ import {
   Filler,
 } from 'chart.js';
 import zoomPlugin from 'chartjs-plugin-zoom';
-import { metricsAtom, chartZoomRangeAtom } from '../../atoms/dashboardAtoms';
+import { metricsAtom, chartZoomRangeAtom, chartsStackedAtom } from '../../atoms/dashboardAtoms';
 import '../panels.css';
 
 // Register Chart.js components
@@ -39,29 +39,31 @@ export const NetworkChartPanel: React.FC = () => {
   const metrics = useAtomValue(metricsAtom);
   const zoomRange = useAtomValue(chartZoomRangeAtom);
   const setZoomRange = useSetAtom(chartZoomRangeAtom);
-  const chartRef = useRef<ChartJS<'line'>>(null);
+  const isStacked = useAtomValue(chartsStackedAtom);
+  const rxChartRef = useRef<ChartJS<'line'>>(null);
+  const txChartRef = useRef<ChartJS<'line'>>(null);
 
   // Apply shared zoom range when it changes
   useEffect(() => {
-    const chart = chartRef.current;
-    if (!chart) return;
-
-    if (zoomRange) {
-      chart.options.scales!.x!.min = zoomRange.min;
-      chart.options.scales!.x!.max = zoomRange.max;
-    } else {
-      chart.options.scales!.x!.min = undefined;
-      chart.options.scales!.x!.max = undefined;
+    for (const ref of [rxChartRef, txChartRef]) {
+      const chart = ref.current;
+      if (!chart) continue;
+      if (zoomRange) {
+        chart.options.scales!.x!.min = zoomRange.min;
+        chart.options.scales!.x!.max = zoomRange.max;
+      } else {
+        chart.options.scales!.x!.min = undefined;
+        chart.options.scales!.x!.max = undefined;
+      }
+      chart.update('none');
     }
-    chart.update('none');
   }, [zoomRange]);
 
-  const chartData = useMemo(() => {
+  const { rxData, txData } = useMemo(() => {
     if (!metrics || !metrics.workers || metrics.workers.length === 0) {
-      return { labels: [], datasets: [] };
+      return { rxData: { labels: [] as string[], datasets: [] as any[] }, txData: { labels: [] as string[], datasets: [] as any[] } };
     }
 
-    // Extract timestamps from the first worker with data
     const activeWorker = metrics.workers.find((w) => w.snapshots.length > 0);
     const labels = activeWorker
       ? activeWorker.snapshots.map((s) =>
@@ -74,50 +76,41 @@ export const NetworkChartPanel: React.FC = () => {
         )
       : [];
 
-    // Create separate datasets for RX and TX per worker
-    const datasets: Array<{
-      label: string;
-      data: number[];
-      borderColor: string;
-      backgroundColor: string;
-      borderWidth: number;
-      pointRadius: number;
-      tension: number;
-      fill: boolean;
-      borderDash?: number[];
-    }> = [];
+    const rxDatasets: any[] = [];
+    const txDatasets: any[] = [];
 
     metrics.workers.forEach((worker, i) => {
       const color = CHART_COLORS[i % CHART_COLORS.length];
+      const bgColor = isStacked ? `${color}80` : `${color}20`;
 
-      // RX dataset (solid line)
-      datasets.push({
-        label: `${worker.worker_id} RX`,
+      rxDatasets.push({
+        label: worker.worker_id,
         data: worker.snapshots.map((s) => (s.network_rx_bytes_sec ?? 0) / 1e6),
         borderColor: color,
-        backgroundColor: `${color}20`,
+        backgroundColor: bgColor,
         borderWidth: 1.5,
         pointRadius: 0,
         tension: 0.3,
-        fill: false,
+        fill: isStacked,
       });
 
-      // TX dataset (dashed line)
-      datasets.push({
-        label: `${worker.worker_id} TX`,
+      txDatasets.push({
+        label: worker.worker_id,
         data: worker.snapshots.map((s) => (s.network_tx_bytes_sec ?? 0) / 1e6),
         borderColor: color,
-        backgroundColor: `${color}10`,
+        backgroundColor: bgColor,
         borderWidth: 1.5,
         pointRadius: 0,
         tension: 0.3,
-        fill: false,
-        borderDash: [4, 4],
+        fill: isStacked,
       });
     });
 
-    return { labels, datasets };
-  }, [metrics]);
+    return {
+      rxData: { labels, datasets: rxDatasets },
+      txData: { labels, datasets: txDatasets },
+    };
+  }, [metrics, isStacked]);
 
   const handleZoomComplete = ({ chart }: { chart: ChartJS }) => {
     const xScale = chart.scales.x;
@@ -126,60 +119,77 @@ export const NetworkChartPanel: React.FC = () => {
     }
   };
 
+  const commonOptions: any = {
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: { duration: 0 },
+    interaction: {
+      mode: isStacked ? 'index' : 'nearest',
+      intersect: false,
+    },
+    plugins: {
+      legend: { display: false },
+      zoom: {
+        pan: { enabled: true, mode: 'x', onPanComplete: handleZoomComplete },
+        zoom: { drag: { enabled: true }, mode: 'x', onZoomComplete: handleZoomComplete },
+      },
+    },
+    scales: {
+      x: {
+        ticks: { color: '#7d8590', maxTicksLimit: 8, display: false },
+        grid: { color: '#21262d' },
+        min: zoomRange?.min,
+        max: zoomRange?.max,
+      },
+      y: {
+        stacked: isStacked,
+        ticks: { color: '#7d8590', maxTicksLimit: 5 },
+        grid: { color: '#21262d' },
+        beginAtZero: true,
+      },
+    },
+  };
+
   return (
     <div className="panel-container" style={{ display: 'flex', flexDirection: 'column' }}>
       <h2 className="panel-title">Network Bandwidth (MB/s)</h2>
-      <div className="chart-container">
-        {chartData.datasets.length > 0 ? (
-          <Line
-            ref={chartRef}
-            data={chartData}
-            options={{
-              responsive: true,
-              maintainAspectRatio: false,
-              animation: { duration: 0 },
-              plugins: {
-                legend: {
-                  display: true,
-                  position: 'bottom',
-                  labels: {
-                    color: '#7d8590',
-                    font: { size: 10 },
-                    boxWidth: 12,
-                  },
+      {rxData.datasets.length > 0 ? (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', flex: 1, minHeight: 0 }}>
+          <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
+            <Line
+              ref={rxChartRef}
+              data={rxData}
+              options={{
+                ...commonOptions,
+                plugins: {
+                  ...commonOptions.plugins,
+                  title: { display: true, text: 'Receive (RX)', color: '#7d8590', font: { size: 10, weight: 'normal' as const }, padding: { top: 0, bottom: 4 } },
                 },
-                zoom: {
-                  pan: {
-                    enabled: true,
-                    mode: 'x',
-                    onPanComplete: handleZoomComplete,
-                  },
-                  zoom: {
-                    drag: { enabled: true },
-                    mode: 'x',
-                    onZoomComplete: handleZoomComplete,
-                  },
+              }}
+            />
+          </div>
+          <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
+            <Line
+              ref={txChartRef}
+              data={txData}
+              options={{
+                ...commonOptions,
+                plugins: {
+                  ...commonOptions.plugins,
+                  title: { display: true, text: 'Transmit (TX)', color: '#7d8590', font: { size: 10, weight: 'normal' as const }, padding: { top: 0, bottom: 4 } },
+                  legend: { display: true, position: 'bottom' as const, labels: { color: '#7d8590', font: { size: 10 }, boxWidth: 12 } },
                 },
-              },
-              scales: {
-                x: {
-                  ticks: { color: '#7d8590', maxTicksLimit: 8 },
-                  grid: { color: '#21262d' },
-                  min: zoomRange?.min,
-                  max: zoomRange?.max,
+                scales: {
+                  ...commonOptions.scales,
+                  x: { ...commonOptions.scales.x, ticks: { ...commonOptions.scales.x.ticks, display: true } },
                 },
-                y: {
-                  ticks: { color: '#7d8590' },
-                  grid: { color: '#21262d' },
-                  beginAtZero: true,
-                },
-              },
-            }}
-          />
-        ) : (
-          <div className="empty-state">Waiting for metrics...</div>
-        )}
-      </div>
+              }}
+            />
+          </div>
+        </div>
+      ) : (
+        <div className="empty-state">Waiting for metrics...</div>
+      )}
     </div>
   );
 };

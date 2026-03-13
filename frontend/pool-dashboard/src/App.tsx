@@ -5,6 +5,7 @@ import {
   isLoadedAtom,
   selectedJobIdAtom,
   chartZoomRangeAtom,
+  chartsStackedAtom,
 } from './atoms/dashboardAtoms';
 import { DockViewLayout } from './DockViewLayout';
 import './App.css';
@@ -23,6 +24,7 @@ function App() {
   const [selectedJobId, setSelectedJobId] = useAtom(selectedJobIdAtom);
   const zoomRange = useAtomValue(chartZoomRangeAtom);
   const setZoomRange = useSetAtom(chartZoomRangeAtom);
+  const [isStacked, setChartsStacked] = useAtom(chartsStackedAtom);
 
   const isViewingHistory = selectedJobId !== 'active';
   const isZoomed = zoomRange !== null;
@@ -85,6 +87,28 @@ function App() {
               Reset Zoom
             </button>
           )}
+          <button
+            onClick={() => setChartsStacked((prev) => !prev)}
+            style={{
+              background: isStacked ? 'rgba(255,255,255,0.1)' : 'transparent',
+              color: 'var(--text)',
+              border: '1px solid var(--border)',
+              padding: '4px 12px',
+              borderRadius: '4px',
+              cursor: 'pointer',
+              fontSize: '11px',
+              fontWeight: 500,
+              transition: 'all 0.2s',
+            }}
+            onMouseEnter={(e) =>
+              (e.currentTarget.style.background = 'rgba(255,255,255,0.05)')
+            }
+            onMouseLeave={(e) =>
+              (e.currentTarget.style.background = isStacked ? 'rgba(255,255,255,0.1)' : 'transparent')
+            }
+          >
+            Stacked View: {isStacked ? 'On' : 'Off'}
+          </button>
           {summary?.build_version && (
             <span style={{ fontSize: '11px', color: 'var(--text-dim)' }}>
               v: {summary.build_version.slice(0, 7)}

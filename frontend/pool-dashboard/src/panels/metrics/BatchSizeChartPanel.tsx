@@ -13,7 +13,7 @@ import {
   Filler,
 } from 'chart.js';
 import zoomPlugin from 'chartjs-plugin-zoom';
-import { metricsAtom, chartZoomRangeAtom } from '../../atoms/dashboardAtoms';
+import { metricsAtom, chartZoomRangeAtom, chartsStackedAtom } from '../../atoms/dashboardAtoms';
 import '../panels.css';
 
 ChartJS.register(
@@ -38,6 +38,7 @@ export const BatchSizeChartPanel: React.FC = () => {
   const metrics = useAtomValue(metricsAtom);
   const zoomRange = useAtomValue(chartZoomRangeAtom);
   const setZoomRange = useSetAtom(chartZoomRangeAtom);
+  const isStacked = useAtomValue(chartsStackedAtom);
   const chartRef = useRef<ChartJS<'line'>>(null);
 
   // Apply shared zoom range when it changes
@@ -76,16 +77,18 @@ export const BatchSizeChartPanel: React.FC = () => {
       label: worker.worker_id,
       data: worker.snapshots.map((s) => s.current_batch_size ?? 0),
       borderColor: CHART_COLORS[i % CHART_COLORS.length],
-      backgroundColor: `${CHART_COLORS[i % CHART_COLORS.length]}20`,
+      backgroundColor: isStacked
+        ? `${CHART_COLORS[i % CHART_COLORS.length]}80`
+        : `${CHART_COLORS[i % CHART_COLORS.length]}20`,
       borderWidth: 1.5,
       pointRadius: 0,
       tension: 0.1, // Less smoothing to show stepped AIMD changes
       stepped: true, // AIMD makes discrete steps, stepped charting looks best
-      fill: false,
+      fill: isStacked,
     }));
 
     return { labels, datasets };
-  }, [metrics]);
+  }, [metrics, isStacked]);
 
   const handleZoomComplete = ({ chart }: { chart: ChartJS }) => {
     const xScale = chart.scales.x;
@@ -106,6 +109,10 @@ export const BatchSizeChartPanel: React.FC = () => {
               responsive: true,
               maintainAspectRatio: false,
               animation: { duration: 0 },
+              interaction: {
+                mode: isStacked ? 'index' : 'nearest',
+                intersect: false,
+              },
               plugins: {
                 legend: {
                   display: true,
@@ -133,6 +140,7 @@ export const BatchSizeChartPanel: React.FC = () => {
                   max: zoomRange?.max,
                 },
                 y: {
+                  stacked: isStacked,
                   ticks: { color: '#7d8590' },
                   grid: { color: '#21262d' },
                   beginAtZero: true,
