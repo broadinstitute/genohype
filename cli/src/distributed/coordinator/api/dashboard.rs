@@ -328,12 +328,13 @@ pub(crate) async fn get_dashboard_workers(
 /// only the data for the active/most recent job rather than all historical data.
 pub(crate) async fn get_dashboard_metrics(
     axum::extract::State(state): axum::extract::State<SharedState>,
+    axum::extract::Query(query): axum::extract::Query<crate::distributed::coordinator::api::jobs::SinceQuery>,
 ) -> axum::Json<DashboardMetrics> {
     let data = state.lock().unwrap();
 
     // Scope metrics to the current job if one exists
     let workers = if let Some(ref job_id) = data.current_job_id {
-        match data.metrics_db.get_job_metrics(job_id) {
+        match data.metrics_db.get_job_metrics(job_id, query.since_ms) {
             Ok(worker_data) => worker_data
                 .into_iter()
                 .map(|(worker_id, snapshots)| WorkerMetricsSeries {

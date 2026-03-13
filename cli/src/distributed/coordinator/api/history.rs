@@ -116,6 +116,7 @@ pub(crate) async fn get_history_job_summary(
 pub(crate) async fn get_history_job_metrics(
     axum::extract::State(state): axum::extract::State<SharedState>,
     axum::extract::Path(job_id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<crate::distributed::coordinator::api::jobs::SinceQuery>,
 ) -> axum::Json<DashboardMetrics> {
     let data = state.lock().unwrap();
 
@@ -127,7 +128,7 @@ pub(crate) async fn get_history_job_metrics(
                 .iter()
                 .map(|(id, state)| WorkerMetricsSeries {
                     worker_id: id.clone(),
-                    snapshots: state.metrics_history.iter().cloned().collect(),
+                    snapshots: state.metrics_history.iter().filter(|s| s.timestamp_ms > query.since_ms).cloned().collect(),
                 })
                 .collect();
             return axum::Json(DashboardMetrics { workers });
@@ -135,7 +136,7 @@ pub(crate) async fn get_history_job_metrics(
     }
 
     // Fetch from database
-    match data.metrics_db.get_job_metrics(&job_id) {
+    match data.metrics_db.get_job_metrics(&job_id, query.since_ms) {
         Ok(worker_data) => {
             let workers = worker_data
                 .into_iter()

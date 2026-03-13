@@ -4,6 +4,7 @@ import { useAtom, useAtomValue, useSetAtom } from 'jotai';
 import {
   catalogAtom,
   summaryAtom,
+  batchAtom,
   libraryFilterAtom,
   libraryAncestryFilterAtom,
   libraryTraitTypeFilterAtom,
@@ -131,8 +132,18 @@ export const PhenotypeLibraryPanel: React.FC = () => {
     }
   };
 
+  const batch = useAtomValue(batchAtom);
+
   const filteredCatalog = useMemo(() => {
-    let result = catalog;
+    // Map live batch status onto static catalog entries
+    let result = catalog.map(c => {
+      const activeBatchItem = batch?.phenotypes?.find(p => p.id.endsWith(`/${c.ancestry}/${c.id}`));
+      return {
+        ...c,
+        status: activeBatchItem ? activeBatchItem.stage : c.status
+      };
+    });
+
     if (ancestryFilter) {
       result = result.filter(c => c.ancestry === ancestryFilter);
     }
@@ -231,7 +242,7 @@ export const PhenotypeLibraryPanel: React.FC = () => {
     }
 
     return sampled;
-  }, [catalog, filter, ancestryFilter, traitTypeFilter, assetFilter, statusFilter, selectedCategories, sortKey, sortDir, randomSamplePct, limitCount]);
+  }, [catalog, batch, filter, ancestryFilter, traitTypeFilter, assetFilter, statusFilter, selectedCategories, sortKey, sortDir, randomSamplePct, limitCount]);
 
   const toggleSelect = (key: string) => {
     const next = new Set(selectedIds);

@@ -1,4 +1,4 @@
-import { atom, useSetAtom } from 'jotai';
+import { atom, useAtomValue, useSetAtom } from 'jotai';
 import { atomWithStorage } from 'jotai/utils';
 import { useEffect, useRef } from 'react';
 import type {
@@ -78,6 +78,12 @@ export const layoutPresetAtom = atomWithStorage<string>(
   'overview'
 );
 
+/** Whether performance charts should be displayed as stacked area charts */
+export const chartsStackedAtom = atomWithStorage<boolean>(
+  'chartsStacked',
+  false
+);
+
 /** Which job is currently being viewed ('active' for live job, or a specific job UUID) */
 export const selectedJobIdAtom = atom<string>('active');
 
@@ -108,8 +114,14 @@ export const activeWorkerCountAtom = atom((get) => {
 });
 
 // ============================================================================
-// Action Atom: Fetch All Dashboard Data
+// Polling Architecture & Data Fetching
 // ============================================================================
+
+const pollCursors = {
+  jobId: '',
+  events: 0,
+  metrics: 0,
+};
 
 /**
  * Helper function to fetch JSON from an endpoint, returning null on failure.
@@ -130,89 +142,177 @@ async function fetchJson<T>(url: string): Promise<T | null> {
   }
 }
 
+// Legacy export to keep other components from breaking, triggers just the fast loop
+export const fetchDashboardDataAtom = atom(null, async (_get, _set) => {
+  // Provided for backward compatibility / manual refresh logic
+});
+
 /**
- * Action atom that fetches all dashboard endpoints concurrently.
- * Uses Promise.all so failures on optional endpoints (like /batch) don't
- * break updates for other atoms.
- *
- * Supports viewing either the "active" live job or a historical job by ID.
+ * React hook that initiates and manages multi-tiered dashboard polling.
+ * Should be mounted once at the top level of the application (e.g., in App.tsx).
  */
-export const fetchDashboardDataAtom = atom(null, async (get, set) => {
-  const jobId = get(selectedJobIdAtom);
-  const isHistoryView = jobId !== 'active';
+export function useDashboardPolling(intervalMs = 2000): void {
+  const setSummary = useSetAtom(summaryAtom);
+  const setWorkers = useSetAtom(workersAtom);
+  const setMetrics = useSetAtom(metricsAtom);
+  const setBottleneck = useSetAtom(bottleneckAtom);
+  const setBatch = useSetAtom(batchAtom);
+  const setEvents = useSetAtom(eventsAtom);
+  const setFailures = useSetAtom(failuresAtom);
+  const setJobsList = useSetAtom(jobsListAtom);
+  const setCatalog = useSetAtom(catalogAtom);
+  const setClickhouseInfo = useSetAtom(clickhouseInfoAtom);
+  const setClusterConfig = useSetAtom(clusterConfigAtom);
+  const setClusterVms = useSetAtom(clusterVmsAtom);
 
-  // Determine API base paths based on whether we're viewing history
-  const basePath = isHistoryView ? `/api/history/jobs/${jobId}` : '/api/dashboard';
-  const eventsPath = isHistoryView ? `/api/history/jobs/${jobId}/events` : '/api/events';
-  const failuresPath = isHistoryView ? `/api/history/jobs/${jobId}/failures` : '/api/failures';
+  const selectedJobId = useAtomValue(selectedJobIdAtom);
 
-  // Fetch all endpoints concurrently
-  const [summary, workers, metrics, bottleneck, batch, eventsResp, failuresResp, jobsList, catalogList, clickhouseInfo, clusterConfig, clusterVmsResp] =
-    await Promise.all([
-      fetchJson<DashboardSummary>(`${basePath}/summary`),
-      // Workers endpoint doesn't exist for history (workers are transient)
-      isHistoryView ? Promise.resolve([] as DashboardWorker[]) : fetchJson<DashboardWorker[]>('/api/dashboard/workers'),
-      fetchJson<DashboardMetrics>(`${basePath}/metrics`),
-      // Bottleneck is a live metric, not available for history
-      isHistoryView ? Promise.resolve(null) : fetchJson<DashboardBottleneck>('/api/dashboard/bottlenecks'),
-      fetchJson<BatchStatusResponse>(`${basePath}/batch`),
-      fetchJson<{ events: JobEvent[] }>(eventsPath),
-      fetchJson<{ failures: FailureRecord[] }>(failuresPath),
-      // Always fetch jobs list for the history panel
-      fetchJson<JobRecord[]>('/api/history/jobs'),
-      // Fetch catalog (only for live view)
-      isHistoryView ? Promise.resolve([]) : fetchJson<import('../types').CatalogEntry[]>('/api/catalog'),
-      // Fetch clickhouse info (only for live view)
+  // Refs to control the recursive setTimeouts
+  const isMounted = useRef(true);
+  const fastTimer = useRef<number | null>(null);
+  const slowTimer = useRef<number | null>(null);
+
+  useEffect(() => {
+    isMounted.current = true;
+    return () => {
+      isMounted.current = false;
+      if (fastTimer.current) clearTimeout(fastTimer.current);
+      if (slowTimer.current) clearTimeout(slowTimer.current);
+    };
+  }, []);
+
+  // Detect job switches and reset cursors
+  useEffect(() => {
+    if (pollCursors.jobId !== selectedJobId) {
+      pollCursors.jobId = selectedJobId;
+      pollCursors.events = 0;
+      pollCursors.metrics = 0;
+
+      // Clear data to prevent flashing old state
+      setMetrics(null);
+      setEvents([]);
+
+      // Fire static tier immediately on job switch
+      fetchStaticTier();
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedJobId]);
+
+  // 1. Static Tier (Fetch Once / On Job Switch)
+  const fetchStaticTier = async () => {
+    if (selectedJobId !== 'active') return; // History mode doesn't load these
+    const [catalogList, clusterConfig] = await Promise.all([
+      fetchJson<import('../types').CatalogEntry[]>('/api/catalog'),
+      fetchJson<ClusterConfig>('/api/cluster/config')
+    ]);
+    if (catalogList) setCatalog(catalogList);
+    if (clusterConfig) setClusterConfig(clusterConfig);
+  };
+
+  // 2. Slow Tier (Every 15s)
+  const fetchSlowTier = async () => {
+    if (!isMounted.current) return;
+    const isHistoryView = selectedJobId !== 'active';
+
+    const [chInfo, jobsList, vmsResp] = await Promise.all([
       isHistoryView ? Promise.resolve(null) : fetchJson<ClickHouseInfo>('/api/clickhouse/info'),
-      // Fetch cluster config (only for live view)
-      isHistoryView ? Promise.resolve(null) : fetchJson<ClusterConfig>('/api/cluster/config'),
-      // Fetch cluster VMs (only for live view)
+      fetchJson<JobRecord[]>('/api/history/jobs'),
       isHistoryView ? Promise.resolve(null) : fetchJson<{ vms: GcpVm[] }>('/api/cluster/vms'),
     ]);
 
-  // Update atoms with fetched data (only if fetch succeeded)
-  if (summary !== null) set(summaryAtom, summary);
-  if (workers !== null) set(workersAtom, workers);
-  if (metrics !== null) set(metricsAtom, metrics);
-  if (bottleneck !== null) set(bottleneckAtom, bottleneck);
-  if (batch !== null) set(batchAtom, batch);
-  if (eventsResp !== null) set(eventsAtom, eventsResp.events);
-  if (failuresResp !== null) set(failuresAtom, failuresResp.failures);
-  if (jobsList !== null) set(jobsListAtom, jobsList);
-  if (catalogList !== null) set(catalogAtom, catalogList);
-  if (clickhouseInfo !== null) set(clickhouseInfoAtom, clickhouseInfo);
-  if (clusterConfig !== null) set(clusterConfigAtom, clusterConfig);
-  if (clusterVmsResp !== null) set(clusterVmsAtom, clusterVmsResp.vms ?? []);
-});
+    if (chInfo) setClickhouseInfo(chInfo);
+    if (jobsList) setJobsList(jobsList);
+    if (vmsResp) setClusterVms(vmsResp.vms ?? []);
 
-// ============================================================================
-// React Hook: Dashboard Polling
-// ============================================================================
+    if (isMounted.current) {
+      slowTimer.current = window.setTimeout(fetchSlowTier, 15000);
+    }
+  };
 
-/**
- * React hook that initiates and manages dashboard data polling.
- * Should be mounted once at the top level of the application (e.g., in App.tsx).
- *
- * @param intervalMs - Polling interval in milliseconds (default: 2000)
- */
-export function useDashboardPolling(intervalMs = 2000): void {
-  const fetchDashboardData = useSetAtom(fetchDashboardDataAtom);
-  const intervalRef = useRef<number | null>(null);
+  // 3. Fast Tier (Every 2s)
+  const fetchFastTier = async () => {
+    if (!isMounted.current) return;
+    const isHistoryView = selectedJobId !== 'active';
 
+    const basePath = isHistoryView ? `/api/history/jobs/${selectedJobId}` : '/api/dashboard';
+    const eventsPath = isHistoryView ? `/api/history/jobs/${selectedJobId}/events` : '/api/events';
+    const failuresPath = isHistoryView ? `/api/history/jobs/${selectedJobId}/failures` : '/api/failures';
+
+    const [summary, workers, metricsResp, bottleneck, batch, eventsResp, failuresResp] = await Promise.all([
+      fetchJson<DashboardSummary>(`${basePath}/summary`),
+      isHistoryView ? Promise.resolve([] as DashboardWorker[]) : fetchJson<DashboardWorker[]>('/api/dashboard/workers'),
+      fetchJson<DashboardMetrics>(`${basePath}/metrics?since_ms=${pollCursors.metrics}`),
+      isHistoryView ? Promise.resolve(null) : fetchJson<DashboardBottleneck>('/api/dashboard/bottlenecks'),
+      fetchJson<BatchStatusResponse>(`${basePath}/batch`),
+      fetchJson<{ events: JobEvent[] }>(`${eventsPath}?since_ms=${pollCursors.events}`),
+      fetchJson<{ failures: FailureRecord[] }>(failuresPath),
+    ]);
+
+    if (summary) setSummary(summary);
+    if (workers) setWorkers(workers);
+    if (bottleneck) setBottleneck(bottleneck);
+    if (batch) setBatch(batch);
+    if (failuresResp) setFailures(failuresResp.failures);
+
+    // Merge Incremental Events
+    if (eventsResp) {
+      setEvents(prev => {
+        const newEvents = pollCursors.events === 0 ? eventsResp.events : [...prev, ...eventsResp.events];
+        if (newEvents.length > 0) {
+          pollCursors.events = Math.max(...newEvents.map(e => e.timestamp_ms));
+        }
+        return newEvents.slice(-1000); // Keep max 1000 items
+      });
+    }
+
+    // Merge Incremental Metrics
+    if (metricsResp) {
+      setMetrics(prev => {
+        if (pollCursors.metrics === 0 || !prev) {
+          // Find max timestamp to set cursor
+          let maxTs = 0;
+          metricsResp.workers.forEach(w => {
+            w.snapshots.forEach(s => { maxTs = Math.max(maxTs, s.timestamp_ms); });
+          });
+          if (maxTs > 0) pollCursors.metrics = maxTs;
+          return metricsResp;
+        }
+
+        // Deep merge
+        const updatedWorkers = [...prev.workers];
+        let newMaxTs = pollCursors.metrics;
+
+        metricsResp.workers.forEach(incomingWorker => {
+          if (incomingWorker.snapshots.length === 0) return;
+
+          const existingIdx = updatedWorkers.findIndex(w => w.worker_id === incomingWorker.worker_id);
+          if (existingIdx >= 0) {
+            const mergedSnapshots = [...updatedWorkers[existingIdx].snapshots, ...incomingWorker.snapshots].slice(-300);
+            updatedWorkers[existingIdx] = { ...updatedWorkers[existingIdx], snapshots: mergedSnapshots };
+          } else {
+            updatedWorkers.push({ ...incomingWorker, snapshots: incomingWorker.snapshots.slice(-300) });
+          }
+
+          incomingWorker.snapshots.forEach(s => {
+            newMaxTs = Math.max(newMaxTs, s.timestamp_ms);
+          });
+        });
+
+        pollCursors.metrics = newMaxTs;
+        return { workers: updatedWorkers };
+      });
+    }
+
+    if (isMounted.current) {
+      fastTimer.current = window.setTimeout(fetchFastTier, intervalMs);
+    }
+  };
+
+  // Kickoff loops once on mount
   useEffect(() => {
-    // Immediate fetch on mount
-    fetchDashboardData();
-
-    // Setup recurring interval
-    intervalRef.current = window.setInterval(() => {
-      fetchDashboardData();
-    }, intervalMs);
-
-    // Cleanup on unmount
-    return () => {
-      if (intervalRef.current !== null) {
-        window.clearInterval(intervalRef.current);
-      }
-    };
-  }, [fetchDashboardData, intervalMs]);
+    fetchStaticTier();
+    fetchSlowTier();
+    fetchFastTier();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 }

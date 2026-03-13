@@ -13,9 +13,9 @@ use crate::distributed::message::{
     JobSpec, UpdateFleetRequest,
 };
 
-/// Query parameters for GET /api/events
+/// Query parameters for incremental GET endpoints
 #[derive(serde::Deserialize)]
-pub(crate) struct EventsQuery {
+pub(crate) struct SinceQuery {
     #[serde(default)]
     pub(crate) since_ms: u64,
 }
@@ -362,7 +362,7 @@ pub(crate) async fn get_job_result(
 /// Handler for GET /api/events - get recent events.
 pub(crate) async fn get_events(
     axum::extract::State(state): axum::extract::State<SharedState>,
-    axum::extract::Query(query): axum::extract::Query<EventsQuery>,
+    axum::extract::Query(query): axum::extract::Query<SinceQuery>,
 ) -> axum::Json<EventsResponse> {
     let data = state.lock().unwrap();
     let events = data

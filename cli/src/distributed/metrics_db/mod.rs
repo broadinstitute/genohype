@@ -471,7 +471,7 @@ impl MetricsDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             r#"
-            SELECT job_id, status, start_time_ms, end_time_ms, job_spec_json, input_path, total_tasks, job_type
+            SELECT job_id, status, start_time_ms, end_time_ms, NULL as job_spec_json, input_path, total_tasks, job_type
             FROM jobs
             ORDER BY start_time_ms DESC
             "#,
@@ -720,7 +720,7 @@ impl MetricsDb {
     }
 
     /// Get metrics for a specific job.
-    pub fn get_job_metrics(&self, job_id: &str) -> SqliteResult<Vec<(String, Vec<TelemetrySnapshot>)>> {
+    pub fn get_job_metrics(&self, job_id: &str, since_ms: u64) -> SqliteResult<Vec<(String, Vec<TelemetrySnapshot>)>> {
         let conn = self.conn.lock().unwrap();
 
         // First get distinct worker IDs for this job
@@ -743,13 +743,13 @@ impl MetricsDb {
                        network_rx_bytes_sec, network_tx_bytes_sec, current_batch_size,
                        max_batch_capacity
                 FROM telemetry
-                WHERE job_id = ?1 AND worker_id = ?2
+                WHERE job_id = ?1 AND worker_id = ?2 AND timestamp_ms > ?3
                 ORDER BY timestamp_ms ASC
                 "#,
             )?;
 
             let snapshots: Vec<TelemetrySnapshot> = stmt
-                .query_map(params![job_id, &worker_id], |row| {
+                .query_map(params![job_id, &worker_id, since_ms as i64], |row| {
                     Ok(TelemetrySnapshot {
                         timestamp_ms: row.get::<_, i64>(0)? as u64,
                         cpu_percent: row.get(1)?,
