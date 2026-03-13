@@ -215,11 +215,8 @@ pub(crate) fn get_ingestion_work(
         return axum::Json(WorkResponse::Wait);
     }
 
-    // All work complete - return Wait so worker stays alive for next job
-    println!(
-        "Ingestion complete: {} succeeded, {} failed",
-        ingestion.completed_count, ingestion.failed_count
-    );
+    // All work complete - return Wait so worker stays alive for next job.
+    // The monitor loop handles the one-time completion log and idle transition.
     axum::Json(WorkResponse::Wait)
 }
 
