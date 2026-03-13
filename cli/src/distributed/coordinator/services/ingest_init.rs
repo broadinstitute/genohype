@@ -16,6 +16,19 @@ pub fn discover_phenotypes_for_ingestion(
 ) -> crate::Result<Vec<(String, String, String)>> {
     let input_dir = input_dir.trim_end_matches('/');
 
+    // Fast path: construct deterministic paths directly from the filtered list,
+    // bypassing the expensive GCS object listing. Used when the UI sends an
+    // explicit set of pre-verified phenotypes.
+    if let Some(explicit_phenotypes) = filter {
+        let mut phenotypes = Vec::with_capacity(explicit_phenotypes.len());
+        for (id, ancestry) in explicit_phenotypes {
+            let base_path = format!("{}/{}/{}", input_dir, ancestry, id);
+            phenotypes.push((id.clone(), ancestry.clone(), base_path));
+        }
+        return Ok(phenotypes);
+    }
+
+    // Slow path: no filter provided (e.g. CLI ingest). Fall back to full GCS scan.
     let url = url::Url::parse(input_dir).map_err(|e| {
         crate::HailError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,

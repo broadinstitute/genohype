@@ -252,13 +252,18 @@ pub(crate) async fn process_catalog_api(
             return Json(serde_json::json!({ "success": false, "error": e }));
         }
 
-        let pheno_names: Vec<String> = req.phenotypes.iter().map(|(id, anc)| format!("{}/{}", anc, id)).collect();
+        let pheno_count = req.phenotypes.len();
+        let max_display = 5;
+        let mut display_names: Vec<String> = req.phenotypes.iter().take(max_display).map(|(id, anc)| format!("{}/{}", anc, id)).collect();
+        if pheno_count > max_display {
+            display_names.push(format!("+ {} more", pheno_count - max_display));
+        }
         data.log_event(JobEvent {
             timestamp_ms: CoordinatorData::now_ms(),
             event_type: "submitted".to_string(),
             worker_id: None,
             phenotype_id: None,
-            details: format!("Started batch from catalog: {} phenotypes ({})", pheno_names.len(), pheno_names.join(", ")),
+            details: format!("Started batch from catalog: {} phenotypes ({})", pheno_count, display_names.join(", ")),
         });
 
         Json(serde_json::json!({ "success": true, "message": "Started new batch job" }))
@@ -310,12 +315,25 @@ pub(crate) async fn ingest_catalog_api(
             _ => crate::distributed::message::InitStrategy::Create,
         };
 
+        // Zero-I/O verification: only keep phenotypes that are marked completed
+        // in the coordinator's in-memory state, avoiding any GCS round-trips.
+        let valid_phenotypes: Vec<(String, String)> = req.phenotypes.into_iter()
+            .filter(|p| data.completed_phenotypes.contains(p))
+            .collect();
+
+        if valid_phenotypes.is_empty() {
+            return Json(serde_json::json!({
+                "success": false,
+                "error": "None of the selected phenotypes are marked as completed yet."
+            }));
+        }
+
         let job_spec = JobSpec::IngestManhattan {
             input_dir: input_dir.clone(),
             clickhouse_url: clickhouse_url.clone(),
             database: catalog.config.ingest.database.clone(),
             init_strategy,
-            phenotypes: Some(req.phenotypes),
+            phenotypes: Some(valid_phenotypes),
         };
 
         (catalog, input_dir, clickhouse_url, init_strategy, job_spec)
@@ -360,7 +378,13 @@ pub(crate) async fn ingest_catalog_api(
     data.retry_counts.clear();
 
     let pheno_count = phenotypes.len();
-    let pheno_names: Vec<String> = phenotypes.iter().map(|(id, anc, _)| format!("{}/{}", anc, id)).collect();
+
+    // Truncate the display list to prevent massive strings with thousands of phenotypes
+    let max_display = 5;
+    let mut display_names: Vec<String> = phenotypes.iter().take(max_display).map(|(id, anc, _)| format!("{}/{}", anc, id)).collect();
+    if pheno_count > max_display {
+        display_names.push(format!("+ {} more", pheno_count - max_display));
+    }
 
     #[cfg(feature = "clickhouse")]
     {
@@ -391,7 +415,7 @@ pub(crate) async fn ingest_catalog_api(
         event_type: "submitted".to_string(),
         worker_id: None,
         phenotype_id: None,
-        details: format!("Started ingestion for {} phenotypes ({})", pheno_count, pheno_names.join(", ")),
+        details: format!("Started ingestion for {} phenotypes ({})", pheno_count, display_names.join(", ")),
     });
 
     Json(serde_json::json!({ "success": true, "message": "Started ingestion job" }))
