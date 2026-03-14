@@ -36,6 +36,11 @@ pub mod vcf;
 #[cfg(feature = "validation")]
 pub mod validation;
 
+pub mod export;
+
+#[cfg(feature = "genomic")]
+pub mod genomic;
+
 pub use error::{HailError, Result};
 
 /// Version of the Hail format this decoder supports

@@ -11,6 +11,10 @@ gcp = ["object_store/gcp"]
 aws = ["object_store/aws"]
 http = ["object_store/http"]
 validation = ["dep:jsonschema"]
+export = []
+genomic = ["dep:lru"]
+clickhouse = ["export", "dep:reqwest"]
+bigquery = ["export", "dep:google-cloud-bigquery", "dep:google-cloud-storage", "dep:google-cloud-auth"]
 
 [dependencies]
 # Compression
@@ -66,6 +70,17 @@ indicatif = "0.17"
 
 # JSON Schema validation (validation feature)
 jsonschema = { version = "0.27", default-features = false, optional = true }
+
+# LRU Cache for the genomic client (genomic feature)
+lru = { version = "0.12", optional = true }
+
+# HTTP Client for ClickHouse export (clickhouse feature)
+reqwest = { version = "0.11", default-features = false, features = ["blocking", "json", "rustls-tls"], optional = true }
+
+# Google Cloud for BigQuery export (bigquery feature)
+google-cloud-bigquery = { version = "0.13", optional = true }
+google-cloud-storage = { version = "0.22", optional = true }
+google-cloud-auth = { version = "0.19", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

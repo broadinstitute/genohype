@@ -10,7 +10,7 @@
 //! - Computes `xpos` from contig and position
 //! - Adds "chr" prefix to contig for annotation joining
 
-use crate::export::ClickHouseClient;
+use genohype_core::export::ClickHouseClient;
 use genohype_core::io::{get_file_size, is_cloud_path, range_read};
 use crate::Result;
 use arrow::array::{

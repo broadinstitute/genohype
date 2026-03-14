@@ -2,8 +2,8 @@
 
 use crate::cli::ExportClickhouseArgs;
 use crate::commands::utils::{parse_export_filters, parse_export_intervals, progress_style_spinner};
-use crate::export::clickhouse::generate_create_table;
-use crate::export::ClickHouseClient;
+use genohype_core::export::clickhouse::generate_create_table;
+use genohype_core::export::ClickHouseClient;
 use genohype_core::parquet::{build_record_batch, ParquetWriter};
 use genohype_core::query::QueryEngine;
 use genohype_core::Result;

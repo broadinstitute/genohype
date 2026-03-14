@@ -3,7 +3,7 @@
 //! This module provides functionality to export Hail tables to Google BigQuery
 //! using Parquet as an intermediate format staged in Google Cloud Storage.
 
-use genohype_core::codec::EncodedType;
+use crate::codec::EncodedType;
 use google_cloud_bigquery::client::{Client as BqClient, ClientConfig as BqClientConfig};
 use google_cloud_bigquery::http::job::get::GetJobRequest;
 use google_cloud_bigquery::http::job::{
@@ -326,7 +326,7 @@ fn hail_to_bq_field(name: &str, etype: &EncodedType) -> TableFieldSchema {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use genohype_core::codec::EncodedField;
+    use crate::codec::EncodedField;
 
     #[test]
     fn test_primitive_type_mapping() {

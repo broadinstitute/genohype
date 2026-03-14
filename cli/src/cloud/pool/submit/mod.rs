@@ -1074,7 +1074,7 @@ EOF
                 ref table_name,
             } = job_spec
             {
-                use crate::export::clickhouse::{generate_create_table, ClickHouseClient};
+                use genohype_core::export::clickhouse::{generate_create_table, ClickHouseClient};
                 use genohype_core::query::QueryEngine;
 
                 println!(

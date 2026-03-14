@@ -2,7 +2,7 @@
 
 use crate::cli::ExportHailArgs;
 use crate::commands::utils::{parse_export_filters, parse_export_intervals, progress_style_spinner};
-use crate::export::hail::HailTableWriter;
+use genohype_core::export::hail::HailTableWriter;
 use genohype_core::query::QueryEngine;
 use genohype_core::Result;
 use indicatif::ProgressBar;

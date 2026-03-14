@@ -115,7 +115,7 @@ pub fn init_clickhouse_tables(
     init_strategy: &crate::distributed::message::InitStrategy,
 ) -> Result<(), String> {
     use crate::distributed::message::InitStrategy;
-    use crate::export::ClickHouseClient;
+    use genohype_core::export::ClickHouseClient;
     use crate::ingest::get_manhattan_schemas;
 
     if *init_strategy == InitStrategy::Append {
@@ -162,5 +162,7 @@ pub fn create_ingestion_state(
         completed_count: 0,
         failed_count: 0,
         total_tasks: total,
+        dynamic_batch_size: 2,
+        max_batch_size: 16,
     }
 }

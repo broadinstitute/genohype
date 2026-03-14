@@ -4,9 +4,9 @@ pub mod extract;
 pub use async_client::*;
 pub use extract::*;
 
-use genohype_core::codec::EncodedValue;
-use genohype_core::query::{IntervalList, KeyRange, KeyValue, QueryBound, QueryEngine};
-use crate::Result;
+use crate::codec::EncodedValue;
+use crate::query::{IntervalList, KeyRange, KeyValue, QueryBound, QueryEngine};
+use crate::error::Result;
 use std::sync::Arc;
 
 /// A client for querying locus-keyed Hail Tables

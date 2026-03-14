@@ -33,7 +33,7 @@ pub(crate) async fn submit_job(
         ref table_name,
     } = req.job_spec
     {
-        use crate::export::{generate_create_table, ClickHouseClient};
+        use genohype_core::export::{generate_create_table, ClickHouseClient};
         use genohype_core::query::QueryEngine;
 
         println!(

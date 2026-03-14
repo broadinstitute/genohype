@@ -69,7 +69,7 @@ pub fn process_clickhouse_export(
     table: &str,
     telemetry: Option<Arc<TelemetryState>>,
 ) -> Result<(usize, Option<(String, QueryEngine)>)> {
-    use crate::export::ClickHouseClient;
+    use genohype_core::export::ClickHouseClient;
     use crossbeam_channel::bounded;
     use rayon::prelude::*;
 
@@ -238,7 +238,7 @@ pub fn process_clickhouse_export(
 /// This avoids writing to disk entirely - the Parquet data is built in memory
 /// and streamed directly to ClickHouse via HTTP POST.
 fn upload_chunk_to_clickhouse(
-    client: &crate::export::ClickHouseClient,
+    client: &genohype_core::export::ClickHouseClient,
     table: &str,
     rows: &[genohype_core::codec::EncodedValue],
     row_type: &genohype_core::codec::EncodedType,

@@ -15,14 +15,10 @@ mod commands;
 mod config;
 mod distributed;
 mod env;
-mod export;
 mod manhattan;
 
 #[cfg(feature = "clickhouse")]
 mod ingest;
-
-#[cfg(feature = "genomic")]
-mod genomic;
 
 // Re-export core error types for use in CLI modules
 pub use genohype_core::{HailError, Result};

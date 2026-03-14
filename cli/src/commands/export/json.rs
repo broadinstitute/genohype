@@ -2,7 +2,7 @@
 
 use crate::cli::ExportJsonArgs;
 use crate::commands::utils::{parse_export_filters, parse_export_intervals};
-use crate::export::hail_to_json_sharded_full;
+use genohype_core::export::hail_to_json_sharded_full;
 use genohype_core::partitioning::PartitionAllocator;
 use genohype_core::query::QueryEngine;
 use genohype_core::Result;

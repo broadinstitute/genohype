@@ -19,9 +19,9 @@ http = ["genohype-core/http", "object_store/http"]
 validation = ["genohype-core/validation"]
 
 # Genomic high-level API
-genomic = ["dep:lru"]
-clickhouse = ["reqwest/blocking"]  # enables blocking HTTP client for ClickHouse export
-bigquery = ["gcp", "dep:google-cloud-bigquery", "dep:google-cloud-storage", "dep:google-cloud-auth"]
+genomic = ["genohype-core/genomic"]
+clickhouse = ["genohype-core/clickhouse", "reqwest/blocking"]
+bigquery = ["gcp", "genohype-core/bigquery"]
 benchmark = []  # sysinfo is now always included
 
 # HTTP server binary (axum is always included for distributed coordinator)
@@ -89,11 +89,6 @@ tiny-skia = "0.11"
 # Use rustls for TLS to avoid OpenSSL cross-compilation issues
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 
-# Google Cloud for BigQuery export (bigquery feature)
-google-cloud-bigquery = { version = "0.13", optional = true }
-google-cloud-storage = { version = "0.22", optional = true }
-google-cloud-auth = { version = "0.19", optional = true }
-
 # HTTP Server for distributed coordinator (and optional hail-server)
 axum = "0.7"
 tokio-util = { version = "0.7", features = ["io"] }
@@ -122,8 +117,6 @@ dirs = "5.0"
 # TOML config file parsing
 toml = "0.8"
 
-# LRU Cache for the genomic client (genomic feature)
-lru = { version = "0.12", optional = true }
 
 [[bin]]
 name = "genohype"

@@ -1,5 +1,5 @@
 use crate::genomic::{LocusTable, VariantAssociation};
-use crate::Result;
+use crate::error::Result;
 use lru::LruCache;
 use std::num::NonZeroUsize;
 use std::sync::Arc;

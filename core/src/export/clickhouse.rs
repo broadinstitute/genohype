@@ -3,7 +3,7 @@
 //! This module provides functionality to export Hail tables to ClickHouse
 //! using Parquet as an intermediate format.
 
-use genohype_core::codec::{EncodedField, EncodedType};
+use crate::codec::{EncodedField, EncodedType};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;

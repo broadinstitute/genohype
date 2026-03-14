@@ -16,7 +16,6 @@ pub mod cluster;
 pub mod config;
 pub mod distributed;
 pub mod env;
-pub mod export;
 pub mod manhattan;
 
 #[cfg(feature = "clickhouse")]
@@ -25,8 +24,10 @@ pub mod clickhouse;
 #[cfg(feature = "clickhouse")]
 pub mod ingest;
 
+pub use genohype_core::export;
+
 #[cfg(feature = "genomic")]
-pub mod genomic;
+pub use genohype_core::genomic;
 
 pub mod benchmark;
 

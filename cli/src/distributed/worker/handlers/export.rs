@@ -163,7 +163,7 @@ pub fn process_json_export(
     intervals: Option<&Arc<IntervalList>>,
     telemetry: Option<Arc<TelemetryState>>,
 ) -> Result<(usize, Option<(String, QueryEngine)>)> {
-    use crate::export::JsonWriter;
+    use genohype_core::export::JsonWriter;
     use genohype_core::query::row_matches_intervals;
     use rayon::prelude::*;
     use std::fs::File;

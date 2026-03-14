@@ -1,4 +1,4 @@
-use genohype_core::codec::EncodedValue;
+use crate::codec::EncodedValue;
 
 /// Extract a field from an EncodedValue struct (exact match)
 pub fn get_field<'a>(value: &'a EncodedValue, name: &str) -> Option<&'a EncodedValue> {

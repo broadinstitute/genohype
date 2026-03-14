@@ -3,10 +3,10 @@
 //! Exports data to Hail Table (.ht) format, enabling round-trip
 //! conversions and filtered table exports.
 
-use genohype_core::buffer::{BlockingOutputBuffer, LEB128OutputBuffer, OutputBuffer, StreamBlockOutputBuffer};
-use genohype_core::codec::{EncodedType, EncodedValue, Encoder};
-use genohype_core::metadata::{Interval, RVDComponentSpec};
-use crate::{HailError, Result};
+use crate::buffer::{BlockingOutputBuffer, LEB128OutputBuffer, OutputBuffer, StreamBlockOutputBuffer};
+use crate::codec::{EncodedType, EncodedValue, Encoder};
+use crate::metadata::{Interval, RVDComponentSpec};
+use crate::error::{HailError, Result};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use serde_json::{json, Value};

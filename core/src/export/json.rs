@@ -3,11 +3,11 @@
 //! This module provides functionality to export Hail tables to JSON (NDJSON) format.
 //! Supports both local files and cloud storage.
 
-use genohype_core::codec::EncodedValue;
-use genohype_core::error::Result;
-use genohype_core::io::{is_cloud_path, StreamingCloudWriter};
-use genohype_core::partitioning::PartitionAllocator;
-use genohype_core::query::{row_matches_intervals, IntervalList, KeyRange, QueryEngine};
+use crate::codec::EncodedValue;
+use crate::error::Result;
+use crate::io::{is_cloud_path, StreamingCloudWriter};
+use crate::partitioning::PartitionAllocator;
+use crate::query::{row_matches_intervals, IntervalList, KeyRange, QueryEngine};
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use std::fs::File;
@@ -226,14 +226,10 @@ pub fn hail_to_json_sharded_full(
                                 completed_partitions_ref.fetch_add(1, Ordering::Relaxed) + 1;
                             let rows = total_rows_ref.load(Ordering::Relaxed) + shard_rows;
                             let elapsed = start_time_ref.elapsed().as_secs_f64();
-                            let update = crate::cloud::ProgressUpdate::new(
-                                worker_id,
-                                done,
-                                owned_partition_count,
-                                rows,
-                                elapsed,
+                            println!(
+                                "{{\"type\":\"progress\",\"worker_id\":{},\"partitions_done\":{},\"partitions_total\":{},\"rows\":{},\"elapsed_secs\":{:.3}}}",
+                                worker_id, done, owned_partition_count, rows, elapsed
                             );
-                            println!("{}", update.to_json_line());
                         }
                     }
 
