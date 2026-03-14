@@ -234,6 +234,50 @@ pub fn dispatch_job(
                 )))
             }
         }
+        JobSpec::IngestManhattanBatch { tasks, clickhouse_url, database } => {
+            #[cfg(feature = "clickhouse")]
+            {
+                use rayon::prelude::*;
+
+                println!("Processing batch of {} ingestion tasks concurrently...", tasks.len());
+
+                let results: Vec<crate::Result<usize>> = tasks.par_iter()
+                    .map(|task| {
+                        let _core_guard = telemetry.as_ref().map(|ts| {
+                            crate::distributed::worker::telemetry::CoreTaskGuard::phenotype(
+                                ts,
+                                &task.phenotype_id,
+                                Some(format!("{}/{}", task.ancestry, task.phenotype_id)),
+                            )
+                        });
+
+                        handlers::ingest::process_ingest_manhattan(
+                            &task.phenotype_id,
+                            &task.ancestry,
+                            &task.base_path,
+                            clickhouse_url,
+                            database,
+                        )
+                    })
+                    .collect();
+
+                let mut total_rows = 0;
+                for result in results {
+                    total_rows += result?;
+                }
+
+                println!("Batch ingestion complete: {} tasks, {} total rows", tasks.len(), total_rows);
+                Ok((total_rows, None, None))
+            }
+            #[cfg(not(feature = "clickhouse"))]
+            {
+                let _ = (tasks, clickhouse_url, database);
+                Err(crate::HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Worker binary not built with 'clickhouse' feature. Rebuild with --features clickhouse"
+                )))
+            }
+        }
         JobSpec::Stress(spec) => {
             let rows = handlers::stress::process_stress(partitions, spec, telemetry)?;
             Ok((rows, None, cached_engine))

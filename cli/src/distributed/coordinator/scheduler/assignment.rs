@@ -127,16 +127,39 @@ fn count_partitions_if_present(path: Option<&str>, source: &str, phenotype_id: &
 }
 
 /// Get work for an ingestion job.
+///
+/// Assigns a batch of ingestion tasks to the worker so it can process
+/// them concurrently, improving ClickHouse utilization. The batch size
+/// is dynamically adjusted by the ClickHouse health monitor (AIMD).
 pub(crate) fn get_ingestion_work(
     data: &mut CoordinatorData,
     ingestion: &mut IngestionState,
     worker_id: &str,
 ) -> axum::Json<WorkResponse> {
-    // Check if there's a pending task
-    if let Some((phenotype_id, ancestry, base_path)) = ingestion.pending_tasks.pop_front() {
+    if ingestion.pending_tasks.is_empty() {
+        // No pending tasks — either still processing or fully done
+        if !ingestion.active_tasks.is_empty() {
+            if let Some(w) = data.worker_registry.get_mut(worker_id) {
+                w.status = WorkerStatus::Idle;
+            }
+        }
+        // The monitor loop handles the one-time completion log and idle transition.
+        return axum::Json(WorkResponse::Wait);
+    }
+
+    let batch_size = ingestion.dynamic_batch_size.min(ingestion.pending_tasks.len());
+
+    let now = Instant::now();
+    let mut task_descriptors = Vec::with_capacity(batch_size);
+    let mut ingest_tasks = Vec::with_capacity(batch_size);
+
+    for _ in 0..batch_size {
+        let (phenotype_id, ancestry, base_path) = match ingestion.pending_tasks.pop_front() {
+            Some(t) => t,
+            None => break,
+        };
         let task_id = Uuid::new_v4().to_string();
 
-        // Track this task
         ingestion.active_tasks.insert(
             task_id.clone(),
             (
@@ -144,80 +167,77 @@ pub(crate) fn get_ingestion_work(
                 ancestry.clone(),
                 base_path.clone(),
                 worker_id.to_string(),
-                Instant::now(),
+                now,
             ),
         );
 
-        // Update worker status
-        if let Some(w) = data.worker_registry.get_mut(worker_id) {
-            w.status = WorkerStatus::Active;
-        }
+        task_descriptors.push(
+            TaskType::Phenotype {
+                phenotype_id: phenotype_id.clone(),
+                ancestry: Some(ancestry.clone()),
+                operation: PhenotypeOp::Ingest {
+                    clickhouse_url: ingestion.clickhouse_url.clone(),
+                    database: ingestion.database.clone(),
+                },
+            }
+            .into_descriptor(
+                task_id.clone(),
+                Some(format!("{}/{} → Ingest", ancestry, phenotype_id)),
+                None,
+                Some(ingestion.total_tasks),
+            ),
+        );
 
-        data.log_event(crate::distributed::message::JobEvent {
-            timestamp_ms: crate::distributed::coordinator::state::CoordinatorData::now_ms(),
-            event_type: "assigned".to_string(),
-            worker_id: Some(worker_id.to_string()),
-            phenotype_id: Some(format!("{}/{}", ancestry, phenotype_id)),
-            details: format!("Started ingesting {}/{}", ancestry, phenotype_id),
-        });
-
-        println!(
-            "Assigned 1 ingest task to {} [{}/{}] ({} pending, {} active, {} done)",
-            worker_id,
+        ingest_tasks.push(crate::distributed::message::IngestTask {
+            task_id,
             phenotype_id,
             ancestry,
-            ingestion.pending_tasks.len(),
-            ingestion.active_tasks.len(),
-            ingestion.completed_count
-        );
-
-        // Create IngestManhattanTask job spec
-        let job_spec = JobSpec::IngestManhattanTask {
-            phenotype_id: phenotype_id.clone(),
-            ancestry: ancestry.clone(),
             base_path,
-            clickhouse_url: ingestion.clickhouse_url.clone(),
-            database: ingestion.database.clone(),
-        };
-
-        // Create TaskDescriptor for this ingestion task
-        let task = TaskType::Phenotype {
-            phenotype_id: phenotype_id.clone(),
-            ancestry: Some(ancestry),
-            operation: PhenotypeOp::Ingest {
-                clickhouse_url: ingestion.clickhouse_url.clone(),
-                database: ingestion.database.clone(),
-            },
-        }
-        .into_descriptor(
-            task_id.clone(),
-            Some(format!("{} → Ingest", phenotype_id)),
-            None,
-            Some(ingestion.total_tasks),
-        );
-
-        return axum::Json(WorkResponse::Task {
-            tasks: vec![task],
-            input_path: String::new(), // Not used for ingestion tasks
-            payload: serde_json::to_value(&job_spec).unwrap_or_default(),
-            total_tasks: ingestion.total_tasks,
-            filters: Vec::new(),
-            intervals: Vec::new(),
-            session_id: Some(data.session_id.clone()),
         });
     }
 
-    // Check if there's active work in progress
-    if !ingestion.active_tasks.is_empty() {
-        if let Some(w) = data.worker_registry.get_mut(worker_id) {
-            w.status = WorkerStatus::Idle;
-        }
-        return axum::Json(WorkResponse::Wait);
+    // Update worker status
+    if let Some(w) = data.worker_registry.get_mut(worker_id) {
+        w.status = WorkerStatus::Active;
     }
 
-    // All work complete - return Wait so worker stays alive for next job.
-    // The monitor loop handles the one-time completion log and idle transition.
-    axum::Json(WorkResponse::Wait)
+    let task_names: Vec<String> = ingest_tasks
+        .iter()
+        .map(|t| format!("{}/{}", t.ancestry, t.phenotype_id))
+        .collect();
+    println!(
+        "Assigned {} ingest task(s) to {} [{}] ({} pending, {} active, {} done)",
+        ingest_tasks.len(),
+        worker_id,
+        task_names.join(", "),
+        ingestion.pending_tasks.len(),
+        ingestion.active_tasks.len(),
+        ingestion.completed_count
+    );
+
+    data.log_event(crate::distributed::message::JobEvent {
+        timestamp_ms: crate::distributed::coordinator::state::CoordinatorData::now_ms(),
+        event_type: "assigned".to_string(),
+        worker_id: Some(worker_id.to_string()),
+        phenotype_id: None,
+        details: format!("Assigned {} ingest tasks: {}", ingest_tasks.len(), task_names.join(", ")),
+    });
+
+    let job_spec = JobSpec::IngestManhattanBatch {
+        tasks: ingest_tasks,
+        clickhouse_url: ingestion.clickhouse_url.clone(),
+        database: ingestion.database.clone(),
+    };
+
+    axum::Json(WorkResponse::Task {
+        tasks: task_descriptors,
+        input_path: String::new(),
+        payload: serde_json::to_value(&job_spec).unwrap_or_default(),
+        total_tasks: ingestion.total_tasks,
+        filters: Vec::new(),
+        intervals: Vec::new(),
+        session_id: Some(data.session_id.clone()),
+    })
 }
 
 /// Get work for a batch Manhattan job (multi-phenotype scheduling).

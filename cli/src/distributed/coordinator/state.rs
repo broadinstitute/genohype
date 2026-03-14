@@ -226,6 +226,10 @@ pub(crate) struct IngestionState {
     pub(crate) failed_count: usize,
     /// Total tasks discovered
     pub(crate) total_tasks: usize,
+    /// Dynamic batch size per worker, adjusted by ClickHouse health monitor (AIMD)
+    pub(crate) dynamic_batch_size: usize,
+    /// Maximum batch size ceiling
+    pub(crate) max_batch_size: usize,
 }
 
 /// State for tracking Manhattan pipeline phases.

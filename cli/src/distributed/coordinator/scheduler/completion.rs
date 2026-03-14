@@ -92,45 +92,52 @@ pub(crate) fn complete_manhattan_work(
     }
 }
 
-/// Complete an ingestion task.
+/// Complete ingestion task(s).
+///
+/// Handles both single-task and batch completions by iterating over
+/// all task IDs reported in the request.
 pub(crate) fn complete_ingestion_work(data: &mut CoordinatorData, ingestion: &mut IngestionState, req: &CompleteRequest) {
-    // Extract task ID from tasks list
-    let task_id = req.tasks.first().cloned().unwrap_or_default();
+    let task_count = req.tasks.len();
 
-    // Remove from active tasks
-    if let Some((phenotype_id, ancestry, _base_path, _worker_id, start_time)) =
-        ingestion.active_tasks.remove(&task_id)
-    {
-        // Mark as ingested in coordinator state on success
-        if req.error.is_none() {
-            data.ingested_phenotypes.insert((phenotype_id.clone(), ancestry.clone()));
-            data.log_event(crate::distributed::message::JobEvent {
-                timestamp_ms: crate::distributed::coordinator::state::CoordinatorData::now_ms(),
-                event_type: "success".to_string(),
-                worker_id: Some(req.worker_id.clone()),
-                phenotype_id: Some(format!("{}/{}", ancestry, phenotype_id)),
-                details: format!("Ingested into ClickHouse: {} rows in {:.1}s", req.items_processed, start_time.elapsed().as_secs_f64()),
-            });
+    for task_id in &req.tasks {
+        if let Some((phenotype_id, ancestry, _base_path, _worker_id, start_time)) =
+            ingestion.active_tasks.remove(task_id)
+        {
+            if req.error.is_none() {
+                data.ingested_phenotypes.insert((phenotype_id.clone(), ancestry.clone()));
+                data.log_event(crate::distributed::message::JobEvent {
+                    timestamp_ms: crate::distributed::coordinator::state::CoordinatorData::now_ms(),
+                    event_type: "success".to_string(),
+                    worker_id: Some(req.worker_id.clone()),
+                    phenotype_id: Some(format!("{}/{}", ancestry, phenotype_id)),
+                    details: format!("Ingested into ClickHouse: {} rows", req.items_processed),
+                });
+            }
+            let duration = start_time.elapsed();
+            ingestion.completed_count += 1;
+
+            println!(
+                "Ingestion complete: {}/{} ({:.1}s) [{}/{}]",
+                phenotype_id,
+                ancestry,
+                duration.as_secs_f64(),
+                ingestion.completed_count,
+                ingestion.total_tasks
+            );
+        } else {
+            println!(
+                "Warning: Ingestion task {} not found in active_tasks",
+                task_id
+            );
+            ingestion.completed_count += 1;
         }
-        let duration = start_time.elapsed();
-        ingestion.completed_count += 1;
+    }
 
+    if task_count > 1 {
         println!(
-            "Ingestion complete: {}/{} ({} rows in {:.1}s) [{}/{}]",
-            phenotype_id,
-            ancestry,
-            req.items_processed,
-            duration.as_secs_f64(),
-            ingestion.completed_count,
-            ingestion.total_tasks
+            "Batch of {} ingest tasks completed by {} ({} rows total)",
+            task_count, req.worker_id, req.items_processed
         );
-    } else {
-        // Task not found - might have already been handled
-        println!(
-            "Warning: Ingestion task {} not found in active_tasks",
-            task_id
-        );
-        ingestion.completed_count += 1;
     }
 }
 

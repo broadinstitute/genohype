@@ -259,3 +259,122 @@ pub(crate) fn check_cpu_status_consistency(state: &SharedState) {
         }
     }
 }
+
+/// Background loop that polls ClickHouse system metrics and adjusts
+/// the ingestion batch size using AIMD (Additive Increase, Multiplicative Decrease).
+///
+/// Only active during ingestion jobs. Queries `system.asynchronous_metrics`
+/// for OS memory and `system.metrics` for HTTP connections every 5 seconds.
+pub(crate) async fn monitor_clickhouse_health(state: SharedState) {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap();
+
+    loop {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        // Extract ClickHouse URL and current state without holding the lock during HTTP
+        let (ch_url, current_batch, max_batch) = {
+            let data = state.lock().unwrap();
+            if data.idle {
+                continue;
+            }
+            if let JobExecutionState::Ingestion(ref ing) = data.job_state {
+                (
+                    ing.clickhouse_url.clone(),
+                    ing.dynamic_batch_size,
+                    ing.max_batch_size,
+                )
+            } else {
+                continue;
+            }
+        };
+
+        // Query ClickHouse for memory and HTTP connection metrics
+        let query = "SELECT metric, value FROM system.asynchronous_metrics \
+                     WHERE metric IN ('OSMemoryAvailable', 'OSMemoryTotal') \
+                     UNION ALL \
+                     SELECT metric, value FROM system.metrics \
+                     WHERE metric = 'HTTPConnection' \
+                     FORMAT JSON";
+        let url = format!("{}/?default_format=JSON", ch_url.trim_end_matches('/'));
+
+        let resp = match client.post(&url).body(query).send().await {
+            Ok(r) => r,
+            Err(_) => continue, // Silently ignore transient network errors
+        };
+
+        let json = match resp.json::<serde_json::Value>().await {
+            Ok(j) => j,
+            Err(_) => continue,
+        };
+
+        let mut mem_avail = 0.0_f64;
+        let mut mem_total = 0.0_f64;
+        let mut http_conns = 0.0_f64;
+
+        if let Some(data_arr) = json.get("data").and_then(|d| d.as_array()) {
+            for row in data_arr {
+                let metric = row.get("metric").and_then(|m| m.as_str()).unwrap_or("");
+                // CH JSON format may return values as strings or numbers
+                let value = row
+                    .get("value")
+                    .and_then(|v| {
+                        v.as_f64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+                    })
+                    .unwrap_or(0.0);
+
+                match metric {
+                    "OSMemoryAvailable" => mem_avail = value,
+                    "OSMemoryTotal" => mem_total = value,
+                    "HTTPConnection" => http_conns = value,
+                    _ => {}
+                }
+            }
+        }
+
+        if mem_total <= 0.0 {
+            continue;
+        }
+
+        let mem_usage_pct = ((mem_total - mem_avail) / mem_total) * 100.0;
+
+        // AIMD logic
+        let mut new_batch = current_batch;
+        let mut log_warning = None;
+
+        if mem_usage_pct > 80.0 || http_conns > 100.0 {
+            // Multiplicative Decrease — cut in half, floor at 1
+            new_batch = (current_batch / 2).max(1);
+            if new_batch < current_batch {
+                log_warning = Some(format!(
+                    "ClickHouse under pressure (Mem: {:.1}%, HTTP conns: {:.0}). Reduced ingest batch size {} → {}",
+                    mem_usage_pct, http_conns, current_batch, new_batch
+                ));
+            }
+        } else if mem_usage_pct < 60.0 && http_conns < 50.0 {
+            // Additive Increase — increment by 1 up to ceiling
+            new_batch = (current_batch + 1).min(max_batch);
+        }
+
+        // Apply back to state
+        if new_batch != current_batch || log_warning.is_some() {
+            let mut data = state.lock().unwrap();
+            if let JobExecutionState::Ingestion(ref mut ing) = data.job_state {
+                ing.dynamic_batch_size = new_batch;
+            }
+            if let Some(msg) = log_warning {
+                println!("AIMD: {}", msg);
+                data.log_event(crate::distributed::message::JobEvent {
+                    timestamp_ms: CoordinatorData::now_ms(),
+                    event_type: "warning".to_string(),
+                    worker_id: None,
+                    phenotype_id: None,
+                    details: msg,
+                });
+            }
+        }
+    }
+}

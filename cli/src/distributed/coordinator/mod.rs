@@ -313,6 +313,12 @@ pub async fn run_coordinator(
         println!("  Session ID: {}", &data.session_id[..8]);
     }
 
+    // Start background ClickHouse health monitor (AIMD for ingestion batch sizing)
+    let ch_monitor_state = state.clone();
+    tokio::spawn(async move {
+        monitor::monitor_clickhouse_health(ch_monitor_state).await;
+    });
+
     // Start background timeout monitor
     let monitor_state = state.clone();
     tokio::spawn(async move {
@@ -1205,27 +1211,28 @@ async fn complete_work(
             }
         }
 
-        // For ingestion jobs, mark task as failed
+        // For ingestion jobs, mark all batch tasks as failed
         if let JobExecutionState::Ingestion(ref mut ingestion) = data.job_state {
-            // Check ownership for ingestion tasks
-            let mut is_owned = false;
-            if let Some((_, _, _, worker_id, _)) = ingestion.active_tasks.get(&task_id) {
-                if worker_id == &req.worker_id {
-                    is_owned = true;
-                } else {
-                    println!("Warning: Ignoring failure for ingestion task {} from {} (assigned to {})", task_id, req.worker_id, worker_id);
+            for t_id in task_ids {
+                let mut is_owned = false;
+                if let Some((_, _, _, worker_id, _)) = ingestion.active_tasks.get(t_id) {
+                    if worker_id == &req.worker_id {
+                        is_owned = true;
+                    } else {
+                        println!("Warning: Ignoring failure for ingestion task {} from {} (assigned to {})", t_id, req.worker_id, worker_id);
+                    }
                 }
-            }
 
-            if is_owned {
-                if let Some((phenotype_id, ancestry, _base_path, _worker_id, _start_time)) =
-                    ingestion.active_tasks.remove(&task_id)
-                {
-                    println!(
-                        "Ingestion failed: {}/{} - {}",
-                        phenotype_id, ancestry, req.error.as_ref().unwrap()
-                    );
-                    ingestion.failed_count += 1;
+                if is_owned {
+                    if let Some((phenotype_id, ancestry, _base_path, _worker_id, _start_time)) =
+                        ingestion.active_tasks.remove(t_id)
+                    {
+                        println!(
+                            "Ingestion failed: {}/{} - {}",
+                            phenotype_id, ancestry, req.error.as_deref().unwrap_or("unknown")
+                        );
+                        ingestion.failed_count += 1;
+                    }
                 }
             }
         }

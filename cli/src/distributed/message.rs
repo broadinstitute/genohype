@@ -222,8 +222,23 @@ pub enum JobSpec {
         clickhouse_url: String,
         database: String,
     },
+    /// Batch of ingestion tasks processed concurrently on a single worker
+    IngestManhattanBatch {
+        tasks: Vec<IngestTask>,
+        clickhouse_url: String,
+        database: String,
+    },
     /// Synthetic workload for testing cluster telemetry and autoscaling
     Stress(StressSpec),
+}
+
+/// A single ingestion task within a batch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngestTask {
+    pub task_id: String,
+    pub phenotype_id: String,
+    pub ancestry: String,
+    pub base_path: String,
 }
 
 /// Parameters for a synthetic stress test workload.
@@ -644,6 +659,7 @@ impl JobSpec {
             JobSpec::ExportClickhouse { .. } => "export clickhouse",
             JobSpec::IngestManhattan { .. } => "ingest manhattan",
             JobSpec::IngestManhattanTask { .. } => "ingest manhattan task",
+            JobSpec::IngestManhattanBatch { .. } => "ingest manhattan batch",
             JobSpec::Stress(_) => "synthetic stress test",
         }
     }
@@ -672,6 +688,7 @@ impl JobSpec {
             JobSpec::ExportClickhouse { table_name, .. } => Some(table_name),
             JobSpec::IngestManhattan { input_dir, .. } => Some(input_dir),
             JobSpec::IngestManhattanTask { base_path, .. } => Some(base_path),
+            JobSpec::IngestManhattanBatch { tasks, .. } => tasks.first().map(|t| t.base_path.as_str()),
             JobSpec::Stress(spec) => spec.write_dir.as_deref(),
         }
     }
@@ -809,7 +826,8 @@ impl JobSpec {
             | JobSpec::ManhattanAggregateBatch { .. }
             | JobSpec::Loci(_)
             | JobSpec::IngestManhattan { .. }
-            | JobSpec::IngestManhattanTask { .. } => vec![],
+            | JobSpec::IngestManhattanTask { .. }
+            | JobSpec::IngestManhattanBatch { .. } => vec![],
         }
     }
 }
