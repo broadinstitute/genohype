@@ -135,7 +135,7 @@ export const PhenotypeBatchPanel: React.FC = () => {
             active={stageFilter === 'all'}
             onClick={() => setStageFilter('all')}
           />
-          {['queued', 'scanning', 'aggregating', 'completed', 'failed'].map((stage) => (
+          {['queued', 'scanning', 'aggregating', 'ingesting', 'completed', 'ingested', 'failed'].map((stage) => (
             <StageFilterBadge
               key={stage}
               stage={stage}
@@ -217,8 +217,12 @@ const StageFilterBadge: React.FC<{
         return 'var(--cyan)';
       case 'aggregating':
         return 'var(--orange)';
+      case 'ingesting':
+        return 'var(--purple)';
       case 'completed':
         return 'var(--green)';
+      case 'ingested':
+        return 'var(--accent)';
       case 'failed':
         return 'var(--red)';
       default:

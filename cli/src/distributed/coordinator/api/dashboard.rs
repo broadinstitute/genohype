@@ -121,6 +121,15 @@ pub(crate) fn build_dashboard_summary(data: &CoordinatorData) -> DashboardSummar
             completed: batch.completed_count,
             failed: batch.failed_count,
         })
+    } else if let JobExecutionState::Ingestion(ref ing) = data.job_state {
+        Some(DashboardBatchProgress {
+            total: ing.total_tasks,
+            queued: ing.pending_tasks.len(),
+            active_scan: ing.active_tasks.len(), // "ingesting" maps to active_scan slot
+            active_aggregate: 0,
+            completed: ing.completed_count,
+            failed: ing.failed_count,
+        })
     } else if let Some(ref last_batch) = data.last_completed_batch {
         let completed = last_batch.values().filter(|s| s.stage == "completed").count();
         let failed = last_batch.values().filter(|s| s.stage == "failed").count();
@@ -136,10 +145,18 @@ pub(crate) fn build_dashboard_summary(data: &CoordinatorData) -> DashboardSummar
         None
     };
 
+    // For ingestion jobs, show the dynamic AIMD batch size instead of the
+    // static partition batch size (which is irrelevant to ingestion).
+    let effective_batch_size = if let JobExecutionState::Ingestion(ref ing) = data.job_state {
+        ing.dynamic_batch_size
+    } else {
+        data.config.batch_size
+    };
+
     DashboardSummary {
         progress_percent,
         total_tasks: total,
-        batch_size: data.config.batch_size,
+        batch_size: effective_batch_size,
         completed_tasks: completed,
         processing_tasks: processing,
         pending_tasks: pending,

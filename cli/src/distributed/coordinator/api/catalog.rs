@@ -88,6 +88,15 @@ pub(crate) async fn get_catalog_api(
                     entry.status = status.stage.clone();
                     is_processing = true;
                 }
+            } else if let JobExecutionState::Ingestion(ref ing) = data.job_state {
+                // Check if this phenotype is currently being ingested
+                let is_active = ing.active_tasks.values().any(|(pid, anc, _, _, _)| {
+                    pid == &entry.id && anc == &entry.ancestry
+                });
+                if is_active {
+                    entry.status = "ingesting".to_string();
+                    is_processing = true;
+                }
             } else if let Some(ref last_batch) = data.last_completed_batch {
                 if let Some(status) = last_batch.get(&output_path) {
                     entry.status = status.stage.clone();

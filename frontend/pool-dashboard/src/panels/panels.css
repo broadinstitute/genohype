@@ -374,6 +374,16 @@
   color: var(--green);
 }
 
+.stage-badge.ingesting {
+  background: rgba(163, 113, 247, 0.2);
+  color: var(--purple);
+}
+
+.stage-badge.ingested {
+  background: rgba(88, 166, 255, 0.2);
+  color: var(--accent);
+}
+
 .stage-badge.failed {
   background: rgba(248, 81, 73, 0.2);
   color: var(--red);

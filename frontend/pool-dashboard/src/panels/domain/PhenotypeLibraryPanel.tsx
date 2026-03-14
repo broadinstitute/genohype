@@ -178,11 +178,12 @@ export const PhenotypeLibraryPanel: React.FC = () => {
       switch (s) {
         case 'scanning': return 0;
         case 'aggregating': return 1;
-        case 'queued': return 2;
-        case 'failed': return 3;
-        case 'completed': return 4;
-        case 'ingested': return 5;
-        default: return 6; // idle
+        case 'ingesting': return 2;
+        case 'queued': return 3;
+        case 'failed': return 4;
+        case 'completed': return 5;
+        case 'ingested': return 6;
+        default: return 7; // idle
       }
     };
 
@@ -336,6 +337,7 @@ export const PhenotypeLibraryPanel: React.FC = () => {
           <option value="scanning">Scanning</option>
           <option value="aggregating">Aggregating</option>
           <option value="completed">Completed</option>
+          <option value="ingesting">Ingesting</option>
           <option value="ingested">Ingested</option>
           <option value="failed">Failed</option>
         </select>
