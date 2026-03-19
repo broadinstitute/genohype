@@ -47,12 +47,14 @@ pub fn resolve_url(url_str: &str) -> Result<ResolvedStore> {
                 HailError::InvalidFormat("Missing bucket in S3 URL".to_string())
             })?;
             let path = url.path().trim_start_matches('/');
-            let s3 = object_store::aws::AmazonS3Builder::new()
-                .with_bucket_name(bucket)
-                .build()
-                .map_err(|e| {
-                    HailError::InvalidFormat(format!("Failed to create S3 client: {}", e))
-                })?;
+            let mut s3_builder = object_store::aws::AmazonS3Builder::from_env()
+                .with_bucket_name(bucket);
+            if std::env::var("AWS_SKIP_SIGNATURE").ok().as_deref() == Some("true") {
+                s3_builder = s3_builder.with_skip_signature(true);
+            }
+            let s3 = s3_builder.build().map_err(|e| {
+                HailError::InvalidFormat(format!("Failed to create S3 client: {}", e))
+            })?;
             Ok((Arc::new(s3), ObjPath::from(path)))
         }
         #[cfg(feature = "http")]
@@ -94,12 +96,14 @@ pub fn resolve_url_for_write(url_str: &str) -> Result<ResolvedStore> {
                 HailError::InvalidFormat("Missing bucket in S3 URL".to_string())
             })?;
             let path = url.path().trim_start_matches('/');
-            let s3 = object_store::aws::AmazonS3Builder::new()
-                .with_bucket_name(bucket)
-                .build()
-                .map_err(|e| {
-                    HailError::InvalidFormat(format!("Failed to create S3 client: {}", e))
-                })?;
+            let mut s3_builder = object_store::aws::AmazonS3Builder::from_env()
+                .with_bucket_name(bucket);
+            if std::env::var("AWS_SKIP_SIGNATURE").ok().as_deref() == Some("true") {
+                s3_builder = s3_builder.with_skip_signature(true);
+            }
+            let s3 = s3_builder.build().map_err(|e| {
+                HailError::InvalidFormat(format!("Failed to create S3 client: {}", e))
+            })?;
             Ok((Arc::new(s3), ObjPath::from(path)))
         }
         scheme => Err(HailError::InvalidFormat(format!(
