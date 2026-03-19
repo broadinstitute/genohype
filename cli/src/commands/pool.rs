@@ -132,6 +132,7 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
             zone,
             cluster,
             binary,
+            worker_binary,
             auto_stop,
             redeploy_binary,
             force,
@@ -270,12 +271,18 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
                     project: p.project.clone(),
                     with_coordinator: p.with_coordinator,
                     pool_db_path: p.pool_db_path.clone(),
+                    worker_binary: p.worker_binary.clone(),
                 }
             });
+            // Resolve worker binary: CLI flag > config profile
+            let resolved_worker_binary = worker_binary
+                .or_else(|| scaling_config.as_ref().and_then(|c| c.worker_binary.clone()));
+
             manager.submit(
                 &name,
                 &resolved_zone,
                 binary,
+                resolved_worker_binary,
                 auto_stop,
                 redeploy_binary,
                 force,
@@ -292,6 +299,7 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
             workers,
             zone,
             binary,
+            worker_binary,
             skip_build,
         } => {
             let pool_config = app_config.get_pool(&name).ok_or_else(|| {
@@ -313,10 +321,14 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
                 project: pool_config.project.clone(),
                 with_coordinator: pool_config.with_coordinator,
                 pool_db_path: pool_config.pool_db_path.clone(),
+                worker_binary: pool_config.worker_binary.clone(),
             };
 
             let resolved_zone = resolve_zone(zone, &name, app_config);
-            manager.scale(&name, workers, &resolved_zone, binary, skip_build, &scaling_config)?;
+            // Resolve worker binary: CLI flag > config profile
+            let resolved_worker_binary = worker_binary
+                .or(scaling_config.worker_binary.clone());
+            manager.scale(&name, workers, &resolved_zone, binary, resolved_worker_binary, skip_build, &scaling_config)?;
         }
         PoolCommands::Destroy {
             name,
@@ -337,6 +349,7 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
             name,
             zone,
             binary,
+            worker_binary,
             skip_build,
             via_api,
             port,
@@ -344,6 +357,9 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
             let resolved_zone = resolve_zone(zone, &name, app_config);
             let pool_config = app_config.get_pool(&name);
             let pool_db_path = pool_config.as_ref().and_then(|p| p.pool_db_path.clone());
+            // Resolve worker binary: CLI flag > config profile
+            let resolved_worker_binary = worker_binary
+                .or_else(|| pool_config.as_ref().and_then(|p| p.worker_binary.clone()));
             // CLI flag overrides config, config defaults to false
             let use_api =
                 via_api || pool_config.as_ref().map(|p| p.update_via_api).unwrap_or(false);
@@ -359,12 +375,13 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
             if use_api {
                 manager.update_binary_via_api(
                     binary,
+                    resolved_worker_binary,
                     skip_build,
                     pool_db_path.as_deref(),
                     api_port,
                 )?;
             } else {
-                manager.update_binary(&name, &resolved_zone, binary, skip_build, pool_db_path.as_deref())?;
+                manager.update_binary(&name, &resolved_zone, binary, resolved_worker_binary, skip_build, pool_db_path.as_deref())?;
             }
         }
         PoolCommands::Cancel { name, zone } => {

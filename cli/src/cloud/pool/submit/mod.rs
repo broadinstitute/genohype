@@ -188,6 +188,7 @@ EOF
         name: &str,
         zone: &str,
         binary_path: Option<String>,
+        worker_binary_path: Option<String>,
         auto_stop: bool,
         force_redeploy: bool,
         force: bool,
@@ -264,7 +265,7 @@ EOF
             );
 
             // Pass skip_build=true because we handled the build logic above
-            self.scale(name, target, zone, binary_path.clone(), true, pool_config)?;
+            self.scale(name, target, zone, binary_path.clone(), worker_binary_path.clone(), true, pool_config)?;
         }
 
         // Run the actual job
@@ -272,6 +273,7 @@ EOF
             name,
             zone,
             binary_path.clone(),
+            worker_binary_path.clone(),
             auto_stop,
             force_redeploy,
             force,
@@ -289,7 +291,7 @@ EOF
                     "Cleanup:".cyan()
                 );
                 // Ignore errors during scale down to ensure we return the job result
-                if let Err(e) = self.scale(name, 0, zone, binary_path, true, pool_config) {
+                if let Err(e) = self.scale(name, 0, zone, binary_path, worker_binary_path, true, pool_config) {
                     eprintln!("{} Failed to scale down: {}", "Warning:".yellow(), e);
                 }
             }
@@ -304,6 +306,7 @@ EOF
         name: &str,
         zone: &str,
         binary_path: Option<String>,
+        worker_binary_path: Option<String>,
         auto_stop: bool,
         force_redeploy: bool,
         force: bool,
@@ -314,6 +317,25 @@ EOF
     ) -> Result<()> {
         // 1. Locate the Linux binary (will check if needed after seeing coordinator status)
         let binary = self.locate_binary(binary_path).ok();
+
+        // Resolve worker binary (if --worker-binary specified, validate it exists)
+        let worker_binary = if let Some(ref wb_path) = worker_binary_path {
+            let path = std::path::PathBuf::from(wb_path);
+            if !path.exists() {
+                return Err(HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("Worker binary not found at: {}", wb_path),
+                )));
+            }
+            println!(
+                "{} {}",
+                "Worker binary:".cyan(),
+                path.display().to_string().bright_white()
+            );
+            Some(path)
+        } else {
+            None
+        };
 
         // 2. Get running instances
         println!("{}", "Fetching instance list...".dimmed());
@@ -403,6 +425,17 @@ EOF
                 None
             };
 
+            // Stage worker binary to GCS separately if it differs from coordinator binary
+            let worker_staging_url = if let Some(ref wb) = worker_binary {
+                if let Some(db_path) = pool_db_path {
+                    self.stage_binary_to_gcs(wb, db_path).ok()
+                } else {
+                    None
+                }
+            } else {
+                staging_url.clone() // Same binary for both
+            };
+
             if use_distributed {
                 let coord = coordinator.as_ref().unwrap();
                 let coord_ip = coord.ip().ok_or_else(|| {
@@ -421,11 +454,11 @@ EOF
                     .status();
                 std::thread::sleep(std::time::Duration::from_secs(1));
 
-                // Deploy binary to coordinator via GCS (fast) or SCP (fallback)
+                // Deploy coordinator binary (always the stock genohype binary)
                 if let Some(ref gcs_url) = staging_url {
                     println!(
                         "{}",
-                        "Deploying binary to coordinator via GCS...".dimmed()
+                        "Deploying coordinator binary via GCS...".dimmed()
                     );
                     let update_coord_cmd = format!(
                         "gsutil cp {} /tmp/genohype && chmod +x /tmp/genohype && sudo mv /tmp/genohype /usr/local/bin/genohype",
@@ -438,7 +471,7 @@ EOF
                 } else {
                     println!(
                         "{}",
-                        "Deploying binary to coordinator via SCP...".dimmed()
+                        "Deploying coordinator binary via SCP...".dimmed()
                     );
                     self.deploy_binary(binary, &[coord.clone()], zone)?;
                 }
@@ -493,36 +526,74 @@ EOF
                     )));
                 }
 
-                // Update workers via GCS (zero-SSH) or coordinator pull (fallback)
-                if let Some(ref gcs_url) = staging_url {
-                    println!(
-                        "{} Instructing workers to self-update via GCS...",
-                        "API:".cyan()
-                    );
-                    let req = serde_json::json!({ "gcs_url": gcs_url });
-                    let curl_cmd = format!(
-                        "curl -s -X POST -H 'Content-Type: application/json' -d '{}' http://localhost:3000/api/update-fleet",
-                        req.to_string()
-                    );
-                    let _ = self
-                        .provider
-                        .get_ssh_command(&coord.name, zone, &curl_cmd)
-                        .status();
-                    println!(
-                        "{} Binary update triggered for workers.",
-                        "OK".green().bold()
-                    );
+                // Deploy worker binary (custom binary if specified, otherwise same as coordinator)
+                if worker_binary.is_some() {
+                    // Custom worker binary: deploy separately to workers
+                    let wb = worker_binary.as_ref().unwrap();
+                    if let Some(ref gcs_url) = worker_staging_url {
+                        println!(
+                            "{} Deploying custom worker binary to {} workers via GCS...",
+                            "API:".cyan(),
+                            workers.len()
+                        );
+                        let req = serde_json::json!({ "gcs_url": gcs_url });
+                        let curl_cmd = format!(
+                            "curl -s -X POST -H 'Content-Type: application/json' -d '{}' http://localhost:3000/api/update-fleet",
+                            req.to_string()
+                        );
+                        let _ = self
+                            .provider
+                            .get_ssh_command(&coord.name, zone, &curl_cmd)
+                            .status();
+                        println!(
+                            "{} Custom worker binary update triggered.",
+                            "OK".green().bold()
+                        );
+                    } else {
+                        // Fallback: SCP the custom worker binary directly to workers
+                        println!(
+                            "{}",
+                            "Deploying custom worker binary to workers via SCP...".dimmed()
+                        );
+                        self.deploy_binary(wb, &workers, zone)?;
+                        println!(
+                            "{} Custom worker binary deployed to {} workers.",
+                            "OK".green().bold(),
+                            workers.len()
+                        );
+                    }
                 } else {
-                    println!(
-                        "{}",
-                        "Workers pulling binary from coordinator...".dimmed()
-                    );
-                    self.propagate_binary_from_coordinator(coord_ip, &workers, zone)?;
-                    println!(
-                        "{} Binary propagated to {} workers.",
-                        "OK".green().bold(),
-                        workers.len()
-                    );
+                    // Same binary for coordinator and workers
+                    if let Some(ref gcs_url) = staging_url {
+                        println!(
+                            "{} Instructing workers to self-update via GCS...",
+                            "API:".cyan()
+                        );
+                        let req = serde_json::json!({ "gcs_url": gcs_url });
+                        let curl_cmd = format!(
+                            "curl -s -X POST -H 'Content-Type: application/json' -d '{}' http://localhost:3000/api/update-fleet",
+                            req.to_string()
+                        );
+                        let _ = self
+                            .provider
+                            .get_ssh_command(&coord.name, zone, &curl_cmd)
+                            .status();
+                        println!(
+                            "{} Binary update triggered for workers.",
+                            "OK".green().bold()
+                        );
+                    } else {
+                        println!(
+                            "{}",
+                            "Workers pulling binary from coordinator...".dimmed()
+                        );
+                        self.propagate_binary_from_coordinator(coord_ip, &workers, zone)?;
+                        println!(
+                            "{} Binary propagated to {} workers.",
+                            "OK".green().bold(),
+                            workers.len()
+                        );
+                    }
                 }
             } else {
                 // Non-distributed mode
@@ -815,6 +886,14 @@ EOF
         } else if let crate::distributed::message::JobSpec::Stress(ref spec) = job_spec {
             println!("Stress job: queuing {} synthetic partitions", spec.partitions);
             (spec.partitions, None)
+        } else if let crate::distributed::message::JobSpec::Custom { ref manifest, tasks, .. } = job_spec {
+            let count = manifest.as_ref().map(|m| m.len()).unwrap_or(tasks);
+            if manifest.is_some() {
+                println!("Custom job: queuing {} tasks from manifest", count);
+            } else {
+                println!("Custom job: queuing {} generic tasks", count);
+            }
+            (count, None)
         } else {
             // Calculate total partitions by reading metadata locally
             println!("Reading metadata from {}...", input_path.bright_white());

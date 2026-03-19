@@ -227,6 +227,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         target_workers: usize,
         zone: &str,
         binary_path: Option<String>,
+        worker_binary_path: Option<String>,
         skip_build: bool,
         config: &crate::cloud::ScalingConfig,
     ) -> Result<()> {
@@ -296,6 +297,20 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             }
             let binary = self.locate_binary(binary_path.clone())?;
 
+            // Resolve worker binary if specified
+            let worker_bin = if let Some(ref wb_path) = worker_binary_path {
+                let path = std::path::PathBuf::from(wb_path);
+                if !path.exists() {
+                    return Err(HailError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("Worker binary not found at: {}", wb_path),
+                    )));
+                }
+                Some(path)
+            } else {
+                None
+            };
+
             // Determine indices for new workers
             // Find existing indices and create new workers at gaps or at the end
             let mut existing_indices: Vec<usize> = workers
@@ -360,8 +375,17 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                 .filter(|i| new_instances.iter().any(|n| n.name == i.name))
                 .collect();
 
-            // Deploy binary
-            if let Some(coord) = coordinator {
+            // Deploy binary to new workers
+            // If a custom worker binary is specified, always deploy it directly via SCP
+            // (can't use coordinator propagation since coordinator serves a different binary)
+            let deploy_bin = worker_bin.as_ref().unwrap_or(&binary);
+            if worker_bin.is_some() {
+                println!(
+                    "{}",
+                    "Deploying custom worker binary via SCP...".dimmed()
+                );
+                self.deploy_binary(deploy_bin, &new_worker_instances, zone)?;
+            } else if let Some(coord) = coordinator {
                 if let Some(coord_ip) = coord.ip() {
                     // Coordinator exists, check if it's running to serve binary
                     if self.check_coordinator_status(coord, zone) {
@@ -380,14 +404,14 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                             "{}",
                             "Coordinator not running, deploying via SCP...".dimmed()
                         );
-                        self.deploy_binary(&binary, &new_worker_instances, zone)?;
+                        self.deploy_binary(deploy_bin, &new_worker_instances, zone)?;
                     }
                 } else {
-                    self.deploy_binary(&binary, &new_worker_instances, zone)?;
+                    self.deploy_binary(deploy_bin, &new_worker_instances, zone)?;
                 }
             } else {
                 // No coordinator, direct SCP
-                self.deploy_binary(&binary, &new_worker_instances, zone)?;
+                self.deploy_binary(deploy_bin, &new_worker_instances, zone)?;
             }
 
             println!(

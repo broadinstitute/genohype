@@ -118,6 +118,8 @@ pub struct PoolProfile {
     pub update_via_api: Option<bool>,
     /// Port for API updates (default: 3000)
     pub update_api_port: Option<u16>,
+    /// Path to a custom binary to deploy to workers instead of the coordinator binary
+    pub worker_binary: Option<String>,
 }
 
 /// A named ClickHouse instance profile.
@@ -281,7 +283,16 @@ impl Config {
             .into_iter()
             .flatten()
             .find(|p| p.exists())
-            .and_then(|p| Self::load_file(p.to_str().unwrap()).ok());
+            .and_then(|p| {
+                let path_str = p.to_str().unwrap();
+                match Self::load_file(path_str) {
+                    Ok(cfg) => Some(cfg),
+                    Err(e) => {
+                        eprintln!("Warning: Failed to parse {}: {}", path_str, e);
+                        None
+                    }
+                }
+            });
 
         // 3. Merge user config into project config (project takes precedence for shared keys)
         if let Some(user) = user_config {
@@ -402,6 +413,7 @@ impl Config {
                 pool_db_path: profile.pool_db_path.clone(),
                 update_via_api: profile.update_via_api.unwrap_or(false),
                 update_api_port: profile.update_api_port.unwrap_or(3000),
+                worker_binary: profile.worker_binary.clone(),
             }
         })
     }
@@ -498,6 +510,8 @@ pub struct ResolvedPoolConfig {
     pub update_via_api: bool,
     /// Port for API updates
     pub update_api_port: u16,
+    /// Path to a custom binary to deploy to workers instead of the coordinator binary
+    pub worker_binary: Option<String>,
 }
 
 /// Status of a cluster deployment.

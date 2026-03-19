@@ -72,6 +72,10 @@ pub enum PoolCommands {
         #[arg(long)]
         binary: Option<String>,
 
+        /// Path to a custom binary to deploy to workers (workers get this instead of the coordinator binary)
+        #[arg(long)]
+        worker_binary: Option<String>,
+
         /// Automatically stop VMs after job completion to save costs
         #[arg(long)]
         auto_stop: bool,
@@ -122,6 +126,10 @@ pub enum PoolCommands {
         #[arg(long)]
         binary: Option<String>,
 
+        /// Path to a custom binary to deploy to workers (workers get this instead of the coordinator binary)
+        #[arg(long)]
+        worker_binary: Option<String>,
+
         /// Skip automatic Linux binary build (use existing binary)
         #[arg(long)]
         skip_build: bool,
@@ -169,6 +177,10 @@ pub enum PoolCommands {
         /// Path to the Linux-compiled binary (defaults to target/x86_64-unknown-linux-gnu/release/genohype)
         #[arg(long)]
         binary: Option<String>,
+
+        /// Path to a custom binary to deploy to workers (workers get this instead of the coordinator binary)
+        #[arg(long)]
+        worker_binary: Option<String>,
 
         /// Skip automatic Linux binary build (use existing binary)
         #[arg(long)]

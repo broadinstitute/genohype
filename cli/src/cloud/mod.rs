@@ -155,6 +155,8 @@ pub struct ScalingConfig {
     pub with_coordinator: bool,
     /// GCS path for SQLite database backup/restore
     pub pool_db_path: Option<String>,
+    /// Path to a custom binary to deploy to workers instead of the coordinator binary
+    pub worker_binary: Option<String>,
 }
 
 /// Abstract interface for cloud infrastructure operations.

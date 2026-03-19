@@ -58,6 +58,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         name: &str,
         zone: &str,
         binary_path: Option<String>,
+        worker_binary_path: Option<String>,
         skip_build: bool,
         pool_db_path: Option<&str>,
     ) -> Result<()> {
@@ -78,13 +79,32 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             Self::build_linux_binary(&[])?;
         }
 
-        // Locate the binary
+        // Locate the coordinator binary
         let binary = self.locate_binary(binary_path)?;
         println!(
             "{} {}",
             "Binary:".cyan(),
             binary.display().to_string().bright_white()
         );
+
+        // Resolve worker binary (if --worker-binary specified, validate it exists)
+        let worker_binary = if let Some(ref wb_path) = worker_binary_path {
+            let path = PathBuf::from(wb_path);
+            if !path.exists() {
+                return Err(HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("Worker binary not found at: {}", wb_path),
+                )));
+            }
+            println!(
+                "{} {}",
+                "Worker binary:".cyan(),
+                path.display().to_string().bright_white()
+            );
+            Some(path)
+        } else {
+            None
+        };
 
         // Get running instances
         println!("{}", "Fetching instance list...".dimmed());
@@ -132,13 +152,24 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             workers.len().to_string().bright_white()
         );
 
-        // Try to stage binary to GCS for fast updates
+        // Try to stage binaries to GCS for fast updates
         let pool_db_path = pool_db_path.map(|s| s.to_string());
         let staging_url = if let Some(ref db_path) = pool_db_path {
             println!("{}", "Using fast GCS staging for update...".dimmed());
             self.stage_binary_to_gcs(&binary, db_path).ok()
         } else {
             None
+        };
+
+        // Stage worker binary to GCS separately if it differs from coordinator binary
+        let worker_staging_url = if let Some(ref wb) = worker_binary {
+            if let Some(ref db_path) = pool_db_path {
+                self.stage_binary_to_gcs(wb, db_path).ok()
+            } else {
+                None
+            }
+        } else {
+            staging_url.clone() // Same binary for both
         };
 
         // Always stop any running coordinator before updating (to avoid "Address already in use")
@@ -249,8 +280,38 @@ EOF
 
         // Update workers
         if !workers.is_empty() {
-            if let Some(ref gcs_url) = staging_url {
-                // Zero-SSH fleet update: call /api/update-fleet
+            if worker_binary.is_some() {
+                // Custom worker binary: deploy separately
+                let wb = worker_binary.as_ref().unwrap();
+                if let Some(ref gcs_url) = worker_staging_url {
+                    println!(
+                        "{} Deploying custom worker binary to {} workers via GCS...",
+                        "API:".cyan(),
+                        workers.len()
+                    );
+                    let req = serde_json::json!({ "gcs_url": gcs_url });
+                    let curl_cmd = format!(
+                        "curl -s -X POST -H 'Content-Type: application/json' -d '{}' http://localhost:3000/api/update-fleet",
+                        req.to_string()
+                    );
+                    let status = self
+                        .provider
+                        .get_ssh_command(&coordinator.name, zone, &curl_cmd)
+                        .status()
+                        .map_err(HailError::Io)?;
+                    if !status.success() {
+                        println!("{}", "Warning: Failed to call /api/update-fleet".yellow());
+                    }
+                } else {
+                    // Fallback: SCP the custom worker binary directly to workers
+                    println!(
+                        "{}",
+                        "Deploying custom worker binary to workers via SCP...".dimmed()
+                    );
+                    self.deploy_binary(wb, &workers, zone)?;
+                }
+            } else if let Some(ref gcs_url) = staging_url {
+                // Same binary: zero-SSH fleet update via /api/update-fleet
                 println!(
                     "{} Instructing {} workers to self-update...",
                     "API:".cyan(),
@@ -300,6 +361,7 @@ EOF
     pub(crate) fn update_binary_via_api(
         &self,
         binary_path: Option<String>,
+        worker_binary_path: Option<String>,
         skip_build: bool,
         pool_db_path: Option<&str>,
         port: u16,
@@ -340,11 +402,31 @@ EOF
 
         let gcs_url = self.stage_binary_to_gcs(&binary, pool_db_path)?;
 
+        // Stage worker binary separately if specified
+        let worker_gcs_url = if let Some(ref wb_path) = worker_binary_path {
+            let wb = PathBuf::from(wb_path);
+            if !wb.exists() {
+                return Err(HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("Worker binary not found at: {}", wb_path),
+                )));
+            }
+            println!(
+                "{} {}",
+                "Worker binary:".cyan(),
+                wb.display().to_string().bright_white()
+            );
+            self.stage_binary_to_gcs(&wb, pool_db_path)?
+        } else {
+            gcs_url.clone()
+        };
+
         let base_url = format!("http://localhost:{}", port);
-        let payload = serde_json::json!({ "gcs_url": gcs_url }).to_string();
+        let coord_payload = serde_json::json!({ "gcs_url": gcs_url }).to_string();
+        let worker_payload = serde_json::json!({ "gcs_url": worker_gcs_url }).to_string();
 
         // Helper to call curl
-        let curl_post = |endpoint: &str| -> Result<()> {
+        let curl_post = |endpoint: &str, payload: &str| -> Result<()> {
             let output = std::process::Command::new("curl")
                 .args([
                     "-s",
@@ -355,7 +437,7 @@ EOF
                     "-H",
                     "Content-Type: application/json",
                     "-d",
-                    &payload,
+                    payload,
                     &format!("{}{}", base_url, endpoint),
                 ])
                 .output()
@@ -417,7 +499,7 @@ EOF
 
         // Update coordinator
         println!("{} Updating coordinator via API...", "HTTP:".cyan());
-        curl_post("/api/update-coordinator")?;
+        curl_post("/api/update-coordinator", &coord_payload)?;
 
         println!(
             "{} Coordinator restarting with new binary...",
@@ -450,7 +532,7 @@ EOF
 
         // Trigger fleet update immediately - workers will get the signal when they poll
         println!("{} Triggering worker updates via API...", "HTTP:".cyan());
-        curl_post("/api/update-fleet")?;
+        curl_post("/api/update-fleet", &worker_payload)?;
 
         // Wait for workers to re-register and update
         // Workers poll every ~1s, so we wait for them to show up with recent heartbeats
