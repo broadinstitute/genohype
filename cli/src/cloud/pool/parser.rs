@@ -4,6 +4,7 @@ use super::PoolManager;
 use crate::cloud::CloudProvider;
 use crate::HailError;
 use crate::Result;
+use owo_colors::OwoColorize;
 
 impl<P: CloudProvider + Sync> PoolManager<P> {
     /// Parse a command array into a JobSpec and input path.
@@ -63,6 +64,11 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         // Handle 'stress' command
         if cmd == "stress" {
             return Self::parse_stress_command(&command[1..]);
+        }
+
+        // Handle 'custom' command
+        if cmd == "custom" {
+            return Self::parse_custom_command(&command[1..]);
         }
 
         // Expect: export <type> <input> <output> [args...]
@@ -1135,5 +1141,97 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
 
         // Use input_dir as the "input_path" for job tracking
         Ok((input_dir, spec, Vec::new(), Vec::new()))
+    }
+
+    /// Parse a `custom` command into a Custom job.
+    ///
+    /// Supports:
+    ///   custom --payload '{"clickhouse_url": "..."}' --tasks 100
+    ///   custom --payload '{"clickhouse_url": "..."}' --manifest manifest.json
+    ///
+    /// When --manifest is provided, the file should contain a JSON array of task entries.
+    /// Each entry becomes a separate task with the entry as its payload.
+    /// --tasks is ignored when --manifest is present (task count = manifest length).
+    pub(crate) fn parse_custom_command(
+        args: &[String],
+    ) -> Result<(String, crate::distributed::message::JobSpec, Vec<String>, Vec<String>)> {
+        use crate::distributed::message::JobSpec;
+
+        let mut payload_str = "{}".to_string();
+        let mut tasks = 1;
+        let mut manifest_path: Option<String> = None;
+
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--payload" => {
+                    if i + 1 < args.len() {
+                        payload_str = args[i + 1].clone();
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                "--tasks" => {
+                    if i + 1 < args.len() {
+                        tasks = args[i + 1].parse().unwrap_or(1);
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                "--manifest" => {
+                    if i + 1 < args.len() {
+                        manifest_path = Some(args[i + 1].clone());
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                _ => i += 1,
+            }
+        }
+
+        let payload: serde_json::Value = serde_json::from_str(&payload_str).map_err(|e| {
+            HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Invalid JSON payload: {}", e),
+            ))
+        })?;
+
+        // Load manifest from file if provided
+        let manifest = if let Some(path) = manifest_path {
+            let content = std::fs::read_to_string(&path).map_err(|e| {
+                HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("Failed to read manifest file '{}': {}", path, e),
+                ))
+            })?;
+            let entries: Vec<serde_json::Value> = serde_json::from_str(&content).map_err(|e| {
+                HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Invalid manifest JSON in '{}': {}", path, e),
+                ))
+            })?;
+            if entries.is_empty() {
+                return Err(HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Manifest file '{}' contains an empty array", path),
+                )));
+            }
+            println!(
+                "  {} {} tasks from manifest '{}'",
+                "Loaded".green(),
+                entries.len().to_string().bright_white(),
+                path
+            );
+            tasks = entries.len(); // Override tasks count
+            Some(entries)
+        } else {
+            None
+        };
+
+        let spec = JobSpec::Custom { payload, tasks, manifest };
+        Ok(("custom".to_string(), spec, Vec::new(), Vec::new()))
     }
 }

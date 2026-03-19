@@ -842,10 +842,19 @@ async fn get_work(
             data.completed_tasks.len()
         );
 
+        // For Custom jobs, send the inner payload (e.g. {"clickhouse_url": "..."})
+        // instead of the entire serialized JobSpec enum wrapper.
+        // This lets custom worker binaries read payload fields directly.
+        let work_payload = if let JobSpec::Custom { ref payload, .. } = job_spec {
+            payload.clone()
+        } else {
+            serde_json::to_value(&job_spec).unwrap_or_default()
+        };
+
         axum::Json(WorkResponse::Task {
             tasks,
             input_path: data.config.input_path.clone(),
-            payload: serde_json::to_value(&job_spec).unwrap_or_default(),
+            payload: work_payload,
             total_tasks: data.config.total_tasks,
             filters: data.config.filters.clone(),
             intervals: data.config.intervals.clone(),

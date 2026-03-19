@@ -230,6 +230,20 @@ pub enum JobSpec {
     },
     /// Synthetic workload for testing cluster telemetry and autoscaling
     Stress(StressSpec),
+    /// Generic custom job payload for external worker binaries
+    ///
+    /// If `manifest` is provided, each entry becomes a separate task with the entry
+    /// embedded in the task descriptor's payload. This allows the coordinator to
+    /// distribute domain-specific work (e.g., S3 file URIs) without understanding
+    /// the payload format. `tasks` is ignored when `manifest` is present.
+    ///
+    /// If `manifest` is absent, `tasks` generic numbered tasks are created.
+    Custom {
+        payload: serde_json::Value,
+        tasks: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        manifest: Option<Vec<serde_json::Value>>,
+    },
 }
 
 /// A single ingestion task within a batch.
@@ -661,6 +675,7 @@ impl JobSpec {
             JobSpec::IngestManhattanTask { .. } => "ingest manhattan task",
             JobSpec::IngestManhattanBatch { .. } => "ingest manhattan batch",
             JobSpec::Stress(_) => "synthetic stress test",
+            JobSpec::Custom { .. } => "custom payload",
         }
     }
 
@@ -690,6 +705,7 @@ impl JobSpec {
             JobSpec::IngestManhattanTask { base_path, .. } => Some(base_path),
             JobSpec::IngestManhattanBatch { tasks, .. } => tasks.first().map(|t| t.base_path.as_str()),
             JobSpec::Stress(spec) => spec.write_dir.as_deref(),
+            JobSpec::Custom { .. } => None,
         }
     }
 
@@ -817,6 +833,63 @@ impl JobSpec {
                     )
                 })
                 .collect(),
+
+            JobSpec::Custom { tasks, manifest, .. } => {
+                if let Some(entries) = manifest {
+                    // Manifest-backed: one task per manifest entry with entry as task payload
+                    let total = entries.len();
+                    entries
+                        .iter()
+                        .enumerate()
+                        .map(|(i, entry)| {
+                            // Derive a dashboard label: explicit "label" field, or first
+                            // string value in the object (often a URI/name), or fallback to index
+                            let label = entry.get("label")
+                                .and_then(|v| v.as_str())
+                                .map(String::from)
+                                .or_else(|| {
+                                    // Use first string value as label (e.g. a URI, name, or path)
+                                    entry.as_object().and_then(|obj| {
+                                        obj.values()
+                                            .find_map(|v| v.as_str())
+                                            .map(|s| s.rsplit('/').next().unwrap_or(s).to_string())
+                                    })
+                                })
+                                .unwrap_or_else(|| format!("Task {}", i + 1));
+
+                            // Each manifest entry should be a JSON object with
+                            // domain-specific fields the custom binary interprets.
+                            // Pass it through as the task payload — the custom binary interprets it.
+                            let task_payload = entry.clone();
+
+                            TaskDescriptor {
+                                id: format!("custom_{}", i),
+                                task_type: "custom".to_string(),
+                                label: Some(label),
+                                index: Some(i),
+                                total: Some(total),
+                                payload: task_payload,
+                            }
+                        })
+                        .collect()
+                } else {
+                    // Count-backed: N generic tasks (legacy behavior)
+                    (0..*tasks)
+                        .map(|i| {
+                            TaskType::Custom {
+                                name: "custom_task".to_string(),
+                                metadata: std::collections::HashMap::new(),
+                            }
+                            .into_descriptor(
+                                format!("custom_{}", i),
+                                Some(format!("Custom Task {}", i + 1)),
+                                Some(i),
+                                Some(*tasks),
+                            )
+                        })
+                        .collect()
+                }
+            }
 
             // These job types have specialized runtime-managed queues or are single tasks
             JobSpec::Validate { .. }
