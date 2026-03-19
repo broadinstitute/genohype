@@ -282,6 +282,11 @@ pub fn dispatch_job(
             let rows = handlers::stress::process_stress(partitions, spec, telemetry)?;
             Ok((rows, None, cached_engine))
         }
+        JobSpec::Custom { .. } => {
+            // Custom jobs are handled by external binaries, not the genohype worker
+            eprintln!("Custom job dispatched to genohype worker — this should not happen");
+            Ok((0, None, cached_engine))
+        }
     }
 }
 

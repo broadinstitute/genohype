@@ -101,6 +101,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             crate::distributed::message::JobSpec::ExportParquet { .. }
             | crate::distributed::message::JobSpec::ExportJson { .. } => Some(256), // 256MB
             crate::distributed::message::JobSpec::Summary => Some(64), // 64MB, very light
+            crate::distributed::message::JobSpec::Custom { .. } => Some(512), // Safe default for external bins
             _ => None,
         });
 
