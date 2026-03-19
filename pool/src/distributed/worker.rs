@@ -4,7 +4,7 @@
 //! and delegates task execution to a `TaskHandler` implementation.
 
 use crate::distributed::message::{
-    CompleteRequest, HeartbeatRequest, TelemetrySnapshot, WorkRequest, WorkResponse,
+    CompleteRequest, HeartbeatRequest, WorkRequest, WorkResponse,
 };
 use crate::traits::TaskHandler;
 use std::sync::Arc;
@@ -21,6 +21,8 @@ pub struct WorkerConfig {
     pub poll_interval_ms: u64,
     /// Connection timeout in seconds
     pub connect_timeout_secs: u64,
+    /// Git commit hash or package version of the worker binary
+    pub build_version: Option<String>,
 }
 
 impl Default for WorkerConfig {
@@ -30,6 +32,7 @@ impl Default for WorkerConfig {
             coordinator_url: "http://localhost:3000".to_string(),
             poll_interval_ms: 1000,
             connect_timeout_secs: 10,
+            build_version: None,
         }
     }
 }
@@ -57,9 +60,13 @@ pub async fn run_worker(
     config: WorkerConfig,
     handler: Arc<dyn TaskHandler>,
 ) -> Result<(), anyhow::Error> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::signal::unix::{signal, SignalKind};
+    use crate::distributed::telemetry::SystemMetrics;
+
     println!(
-        "Worker {} starting, connecting to {}",
-        config.worker_id, config.coordinator_url
+        "Worker {} starting (version: {:?}), connecting to {}",
+        config.worker_id, config.build_version, config.coordinator_url
     );
 
     let client = reqwest::Client::builder()
@@ -70,9 +77,23 @@ pub async fn run_worker(
     let work_url = format!("{}/work", config.coordinator_url);
     let complete_url = format!("{}/complete", config.coordinator_url);
 
+    // Initialize System Metrics Collector
+    let metrics = Arc::new(SystemMetrics::new());
+
+    // Register Graceful Shutdown Hook (SIGTERM)
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let shutdown_clone = shutdown_flag.clone();
+    tokio::spawn(async move {
+        if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
+            sigterm.recv().await;
+            println!("SIGTERM received. Finishing current task before shutting down...");
+            shutdown_clone.store(true, Ordering::SeqCst);
+        }
+    });
+
     loop {
         // Request work from coordinator
-        let work_response = match request_work(&client, &work_url, &config.worker_id).await {
+        let work_response = match request_work(&client, &work_url, &config).await {
             Ok(resp) => resp,
             Err(e) => {
                 eprintln!(
@@ -121,14 +142,17 @@ pub async fn run_worker(
                     let client = client.clone();
                     let heartbeat_url = format!("{}/heartbeat", config.coordinator_url);
                     let worker_id = config.worker_id.clone();
+                    let build_version = config.build_version.clone();
+                    let metrics = metrics.clone();
+
                     tokio::spawn(async move {
                         loop {
                             tokio::select! {
                                 _ = tokio::time::sleep(Duration::from_secs(10)) => {
                                     let req = HeartbeatRequest {
                                         worker_id: worker_id.clone(),
-                                        telemetry: TelemetrySnapshot::empty(),
-                                        build_version: None,
+                                        telemetry: metrics.snapshot(10.0),
+                                        build_version: build_version.clone(),
                                     };
                                     let _ = client.post(&heartbeat_url).json(&req).send().await;
                                 }
@@ -148,6 +172,7 @@ pub async fn run_worker(
                 let (items_processed, result_json, error) = match result {
                     Ok(task_result) => {
                         if task_result.is_success() {
+                            metrics.record_task_completion(task_result.items_processed);
                             (task_result.items_processed, task_result.result_json, None)
                         } else {
                             (0, None, task_result.error)
@@ -176,9 +201,44 @@ pub async fn run_worker(
                 );
             }
             WorkResponse::UpdateBinary { gcs_url } => {
-                println!("Received UpdateBinary request: {}", gcs_url);
-                // TODO: Implement binary update logic
+                println!("Received UpdateBinary request. Self-updating from {}", gcs_url);
+
+                async fn update_logic(client: &reqwest::Client, url: &str) -> anyhow::Result<()> {
+                    use std::os::unix::fs::PermissionsExt;
+
+                    // Download to temp file
+                    let resp = client.get(url).send().await?;
+                    let bytes = resp.bytes().await?;
+                    let tmp_path = "/tmp/genohype-update";
+                    std::fs::write(tmp_path, &bytes)?;
+
+                    // Make executable and replace target
+                    std::fs::set_permissions(tmp_path, std::fs::Permissions::from_mode(0o755))?;
+                    std::fs::rename(tmp_path, "/usr/local/bin/genohype")?;
+
+                    // Restart via systemd
+                    std::process::Command::new("sudo")
+                        .args(["systemctl", "restart", "genohype-worker"])
+                        .spawn()?;
+
+                    Ok(())
+                }
+
+                if let Err(e) = update_logic(&client, &gcs_url).await {
+                    eprintln!("Failed to perform self-update: {}. Continuing with old binary.", e);
+                    continue;
+                }
+
+                // Give systemd a moment to cleanly terminate us
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                break;
             }
+        }
+
+        // Evaluate graceful shutdown after each operation
+        if shutdown_flag.load(std::sync::atomic::Ordering::SeqCst) {
+            println!("Graceful shutdown active: Exiting worker loop safely.");
+            break;
         }
     }
 
@@ -189,12 +249,12 @@ pub async fn run_worker(
 async fn request_work(
     client: &reqwest::Client,
     url: &str,
-    worker_id: &str,
+    config: &WorkerConfig,
 ) -> Result<WorkResponse, anyhow::Error> {
     let request = WorkRequest {
-        worker_id: worker_id.to_string(),
+        worker_id: config.worker_id.clone(),
         hardware: None,
-        build_version: None, // Pool crate doesn't have GIT_HASH; CLI worker sets this
+        build_version: config.build_version.clone(),
     };
 
     let response = client.post(url).json(&request).send().await?;

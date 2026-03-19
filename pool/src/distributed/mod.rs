@@ -5,6 +5,7 @@
 
 pub mod coordinator;
 pub mod message;
+pub mod telemetry;
 pub mod worker;
 
 // Re-export message types
