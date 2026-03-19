@@ -330,6 +330,40 @@ pub struct TelemetrySnapshot {
     pub prefetch_depth: Option<usize>,
 }
 
+impl TelemetrySnapshot {
+    /// Create a minimal empty snapshot for keepalive heartbeats.
+    pub fn empty() -> Self {
+        Self {
+            timestamp_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            cpu_percent: None,
+            memory_used_bytes: None,
+            memory_total_bytes: None,
+            items_per_sec: 0.0,
+            total_items: 0,
+            active_partition: None,
+            partitions_completed: 0,
+            cpu_per_core: None,
+            disk_read_bytes_sec: None,
+            disk_write_bytes_sec: None,
+            disk_used_bytes: None,
+            disk_total_bytes: None,
+            network_rx_bytes_sec: None,
+            network_tx_bytes_sec: None,
+            core_tasks: None,
+            current_batch_size: None,
+            max_batch_capacity: None,
+            current_phenotype_id: None,
+            current_phase: None,
+            current_source: None,
+            current_ancestry: None,
+            prefetch_depth: None,
+        }
+    }
+}
+
 /// Heartbeat request from worker to coordinator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatRequest {

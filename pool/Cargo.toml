@@ -17,5 +17,8 @@ tokio = { version = "1.35", features = ["rt-multi-thread", "net", "time"] }
 # HTTP client (worker)
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 
+# Cancellation token for background heartbeat
+tokio-util = "0.7"
+
 # UUID for task/worker IDs
 uuid = { version = "1.0", features = ["v4"] }

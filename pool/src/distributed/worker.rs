@@ -3,7 +3,9 @@
 //! This module provides a generic worker that polls a coordinator for work
 //! and delegates task execution to a `TaskHandler` implementation.
 
-use crate::distributed::message::{CompleteRequest, WorkRequest, WorkResponse};
+use crate::distributed::message::{
+    CompleteRequest, HeartbeatRequest, TelemetrySnapshot, WorkRequest, WorkResponse,
+};
 use crate::traits::TaskHandler;
 use std::sync::Arc;
 use std::time::Duration;
@@ -110,8 +112,38 @@ pub async fn run_worker(
                     task_labels
                 );
 
+                // Spawn background heartbeat to keep coordinator from marking us dead
+                // during long-running tasks. The heartbeat runs every 10s and stops
+                // when the task completes (cancel token is dropped).
+                let heartbeat_cancel = tokio_util::sync::CancellationToken::new();
+                let heartbeat_handle = {
+                    let cancel = heartbeat_cancel.clone();
+                    let client = client.clone();
+                    let heartbeat_url = format!("{}/heartbeat", config.coordinator_url);
+                    let worker_id = config.worker_id.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            tokio::select! {
+                                _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                                    let req = HeartbeatRequest {
+                                        worker_id: worker_id.clone(),
+                                        telemetry: TelemetrySnapshot::empty(),
+                                        build_version: None,
+                                    };
+                                    let _ = client.post(&heartbeat_url).json(&req).send().await;
+                                }
+                                _ = cancel.cancelled() => break,
+                            }
+                        }
+                    })
+                };
+
                 // Execute the task using the handler
                 let result = handler.handle_task(&payload, tasks).await;
+
+                // Stop heartbeat
+                heartbeat_cancel.cancel();
+                let _ = heartbeat_handle.await;
 
                 let (items_processed, result_json, error) = match result {
                     Ok(task_result) => {
