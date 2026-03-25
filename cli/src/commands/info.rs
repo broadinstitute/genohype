@@ -6,12 +6,15 @@ use genohype_core::Result;
 use owo_colors::OwoColorize;
 
 pub fn show_info(table_path: &str) -> Result<()> {
-    // Check if this is a VCF file
-    if table_path.ends_with(".vcf")
+    // Check if this is a VCF or BED file
+    let is_vcf = table_path.ends_with(".vcf")
         || table_path.ends_with(".vcf.gz")
-        || table_path.ends_with(".vcf.bgz")
-    {
-        println!("{}", "VCF File Information".bold().underline());
+        || table_path.ends_with(".vcf.bgz");
+    let is_bed = table_path.ends_with(".bed.gz") || table_path.ends_with(".bed.bgz");
+
+    if is_vcf || is_bed {
+        let label = if is_vcf { "VCF" } else { "BED" };
+        println!("{}", format!("{} File Information", label).bold().underline());
         println!();
         println!("{} {}", "Path:".green(), table_path.bright_white());
         println!();
@@ -21,7 +24,7 @@ pub fn show_info(table_path: &str) -> Result<()> {
 
         println!(
             "{} {}",
-            "Contigs:".green(),
+            "Partitions (contigs):".green(),
             engine.num_partitions().to_string().bright_white()
         );
         println!("{}", "Row Schema:".green());

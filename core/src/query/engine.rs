@@ -3,6 +3,7 @@
 //! Provides a high-level API for querying Hail tables and other genomic data sources.
 //! Delegates actual data access to implementations of the `DataSource` trait.
 
+use crate::bed::BedDataSource;
 use crate::codec::{EncodedType, EncodedValue};
 use crate::datasource::DataSource;
 use crate::hail_adapter::HailTableSource;
@@ -82,6 +83,13 @@ impl QueryEngine {
             let vcf_source = VcfDataSource::new(table_path)?;
             Ok(QueryEngine {
                 source: Box::new(vcf_source),
+                hail_source: None,
+            })
+        } else if table_path.ends_with(".bed.gz") || table_path.ends_with(".bed.bgz") {
+            // BED file (Tabix-indexed)
+            let bed_source = BedDataSource::new(table_path)?;
+            Ok(QueryEngine {
+                source: Box::new(bed_source),
                 hail_source: None,
             })
         } else {

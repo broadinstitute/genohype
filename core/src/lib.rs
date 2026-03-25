@@ -17,6 +17,7 @@
 //! 3. Blocking Buffer - provides fixed-size buffering
 //! 4. LEB128 Buffer - decodes variable-length integers
 
+pub mod bed;
 pub mod buffer;
 pub mod codec;
 pub mod datasource;
