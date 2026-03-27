@@ -960,7 +960,7 @@ async fn complete_work(
 
                 let next_batch = if clamped_target > current_batch {
                     // Additive Increase / Slow Start: grow safely up to the optimal target
-                    let growth = (current_batch / 4).max(2);
+                    let growth = (current_batch / 10).max(1);
                     (current_batch + growth).min(clamped_target)
                 } else {
                     // Multiplicative Decrease (soft): instantly drop to the optimal target if taking too long
@@ -1437,11 +1437,11 @@ async fn handle_heartbeat(
         }
 
         // Phase 3: Memory-based batch reduction heuristic
-        // If memory usage exceeds 85%, aggressively slash batch size to prevent OOM
+        // If memory usage exceeds 80%, aggressively slash batch size to prevent OOM
         if let (Some(used), Some(total)) = (req.telemetry.memory_used_bytes, req.telemetry.memory_total_bytes) {
             if total > 0 {
                 let mem_usage_pct = (used as f64 / total as f64) * 100.0;
-                if mem_usage_pct > 85.0 {
+                if mem_usage_pct > 80.0 {
                     // Aggressively slash batch size to prevent OOM
                     let current_batch = w.current_batch_size.unwrap_or(default_batch_size);
                     let new_batch = (current_batch / 2).max(1);

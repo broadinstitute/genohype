@@ -23,6 +23,7 @@ pub(crate) fn determine_batch_size(
             Some(JobSpec::ManhattanScan(_))
             | Some(JobSpec::ManhattanBatch { .. })
             | Some(JobSpec::Manhattan { .. }) => 1.0,
+            Some(JobSpec::ExportClickhouse { .. }) => 1.0,
             Some(JobSpec::Summary) => 3.0,
             _ => 1.5,
         };
@@ -34,6 +35,7 @@ pub(crate) fn determine_batch_size(
             Some(JobSpec::ManhattanScan(_))
             | Some(JobSpec::ManhattanBatch { .. })
             | Some(JobSpec::Manhattan { .. }) => 1024, // 1GB per partition for Manhattan
+            Some(JobSpec::ExportClickhouse { .. }) => 1024, // 1GB per partition for ClickHouse buffered inserts
             Some(JobSpec::ExportParquet { .. }) | Some(JobSpec::ExportJson { .. }) => 256, // 256MB
             Some(JobSpec::Summary) => 64, // 64MB, very light
             _ => 500,
