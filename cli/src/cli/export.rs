@@ -126,6 +126,16 @@ pub struct ExportClickhouseArgs {
 
     /// Target table name in ClickHouse
     pub table: String,
+
+    /// Glob pattern to match multiple input files (e.g., "*.bed.gz")
+    /// When specified, input is treated as a directory and files matching the glob are processed
+    #[arg(long)]
+    pub glob: Option<String>,
+
+    /// Add a column with the filename stem (without extension) as its value
+    /// Useful for injecting sample_id from filenames like HG002.model.pbmm2.combined.bed.gz
+    #[arg(long)]
+    pub filename_column: Option<String>,
 }
 
 #[cfg(feature = "clickhouse")]

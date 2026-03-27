@@ -2,6 +2,7 @@
 
 use crate::cli::ExportClickhouseArgs;
 use crate::commands::utils::{parse_export_filters, parse_export_intervals, progress_style_spinner};
+use genohype_core::codec::{EncodedField, EncodedType, EncodedValue};
 use genohype_core::export::clickhouse::generate_create_table;
 use genohype_core::export::ClickHouseClient;
 use genohype_core::parquet::{build_record_batch, ParquetWriter};
@@ -9,13 +10,280 @@ use genohype_core::query::QueryEngine;
 use genohype_core::Result;
 use indicatif::ProgressBar;
 use owo_colors::OwoColorize;
+use std::path::Path;
 use uuid::Uuid;
+
+/// Check if a path is a cloud URL (gs://, s3://, http://, https://)
+fn is_cloud_path(path: &str) -> bool {
+    path.starts_with("gs://") || path.starts_with("s3://") || path.starts_with("http")
+}
+
+/// List files in a cloud directory matching a glob pattern.
+/// Uses object_store to list objects and filters by the glob pattern.
+fn list_cloud_files(dir_url: &str, pattern: &str) -> Result<Vec<String>> {
+    use futures::StreamExt;
+    use genohype_core::io::resolve_url;
+
+    let (store, prefix) = resolve_url(dir_url)?;
+
+    // Build a simple glob matcher from the pattern (supports * and ?)
+    let glob_matcher = glob::Pattern::new(pattern).map_err(|e| {
+        genohype_core::HailError::InvalidFormat(format!("Invalid glob pattern: {}", e))
+    })?;
+
+    // Reconstruct base URL for building full file paths
+    let parsed_url = url::Url::parse(dir_url).map_err(|e| {
+        genohype_core::HailError::InvalidFormat(format!("Invalid URL: {}", e))
+    })?;
+    let scheme = parsed_url.scheme().to_string();
+    let host = parsed_url.host_str().unwrap_or("").to_string();
+    let base_path = parsed_url.path().trim_end_matches('/').to_string();
+
+    // List objects using tokio runtime (blocking from sync context)
+    let rt = tokio::runtime::Runtime::new().map_err(|e| {
+        genohype_core::HailError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+    })?;
+
+    let mut files: Vec<String> = rt.block_on(async {
+        let mut stream = store.list(Some(&prefix));
+        let mut results = Vec::new();
+        while let Some(item) = stream.next().await {
+            if let Ok(meta) = item {
+                let filename = meta.location.filename().unwrap_or_default().to_string();
+                if glob_matcher.matches(&filename)
+                    && !filename.ends_with(".tbi")
+                    && !filename.ends_with(".csi")
+                {
+                    let full_url = format!("{}://{}/{}/{}", scheme, host, base_path.trim_start_matches('/'), filename);
+                    results.push(full_url);
+                }
+            }
+        }
+        results
+    });
+
+    files.sort();
+
+    if files.is_empty() {
+        return Err(genohype_core::HailError::InvalidFormat(format!(
+            "No files matched glob pattern '{}' in '{}'",
+            pattern, dir_url
+        )));
+    }
+
+    Ok(files)
+}
+
+/// Resolve input files: if --glob is provided, treat input as a directory and match files.
+/// Supports both local filesystem globs and cloud storage (gs://, s3://) listing.
+/// Otherwise, return a single-element vec with the input path.
+fn resolve_input_files(input: &str, glob_pattern: Option<&str>) -> Result<Vec<String>> {
+    match glob_pattern {
+        Some(pattern) => {
+            if is_cloud_path(input) {
+                list_cloud_files(input, pattern)
+            } else {
+                // Local filesystem glob
+                let dir = Path::new(input);
+                let full_pattern = dir.join(pattern);
+                let pattern_str = full_pattern.to_string_lossy();
+
+                let mut files: Vec<String> = glob::glob(&pattern_str)
+                    .map_err(|e| {
+                        genohype_core::HailError::InvalidFormat(format!(
+                            "Invalid glob pattern: {}",
+                            e
+                        ))
+                    })?
+                    .filter_map(|entry| entry.ok())
+                    .filter(|p| !p.to_string_lossy().ends_with(".tbi"))
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect();
+
+                files.sort();
+
+                if files.is_empty() {
+                    return Err(genohype_core::HailError::InvalidFormat(format!(
+                        "No files matched glob pattern '{}' in '{}'",
+                        pattern, input
+                    )));
+                }
+
+                Ok(files)
+            }
+        }
+        None => Ok(vec![input.to_string()]),
+    }
+}
+
+/// Extract the filename stem (first component before '.') from a path.
+/// e.g., "HG002.model.pbmm2.combined.bed.gz" -> "HG002"
+fn extract_filename_stem(path: &str) -> String {
+    let filename = Path::new(path)
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    // Take the first component before '.' to get the sample ID
+    filename.split('.').next().unwrap_or(&filename).to_string()
+}
+
+/// Add a filename column to the schema
+fn augment_schema(schema: &EncodedType, column_name: &str) -> EncodedType {
+    match schema {
+        EncodedType::EBaseStruct {
+            required, fields, ..
+        } => {
+            let mut new_fields = fields.clone();
+            new_fields.push(EncodedField {
+                name: column_name.to_string(),
+                encoded_type: EncodedType::EBinary { required: true },
+                index: new_fields.len(),
+            });
+            EncodedType::EBaseStruct {
+                required: *required,
+                fields: new_fields,
+            }
+        }
+        other => other.clone(),
+    }
+}
+
+/// Add a filename column value to each row
+fn augment_row(row: EncodedValue, column_name: &str, value: &str) -> EncodedValue {
+    match row {
+        EncodedValue::Struct(mut fields) => {
+            fields.push((
+                column_name.to_string(),
+                EncodedValue::Binary(value.as_bytes().to_vec()),
+            ));
+            EncodedValue::Struct(fields)
+        }
+        other => other,
+    }
+}
+
+/// Export a single file to ClickHouse, returning the number of rows written
+fn export_single_file(
+    file_path: &str,
+    args: &ExportClickhouseArgs,
+    client: &ClickHouseClient,
+    table_created: bool,
+    filename_column: Option<&str>,
+) -> Result<u64> {
+    let where_filters = parse_export_filters(args);
+    let intervals = parse_export_intervals(args)?;
+
+    println!(
+        "  {} {}",
+        "Processing:".cyan(),
+        file_path.bright_white()
+    );
+
+    // Open the query engine for this file
+    let engine = QueryEngine::open_path(file_path)?;
+    let row_type = engine.row_type().clone();
+
+    // Augment schema if filename column is requested
+    let effective_schema = match filename_column {
+        Some(col) => augment_schema(&row_type, col),
+        None => row_type.clone(),
+    };
+
+    // Create table on first file only
+    if !table_created {
+        println!("{}", "  Generating CREATE TABLE DDL...".dimmed());
+        let ddl = generate_create_table(&args.table, &effective_schema, engine.key_fields())
+            .map_err(|e| genohype_core::HailError::InvalidFormat(e.to_string()))?;
+        println!("{}", ddl.dimmed());
+
+        client.execute(&ddl).map_err(|e| {
+            genohype_core::HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string(),
+            ))
+        })?;
+        println!("  {}", "Table created (or already exists)".green());
+    }
+
+    // Convert filtered rows to temporary Parquet file
+    let temp_path = format!("/tmp/hail_export_{}.parquet", Uuid::new_v4());
+
+    let mut writer = ParquetWriter::new(&temp_path, &effective_schema)?;
+    let arrow_schema = writer.schema().clone();
+
+    let iterator = engine.query_iter_with_intervals(&where_filters, intervals)?;
+
+    let iterator: Box<dyn Iterator<Item = _>> = if let Some(n) = args.common.limit {
+        Box::new(iterator.take(n))
+    } else {
+        Box::new(iterator)
+    };
+
+    let batch_size = 10000;
+    let mut batch_rows = Vec::with_capacity(batch_size);
+    let mut total_rows: u64 = 0;
+
+    let filename_stem = extract_filename_stem(file_path);
+
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(progress_style_spinner());
+
+    for row_result in iterator {
+        let row = row_result?;
+        let row = match filename_column {
+            Some(col) => augment_row(row, col, &filename_stem),
+            None => row,
+        };
+        batch_rows.push(row);
+        total_rows += 1;
+
+        if batch_rows.len() >= batch_size {
+            pb.set_message(format!("{} rows processed...", total_rows));
+            let batch = build_record_batch(&batch_rows, &effective_schema, arrow_schema.clone())?;
+            writer.write_batch(&batch)?;
+            batch_rows.clear();
+        }
+    }
+
+    if !batch_rows.is_empty() {
+        let batch = build_record_batch(&batch_rows, &effective_schema, arrow_schema.clone())?;
+        writer.write_batch(&batch)?;
+    }
+
+    pb.finish_and_clear();
+    writer.close()?;
+
+    // Insert into ClickHouse
+    if total_rows > 0 {
+        client.insert_parquet(&args.table, &temp_path).map_err(|e| {
+            genohype_core::HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string(),
+            ))
+        })?;
+    }
+
+    // Clean up temp file
+    if let Err(e) = std::fs::remove_file(&temp_path) {
+        eprintln!(
+            "{} Failed to remove temp file {}: {}",
+            "Warning:".yellow(),
+            temp_path,
+            e
+        );
+    }
+
+    println!(
+        "  {} {}",
+        "Wrote".green(),
+        format!("{} rows", total_rows).bright_white()
+    );
+
+    Ok(total_rows)
+}
 
 /// Export a Hail table to ClickHouse with optional filtering
 pub fn run_export_clickhouse(args: ExportClickhouseArgs) -> Result<()> {
-    let where_filters = parse_export_filters(&args);
-    let intervals = parse_export_intervals(&args)?;
-
     println!(
         "{} {}",
         "Exporting to ClickHouse:".green().bold(),
@@ -31,140 +299,55 @@ pub fn run_export_clickhouse(args: ExportClickhouseArgs) -> Result<()> {
         "Target table:".cyan(),
         args.table.bright_white()
     );
-    if !where_filters.is_empty() {
-        println!(
-            "  {} {:?}",
-            "Filters:".cyan(),
-            where_filters
-                .iter()
-                .map(|r| r.field_path_str())
-                .collect::<Vec<_>>()
-        );
+    if let Some(ref glob) = args.glob {
+        println!("  {} {}", "Glob pattern:".cyan(), glob.bright_white());
     }
-    if let Some(ref ivl) = intervals {
-        println!(
-            "  {} {} intervals",
-            "Interval filter:".cyan(),
-            ivl.len().to_string().bright_white()
-        );
-    }
-    if let Some(l) = args.common.limit {
+    if let Some(ref col) = args.filename_column {
         println!(
             "  {} {}",
-            "Row limit:".cyan(),
-            l.to_string().bright_white()
+            "Filename column:".cyan(),
+            col.bright_white()
         );
     }
     println!();
 
-    // Step 1: Open the query engine
-    println!("{}", "Reading table metadata...".dimmed());
-    let engine = QueryEngine::open_path(&args.common.input)?;
-    let row_type = engine.row_type().clone();
-    println!(
-        "  {} {}",
-        "Partitions:".cyan(),
-        engine.num_partitions().to_string().bright_white()
-    );
-    println!("  {} {:?}", "Key fields:".cyan(), engine.key_fields());
-    println!();
+    // Resolve input files
+    let input_files = resolve_input_files(&args.common.input, args.glob.as_deref())?;
+    let num_files = input_files.len();
 
-    // Step 2: Create ClickHouse client and generate DDL
+    if num_files > 1 {
+        println!(
+            "{} {} files to process",
+            "Multi-file mode:".green().bold(),
+            num_files.to_string().bright_white()
+        );
+        println!();
+    }
+
     let client = ClickHouseClient::new(&args.url);
+    let mut grand_total: u64 = 0;
 
-    println!("{}", "Generating CREATE TABLE DDL...".dimmed());
-    let ddl = generate_create_table(&args.table, &row_type, engine.key_fields())
-        .map_err(|e| genohype_core::HailError::InvalidFormat(e.to_string()))?;
-    println!("{}", ddl.dimmed());
-    println!();
-
-    // Step 3: Execute CREATE TABLE
-    println!("{}", "Creating table in ClickHouse...".dimmed());
-    client.execute(&ddl).map_err(|e| {
-        genohype_core::HailError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            e.to_string(),
-        ))
-    })?;
-    println!("  {}", "Table created (or already exists)".green());
-    println!();
-
-    // Step 4: Convert filtered rows to temporary Parquet file
-    let temp_path = format!("/tmp/hail_export_{}.parquet", Uuid::new_v4());
-    println!("{}", "Converting to temporary Parquet file...".dimmed());
-    println!("  {} {}", "Temp file:".cyan(), temp_path.dimmed());
-
-    // Create writer and get schema
-    let mut writer = ParquetWriter::new(&temp_path, &row_type)?;
-    let arrow_schema = writer.schema().clone();
-
-    // Use streaming query with filters and intervals
-    let iterator = engine.query_iter_with_intervals(&where_filters, intervals)?;
-
-    // Apply limit if specified
-    let iterator: Box<dyn Iterator<Item = _>> = if let Some(n) = args.common.limit {
-        Box::new(iterator.take(n))
-    } else {
-        Box::new(iterator)
-    };
-
-    // Collect rows in batches for efficient parquet writing
-    let batch_size = 10000;
-    let mut batch_rows = Vec::with_capacity(batch_size);
-    let mut total_rows = 0;
-
-    // Progress indicator
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(progress_style_spinner());
-
-    for row_result in iterator {
-        let row = row_result?;
-        batch_rows.push(row);
-        total_rows += 1;
-
-        if batch_rows.len() >= batch_size {
-            pb.set_message(format!("{} rows processed...", total_rows));
-            let batch = build_record_batch(&batch_rows, &row_type, arrow_schema.clone())?;
-            writer.write_batch(&batch)?;
-            batch_rows.clear();
+    for (i, file_path) in input_files.iter().enumerate() {
+        if num_files > 1 {
+            println!(
+                "\n{} [{}/{}]",
+                "File".cyan().bold(),
+                (i + 1).to_string().bright_white(),
+                num_files.to_string().bright_white()
+            );
         }
+
+        let rows = export_single_file(
+            file_path,
+            &args,
+            &client,
+            i > 0, // table_created = true after first file
+            args.filename_column.as_deref(),
+        )?;
+        grand_total += rows;
     }
 
-    // Write remaining rows
-    if !batch_rows.is_empty() {
-        let batch = build_record_batch(&batch_rows, &row_type, arrow_schema.clone())?;
-        writer.write_batch(&batch)?;
-    }
-
-    pb.finish_and_clear();
-    writer.close()?;
-    println!(
-        "  {} {}",
-        "Converted".green(),
-        format!("{} rows", total_rows).bright_white()
-    );
-    println!();
-
-    // Step 5: Insert Parquet data into ClickHouse
-    println!("{}", "Inserting data into ClickHouse...".dimmed());
-    client.insert_parquet(&args.table, &temp_path).map_err(|e| {
-        genohype_core::HailError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            e.to_string(),
-        ))
-    })?;
-
-    // Step 6: Clean up temp file
-    if let Err(e) = std::fs::remove_file(&temp_path) {
-        eprintln!(
-            "{} Failed to remove temp file {}: {}",
-            "Warning:".yellow(),
-            temp_path,
-            e
-        );
-    }
-
-    // Step 7: Verify
+    // Verify final count
     let row_count = client.count_rows(&args.table).map_err(|e| {
         genohype_core::HailError::Io(std::io::Error::new(
             std::io::ErrorKind::Other,
@@ -175,9 +358,11 @@ pub fn run_export_clickhouse(args: ExportClickhouseArgs) -> Result<()> {
     println!();
     println!("{}", "Export complete!".green().bold());
     println!(
-        "  {} {}",
+        "  {} {} (from {} files, {} rows written this session)",
         "Rows in ClickHouse table:".cyan(),
-        row_count.to_string().bright_white()
+        row_count.to_string().bright_white(),
+        num_files,
+        grand_total,
     );
 
     Ok(())
