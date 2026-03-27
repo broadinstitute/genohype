@@ -159,7 +159,10 @@ impl ClickHouseClient {
         };
 
         Self {
-            client: reqwest::blocking::Client::new(),
+            client: reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(300))
+                .build()
+                .unwrap_or_else(|_| reqwest::blocking::Client::new()),
             base_url,
             auth,
         }
