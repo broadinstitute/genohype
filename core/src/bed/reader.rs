@@ -628,20 +628,46 @@ impl DataSource for BedDataSource {
     fn query_stream_with_intervals(
         &self,
         ranges: &[KeyRange],
-        _intervals: Option<Arc<IntervalList>>,
+        intervals: Option<Arc<IntervalList>>,
     ) -> Result<Box<dyn Iterator<Item = Result<EncodedValue>> + Send>> {
         // Try indexed query first
         if let Some(ref index) = self.index {
+            // Convert --where ranges to a region
             if let Some(region) = self.ranges_to_region(ranges) {
                 debug!("BED: using indexed query for region {:?}", region);
                 return self.indexed_query(&region, index, ranges);
+            }
+
+            // Convert --interval to regions for tabix
+            if let Some(ref interval_list) = intervals {
+                use noodles::core::Position;
+                let mut all_results: Vec<Result<EncodedValue>> = Vec::new();
+
+                for contig in interval_list.contigs() {
+                    if let Some(ranges_for_contig) = interval_list.intervals_for_contig(contig) {
+                        for range in ranges_for_contig {
+                            let start = *range.start() as usize;
+                            let end = *range.end() as usize;
+                            let start_pos = Position::try_from(start.max(1)).unwrap_or(Position::MIN);
+                            let end_pos = Position::try_from(end).unwrap_or(Position::MAX);
+                            let region = Region::new(contig.as_str(), start_pos..=end_pos);
+
+                            debug!("BED: indexed query for interval {}:{}-{}", contig, start, end);
+                            let iter = self.indexed_query(&region, index, ranges)?;
+                            all_results.extend(iter);
+                        }
+                    }
+                }
+
+                info!("BED: indexed interval query returned {} records", all_results.len());
+                return Ok(Box::new(all_results.into_iter()));
             }
         }
 
         // Fall back to full scan with filtering
         debug!("BED: falling back to full scan");
         let iter = self.full_scan_iter()?;
-        if ranges.is_empty() {
+        if ranges.is_empty() && intervals.is_none() {
             Ok(iter)
         } else {
             let ranges = ranges.to_vec();
