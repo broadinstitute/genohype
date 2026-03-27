@@ -159,8 +159,9 @@ fn build_genotypes_array(header: &Header) -> Result<EncodedType> {
     }
 
     // Array of structs (one per sample)
+    // Not required because indexed queries may skip genotype parsing
     Ok(EncodedType::EArray {
-        required: true,
+        required: false,
         element: Box::new(EncodedType::EBaseStruct {
             required: true,
             fields,

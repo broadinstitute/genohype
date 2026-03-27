@@ -210,8 +210,11 @@ pub fn record_to_row_lazy(header: &Header, record: &Record) -> Result<EncodedVal
     let info = convert_info_lazy(header, record)?;
     fields.push(("info".to_string(), info));
 
-    // Skip genotypes for indexed queries (performance optimization)
-    // Most indexed queries are for variant lookup, not sample data
+    // 7. genotypes: Array[Struct] (if samples exist)
+    if !header.sample_names().is_empty() {
+        let genotypes = convert_genotypes_lazy(header, record)?;
+        fields.push(("genotypes".to_string(), genotypes));
+    }
 
     Ok(EncodedValue::Struct(fields))
 }
@@ -419,6 +422,62 @@ fn convert_genotypes(header: &Header, record: &RecordBuf) -> Result<EncodedValue
                 EncodedValue::Null
             };
             fields.push((format_key_str, val));
+        }
+
+        genotype_list.push(EncodedValue::Struct(fields));
+    }
+
+    Ok(EncodedValue::Array(genotype_list))
+}
+
+/// Convert genotypes from a lazy Record to EncodedValue array.
+/// Uses the concrete Samples type's `select` and `iter` methods for efficiency.
+fn convert_genotypes_lazy(header: &Header, record: &Record) -> Result<EncodedValue> {
+    let samples_data = record.samples();
+    let sample_names = header.sample_names();
+    let num_samples = sample_names.len();
+
+    if samples_data.is_empty() || num_samples == 0 {
+        return Ok(EncodedValue::Array(Vec::new()));
+    }
+
+    // Get the format keys present in this record
+    let format_keys: Vec<&str> = samples_data.keys().iter().collect();
+
+    // Collect format field names from the header (superset of what's in this record)
+    let header_format_keys: Vec<String> = header.formats().keys().map(|k| k.to_string()).collect();
+
+    // Iterate row-by-row using the Sample iterator
+    let mut genotype_list = Vec::with_capacity(num_samples);
+
+    for (sample_idx, sample_name) in sample_names.iter().enumerate() {
+        let mut fields = Vec::with_capacity(header_format_keys.len() + 1);
+
+        // Sample ID
+        fields.push((
+            "sample_id".to_string(),
+            EncodedValue::Binary(sample_name.to_string().into_bytes()),
+        ));
+
+        // Get this sample's data
+        let sample = samples_data.get_index(sample_idx);
+
+        // Format fields - iterate over header format keys to match schema
+        for header_key in &header_format_keys {
+            let val = if let Some(ref s) = sample {
+                // Find this key's index in the record's format keys
+                if let Some(key_idx) = format_keys.iter().position(|k| k == header_key) {
+                    match s.get_index(header, key_idx) {
+                        Some(Some(Ok(value))) => convert_sample_value_from_series(&value),
+                        _ => EncodedValue::Null,
+                    }
+                } else {
+                    EncodedValue::Null
+                }
+            } else {
+                EncodedValue::Null
+            };
+            fields.push((header_key.clone(), val));
         }
 
         genotype_list.push(EncodedValue::Struct(fields));
