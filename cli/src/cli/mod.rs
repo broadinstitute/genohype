@@ -39,6 +39,9 @@ pub enum Commands {
     Info {
         /// Path to the Hail table or VCF file
         path: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// Scan full dataset to calculate row counts and field statistics (slow)

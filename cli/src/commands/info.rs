@@ -18,7 +18,11 @@ fn format_number(n: usize) -> String {
     result
 }
 
-pub fn show_info(table_path: &str) -> Result<()> {
+pub fn show_info(table_path: &str, json: bool) -> Result<()> {
+    if json {
+        return show_info_json(table_path);
+    }
+
     // Check if this is a VCF or BED file
     let is_vcf = table_path.ends_with(".vcf")
         || table_path.ends_with(".vcf.gz")
@@ -169,5 +173,68 @@ pub fn show_info(table_path: &str) -> Result<()> {
         println!("{}", format_schema_clean(&rvd_spec.codec_spec.v_type));
     }
 
+    Ok(())
+}
+
+fn show_info_json(table_path: &str) -> Result<()> {
+    let is_vcf = table_path.ends_with(".vcf")
+        || table_path.ends_with(".vcf.gz")
+        || table_path.ends_with(".vcf.bgz");
+    let is_bed = table_path.ends_with(".bed.gz") || table_path.ends_with(".bed.bgz");
+
+    if is_vcf || is_bed {
+        let format = if is_vcf { "vcf" } else { "bed" };
+        let engine = QueryEngine::open_path(table_path)?;
+        let info = serde_json::json!({
+            "path": table_path,
+            "format": format,
+            "partitions": engine.num_partitions(),
+            "schema": format!("{:?}", engine.row_type()),
+        });
+        println!("{}", serde_json::to_string_pretty(&info)?);
+        return Ok(());
+    }
+
+    // Hail Table
+    let metadata_path = genohype_core::io::join_path(table_path, "metadata.json.gz");
+    let metadata = match genohype_core::io::get_reader(&metadata_path) {
+        Ok(mut reader) => {
+            let mut data = Vec::new();
+            std::io::Read::read_to_end(&mut reader, &mut data)?;
+            genohype_core::schema::Metadata::from_gzipped_json(&data)?
+        }
+        Err(e) => {
+            return Err(e.into());
+        }
+    };
+
+    let engine = QueryEngine::open_path(table_path)?;
+
+    let mut info = serde_json::json!({
+        "path": table_path,
+        "format": "hail_table",
+        "file_version": metadata.file_version,
+        "hail_version": metadata.hail_version,
+        "key_fields": engine.key_fields(),
+        "partitions": engine.num_partitions(),
+        "has_index": engine.has_index(),
+    });
+
+    if let Some(total_rows) = engine.total_rows() {
+        info["total_rows"] = serde_json::json!(total_rows);
+    }
+
+    if let Some(rvd_spec) = engine.rvd_spec() {
+        if let Some(ref index_spec) = rvd_spec.index_spec {
+            info["index"] = serde_json::json!({
+                "path": index_spec.rel_path,
+                "key_type": index_spec.key_type,
+            });
+        }
+
+        info["schema"] = serde_json::json!(format_schema_clean(&rvd_spec.codec_spec.v_type));
+    }
+
+    println!("{}", serde_json::to_string_pretty(&info)?);
     Ok(())
 }

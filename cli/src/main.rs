@@ -56,7 +56,7 @@ fn main() -> Result<()> {
     let config = config::Config::load_from_path(cli.config.as_deref());
 
     match cli.command {
-        Commands::Info { path } => show_info(&path)?,
+        Commands::Info { path, json } => show_info(&path, json)?,
         Commands::Summary { path } => run_summary(&path)?,
         Commands::Query(args) => run_query(args)?,
         Commands::Export { command } => match command {
