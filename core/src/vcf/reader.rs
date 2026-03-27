@@ -56,7 +56,7 @@ impl VcfDataSource {
         let is_bgzf = path.ends_with(".gz") || path.ends_with(".bgz");
 
         // Read header
-        let header = if is_bgzf {
+        let mut header = if is_bgzf {
             let reader = crate::io::get_reader(path)?;
             let bgzf_reader = bgzf::Reader::new(reader);
             let mut vcf_reader = vcf::io::Reader::new(BufReader::new(bgzf_reader));
@@ -66,6 +66,12 @@ impl VcfDataSource {
             let mut vcf_reader = vcf::io::Reader::new(BufReader::new(reader));
             vcf_reader.read_header().map_err(HailError::Io)?
         };
+
+        // Patch FORMAT fields: convert Type=Character to Type=String.
+        // Some VCFs (e.g., HPRC) encode Character fields without comma separators
+        // (e.g., RNC=".." instead of ".,." ), which noodles rejects. Treating them
+        // as String avoids the parse error and is lossless for export.
+        Self::patch_character_formats(&mut header);
 
         // Extract contig information from header (for lengths)
         let (header_contigs, header_lengths) = Self::extract_contigs(&header);
@@ -130,6 +136,20 @@ impl VcfDataSource {
             contigs,
             contig_lengths,
         })
+    }
+
+    /// Rewrite any FORMAT fields with Type=Character to Type=String.
+    /// This avoids noodles strict single-character validation which rejects
+    /// VCFs that encode multi-character values without comma separators.
+    fn patch_character_formats(header: &mut vcf::Header) {
+        use noodles::vcf::header::record::value::map::format::Type;
+
+        for (id, fmt) in header.formats_mut().iter_mut() {
+            if fmt.ty() == Type::Character {
+                *fmt.type_mut() = Type::String;
+                warn!("Patched FORMAT/{} from Type=Character to Type=String", id);
+            }
+        }
     }
 
     /// Extract contig names and lengths from the VCF header
@@ -306,14 +326,28 @@ impl VcfDataSource {
         let header_clone = header.clone();
         let ranges = ranges.to_vec();
         let records: Vec<Result<EncodedValue>> = query
-            .map(|result| {
-                result
-                    .map_err(HailError::Io)
-                    .and_then(|record| super::codec::record_to_row_lazy(&header_clone, &record))
-            })
-            .filter(|result| match result {
-                Ok(row) => ranges.is_empty() || row_matches_ranges(row, &ranges),
-                Err(_) => true,
+            .filter_map(|result| {
+                match result {
+                    Ok(record) => {
+                        match super::codec::record_to_row_lazy(&header_clone, &record) {
+                            Ok(row) => {
+                                if ranges.is_empty() || row_matches_ranges(&row, &ranges) {
+                                    Some(Ok(row))
+                                } else {
+                                    None
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Skipping VCF record (conversion error): {}", e);
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Skipping VCF record (query error): {}", e);
+                        None
+                    }
+                }
             })
             .collect();
 
@@ -347,18 +381,32 @@ impl VcfDataSource {
             .query(&header, region)
             .map_err(HailError::Io)?;
 
-        // Collect records eagerly (same as local)
+        // Collect records eagerly (same as local), skipping unparseable records
         let header_clone = header.clone();
         let ranges = ranges.to_vec();
         let records: Vec<Result<EncodedValue>> = query
-            .map(|result| {
-                result
-                    .map_err(HailError::Io)
-                    .and_then(|record| super::codec::record_to_row_lazy(&header_clone, &record))
-            })
-            .filter(|result| match result {
-                Ok(row) => ranges.is_empty() || row_matches_ranges(row, &ranges),
-                Err(_) => true,
+            .filter_map(|result| {
+                match result {
+                    Ok(record) => {
+                        match super::codec::record_to_row_lazy(&header_clone, &record) {
+                            Ok(row) => {
+                                if ranges.is_empty() || row_matches_ranges(&row, &ranges) {
+                                    Some(Ok(row))
+                                } else {
+                                    None
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Skipping VCF record (conversion error): {}", e);
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Skipping VCF record (query error): {}", e);
+                        None
+                    }
+                }
             })
             .collect();
 
@@ -377,11 +425,28 @@ impl<R: BufRead + Send + 'static> Iterator for VcfRecordIterator<R> {
     type Item = Result<EncodedValue>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut record = vcf::variant::RecordBuf::default();
-        match self.reader.read_record_buf(&self.header, &mut record) {
-            Ok(0) => None, // EOF
-            Ok(_) => Some(super::codec::record_to_row(&self.header, &record)),
-            Err(e) => Some(Err(HailError::Io(e))),
+        loop {
+            let mut record = vcf::variant::RecordBuf::default();
+            match self.reader.read_record_buf(&self.header, &mut record) {
+                Ok(0) => return None, // EOF
+                Ok(_) => {
+                    match super::codec::record_to_row(&self.header, &record) {
+                        Ok(row) => return Some(Ok(row)),
+                        Err(e) => {
+                            // Skip records that fail conversion (e.g., malformed SVLEN,
+                            // non-standard field values). Log and continue.
+                            warn!("Skipping VCF record (conversion error): {}", e);
+                            continue;
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Skip records that noodles can't parse (e.g., non-standard
+                    // Character field encoding). Log and continue.
+                    warn!("Skipping VCF record (parse error): {}", e);
+                    continue;
+                }
+            }
         }
     }
 }
