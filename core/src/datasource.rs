@@ -118,6 +118,13 @@ pub trait DataSource: Send + Sync {
         ))
     }
 
+    /// Get the total number of rows in the data source, if known from metadata
+    ///
+    /// Returns `None` if the count cannot be determined without a full data scan.
+    fn total_rows(&self) -> Option<usize> {
+        None
+    }
+
     /// Sample random rows from the data source
     ///
     /// Returns a random sample of rows. Implementations may optimize this

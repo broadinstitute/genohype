@@ -117,6 +117,11 @@ impl QueryEngine {
         self.source.num_partitions()
     }
 
+    /// Get the total number of rows (if available from metadata)
+    pub fn total_rows(&self) -> Option<usize> {
+        self.source.total_rows()
+    }
+
     /// Check if this table has indexes
     pub fn has_index(&self) -> bool {
         // Only Hail tables have indexes in the current implementation

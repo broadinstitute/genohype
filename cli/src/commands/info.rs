@@ -5,6 +5,19 @@ use genohype_core::summary::format_schema_clean;
 use genohype_core::Result;
 use owo_colors::OwoColorize;
 
+/// Format a number with comma separators (e.g., 40535147 → "40,535,147")
+fn format_number(n: usize) -> String {
+    let s = n.to_string();
+    let mut result = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    result
+}
+
 pub fn show_info(table_path: &str) -> Result<()> {
     // Check if this is a VCF or BED file
     let is_vcf = table_path.ends_with(".vcf")
@@ -93,6 +106,13 @@ pub fn show_info(table_path: &str) -> Result<()> {
         "Partitions:".green(),
         engine.num_partitions().to_string().bright_white()
     );
+    if let Some(total_rows) = engine.total_rows() {
+        println!(
+            "{} {}",
+            "Total Rows:".green(),
+            format_number(total_rows).bright_white()
+        );
+    }
     if engine.has_index() {
         println!("{} {}", "Index:".green(), "Yes".bright_green());
     } else {

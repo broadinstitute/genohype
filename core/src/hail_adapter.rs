@@ -344,6 +344,31 @@ impl DataSource for HailTableSource {
         self.rvd_spec.part_files.len()
     }
 
+    fn total_rows(&self) -> Option<usize> {
+        let index_spec = self.rvd_spec.index_spec.as_ref()?;
+        let index_rel_path = index_spec.rel_path.trim_start_matches("../");
+        let index_base = join_path(&self.table_path, index_rel_path);
+
+        let total: usize = self
+            .rvd_spec
+            .part_files
+            .par_iter()
+            .map(|part_file| {
+                let metadata_path =
+                    join_path(&index_base, &format!("{}.idx/metadata.json.gz", part_file));
+                match crate::index::IndexMetadata::from_path(&metadata_path) {
+                    Ok(meta) => meta.n_keys,
+                    Err(e) => {
+                        warn!("Failed to read index metadata for {}: {}", part_file, e);
+                        0
+                    }
+                }
+            })
+            .sum();
+
+        Some(total)
+    }
+
     fn scan_partition_stream(
         &self,
         partition_idx: usize,
