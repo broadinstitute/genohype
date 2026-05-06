@@ -141,6 +141,14 @@ pub fn init_clickhouse_tables(
             .execute(create_sql)
             .map_err(|e| format!("Failed to create table {}: {}", table_name, e))?;
         println!("    Created table: {}", table_name);
+
+        // Clean up any orphaned temp tables from previous crashed jobs
+        if let Err(e) = client.cleanup_orphaned_temp_tables(table_name) {
+            println!(
+                "    Warning: Failed to clean up orphaned tables for {}: {}",
+                table_name, e
+            );
+        }
     }
 
     println!("  Table initialization complete.");

@@ -61,6 +61,14 @@ pub(crate) async fn submit_job(
                 .execute(&create_sql)
                 .map_err(|e| format!("Failed to create table {}: {}", table_name_clone, e))?;
 
+            // Clean up any orphaned temp tables from previous crashed jobs
+            if let Err(e) = client.cleanup_orphaned_temp_tables(&table_name_clone) {
+                println!(
+                    "    Warning: Failed to clean up orphaned tables for {}: {}",
+                    table_name_clone, e
+                );
+            }
+
             println!("    Created table: {}", table_name_clone);
             Ok(())
         })

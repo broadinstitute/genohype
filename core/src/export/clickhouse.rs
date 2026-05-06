@@ -124,6 +124,7 @@ pub fn generate_create_table(
 }
 
 /// ClickHouse HTTP client for executing queries and inserting data
+#[derive(Clone)]
 pub struct ClickHouseClient {
     client: reqwest::blocking::Client,
     base_url: String,
@@ -242,6 +243,40 @@ impl ClickHouseClient {
             return Err(ClickHouseError::Query(text));
         }
 
+        Ok(())
+    }
+
+    /// Clean up orphaned temporary tables created by failed/crashed workers.
+    ///
+    /// Finds tables matching `{target_table}_part_%` in the current database
+    /// and drops them. This prevents storage leaks from workers that crashed
+    /// before their `TempTableGuard` could run.
+    pub fn cleanup_orphaned_temp_tables(&self, target_table: &str) -> Result<()> {
+        let query = format!(
+            "SELECT name FROM system.tables WHERE name LIKE '{}\\_part\\_%' AND database = currentDatabase() FORMAT JSON",
+            target_table
+        );
+
+        let response = match self.execute(&query) {
+            Ok(res) => res,
+            Err(e) => {
+                return Err(ClickHouseError::Query(format!(
+                    "Failed to query orphaned tables: {}",
+                    e
+                )))
+            }
+        };
+
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&response) {
+            if let Some(data) = parsed.get("data").and_then(|d| d.as_array()) {
+                for row in data {
+                    if let Some(name) = row.get("name").and_then(|n| n.as_str()) {
+                        let drop_sql = format!("DROP TABLE IF EXISTS `{}`", name);
+                        let _ = self.execute(&drop_sql); // Best effort
+                    }
+                }
+            }
+        }
         Ok(())
     }
 

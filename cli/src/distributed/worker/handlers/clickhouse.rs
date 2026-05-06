@@ -8,6 +8,23 @@ use genohype_core::query::QueryEngine;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+/// RAII guard that drops a temporary ClickHouse table when it goes out of scope.
+///
+/// Ensures cleanup even if the partition processing panics or returns an error.
+/// Note: if the worker VM crashes (e.g. spot preemption), the Drop won't run —
+/// orphaned tables are cleaned up by the coordinator at job start.
+struct TempTableGuard {
+    client: genohype_core::export::ClickHouseClient,
+    table_name: String,
+}
+
+impl Drop for TempTableGuard {
+    fn drop(&mut self) {
+        let drop_sql = format!("DROP TABLE IF EXISTS `{}`", self.table_name);
+        let _ = self.client.execute(&drop_sql);
+    }
+}
+
 /// A simple counting semaphore for limiting concurrency.
 ///
 /// Used to bound memory usage by limiting how many partitions are processed
@@ -172,21 +189,46 @@ pub fn process_clickhouse_export(
                     // tx is dropped here, closing the channel
                 });
 
-                // Consumer: receive chunks and upload to ClickHouse
+                // Consumer: receive chunks and upload to ClickHouse via temp table
                 let client = ClickHouseClient::new(&url_clone);
                 let ts = telemetry_clone;
+
+                // Create a unique temp table for atomic partition insert
+                let temp_table = format!(
+                    "{}_part_{}_{}",
+                    table_clone,
+                    partition_id,
+                    uuid::Uuid::new_v4().simple()
+                );
+
+                let create_temp = format!(
+                    "CREATE TABLE `{}` AS `{}` ENGINE = MergeTree() ORDER BY tuple()",
+                    temp_table, table_clone
+                );
+                if let Err(e) = client.execute(&create_temp) {
+                    return Err(crate::HailError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Failed to create temporary table {}: {}", temp_table, e),
+                    )));
+                }
+
+                // RAII guard ensures temp table is dropped on exit (success or failure)
+                let _guard = TempTableGuard {
+                    client: client.clone(),
+                    table_name: temp_table.clone(),
+                };
 
                 let mut partition_rows = 0;
                 let mut chunks_uploaded = 0;
                 const BATCH_SIZE: usize = 4096; // Internal batching for Parquet writing
 
-                // Receive and upload chunks until channel closes
+                // Receive and upload chunks to the temp table
                 for batch_res in rx {
                     let batch = batch_res?;
 
                     let uploaded = upload_chunk_to_clickhouse(
                         &client,
-                        &table_clone,
+                        &temp_table,
                         &batch,
                         row_type_ref,
                         arrow_schema_ref.clone(),
@@ -208,6 +250,25 @@ pub fn process_clickhouse_export(
                         );
                     }
                 }
+
+                // Atomic commit: move all rows from temp table to target table
+                if partition_rows > 0 {
+                    let commit_sql = format!(
+                        "INSERT INTO `{}` SELECT * FROM `{}`",
+                        table_clone, temp_table
+                    );
+                    if let Err(e) = client.execute(&commit_sql) {
+                        return Err(crate::HailError::Io(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!(
+                                "Failed to commit partition {} to target table: {}",
+                                partition_id, e
+                            ),
+                        )));
+                    }
+                }
+
+                // _guard is dropped here, cleaning up the temp table
 
                 println!(
                     "  Partition {} complete: {} rows in {} chunk(s) uploaded to ClickHouse",
