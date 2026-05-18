@@ -184,16 +184,26 @@ fn partition_overlaps_intervals(partition: &Interval, intervals: &IntervalList) 
                         }
                     }
 
-                    // Check any contigs in between (by checking all contigs in the interval list)
-                    // This is approximate - we don't know the actual contig order
-                    // So we check if any other contig in the interval list exists
+                    // Check contigs that are genomically between start and end
+                    let sc_idx = contig_sort_index(sc);
+                    let ec_idx = contig_sort_index(ec);
                     for contig in intervals.contigs() {
                         if contig != sc && contig != ec {
                             if let Some(ranges) = intervals.intervals_for_contig(contig) {
                                 if !ranges.is_empty() {
-                                    // There are intervals on a contig that might be between start and end
-                                    // Be conservative and include this partition
-                                    return true;
+                                    // Use genomic ordering to check if this contig is between start and end
+                                    match (sc_idx, ec_idx, contig_sort_index(contig)) {
+                                        (Some(si), Some(ei), Some(ci)) => {
+                                            if ci >= si && ci <= ei {
+                                                return true;
+                                            }
+                                            // Otherwise this contig is outside the partition range, skip
+                                        }
+                                        _ => {
+                                            // Unknown contig ordering, be conservative
+                                            return true;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -206,6 +216,22 @@ fn partition_overlaps_intervals(partition: &Interval, intervals: &IntervalList) 
         }
         _ => true, // If no locus field, be conservative and include the partition
     }
+}
+
+/// Map a contig name to its sort index in standard reference genomes.
+fn contig_sort_index(name: &str) -> Option<usize> {
+    const GRCH38: &[&str] = &[
+        "chr1", "chr2", "chr3", "chr4", "chr5", "chr6", "chr7", "chr8", "chr9", "chr10",
+        "chr11", "chr12", "chr13", "chr14", "chr15", "chr16", "chr17", "chr18", "chr19", "chr20",
+        "chr21", "chr22", "chrX", "chrY", "chrM",
+    ];
+    const GRCH37: &[&str] = &[
+        "1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
+        "11", "12", "13", "14", "15", "16", "17", "18", "19", "20",
+        "21", "22", "X", "Y", "MT",
+    ];
+    GRCH38.iter().position(|&c| c == name)
+        .or_else(|| GRCH37.iter().position(|&c| c == name))
 }
 
 #[cfg(test)]

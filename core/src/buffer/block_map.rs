@@ -8,7 +8,6 @@
 //! from decompressed offsets to compressed file positions. This enables
 //! seeking directly to the relevant block instead of reading from the beginning.
 
-use crate::io::{is_cloud_path, range_read};
 use crate::Result;
 use std::io::{Read, Seek, SeekFrom};
 
@@ -82,61 +81,55 @@ impl BlockMap {
         Ok(BlockMap { blocks })
     }
 
-    /// Build a block map by scanning block headers from a cloud path
+    /// Build a block map from either a local or cloud path
     ///
-    /// For cloud paths, this uses range requests to fetch only the block headers.
-    /// This is more efficient than downloading the entire file.
-    ///
-    /// # Arguments
-    /// * `path` - Cloud URL to the partition file (gs://, s3://, etc.)
-    /// * `file_size` - Total size of the file in bytes
-    pub fn build_from_cloud_path(path: &str, file_size: u64) -> Result<Self> {
+    /// Uses `crate::io::get_reader()` which returns a `PrefetchingCloudReader` for
+    /// cloud paths (streaming via 32MB prefetch chunks) or a local file reader.
+    /// This replaces the old `build_from_cloud_path` which made N sequential HTTP
+    /// range requests (one per block header), causing massive latency on remote files.
+    pub fn build_from_path(path: &str) -> Result<Self> {
+        let reader = crate::io::get_reader(path)?;
+        Self::build_from_reader(reader)
+    }
+
+    /// Build a block map from any reader that implements Read + Seek
+    pub fn build_from_reader<R: Read + Seek>(mut reader: R) -> Result<Self> {
         let mut blocks = Vec::new();
-        let mut file_offset = 0u64;
         let mut decompressed_offset = 0u64;
 
-        while file_offset < file_size {
+        loop {
+            let file_offset = reader.seek(SeekFrom::Current(0))?;
+
             // Read block length header (4 bytes)
-            let len_buf = range_read(path, file_offset, 4)?;
-            if len_buf.len() < 4 {
-                break;
+            let mut len_buf = [0u8; 4];
+            match reader.read_exact(&mut len_buf) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e.into()),
             }
-            let block_len = u32::from_le_bytes([len_buf[0], len_buf[1], len_buf[2], len_buf[3]]) as usize;
+            let block_len = u32::from_le_bytes(len_buf) as usize;
 
             if block_len < 4 {
                 break;
             }
 
-            // Read decompressed size (first 4 bytes of block data, at file_offset + 4)
-            let size_buf = range_read(path, file_offset + 4, 4)?;
-            if size_buf.len() < 4 {
-                break;
-            }
-            let decompressed_size = i32::from_le_bytes([size_buf[0], size_buf[1], size_buf[2], size_buf[3]]) as u32;
+            // Read decompressed size (first 4 bytes of block data)
+            let mut size_buf = [0u8; 4];
+            reader.read_exact(&mut size_buf)?;
+            let decompressed_size = i32::from_le_bytes(size_buf) as u32;
+
+            // Skip rest of compressed data
+            reader.seek(SeekFrom::Current((block_len - 4) as i64))?;
 
             blocks.push(BlockEntry {
                 file_offset,
                 decompressed_offset,
                 decompressed_size,
             });
-
             decompressed_offset += decompressed_size as u64;
-            file_offset += 4 + block_len as u64; // 4-byte header + block data
         }
 
         Ok(BlockMap { blocks })
-    }
-
-    /// Build a block map from either a local or cloud path
-    ///
-    /// Automatically detects the path type and uses the appropriate method.
-    pub fn build_from_path(path: &str) -> Result<Self> {
-        if is_cloud_path(path) {
-            let file_size = crate::io::get_file_size(path)?;
-            Self::build_from_cloud_path(path, file_size)
-        } else {
-            Self::build_from_local_path(path)
-        }
     }
 
     /// Find the block containing the given decompressed offset

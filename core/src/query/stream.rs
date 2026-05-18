@@ -20,6 +20,8 @@ pub struct PartitionStream {
     row_type: EncodedType,
     ranges: Vec<KeyRange>,
     intervals: Option<Arc<IntervalList>>,
+    /// Whether early termination has been triggered (row past interval bounds)
+    terminated: bool,
 }
 
 impl PartitionStream {
@@ -35,27 +37,38 @@ impl PartitionStream {
             row_type,
             ranges,
             intervals: None,
+            terminated: false,
         }
     }
 
-    /// Create a new partition stream with interval filtering
+    /// Create a new partition stream with interval filtering and optional seek offset
     ///
     /// # Arguments
     /// * `buffer` - The initialized buffer for reading partition data
     /// * `row_type` - The row schema for decoding
     /// * `ranges` - Key range filters to apply
     /// * `intervals` - Optional interval list for genomic region filtering
+    /// * `seek_local_offset` - Bytes to skip in the decompressed stream before decoding.
+    ///   This is the local offset within a block, obtained from the index seek.
     pub fn with_intervals(
-        buffer: Box<dyn InputBuffer>,
+        mut buffer: Box<dyn InputBuffer>,
         row_type: EncodedType,
         ranges: Vec<KeyRange>,
         intervals: Option<Arc<IntervalList>>,
+        seek_local_offset: usize,
     ) -> Self {
+        // Advance the decompressed stream to the row boundary
+        if seek_local_offset > 0 {
+            let mut dummy = vec![0u8; seek_local_offset];
+            // If the skip fails, we'll just start from wherever we are
+            let _ = buffer.read_exact(&mut dummy);
+        }
         Self {
             buffer,
             row_type,
             ranges,
             intervals,
+            terminated: false,
         }
     }
 }
@@ -64,6 +77,10 @@ impl Iterator for PartitionStream {
     type Item = Result<EncodedValue>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.terminated {
+            return None;
+        }
+
         loop {
             // Read row present flag
             let row_present = match self.buffer.read_bool() {
@@ -89,8 +106,12 @@ impl Iterator for PartitionStream {
                 continue;
             }
 
-            // Apply interval filters if present
+            // Apply interval filters if present — with early termination
             if let Some(ref intervals) = self.intervals {
+                if row_is_past_intervals(&row, intervals) {
+                    self.terminated = true;
+                    return None;
+                }
                 if !row_matches_intervals(&row, intervals) {
                     continue;
                 }
@@ -116,6 +137,44 @@ pub fn row_matches_ranges(row: &EncodedValue, ranges: &[KeyRange]) -> bool {
         }
     }
     true
+}
+
+/// Check if a row's locus is strictly past all intervals (for early termination)
+///
+/// Since Hail partitions are sorted by (contig, position), if the row's position
+/// is past the maximum end of all intervals for its contig, no future rows in this
+/// partition can match either. Returns false if we can't determine (safe fallback).
+fn row_is_past_intervals(row: &EncodedValue, intervals: &IntervalList) -> bool {
+    let locus = extract_field_by_path(row, &["locus".to_string()]);
+    let locus = match locus {
+        Some(l) => l,
+        None => return false,
+    };
+
+    let contig = extract_field_by_path(locus, &["contig".to_string()]);
+    let contig_str = match contig {
+        Some(EncodedValue::Binary(b)) => String::from_utf8_lossy(b),
+        _ => return false,
+    };
+
+    let position = extract_field_by_path(locus, &["position".to_string()]);
+    let position_val = match position {
+        Some(EncodedValue::Int32(p)) => *p,
+        Some(EncodedValue::Int64(p)) => *p as i32,
+        _ => return false,
+    };
+
+    // Get the intervals for this contig
+    if let Some(ranges) = intervals.intervals_for_contig(&contig_str) {
+        if let Some(last_range) = ranges.last() {
+            // If position is past the end of the last (highest) interval, we're done
+            return position_val > *last_range.end();
+        }
+    }
+
+    // If there are no intervals for this contig at all, we can't early-terminate
+    // because the data might loop back to a contig that has intervals
+    false
 }
 
 /// Check if a row's locus falls within any interval in the list

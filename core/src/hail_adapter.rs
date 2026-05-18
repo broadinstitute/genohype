@@ -259,26 +259,19 @@ impl HailTableSource {
         Ok(block_map)
     }
 
-    /// Read a row from a partition file at a specific offset using the block map
-    fn read_row_at_offset(&self, partition_idx: usize, offset: i64) -> Result<EncodedValue> {
+    /// Read a row from a partition file at a specific virtual offset
+    ///
+    /// The offset is a Hail virtual offset: high 48 bits = compressed file offset,
+    /// low 16 bits = byte offset within the decompressed block.
+    fn read_row_at_offset(&self, partition_idx: usize, virtual_offset: i64) -> Result<EncodedValue> {
         let part_path = self.get_partition_path(partition_idx);
 
-        // Get or create the block map for this partition
-        let block_map = self.get_block_map(partition_idx)?;
-
-        // Find the block containing our offset
-        let block_entry = block_map.find_block(offset as u64).ok_or_else(|| {
-            HailError::Index(format!(
-                "Offset {} is out of bounds for partition {}",
-                offset, partition_idx
-            ))
-        })?;
-
-        // Calculate the offset within the decompressed block
-        let local_offset = (offset as u64 - block_entry.decompressed_offset) as usize;
+        // Decode virtual offset: high 48 bits = file offset, low 16 bits = local offset
+        let file_offset = (virtual_offset as u64) >> 16;
+        let local_offset = (virtual_offset & 0xFFFF) as usize;
 
         // Read just this one block from the file
-        let block_data = read_single_block(&part_path, block_entry.file_offset)?;
+        let block_data = read_single_block(&part_path, file_offset)?;
 
         // The block data format is: [4-byte decompressed_size][zstd_compressed_data]
         if block_data.len() < 4 {
@@ -332,8 +325,61 @@ impl HailTableSource {
             self.row_type.clone(),
             ranges.to_vec(),
             intervals,
+            0,
         ))
     }
+}
+
+/// Construct an EncodedValue seek key from an IntervalList for index seeking.
+///
+/// For locus-keyed tables, builds a Struct key with the minimum (contig, position)
+/// from the intervals that could appear in a given partition. Returns None if
+/// a seek key can't be constructed.
+fn build_seek_key_from_intervals(
+    intervals: &IntervalList,
+    key_fields: &[String],
+) -> Option<EncodedValue> {
+    // Only works for locus-keyed tables (key starts with "locus")
+    if key_fields.is_empty() || key_fields[0] != "locus" {
+        return None;
+    }
+
+    // Find the minimum start position across all contigs
+    // Since partition pruning already narrowed to relevant partitions,
+    // we use the global minimum as a conservative seek target
+    let mut min_contig: Option<&str> = None;
+    let mut min_pos: Option<i32> = None;
+
+    for contig in intervals.contigs() {
+        if let Some(ranges) = intervals.intervals_for_contig(contig) {
+            if let Some(first_range) = ranges.first() {
+                let start = *first_range.start();
+                match (&min_contig, &min_pos) {
+                    (None, _) => {
+                        min_contig = Some(contig);
+                        min_pos = Some(start);
+                    }
+                    (Some(mc), Some(mp)) => {
+                        if contig.as_str() < *mc || (contig.as_str() == *mc && start < *mp) {
+                            min_contig = Some(contig);
+                            min_pos = Some(start);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let contig = min_contig?;
+    let pos = min_pos?;
+
+    Some(EncodedValue::Struct(vec![
+        ("locus".to_string(), EncodedValue::Struct(vec![
+            ("contig".to_string(), EncodedValue::Binary(contig.as_bytes().to_vec())),
+            ("position".to_string(), EncodedValue::Int32(pos)),
+        ])),
+    ]))
 }
 
 impl DataSource for HailTableSource {
@@ -438,14 +484,62 @@ impl DataSource for HailTableSource {
         let part_files = self.rvd_spec.part_files.clone();
         let row_type = self.row_type.clone();
         let ranges = ranges.to_vec();
+        let has_index = self.rvd_spec.index_spec.is_some();
+        let index_readers = self.index_readers.clone();
+        let block_maps = self.block_maps.clone();
+        let table_path = self.table_path.clone();
+        let index_spec = self.rvd_spec.index_spec.clone();
+        let key_fields = self.rvd_spec.key.clone();
+
+        // Pre-compute seek key from intervals (if available)
+        let seek_key = intervals.as_ref().and_then(|ivl| {
+            build_seek_key_from_intervals(ivl, &key_fields)
+        });
 
         let num_partitions = matching_partitions.len();
 
         std::thread::spawn(move || {
             info!(
-                "Background query thread started. Processing {} partitions.",
-                num_partitions
+                "Background query thread started. Processing {} partitions (index_seeking={}).",
+                num_partitions,
+                has_index && seek_key.is_some()
             );
+
+            // Helper to get or create index reader for a partition
+            let get_index_reader = |partition_idx: usize| -> crate::Result<Arc<IndexReader>> {
+                {
+                    let cache = index_readers.lock().unwrap();
+                    if let Some(reader) = cache.get(&partition_idx) {
+                        return Ok(reader.clone());
+                    }
+                }
+                let spec = index_spec.as_ref().ok_or_else(|| {
+                    HailError::Index("Table does not have an index".to_string())
+                })?;
+                let part_file = &part_files[partition_idx];
+                let index_dir_name = format!("{}.idx", part_file);
+                let index_rel_path = spec.rel_path.trim_start_matches("../");
+                let index_base = join_path(&table_path, index_rel_path);
+                let index_path = join_path(&index_base, &index_dir_name);
+                let reader = Arc::new(IndexReader::new_from_path(&index_path, spec)?);
+                let mut cache = index_readers.lock().unwrap();
+                cache.insert(partition_idx, reader.clone());
+                Ok(reader)
+            };
+
+            // Helper to get or create block map for a partition
+            let get_block_map = |partition_idx: usize, part_path: &str| -> crate::Result<Arc<BlockMap>> {
+                {
+                    let cache = block_maps.lock().unwrap();
+                    if let Some(map) = cache.get(&partition_idx) {
+                        return Ok(map.clone());
+                    }
+                }
+                let map = Arc::new(BlockMap::build_from_path(part_path)?);
+                let mut cache = block_maps.lock().unwrap();
+                cache.insert(partition_idx, map.clone());
+                Ok(map)
+            };
 
             // Process partitions in parallel using rayon
             matching_partitions
@@ -458,19 +552,66 @@ impl DataSource for HailTableSource {
                     let parts_path = join_path(&rows_path, "parts");
                     let part_path = join_path(&parts_path, part_file);
 
+                    // Try index-seeking path
+                    let seek_result = if has_index {
+                        seek_key.as_ref().and_then(|key| {
+                            let reader = match get_index_reader(idx) {
+                                Ok(r) => r,
+                                Err(e) => { debug!("Partition {}: index reader error: {}", idx, e); return None; }
+                            };
+                            let seek_result = reader.seek_lower_bound(key);
+                            let virtual_offset = match seek_result {
+                                Ok(Some(o)) => o,
+                                Ok(None) => { debug!("Partition {}: seek_lower_bound returned None", idx); return None; }
+                                Err(e) => { debug!("Partition {}: seek_lower_bound error: {}", idx, e); return None; }
+                            };
+                            // Index stores virtual offsets: high 48 bits = compressed file offset, low 16 bits = offset within decompressed block
+                            let file_offset = (virtual_offset as u64) >> 16;
+                            let local_offset = (virtual_offset & 0xFFFF) as usize;
+                            debug!(
+                                "Partition {}: virtual_offset={}, file_offset={} ({:.1} MB), local_offset={}",
+                                idx, virtual_offset, file_offset, file_offset as f64 / 1024.0 / 1024.0, local_offset
+                            );
+                            Some((file_offset, local_offset))
+                        })
+                    } else {
+                        None
+                    };
+
                     let open_start = std::time::Instant::now();
-                    let buffer_res = BufferBuilder::from_path(&part_path)
-                        .map(|b| b.with_leb128().build());
+                    let buffer_and_offset = match seek_result {
+                        Some((file_offset, local_offset)) => {
+                            // Seeked path: open reader at the target block
+                            (|| -> crate::Result<_> {
+                                let mut reader = crate::io::get_reader(&part_path)?;
+                                use std::io::Seek;
+                                reader.seek(std::io::SeekFrom::Start(file_offset))?;
+                                let buffer = BufferBuilder::from_reader(reader)
+                                    .with_leb128()
+                                    .build();
+                                Ok((buffer, local_offset))
+                            })()
+                        }
+                        None => {
+                            // Fallback: full scan from offset 0
+                            BufferBuilder::from_path(&part_path)
+                                .map(|b| (b.with_leb128().build(), 0usize))
+                        }
+                    };
                     let open_elapsed = open_start.elapsed();
 
-                    match buffer_res {
-                        Ok(buffer) => {
-                            debug!("Partition {} opened in {:?}", idx, open_elapsed);
+                    match buffer_and_offset {
+                        Ok((buffer, local_offset)) => {
+                            debug!(
+                                "Partition {} opened in {:?} (seek_offset={})",
+                                idx, open_elapsed, local_offset
+                            );
                             let stream = PartitionStream::with_intervals(
                                 buffer,
                                 row_type.clone(),
                                 ranges.clone(),
                                 intervals.clone(),
+                                local_offset,
                             );
 
                             let decode_start = std::time::Instant::now();
