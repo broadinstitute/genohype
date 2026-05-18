@@ -8,6 +8,7 @@ use crate::datasource::DataSource;
 use crate::index::IndexReader;
 use crate::io::join_path;
 use crate::metadata::{RVDComponentSpec, TableMetadata};
+use crate::projection::ProjectionTree;
 use crate::query::{filter_partitions, filter_partitions_with_intervals, IntervalList, KeyRange, KeyValue, PartitionStream};
 use crate::HailError;
 use crate::Result;
@@ -402,7 +403,15 @@ impl DataSource for HailTableSource {
 
         // Build buffer and decode
         let mut buffer = BufferBuilder::from_path(&part_path)?.with_leb128().build();
-        globals_type.read(&mut buffer)
+
+        // Hail partition streams always start with a row-present byte per row,
+        // even for globals (which is a single-row partition). Consume it before
+        // decoding, just like PartitionStream does.
+        let row_present = buffer.read_bool()?;
+        if !row_present {
+            return Ok(EncodedValue::Null);
+        }
+        globals_type.read_present_value(&mut buffer)
     }
 
     fn key_fields(&self) -> &[String] {
@@ -631,6 +640,145 @@ impl DataSource for HailTableSource {
                 });
 
             info!("Background query thread finished");
+        });
+
+        Ok(Box::new(rx.into_iter()))
+    }
+
+    #[instrument(skip_all, fields(num_ranges = ranges.len(), has_intervals = intervals.is_some(), has_projection = decode_projection.is_some()))]
+    fn query_stream_with_projection(
+        &self,
+        ranges: &[KeyRange],
+        intervals: Option<Arc<IntervalList>>,
+        decode_projection: Option<Arc<ProjectionTree>>,
+    ) -> Result<Box<dyn Iterator<Item = Result<EncodedValue>> + Send>> {
+        let matching_partitions = filter_partitions_with_intervals(
+            &self.rvd_spec.range_bounds,
+            ranges,
+            intervals.as_deref(),
+        );
+
+        info!(
+            "query_stream_projected: {} partitions matched filter (decode_projection={})",
+            matching_partitions.len(),
+            decode_projection.is_some()
+        );
+
+        let (tx, rx) = crossbeam_channel::bounded(100);
+
+        let rows_path = self.rows_path.clone();
+        let part_files = self.rvd_spec.part_files.clone();
+        let row_type = self.row_type.clone();
+        let ranges = ranges.to_vec();
+        let has_index = self.rvd_spec.index_spec.is_some();
+        let index_readers = self.index_readers.clone();
+        let table_path = self.table_path.clone();
+        let index_spec = self.rvd_spec.index_spec.clone();
+        let key_fields = self.rvd_spec.key.clone();
+
+        let seek_key = intervals.as_ref().and_then(|ivl| {
+            build_seek_key_from_intervals(ivl, &key_fields)
+        });
+
+        let num_partitions = matching_partitions.len();
+
+        std::thread::spawn(move || {
+            info!(
+                "Background projected query thread started. Processing {} partitions.",
+                num_partitions
+            );
+
+            let get_index_reader = |partition_idx: usize| -> crate::Result<Arc<IndexReader>> {
+                {
+                    let cache = index_readers.lock().unwrap();
+                    if let Some(reader) = cache.get(&partition_idx) {
+                        return Ok(reader.clone());
+                    }
+                }
+                let spec = index_spec.as_ref().ok_or_else(|| {
+                    HailError::Index("Table does not have an index".to_string())
+                })?;
+                let part_file = &part_files[partition_idx];
+                let index_dir_name = format!("{}.idx", part_file);
+                let index_rel_path = spec.rel_path.trim_start_matches("../");
+                let index_base = join_path(&table_path, index_rel_path);
+                let index_path = join_path(&index_base, &index_dir_name);
+                let reader = Arc::new(IndexReader::new_from_path(&index_path, spec)?);
+                let mut cache = index_readers.lock().unwrap();
+                cache.insert(partition_idx, reader.clone());
+                Ok(reader)
+            };
+
+            matching_partitions
+                .into_par_iter()
+                .for_each_with(tx, |sender, idx| {
+                    let _span = info_span!("partition_worker_projected", partition = idx).entered();
+
+                    let part_file = &part_files[idx];
+                    let parts_path = join_path(&rows_path, "parts");
+                    let part_path = join_path(&parts_path, part_file);
+
+                    let seek_result = if has_index {
+                        seek_key.as_ref().and_then(|key| {
+                            let reader = match get_index_reader(idx) {
+                                Ok(r) => r,
+                                Err(e) => { debug!("Partition {}: index reader error: {}", idx, e); return None; }
+                            };
+                            let virtual_offset = match reader.seek_lower_bound(key) {
+                                Ok(Some(o)) => o,
+                                Ok(None) => { return None; }
+                                Err(e) => { debug!("Partition {}: seek error: {}", idx, e); return None; }
+                            };
+                            let file_offset = (virtual_offset as u64) >> 16;
+                            let local_offset = (virtual_offset & 0xFFFF) as usize;
+                            Some((file_offset, local_offset))
+                        })
+                    } else {
+                        None
+                    };
+
+                    let buffer_and_offset = match seek_result {
+                        Some((file_offset, local_offset)) => {
+                            (|| -> crate::Result<_> {
+                                let mut reader = crate::io::get_reader(&part_path)?;
+                                use std::io::Seek;
+                                reader.seek(std::io::SeekFrom::Start(file_offset))?;
+                                let buffer = BufferBuilder::from_reader(reader)
+                                    .with_leb128()
+                                    .build();
+                                Ok((buffer, local_offset))
+                            })()
+                        }
+                        None => {
+                            BufferBuilder::from_path(&part_path)
+                                .map(|b| (b.with_leb128().build(), 0usize))
+                        }
+                    };
+
+                    match buffer_and_offset {
+                        Ok((buffer, local_offset)) => {
+                            let stream = PartitionStream::with_intervals(
+                                buffer,
+                                row_type.clone(),
+                                ranges.clone(),
+                                intervals.clone(),
+                                local_offset,
+                            ).with_decode_projection(decode_projection.clone());
+
+                            for row in stream {
+                                if sender.send(row).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to open partition {}: {}", idx, e);
+                            let _ = sender.send(Err(e));
+                        }
+                    }
+                });
+
+            info!("Background projected query thread finished");
         });
 
         Ok(Box::new(rx.into_iter()))

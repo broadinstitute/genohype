@@ -5,7 +5,9 @@
 
 use crate::buffer::InputBuffer;
 use crate::error::{HailError, Result};
+use crate::projection::ProjectionTree;
 use serde::ser::{Serialize, SerializeMap, SerializeSeq, Serializer};
+use tracing::debug;
 
 /// Encoded type representation
 #[derive(Debug, Clone, PartialEq)]
@@ -124,6 +126,7 @@ impl EncodedType {
                 let mut nullable_idx = 0; // Index in the bitmap (only increments for nullable fields)
 
                 for (_field_idx, field) in fields.iter().enumerate() {
+                    debug!("Decoding struct field: {} (required: {})", field.name, field.encoded_type.is_required());
                     if field.encoded_type.is_required() {
                         // Required field - always present, read it
                         let value = field.encoded_type.read_present_value(buffer)?;
@@ -175,6 +178,7 @@ impl EncodedType {
 
                 // STEP 1: Read array length
                 let length = buffer.read_i32()?;
+                debug!("Decoding array of length: {}", length);
 
                 // Sanity check on length
                 if length < 0 || length > 100000 {
@@ -220,6 +224,164 @@ impl EncodedType {
 
                 Ok(EncodedValue::Array(elements))
             }
+        }
+    }
+
+    /// Skip a value that's known to be present (for struct fields after bitmap check).
+    ///
+    /// Advances the buffer past the encoded bytes without allocating an `EncodedValue`.
+    /// This is the core of Level 2 projection — skipping fields the user didn't request.
+    pub fn skip_present_value(&self, buffer: &mut dyn InputBuffer) -> Result<()> {
+        match self {
+            EncodedType::EBinary { .. } => {
+                let length = buffer.read_i32()?;
+                if length < 0 || length > 1_000_000 {
+                    return Err(HailError::InvalidFormat(format!(
+                        "Invalid binary length: {}",
+                        length
+                    )));
+                }
+                buffer.skip(length as usize)
+            }
+            EncodedType::EBaseStruct { fields, .. } => {
+                let n_nullable = fields.iter().filter(|f| !f.encoded_type.is_required()).count();
+                let n_missing_bytes = (n_nullable + 7) / 8;
+
+                let mut missing_bitmap = vec![0u8; n_missing_bytes];
+                buffer.read_exact(&mut missing_bitmap)?;
+
+                let mut nullable_idx = 0;
+                for field in fields {
+                    if field.encoded_type.is_required() {
+                        field.encoded_type.skip_present_value(buffer)?;
+                    } else {
+                        let byte_idx = nullable_idx / 8;
+                        let bit_idx = nullable_idx % 8;
+                        let is_missing = (missing_bitmap[byte_idx] >> bit_idx) & 1 == 1;
+
+                        if !is_missing {
+                            field.encoded_type.skip_present_value(buffer)?;
+                        }
+                        nullable_idx += 1;
+                    }
+                }
+                Ok(())
+            }
+            EncodedType::EInt32 { .. } => { buffer.read_i32()?; Ok(()) }
+            EncodedType::EInt64 { .. } => { buffer.read_i64()?; Ok(()) }
+            EncodedType::EFloat32 { .. } => buffer.skip(4),
+            EncodedType::EFloat64 { .. } => buffer.skip(8),
+            EncodedType::EBoolean { .. } => buffer.skip(1),
+            EncodedType::EArray { element, .. } => {
+                let length = buffer.read_i32()?;
+                if length < 0 || length > 100000 {
+                    return Err(HailError::InvalidFormat(format!(
+                        "Invalid array length: {}",
+                        length
+                    )));
+                }
+                let length = length as usize;
+
+                // Skip missing bitmap if elements are nullable
+                if !element.is_required() {
+                    let n_missing_bytes = (length + 7) / 8;
+                    let mut bitmap = vec![0u8; n_missing_bytes];
+                    buffer.read_exact(&mut bitmap)?;
+
+                    // Must skip only present elements
+                    for i in 0..length {
+                        let byte_idx = i / 8;
+                        let bit_idx = i % 8;
+                        let is_missing = (bitmap[byte_idx] >> bit_idx) & 1 == 1;
+                        if !is_missing {
+                            element.skip_present_value(buffer)?;
+                        }
+                    }
+                } else {
+                    // All elements present, skip each one
+                    for _ in 0..length {
+                        element.skip_present_value(buffer)?;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Read a value with projection: decode requested fields, skip the rest.
+    ///
+    /// When `projection` is `None` or `select_all`, falls back to `read_present_value`.
+    /// For structs, only fields present in the projection tree are decoded; others are skipped.
+    /// Arrays are always fully decoded (Level 1 projection handles array ops).
+    pub fn read_projected_value(
+        &self,
+        buffer: &mut dyn InputBuffer,
+        projection: Option<&ProjectionTree>,
+    ) -> Result<EncodedValue> {
+        // No projection or select_all → full decode
+        let proj = match projection {
+            Some(p) if !p.is_select_all() || p.has_children() => p,
+            _ => return self.read_present_value(buffer),
+        };
+
+        // select_all with no children → full decode
+        if proj.is_select_all() && !proj.has_children() {
+            return self.read_present_value(buffer);
+        }
+
+        match self {
+            EncodedType::EBaseStruct { fields, .. } => {
+                let n_nullable = fields.iter().filter(|f| !f.encoded_type.is_required()).count();
+                let n_missing_bytes = (n_nullable + 7) / 8;
+
+                let mut missing_bitmap = vec![0u8; n_missing_bytes];
+                buffer.read_exact(&mut missing_bitmap)?;
+
+                let mut field_values = Vec::new();
+                let mut nullable_idx = 0;
+
+                for field in fields {
+                    let child_proj = proj.get_child(&field.name);
+                    let is_wanted = child_proj.is_some();
+
+                    if field.encoded_type.is_required() {
+                        if is_wanted {
+                            let value = field.encoded_type.read_projected_value(
+                                buffer,
+                                child_proj,
+                            )?;
+                            field_values.push((field.name.clone(), value));
+                        } else {
+                            field.encoded_type.skip_present_value(buffer)?;
+                        }
+                    } else {
+                        let byte_idx = nullable_idx / 8;
+                        let bit_idx = nullable_idx % 8;
+                        let is_missing = (missing_bitmap[byte_idx] >> bit_idx) & 1 == 1;
+
+                        if is_missing {
+                            if is_wanted {
+                                field_values.push((field.name.clone(), EncodedValue::Null));
+                            }
+                        } else if is_wanted {
+                            let value = field.encoded_type.read_projected_value(
+                                buffer,
+                                child_proj,
+                            )?;
+                            field_values.push((field.name.clone(), value));
+                        } else {
+                            field.encoded_type.skip_present_value(buffer)?;
+                        }
+
+                        nullable_idx += 1;
+                    }
+                }
+
+                Ok(EncodedValue::Struct(field_values))
+            }
+            // For non-struct types (arrays, primitives), just do full decode.
+            // Level 1 projection handles array slicing/indexing.
+            _ => self.read_present_value(buffer),
         }
     }
 
