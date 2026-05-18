@@ -1,10 +1,11 @@
 //! Query command for streaming data from tables.
 
 use crate::cli::QueryArgs;
-use crate::commands::utils::{parse_interval_list, parse_where_condition};
+use crate::commands::utils::{parse_interval_list, parse_where_condition, progress_style_spinner};
 use genohype_core::codec::EncodedValue;
 use genohype_core::query::{IntervalList, KeyRange, QueryEngine};
 use genohype_core::Result;
+use indicatif::ProgressBar;
 use owo_colors::OwoColorize;
 
 pub fn run_query(args: QueryArgs) -> Result<()> {
@@ -43,7 +44,28 @@ pub fn run_query(args: QueryArgs) -> Result<()> {
     let intervals = parse_interval_list(args.intervals_file.as_deref(), &args.interval)?;
 
     // Open the table (supports both local and cloud paths)
+    let show_spinner = !args.json;
+    let spinner = if show_spinner {
+        let s = ProgressBar::new_spinner();
+        s.set_style(progress_style_spinner());
+        s.set_message("Loading table metadata...");
+        s.enable_steady_tick(std::time::Duration::from_millis(100));
+        Some(s)
+    } else {
+        None
+    };
+
     let mut engine = QueryEngine::open_path(table_path)?;
+
+    if let Some(s) = spinner {
+        s.finish_and_clear();
+    }
+
+    eprintln!(
+        "{} {} partitions loaded",
+        "Table:".green(),
+        engine.num_partitions().to_string().bright_white()
+    );
 
     println!(
         "{} {}",
@@ -119,7 +141,9 @@ pub fn run_query(args: QueryArgs) -> Result<()> {
             Box::new(iterator)
         };
 
+        let consume_start = std::time::Instant::now();
         let mut count = 0;
+        let mut serialize_ns: u64 = 0;
         for row_result in iterator {
             let row = row_result?;
             count += 1;
@@ -132,14 +156,28 @@ pub fn run_query(args: QueryArgs) -> Result<()> {
                     "---".dimmed()
                 );
             }
+            let ser_start = std::time::Instant::now();
             print_row(&row, args.json)?;
+            serialize_ns += ser_start.elapsed().as_nanos() as u64;
         }
+        let consume_elapsed = consume_start.elapsed();
 
         println!();
         println!(
             "{} {}",
             "Rows returned:".green(),
             count.to_string().bright_white()
+        );
+        eprintln!(
+            "{} {:.1}ms total, {:.1}ms serializing ({:.0}%)",
+            "Consume loop:".dimmed(),
+            consume_elapsed.as_secs_f64() * 1000.0,
+            serialize_ns as f64 / 1_000_000.0,
+            if consume_elapsed.as_nanos() > 0 {
+                serialize_ns as f64 / consume_elapsed.as_nanos() as f64 * 100.0
+            } else {
+                0.0
+            }
         );
     }
 

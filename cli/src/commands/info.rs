@@ -1,8 +1,10 @@
 //! Table information display command.
 
+use crate::commands::utils::progress_style_spinner;
 use genohype_core::query::QueryEngine;
 use genohype_core::summary::format_schema_clean;
 use genohype_core::Result;
+use indicatif::ProgressBar;
 use owo_colors::OwoColorize;
 
 /// Format a number with comma separators (e.g., 40535147 → "40,535,147")
@@ -18,9 +20,9 @@ fn format_number(n: usize) -> String {
     result
 }
 
-pub fn show_info(table_path: &str, json: bool) -> Result<()> {
+pub fn show_info(table_path: &str, json: bool, count: bool) -> Result<()> {
     if json {
-        return show_info_json(table_path);
+        return show_info_json(table_path, count);
     }
 
     // Check if this is a VCF or BED file
@@ -36,7 +38,6 @@ pub fn show_info(table_path: &str, json: bool) -> Result<()> {
         println!("{} {}", "Path:".green(), table_path.bright_white());
         println!();
 
-        // Open using query engine to get schema info
         let engine = QueryEngine::open_path(table_path)?;
 
         println!(
@@ -49,44 +50,39 @@ pub fn show_info(table_path: &str, json: bool) -> Result<()> {
         return Ok(());
     }
 
-    // Hail Table - Read basic metadata first
-    let metadata_path = genohype_core::io::join_path(table_path, "metadata.json.gz");
+    // Hail Table - open via QueryEngine (loads metadata once)
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(progress_style_spinner());
+    spinner.set_message("Loading table metadata...");
+    spinner.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    // Try reading metadata (might fail if not a hail table)
-    let metadata = match genohype_core::io::get_reader(&metadata_path) {
-        Ok(mut reader) => {
-            let mut data = Vec::new();
-            std::io::Read::read_to_end(&mut reader, &mut data)?;
-            genohype_core::schema::Metadata::from_gzipped_json(&data)?
-        }
-        Err(_) => {
-            println!("{} Not a valid Hail table or VCF file", "Error:".red());
-            return Ok(());
-        }
-    };
+    let engine = QueryEngine::open_path(table_path)?;
 
+    spinner.finish_and_clear();
+
+    // Get version info from the already-loaded table metadata
     println!("{}", "Hail Table Information".bold().underline());
     println!();
     println!("{} {}", "Path:".green(), table_path.bright_white());
-    println!(
-        "{} {}",
-        "Format version:".green(),
-        metadata.file_version.bright_white()
-    );
-    println!(
-        "{} {}",
-        "Hail version:".green(),
-        metadata.hail_version.bright_white()
-    );
-    println!(
-        "{} {}",
-        "References:".green(),
-        metadata.references_rel_path.bright_white()
-    );
-    println!();
 
-    // Open using query engine for structural inspection
-    let engine = QueryEngine::open_path(table_path)?;
+    if let Some(metadata) = engine.table_metadata() {
+        println!(
+            "{} {}",
+            "Format version:".green(),
+            metadata.file_version.to_string().bright_white()
+        );
+        println!(
+            "{} {}",
+            "Hail version:".green(),
+            metadata.hail_version.bright_white()
+        );
+        println!(
+            "{} {}",
+            "References:".green(),
+            metadata.references_rel_path.bright_white()
+        );
+    }
+    println!();
 
     // Key information
     println!("{}", "Key Fields:".green());
@@ -110,13 +106,45 @@ pub fn show_info(table_path: &str, json: bool) -> Result<()> {
         "Partitions:".green(),
         engine.num_partitions().to_string().bright_white()
     );
-    if let Some(total_rows) = engine.total_rows() {
+
+    // Total rows: fast path always shown, slow path only with --count
+    if engine.has_fast_row_count() {
+        if let Some(total_rows) = engine.total_rows() {
+            println!(
+                "{} {}",
+                "Total Rows:".green(),
+                format_number(total_rows).bright_white()
+            );
+        }
+    } else if count {
+        let spinner = ProgressBar::new_spinner();
+        spinner.set_style(progress_style_spinner());
+        spinner.set_message("Counting rows from partition indexes...");
+        spinner.enable_steady_tick(std::time::Duration::from_millis(100));
+
+        if let Some(total_rows) = engine.total_rows() {
+            spinner.finish_and_clear();
+            println!(
+                "{} {}",
+                "Total Rows:".green(),
+                format_number(total_rows).bright_white()
+            );
+        } else {
+            spinner.finish_and_clear();
+            println!(
+                "{} {}",
+                "Total Rows:".green(),
+                "(unavailable)".dimmed()
+            );
+        }
+    } else {
         println!(
             "{} {}",
             "Total Rows:".green(),
-            format_number(total_rows).bright_white()
+            "(use --count to compute)".dimmed()
         );
     }
+
     if engine.has_index() {
         println!("{} {}", "Index:".green(), "Yes".bright_green());
     } else {
@@ -157,7 +185,6 @@ pub fn show_info(table_path: &str, json: bool) -> Result<()> {
         println!("{}", "Partition Bounds (first 3):".green());
         for (i, interval) in rvd_spec.range_bounds.iter().take(3).enumerate() {
             println!("  {} {}:", "Partition".cyan(), i);
-            // Just show start/end JSON cleanly
             let start = serde_json::to_string(&interval.start).unwrap_or_default();
             let end = serde_json::to_string(&interval.end).unwrap_or_default();
             println!("    {} .. {}", start.dimmed(), end.dimmed());
@@ -169,14 +196,13 @@ pub fn show_info(table_path: &str, json: bool) -> Result<()> {
 
         // Codec information
         println!("{}", "Row Codec:".green());
-        // Clean format the VType
         println!("{}", format_schema_clean(&rvd_spec.codec_spec.v_type));
     }
 
     Ok(())
 }
 
-fn show_info_json(table_path: &str) -> Result<()> {
+fn show_info_json(table_path: &str, count: bool) -> Result<()> {
     let is_vcf = table_path.ends_with(".vcf")
         || table_path.ends_with(".vcf.gz")
         || table_path.ends_with(".vcf.bgz");
@@ -195,33 +221,27 @@ fn show_info_json(table_path: &str) -> Result<()> {
         return Ok(());
     }
 
-    // Hail Table
-    let metadata_path = genohype_core::io::join_path(table_path, "metadata.json.gz");
-    let metadata = match genohype_core::io::get_reader(&metadata_path) {
-        Ok(mut reader) => {
-            let mut data = Vec::new();
-            std::io::Read::read_to_end(&mut reader, &mut data)?;
-            genohype_core::schema::Metadata::from_gzipped_json(&data)?
-        }
-        Err(e) => {
-            return Err(e.into());
-        }
-    };
-
+    // Hail Table - single QueryEngine load
     let engine = QueryEngine::open_path(table_path)?;
 
     let mut info = serde_json::json!({
         "path": table_path,
         "format": "hail_table",
-        "file_version": metadata.file_version,
-        "hail_version": metadata.hail_version,
         "key_fields": engine.key_fields(),
         "partitions": engine.num_partitions(),
         "has_index": engine.has_index(),
     });
 
-    if let Some(total_rows) = engine.total_rows() {
-        info["total_rows"] = serde_json::json!(total_rows);
+    if let Some(metadata) = engine.table_metadata() {
+        info["file_version"] = serde_json::json!(metadata.file_version);
+        info["hail_version"] = serde_json::json!(metadata.hail_version);
+    }
+
+    // Only compute total_rows if fast or --count requested
+    if engine.has_fast_row_count() || count {
+        if let Some(total_rows) = engine.total_rows() {
+            info["total_rows"] = serde_json::json!(total_rows);
+        }
     }
 
     if let Some(rvd_spec) = engine.rvd_spec() {

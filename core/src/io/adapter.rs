@@ -24,7 +24,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
-use tracing::trace;
+use tracing::{debug, trace};
 
 /// Default chunk size for cloud reads (8MB) - used by non-prefetching reader
 const DEFAULT_CHUNK_SIZE: usize = 8 * 1024 * 1024;
@@ -81,8 +81,12 @@ pub fn get_gcs_client(bucket: &str) -> Result<Arc<dyn ObjectStore>> {
     let mut cache = GCS_CLIENT_CACHE.lock().unwrap();
 
     if let Some(client) = cache.get(bucket) {
+        debug!("GCS client cache hit for bucket {}", bucket);
         return Ok(client.clone());
     }
+
+    debug!("GCS client cache miss for bucket {}, creating new client", bucket);
+    let start = std::time::Instant::now();
 
     // Build the GCS client, optionally using service account key file
     let mut builder = object_store::gcp::GoogleCloudStorageBuilder::new()
@@ -118,6 +122,7 @@ pub fn get_gcs_client(bucket: &str) -> Result<Arc<dyn ObjectStore>> {
             .map_err(|e| HailError::InvalidFormat(format!("Failed to create GCS client: {}", e)))?
     );
 
+    debug!("GCS client created for bucket {} in {:?}", bucket, start.elapsed());
     cache.insert(bucket.to_string(), client.clone());
     Ok(client)
 }
@@ -538,6 +543,7 @@ pub type BoxedReader = Box<dyn ReadSeek + Send + Sync>;
 /// For cloud paths, uses `PrefetchingCloudReader` for latency-hiding streaming.
 /// For local paths, attempts to use memory-mapping for optimal NVMe performance,
 /// falling back to standard file I/O if mmap fails.
+#[tracing::instrument(skip_all, fields(path))]
 pub fn get_reader(path: &str) -> Result<BoxedReader> {
     if path.starts_with("gs://") || path.starts_with("s3://") || path.starts_with("http://") || path.starts_with("https://") {
         create_cloud_reader(path)
@@ -567,6 +573,7 @@ pub fn get_reader(path: &str) -> Result<BoxedReader> {
 ///
 /// Uses `PrefetchingCloudReader` which spawns a background task to fetch
 /// data ahead of the read position, hiding network latency.
+#[tracing::instrument(skip_all, fields(url = url_str))]
 fn create_cloud_reader(url_str: &str) -> Result<BoxedReader> {
     let (store, path) = crate::io::resolve_url(url_str)?;
 

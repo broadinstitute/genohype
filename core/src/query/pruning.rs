@@ -4,6 +4,7 @@ use crate::metadata::Interval;
 use crate::query::intervals::IntervalList;
 use crate::query::types::{KeyRange, KeyValue, QueryBound};
 use serde_json::Value;
+use tracing::debug;
 
 /// Extract a KeyValue from a JSON object by field path (supports nested access)
 fn extract_key_value(json: &Value, field_path: &[String]) -> Option<KeyValue> {
@@ -95,7 +96,8 @@ pub fn filter_partitions_with_intervals(
     ranges: &[KeyRange],
     intervals: Option<&IntervalList>,
 ) -> Vec<usize> {
-    range_bounds
+    let start = std::time::Instant::now();
+    let result: Vec<usize> = range_bounds
         .iter()
         .enumerate()
         .filter(|(_, interval)| {
@@ -116,7 +118,14 @@ pub fn filter_partitions_with_intervals(
             true
         })
         .map(|(idx, _)| idx)
-        .collect()
+        .collect();
+    debug!(
+        "filter_partitions: {}/{} partitions matched in {:?}",
+        result.len(),
+        range_bounds.len(),
+        start.elapsed()
+    );
+    result
 }
 
 /// Check if a partition interval overlaps with any genomic interval in the list

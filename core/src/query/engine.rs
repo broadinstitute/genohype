@@ -13,6 +13,7 @@ use crate::vcf::VcfDataSource;
 use crate::Result;
 use std::path::Path;
 use std::sync::Arc;
+use tracing::instrument;
 
 /// High-level query engine for Hail tables and other data sources
 ///
@@ -73,6 +74,7 @@ impl QueryEngine {
     /// // Google Cloud Storage
     /// let engine = QueryEngine::open_path("gs://my-bucket/data/my_table.ht").unwrap();
     /// ```
+    #[instrument(skip_all, fields(path = table_path))]
     pub fn open_path(table_path: &str) -> Result<Self> {
         // Detect file type by extension
         if table_path.ends_with(".vcf")
@@ -93,15 +95,11 @@ impl QueryEngine {
                 hail_source: None,
             })
         } else {
-            // Assume Hail Table
+            // Assume Hail Table - single instance used for both trait and direct access
             let hail_source = HailTableSource::new(table_path)?;
 
-            // Create a second instance for the trait object
-            // (This is necessary because we need to keep Hail-specific access for rvd_spec())
-            let source = Box::new(HailTableSource::new(table_path)?);
-
             Ok(QueryEngine {
-                source,
+                source: Box::new(hail_source.clone()),
                 hail_source: Some(hail_source),
             })
         }
@@ -138,6 +136,18 @@ impl QueryEngine {
     /// This is used by inspection commands.
     pub fn rvd_spec(&self) -> Option<&RVDComponentSpec> {
         self.hail_source.as_ref().map(|h| h.rvd_spec())
+    }
+
+    /// Get the top-level table metadata (Hail tables only)
+    pub fn table_metadata(&self) -> Option<&crate::metadata::TableMetadata> {
+        self.hail_source.as_ref().and_then(|h| h.table_metadata())
+    }
+
+    /// Check if total_rows() is available without an expensive scan
+    pub fn has_fast_row_count(&self) -> bool {
+        self.hail_source
+            .as_ref()
+            .map_or(false, |h| h.has_fast_row_count())
     }
 
     /// Get the genomic interval covered by a specific partition (Hail tables only)

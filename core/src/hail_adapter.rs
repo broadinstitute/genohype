@@ -7,7 +7,7 @@ use crate::codec::{EncodedType, EncodedValue, ETypeParser};
 use crate::datasource::DataSource;
 use crate::index::IndexReader;
 use crate::io::{join_path, read_single_block};
-use crate::metadata::RVDComponentSpec;
+use crate::metadata::{RVDComponentSpec, TableMetadata};
 use crate::query::{filter_partitions, filter_partitions_with_intervals, IntervalList, KeyRange, KeyValue, PartitionStream};
 use crate::HailError;
 use crate::Result;
@@ -15,7 +15,7 @@ use crossbeam_channel;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, info_span, instrument, warn};
 
 /// Iterator that processes partitions sequentially in sorted order.
 /// This ensures rows are yielded in key order for merge-join operations.
@@ -107,6 +107,7 @@ impl Iterator for SortedPartitionIterator {
 /// - Row decoding from partition files
 ///
 /// Supports both local and cloud storage paths (GCS, S3).
+#[derive(Clone)]
 pub struct HailTableSource {
     /// Path to the rows directory
     rows_path: String,
@@ -120,6 +121,10 @@ pub struct HailTableSource {
     index_readers: Arc<Mutex<HashMap<usize, Arc<IndexReader>>>>,
     /// Cached block maps for efficient random access (one per partition) - Arc/Mutex for thread safety
     block_maps: Arc<Mutex<HashMap<usize, Arc<BlockMap>>>>,
+    /// Per-partition row counts from top-level metadata (avoids fetching index files)
+    partition_counts: Option<Vec<usize>>,
+    /// Top-level table metadata (version info, references path)
+    table_metadata: Option<TableMetadata>,
 }
 
 impl HailTableSource {
@@ -128,15 +133,26 @@ impl HailTableSource {
     /// # Arguments
     /// * `table_path` - Path to the table directory (local or cloud URL)
     pub fn new(table_path: &str) -> Result<Self> {
+        let _span = info_span!("HailTableSource::new", table_path).entered();
+
         let table_path = table_path.trim_end_matches('/').to_string();
         let rows_path = join_path(&table_path, "rows");
 
         // Load RVD metadata
         let metadata_path = join_path(&rows_path, "metadata.json.gz");
+        debug!("Loading RVD metadata from {}", metadata_path);
         let rvd_spec = RVDComponentSpec::from_path(&metadata_path)?;
+        debug!("RVD metadata loaded: {} partitions, {} range bounds", rvd_spec.part_files.len(), rvd_spec.range_bounds.len());
 
         // Parse the row type from the codec spec
         let row_type = ETypeParser::parse(&rvd_spec.codec_spec.e_type)?;
+
+        // Load top-level metadata for partition counts and version info
+        let top_metadata_path = join_path(&table_path, "metadata.json.gz");
+        debug!("Loading table metadata from {}", top_metadata_path);
+        let table_metadata = TableMetadata::from_path(&top_metadata_path).ok();
+        let partition_counts = table_metadata.as_ref().and_then(|m| m.partition_counts());
+        debug!("Partition counts from metadata: {}", if partition_counts.is_some() { "available" } else { "unavailable" });
 
         Ok(HailTableSource {
             rows_path,
@@ -145,6 +161,8 @@ impl HailTableSource {
             row_type,
             index_readers: Arc::new(Mutex::new(HashMap::new())),
             block_maps: Arc::new(Mutex::new(HashMap::new())),
+            partition_counts,
+            table_metadata,
         })
     }
 
@@ -153,6 +171,16 @@ impl HailTableSource {
     /// This provides access to Hail-specific metadata for inspection commands.
     pub fn rvd_spec(&self) -> &RVDComponentSpec {
         &self.rvd_spec
+    }
+
+    /// Get the top-level table metadata (version info, references path)
+    pub fn table_metadata(&self) -> Option<&TableMetadata> {
+        self.table_metadata.as_ref()
+    }
+
+    /// Check if partition counts are available without scanning index files
+    pub fn has_fast_row_count(&self) -> bool {
+        self.partition_counts.is_some()
     }
 
     /// Get the path to a partition file
@@ -344,7 +372,14 @@ impl DataSource for HailTableSource {
         self.rvd_spec.part_files.len()
     }
 
+    #[instrument(skip_all)]
     fn total_rows(&self) -> Option<usize> {
+        // Fast path: use partition counts from top-level metadata (no extra I/O)
+        if let Some(counts) = &self.partition_counts {
+            return Some(counts.iter().sum());
+        }
+
+        // Fallback: fetch each partition's index metadata (slow for remote tables)
         let index_spec = self.rvd_spec.index_spec.as_ref()?;
         let index_rel_path = index_spec.rel_path.trim_start_matches("../");
         let index_base = join_path(&self.table_path, index_rel_path);
@@ -378,6 +413,7 @@ impl DataSource for HailTableSource {
         Ok(Box::new(stream))
     }
 
+    #[instrument(skip_all, fields(num_ranges = ranges.len(), has_intervals = intervals.is_some()))]
     fn query_stream_with_intervals(
         &self,
         ranges: &[KeyRange],
@@ -415,17 +451,21 @@ impl DataSource for HailTableSource {
             matching_partitions
                 .into_par_iter()
                 .for_each_with(tx, |sender, idx| {
-                    debug!("Processing partition index {}", idx);
+                    let _span = info_span!("partition_worker", partition = idx).entered();
+                    let partition_start = std::time::Instant::now();
+
                     let part_file = &part_files[idx];
                     let parts_path = join_path(&rows_path, "parts");
                     let part_path = join_path(&parts_path, part_file);
 
+                    let open_start = std::time::Instant::now();
                     let buffer_res = BufferBuilder::from_path(&part_path)
                         .map(|b| b.with_leb128().build());
+                    let open_elapsed = open_start.elapsed();
 
                     match buffer_res {
                         Ok(buffer) => {
-                            debug!("Partition {} opened successfully", idx);
+                            debug!("Partition {} opened in {:?}", idx, open_elapsed);
                             let stream = PartitionStream::with_intervals(
                                 buffer,
                                 row_type.clone(),
@@ -433,6 +473,7 @@ impl DataSource for HailTableSource {
                                 intervals.clone(),
                             );
 
+                            let decode_start = std::time::Instant::now();
                             let mut row_count = 0;
                             for row in stream {
                                 if sender.send(row).is_err() {
@@ -441,7 +482,10 @@ impl DataSource for HailTableSource {
                                 }
                                 row_count += 1;
                             }
-                            debug!("Partition {} finished, yielded {} rows", idx, row_count);
+                            debug!(
+                                "Partition {} finished: {} rows decoded in {:?} (total {:?})",
+                                idx, row_count, decode_start.elapsed(), partition_start.elapsed()
+                            );
                         }
                         Err(e) => {
                             warn!("Failed to open partition {}: {}", idx, e);
@@ -486,6 +530,7 @@ impl DataSource for HailTableSource {
         Ok(Box::new(iter))
     }
 
+    #[instrument(skip_all)]
     fn lookup(&self, key: &EncodedValue) -> Result<Option<EncodedValue>> {
         // For point lookups, skip partition pruning if there's only one partition
         let matching_partitions = if self.rvd_spec.part_files.len() == 1 {

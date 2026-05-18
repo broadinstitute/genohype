@@ -29,6 +29,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub config: Option<String>,
 
+    /// Write a Chrome trace profile to the given path (open in https://ui.perfetto.dev)
+    #[arg(long, global = true, value_name = "PATH")]
+    pub profile: Option<String>,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -42,6 +46,9 @@ pub enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+        /// Compute total row count (slow for remote tables without partition_counts in metadata)
+        #[arg(long)]
+        count: bool,
     },
 
     /// Scan full dataset to calculate row counts and field statistics (slow)

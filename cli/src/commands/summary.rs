@@ -12,7 +12,19 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Run the summary command
 pub fn run_summary(table_path: &str) -> Result<()> {
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} {msg}")
+            .unwrap(),
+    );
+    spinner.set_message("Loading table metadata...");
+    spinner.enable_steady_tick(std::time::Duration::from_millis(100));
+
     let engine = QueryEngine::open_path(table_path)?;
+
+    spinner.finish_and_clear();
+
     let part_count = engine.num_partitions();
 
     // Print header

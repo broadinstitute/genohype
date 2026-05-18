@@ -5,6 +5,7 @@ use serde_json::Value;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use tracing::debug;
 use crate::Result;
 
 /// Top-level table metadata
@@ -156,13 +157,29 @@ impl TableMetadata {
     /// - `http://` or `https://` - HTTP(S) URLs
     /// - Local file path - Regular file system access
     pub fn from_path(path: &str) -> Result<Self> {
+        let start = std::time::Instant::now();
         let mut reader = crate::io::get_reader(path)?;
         let mut data = Vec::new();
         reader.read_to_end(&mut data)?;
+        debug!("TableMetadata::from_path read {} bytes in {:?}", data.len(), start.elapsed());
 
         // Try gzipped first, fall back to plain JSON
         Self::from_gzipped_json(&data)
             .or_else(|_| Self::from_json(&data))
+    }
+
+    /// Extract per-partition row counts from the `components.partition_counts.counts` field.
+    ///
+    /// Returns `None` if the metadata doesn't contain partition counts (e.g., older Hail versions).
+    pub fn partition_counts(&self) -> Option<Vec<usize>> {
+        self.extra
+            .get("components")?
+            .get("partition_counts")?
+            .get("counts")?
+            .as_array()?
+            .iter()
+            .map(|v| v.as_u64().map(|n| n as usize))
+            .collect()
     }
 }
 
@@ -199,13 +216,17 @@ impl RVDComponentSpec {
     /// - `http://` or `https://` - HTTP(S) URLs
     /// - Local file path - Regular file system access
     pub fn from_path(path: &str) -> Result<Self> {
+        let start = std::time::Instant::now();
         let mut reader = crate::io::get_reader(path)?;
         let mut data = Vec::new();
         reader.read_to_end(&mut data)?;
+        debug!("RVDComponentSpec::from_path read {} bytes in {:?}", data.len(), start.elapsed());
 
-        // Try gzipped first, fall back to plain JSON
-        Self::from_gzipped_json(&data)
-            .or_else(|_| Self::from_json(&data))
+        let parse_start = std::time::Instant::now();
+        let result = Self::from_gzipped_json(&data)
+            .or_else(|_| Self::from_json(&data));
+        debug!("RVDComponentSpec::from_path parsed JSON in {:?}", parse_start.elapsed());
+        result
     }
 }
 

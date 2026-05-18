@@ -52,11 +52,15 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // Initialize tracing: --profile writes Chrome trace JSON, otherwise use RUST_LOG env filter
+    // The _guard must live until main() returns so the trace file gets flushed.
+    let _chrome_guard = init_tracing(&cli);
+
     // Load configuration from file
     let config = config::Config::load_from_path(cli.config.as_deref());
 
     match cli.command {
-        Commands::Info { path, json } => show_info(&path, json)?,
+        Commands::Info { path, json, count } => show_info(&path, json, count)?,
         Commands::Summary { path } => run_summary(&path)?,
         Commands::Query(args) => run_query(args)?,
         Commands::Export { command } => match command {
@@ -143,5 +147,40 @@ fn main() -> Result<()> {
         }
     }
 
+    // _chrome_guard is dropped here, flushing the trace file
     Ok(())
+}
+
+/// Initialize tracing based on CLI flags.
+///
+/// - `--profile trace.json` → Chrome trace format (open in https://ui.perfetto.dev)
+/// - `RUST_LOG=genohype_core=debug` → stderr text output with timing
+/// - Neither → no tracing overhead
+fn init_tracing(cli: &Cli) -> Option<tracing_chrome::FlushGuard> {
+    use tracing_subscriber::prelude::*;
+
+    if let Some(ref path) = cli.profile {
+        // Chrome trace mode: captures all spans as a timeline
+        let (chrome_layer, guard) = tracing_chrome::ChromeLayerBuilder::new()
+            .file(path)
+            .include_args(true)
+            .build();
+
+        tracing_subscriber::registry()
+            .with(chrome_layer)
+            .init();
+
+        eprintln!("Profiling enabled → {}", path);
+        Some(guard)
+    } else {
+        // Default: RUST_LOG-based text output to stderr
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_target(true)
+            .with_timer(tracing_subscriber::fmt::time::uptime())
+            .with_writer(std::io::stderr)
+            .init();
+
+        None
+    }
 }
