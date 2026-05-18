@@ -28,6 +28,7 @@ pub mod io;
 pub mod metadata;
 pub mod parquet;
 pub mod partitioning;
+pub mod projection;
 pub mod progress;
 pub mod query;
 pub mod schema;

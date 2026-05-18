@@ -36,6 +36,14 @@ pub struct QueryArgs {
     /// Path to interval file (.bed, .json, or text with chr:start-end lines)
     #[arg(long)]
     pub intervals_file: Option<String>,
+
+    /// Select specific fields (comma-separated, e.g., locus,alleles,freq.AF)
+    #[arg(long, conflicts_with = "exclude")]
+    pub fields: Option<String>,
+
+    /// Exclude top-level fields (comma-separated, e.g., vep,vep115,histograms)
+    #[arg(long, conflicts_with = "fields")]
+    pub exclude: Option<String>,
 }
 
 #[cfg(feature = "validation")]

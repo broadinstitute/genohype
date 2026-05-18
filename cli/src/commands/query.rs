@@ -3,6 +3,7 @@
 use crate::cli::QueryArgs;
 use crate::commands::utils::{parse_interval_list, parse_where_condition, progress_style_spinner};
 use genohype_core::codec::EncodedValue;
+use genohype_core::projection::Projection;
 use genohype_core::query::{IntervalList, KeyRange, QueryEngine};
 use genohype_core::Result;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -69,6 +70,31 @@ pub fn run_query(args: QueryArgs) -> Result<()> {
         load_elapsed.as_secs_f64()
     );
 
+    // Parse and validate projection
+    let projection = if let Some(ref fields_str) = args.fields {
+        let proj = Projection::from_fields_str(fields_str).unwrap_or_else(|e| {
+            eprintln!("{} Invalid --fields: {}", "Error:".red().bold(), e);
+            std::process::exit(1);
+        });
+        proj.validate(engine.row_type()).unwrap_or_else(|e| {
+            eprintln!("{} {}", "Error:".red().bold(), e);
+            std::process::exit(1);
+        });
+        Some(proj)
+    } else if let Some(ref exclude_str) = args.exclude {
+        let proj = Projection::from_exclude_str(exclude_str).unwrap_or_else(|e| {
+            eprintln!("{} Invalid --exclude: {}", "Error:".red().bold(), e);
+            std::process::exit(1);
+        });
+        proj.validate(engine.row_type()).unwrap_or_else(|e| {
+            eprintln!("{} {}", "Error:".red().bold(), e);
+            std::process::exit(1);
+        });
+        Some(proj)
+    } else {
+        None
+    };
+
     // Show filter info
     if let Some(ref ivl) = intervals {
         eprintln!(
@@ -105,6 +131,11 @@ pub fn run_query(args: QueryArgs) -> Result<()> {
                         return Ok(());
                     }
                 }
+                let row = if let Some(ref proj) = projection {
+                    proj.apply(&row)
+                } else {
+                    row
+                };
                 println!();
                 println!("{}", "Found row:".green().bold());
                 print_row(&row, args.json)?;
@@ -170,6 +201,11 @@ pub fn run_query(args: QueryArgs) -> Result<()> {
                     "---".dimmed()
                 );
             }
+            let row = if let Some(ref proj) = projection {
+                proj.apply(&row)
+            } else {
+                row
+            };
             let ser_start = std::time::Instant::now();
             print_row(&row, args.json)?;
             serialize_ns += ser_start.elapsed().as_nanos() as u64;
