@@ -2,11 +2,11 @@
 //!
 //! Implements the `DataSource` trait for native Hail Tables (.ht directories).
 
-use crate::buffer::{BlockMap, BufferBuilder, InputBuffer, LEB128Buffer, SliceBuffer};
+use crate::buffer::{BlockMap, BufferBuilder, InputBuffer};
 use crate::codec::{EncodedType, EncodedValue, ETypeParser};
 use crate::datasource::DataSource;
 use crate::index::IndexReader;
-use crate::io::{join_path, read_single_block};
+use crate::io::join_path;
 use crate::metadata::{RVDComponentSpec, TableMetadata};
 use crate::query::{filter_partitions, filter_partitions_with_intervals, IntervalList, KeyRange, KeyValue, PartitionStream};
 use crate::HailError;
@@ -270,23 +270,18 @@ impl HailTableSource {
         let file_offset = (virtual_offset as u64) >> 16;
         let local_offset = (virtual_offset & 0xFFFF) as usize;
 
-        // Read just this one block from the file
-        let block_data = read_single_block(&part_path, file_offset)?;
+        // Use the full buffer stack so rows spanning block boundaries are handled.
+        // Seek to the compressed block, then skip local_offset decompressed bytes.
+        let mut reader = crate::io::get_reader(&part_path)?;
+        use std::io::Seek;
+        reader.seek(std::io::SeekFrom::Start(file_offset))?;
+        let mut buffer = BufferBuilder::from_reader(reader).with_leb128().build();
 
-        // The block data format is: [4-byte decompressed_size][zstd_compressed_data]
-        if block_data.len() < 4 {
-            return Err(HailError::InvalidFormat(
-                "Block too small for decompressed size header".to_string(),
-            ));
+        // Skip past the local offset within the decompressed block
+        if local_offset > 0 {
+            let mut dummy = vec![0u8; local_offset];
+            buffer.read_exact(&mut dummy)?;
         }
-
-        // Decompress the block
-        let decompressed = zstd::decode_all(&block_data[4..]).map_err(|_| HailError::Zstd)?;
-
-        // Create a buffer for reading from the decompressed data at the local offset
-        // We need LEB128Buffer on top of SliceBuffer because Hail uses LEB128 encoding
-        let slice_buffer = SliceBuffer::new(&decompressed[local_offset..]);
-        let mut buffer = LEB128Buffer::new(slice_buffer);
 
         // Read and decode the row
         let row_present = buffer.read_bool()?;
