@@ -4,6 +4,7 @@
 //! for reading data from various formats (Hail Tables, VCFs, etc.).
 
 use crate::codec::{EncodedType, EncodedValue};
+use crate::projection::ProjectionTree;
 use crate::query::{IntervalList, KeyRange};
 use crate::Result;
 use std::sync::Arc;
@@ -89,6 +90,23 @@ pub trait DataSource: Send + Sync {
         ranges: &[KeyRange],
         intervals: Option<Arc<IntervalList>>,
     ) -> Result<Box<dyn Iterator<Item = Result<EncodedValue>> + Send>>;
+
+    /// Stream rows with intervals and Level 2 decode-time projection.
+    ///
+    /// When `decode_projection` is provided, fields not in the tree are skipped
+    /// during decode rather than being fully materialized. This avoids heap
+    /// allocation for large unused fields like VEP annotations.
+    ///
+    /// Default implementation ignores the projection and falls back to
+    /// `query_stream_with_intervals`.
+    fn query_stream_with_projection(
+        &self,
+        ranges: &[KeyRange],
+        intervals: Option<Arc<IntervalList>>,
+        _decode_projection: Option<Arc<ProjectionTree>>,
+    ) -> Result<Box<dyn Iterator<Item = Result<EncodedValue>> + Send>> {
+        self.query_stream_with_intervals(ranges, intervals)
+    }
 
     /// Stream rows in SORTED key order (sequential partition iteration)
     ///

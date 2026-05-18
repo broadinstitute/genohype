@@ -8,6 +8,7 @@ use crate::codec::{EncodedType, EncodedValue};
 use crate::datasource::DataSource;
 use crate::hail_adapter::HailTableSource;
 use crate::metadata::RVDComponentSpec;
+use crate::projection::ProjectionTree;
 use crate::query::{IntervalList, KeyRange};
 use crate::vcf::VcfDataSource;
 use crate::Result;
@@ -118,6 +119,11 @@ impl QueryEngine {
     /// Get the total number of rows (if available from metadata)
     pub fn total_rows(&self) -> Option<usize> {
         self.source.total_rows()
+    }
+
+    /// Get the table globals (e.g., freq_meta population labels)
+    pub fn globals(&self) -> crate::Result<crate::codec::EncodedValue> {
+        self.source.globals()
     }
 
     /// Check if this table has indexes
@@ -355,6 +361,19 @@ impl QueryEngine {
         intervals: Option<Arc<IntervalList>>,
     ) -> Result<impl Iterator<Item = Result<EncodedValue>>> {
         self.source.query_stream_with_intervals(ranges, intervals)
+    }
+
+    /// Stream query results with Level 2 decode-time projection.
+    ///
+    /// Fields not in the decode_projection are skipped during binary decode,
+    /// avoiding heap allocation for large unused fields.
+    pub fn query_iter_with_projection(
+        &self,
+        ranges: &[KeyRange],
+        intervals: Option<Arc<IntervalList>>,
+        decode_projection: Option<Arc<ProjectionTree>>,
+    ) -> Result<impl Iterator<Item = Result<EncodedValue>>> {
+        self.source.query_stream_with_projection(ranges, intervals, decode_projection)
     }
 
     /// Sample random rows from the data source

@@ -49,6 +49,9 @@ pub enum Commands {
         /// Compute total row count (slow for remote tables without partition_counts in metadata)
         #[arg(long)]
         count: bool,
+        /// Dump table globals as JSON (e.g., freq_meta population labels)
+        #[arg(long)]
+        globals: bool,
     },
 
     /// Scan full dataset to calculate row counts and field statistics (slow)

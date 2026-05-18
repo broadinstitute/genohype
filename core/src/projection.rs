@@ -125,12 +125,50 @@ pub struct ProjectionTree {
 }
 
 #[derive(Debug, Clone)]
-enum ArrayOp {
+pub enum ArrayOp {
     Index(i64),
     Slice(Option<usize>, Option<usize>),
 }
 
 impl ProjectionTree {
+    /// Check if this node selects the entire subtree.
+    pub fn is_select_all(&self) -> bool {
+        self.select_all
+    }
+
+    /// Get a child node by field name (for struct field navigation during decode).
+    pub fn get_child(&self, name: &str) -> Option<&ProjectionTree> {
+        self.children.get(name)
+    }
+
+    /// Check if this node has any children (i.e., is a partial projection).
+    pub fn has_children(&self) -> bool {
+        !self.children.is_empty()
+    }
+
+    /// Get the array operation (index or slice) at this level, if any.
+    pub fn array_op(&self) -> Option<&ArrayOp> {
+        self.array_op.as_ref()
+    }
+
+    /// Ensure a top-level field is included in the projection.
+    ///
+    /// If the tree already selects all or already has this field, this is a no-op.
+    /// Used to ensure filter-dependent fields (like `locus`) are decoded even
+    /// if the user didn't request them.
+    pub fn ensure_field(&mut self, name: &str) {
+        if self.select_all {
+            return;
+        }
+        self.children
+            .entry(name.to_string())
+            .or_insert_with(|| ProjectionTree {
+                select_all: true,
+                children: HashMap::new(),
+                array_op: None,
+            });
+    }
+
     /// Build a projection tree from a list of field paths.
     pub fn from_fields(paths: &[FieldPath]) -> Self {
         let mut root = ProjectionTree {

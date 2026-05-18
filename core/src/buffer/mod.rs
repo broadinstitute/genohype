@@ -92,6 +92,20 @@ pub trait InputBuffer: Send {
     fn read_bool(&mut self) -> Result<bool> {
         Ok(self.read_u8()? != 0)
     }
+
+    /// Skip `len` bytes without allocating or returning them.
+    ///
+    /// Default implementation reads into a small stack buffer in a loop.
+    /// Concrete buffer types can override for better performance.
+    fn skip(&mut self, mut len: usize) -> Result<()> {
+        let mut buf = [0u8; 8192];
+        while len > 0 {
+            let chunk = len.min(buf.len());
+            self.read_exact(&mut buf[..chunk])?;
+            len -= chunk;
+        }
+        Ok(())
+    }
 }
 
 // Implement InputBuffer for Box<dyn InputBuffer> to allow dynamic dispatch
@@ -122,5 +136,9 @@ impl InputBuffer for Box<dyn InputBuffer> {
 
     fn read_bool(&mut self) -> Result<bool> {
         (**self).read_bool()
+    }
+
+    fn skip(&mut self, len: usize) -> Result<()> {
+        (**self).skip(len)
     }
 }

@@ -5,6 +5,7 @@
 
 use crate::buffer::InputBuffer;
 use crate::codec::{EncodedType, EncodedValue};
+use crate::projection::ProjectionTree;
 use crate::query::intervals::IntervalList;
 use crate::query::{KeyRange, KeyValue, QueryBound};
 use crate::HailError;
@@ -20,6 +21,8 @@ pub struct PartitionStream {
     row_type: EncodedType,
     ranges: Vec<KeyRange>,
     intervals: Option<Arc<IntervalList>>,
+    /// Level 2 decode-time projection tree (skip fields not in tree during decode)
+    decode_projection: Option<Arc<ProjectionTree>>,
     /// Whether early termination has been triggered (row past interval bounds)
     terminated: bool,
 }
@@ -37,6 +40,7 @@ impl PartitionStream {
             row_type,
             ranges,
             intervals: None,
+            decode_projection: None,
             terminated: false,
         }
     }
@@ -68,8 +72,18 @@ impl PartitionStream {
             row_type,
             ranges,
             intervals,
+            decode_projection: None,
             terminated: false,
         }
+    }
+
+    /// Set the Level 2 decode-time projection.
+    ///
+    /// When set, fields not in the projection tree are skipped during decode
+    /// rather than being fully materialized.
+    pub fn with_decode_projection(mut self, projection: Option<Arc<ProjectionTree>>) -> Self {
+        self.decode_projection = projection;
+        self
     }
 }
 
@@ -94,11 +108,22 @@ impl Iterator for PartitionStream {
                 continue;
             }
 
-            // Decode the row
-            let row = match self.row_type.read_present_value(&mut *self.buffer) {
-                Ok(r) => r,
-                Err(HailError::UnexpectedEof) => return None,
-                Err(e) => return Some(Err(e)),
+            // Decode the row (with Level 2 projection if available)
+            let row = match self.decode_projection {
+                Some(ref proj) => {
+                    match self.row_type.read_projected_value(&mut *self.buffer, Some(proj)) {
+                        Ok(r) => r,
+                        Err(HailError::UnexpectedEof) => return None,
+                        Err(e) => return Some(Err(e)),
+                    }
+                }
+                None => {
+                    match self.row_type.read_present_value(&mut *self.buffer) {
+                        Ok(r) => r,
+                        Err(HailError::UnexpectedEof) => return None,
+                        Err(e) => return Some(Err(e)),
+                    }
+                }
             };
 
             // Apply key range filters

@@ -8,6 +8,7 @@ use genohype_core::query::{IntervalList, KeyRange, QueryEngine};
 use genohype_core::Result;
 use indicatif::{ProgressBar, ProgressStyle};
 use owo_colors::OwoColorize;
+use std::sync::Arc;
 
 pub fn run_query(args: QueryArgs) -> Result<()> {
     let table_path = &args.table;
@@ -154,8 +155,23 @@ pub fn run_query(args: QueryArgs) -> Result<()> {
             );
         }
 
-        // Use streaming query with intervals for memory-efficient iteration
-        let iterator = engine.query_iter_with_intervals(&where_filters, intervals)?;
+        // Build Level 2 decode-time projection for --fields mode.
+        // For --exclude, we skip Level 2 and rely on Level 1 only.
+        // The decode projection must include filter-dependent fields (locus for intervals).
+        let decode_projection = match &projection {
+            Some(Projection::Fields(tree)) => {
+                let mut decode_tree = tree.clone();
+                // Ensure locus is decoded when interval filtering is active
+                if intervals.is_some() {
+                    decode_tree.ensure_field("locus");
+                }
+                Some(Arc::new(decode_tree))
+            }
+            _ => None, // --exclude or no projection: full decode
+        };
+
+        // Use streaming query with intervals and optional decode projection
+        let iterator = engine.query_iter_with_projection(&where_filters, intervals, decode_projection)?;
 
         // Apply limit if specified
         let iterator: Box<dyn Iterator<Item = _>> = if let Some(n) = args.limit {

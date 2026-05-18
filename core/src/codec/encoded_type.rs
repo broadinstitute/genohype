@@ -320,12 +320,12 @@ impl EncodedType {
     ) -> Result<EncodedValue> {
         // No projection or select_all → full decode
         let proj = match projection {
-            Some(p) if !p.is_select_all() || p.has_children() => p,
+            Some(p) if !p.is_select_all() || p.has_children() || p.array_op().is_some() => p,
             _ => return self.read_present_value(buffer),
         };
 
-        // select_all with no children → full decode
-        if proj.is_select_all() && !proj.has_children() {
+        // select_all with no children and no array_op → full decode
+        if proj.is_select_all() && !proj.has_children() && proj.array_op().is_none() {
             return self.read_present_value(buffer);
         }
 
@@ -379,8 +379,112 @@ impl EncodedType {
 
                 Ok(EncodedValue::Struct(field_values))
             }
-            // For non-struct types (arrays, primitives), just do full decode.
-            // Level 1 projection handles array slicing/indexing.
+            EncodedType::EArray { element, .. } => {
+                use crate::projection::ArrayOp;
+
+                // Determine how many elements we actually need
+                let (decode_limit, index_mode) = match proj.array_op() {
+                    Some(ArrayOp::Slice(start, end)) => {
+                        let s = start.unwrap_or(0);
+                        // end is the exclusive upper bound of elements we need
+                        (end.map(|e| e.max(s)), false)
+                    }
+                    Some(ArrayOp::Index(idx)) if *idx >= 0 => {
+                        // Need to decode up to idx+1 elements
+                        (Some(*idx as usize + 1), true)
+                    }
+                    Some(ArrayOp::Index(_)) => {
+                        // Negative index — need all elements to resolve
+                        (None, true)
+                    }
+                    None => (None, false),
+                };
+
+                // Read array header
+                let length = buffer.read_i32()?;
+                if length < 0 || length > 100000 {
+                    return Err(HailError::InvalidFormat(format!(
+                        "Invalid array length: {}", length
+                    )));
+                }
+                let length = length as usize;
+
+                // Read missing bitmap if elements are nullable
+                let missing_bitmap = if !element.is_required() {
+                    let n_missing_bytes = (length + 7) / 8;
+                    let mut bitmap = vec![0u8; n_missing_bytes];
+                    buffer.read_exact(&mut bitmap)?;
+                    Some(bitmap)
+                } else {
+                    None
+                };
+
+                // How many elements to actually decode vs skip
+                let n_decode = match decode_limit {
+                    Some(limit) => limit.min(length),
+                    None => length,
+                };
+
+                // Decode the elements we need
+                let mut elements = Vec::with_capacity(n_decode);
+                for i in 0..n_decode {
+                    let is_present = if let Some(ref bitmap) = missing_bitmap {
+                        let byte_idx = i / 8;
+                        let bit_idx = i % 8;
+                        (bitmap[byte_idx] >> bit_idx) & 1 == 0
+                    } else {
+                        true
+                    };
+
+                    if is_present {
+                        elements.push(element.read_present_value(buffer)?);
+                    } else {
+                        elements.push(EncodedValue::Null);
+                    }
+                }
+
+                // Skip remaining elements we don't need
+                for i in n_decode..length {
+                    let is_present = if let Some(ref bitmap) = missing_bitmap {
+                        let byte_idx = i / 8;
+                        let bit_idx = i % 8;
+                        (bitmap[byte_idx] >> bit_idx) & 1 == 0
+                    } else {
+                        true
+                    };
+
+                    if is_present {
+                        element.skip_present_value(buffer)?;
+                    }
+                }
+
+                // Apply the slice/index to return only what was requested
+                let result = match proj.array_op() {
+                    Some(ArrayOp::Slice(start, _end)) => {
+                        let s = start.unwrap_or(0);
+                        if s < elements.len() {
+                            EncodedValue::Array(elements[s..].to_vec())
+                        } else {
+                            EncodedValue::Array(vec![])
+                        }
+                    }
+                    Some(ArrayOp::Index(idx)) if index_mode => {
+                        let resolved = if *idx < 0 {
+                            elements.len().checked_sub((-*idx) as usize)
+                        } else {
+                            Some(*idx as usize)
+                        };
+                        match resolved {
+                            Some(i) if i < elements.len() => elements[i].clone(),
+                            _ => EncodedValue::Null,
+                        }
+                    }
+                    _ => EncodedValue::Array(elements),
+                };
+
+                Ok(result)
+            }
+            // For primitive types, just do full decode.
             _ => self.read_present_value(buffer),
         }
     }

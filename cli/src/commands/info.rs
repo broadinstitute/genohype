@@ -20,7 +20,10 @@ fn format_number(n: usize) -> String {
     result
 }
 
-pub fn show_info(table_path: &str, json: bool, count: bool) -> Result<()> {
+pub fn show_info(table_path: &str, json: bool, count: bool, globals: bool) -> Result<()> {
+    if globals {
+        return show_globals(table_path);
+    }
     if json {
         return show_info_json(table_path, count);
     }
@@ -256,5 +259,13 @@ fn show_info_json(table_path: &str, count: bool) -> Result<()> {
     }
 
     println!("{}", serde_json::to_string_pretty(&info)?);
+    Ok(())
+}
+
+fn show_globals(table_path: &str) -> Result<()> {
+    let engine = QueryEngine::open_path(table_path)?;
+    let globals = engine.globals()?;
+    let json = serde_json::to_string_pretty(&globals)?;
+    println!("{}", json);
     Ok(())
 }
