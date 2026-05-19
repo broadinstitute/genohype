@@ -48,6 +48,14 @@ pub struct QueryArgs {
     /// Output structured performance metrics as JSON instead of row data
     #[arg(long)]
     pub stats_json: bool,
+
+    /// Write output to a file instead of stdout (use "-" for explicit stdout)
+    #[arg(short = 'o', long = "output")]
+    pub output: Option<String>,
+
+    /// Show streaming field statistics instead of row data
+    #[arg(long)]
+    pub summary: bool,
 }
 
 #[cfg(feature = "validation")]

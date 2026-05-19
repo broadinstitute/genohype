@@ -48,12 +48,6 @@ use commands::service::run_service_command;
 use commands::summary::run_summary;
 
 fn main() -> Result<()> {
-    // Exit cleanly on broken pipe (e.g., piping to `head` or `jq`)
-    // Rust ignores SIGPIPE by default, causing panics on writes to closed pipes.
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-    }
-
     // Suppress gcloud warnings (e.g., the IAP NumPy warning) globally for all child processes
     std::env::set_var("CLOUDSDK_CORE_DISABLE_WARNINGS", "1");
 

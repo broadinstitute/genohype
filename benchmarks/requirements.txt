@@ -1,0 +1,2 @@
+plotly>=5.0
+pandas>=2.0

@@ -1,0 +1,6 @@
+cli/src/commands/pool.rs
+cli/src/cli/mod.rs
+core/src/pool/**/*.rs
+CLAUDE.md
+
+!**/target

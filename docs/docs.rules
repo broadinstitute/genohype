@@ -1,0 +1,9 @@
+cli/src/**/*.rs
+core/src/**/*.rs
+Cargo.toml
+cli/Cargo.toml
+core/Cargo.toml
+CLAUDE.md
+
+!**/target
+!**/*_test.rs

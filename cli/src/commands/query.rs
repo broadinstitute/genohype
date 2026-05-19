@@ -6,9 +6,11 @@ use genohype_core::codec::EncodedValue;
 use genohype_core::metadata::CacheOptions;
 use genohype_core::projection::Projection;
 use genohype_core::query::{IntervalList, KeyRange, QueryEngine};
+use genohype_core::summary::StatsAccumulator;
 use genohype_core::Result;
 use indicatif::{ProgressBar, ProgressStyle};
 use owo_colors::OwoColorize;
+use std::io::Write;
 use std::sync::Arc;
 
 pub fn run_query(args: QueryArgs, cache_opts: Option<CacheOptions>) -> Result<()> {
@@ -45,6 +47,12 @@ pub fn run_query(args: QueryArgs, cache_opts: Option<CacheOptions>) -> Result<()
 
     // Parse interval list
     let intervals = parse_interval_list(args.intervals_file.as_deref(), &args.interval)?;
+
+    // Open output writer early to fail fast on permission errors
+    let mut writer: Box<dyn Write> = match args.output.as_deref() {
+        Some("-") | None => Box::new(std::io::BufWriter::new(std::io::stdout().lock())),
+        Some(path) => Box::new(std::io::BufWriter::new(std::fs::File::create(path)?)),
+    };
 
     // Open the table (supports both local and cloud paths)
     let show_spinner = !args.json && !args.stats_json;
@@ -121,20 +129,22 @@ pub fn run_query(args: QueryArgs, cache_opts: Option<CacheOptions>) -> Result<()
     }
 
     let stats_mode = args.stats_json;
+    let summary_mode = args.summary;
 
     // Execute query
     if !key_filters.is_empty() {
         // Point lookup using --key
         let key = build_key_from_filters(&key_filters, engine.key_fields())?;
-        println!("{} {:?}", "Point lookup for key:".cyan(), key_filters);
+        let _ = writeln!(writer, "{} {:?}", "Point lookup for key:".cyan(), key_filters);
 
         match engine.lookup(&key)? {
             Some(row) => {
                 // Apply interval filter to lookup result if specified
                 if let Some(ref ivl) = intervals {
                     if !row_matches_intervals(&row, ivl) {
-                        println!();
-                        println!(
+                        let _ = writeln!(writer);
+                        let _ = writeln!(
+                            writer,
                             "{}",
                             "Row found but filtered out by interval list.".yellow()
                         );
@@ -146,18 +156,18 @@ pub fn run_query(args: QueryArgs, cache_opts: Option<CacheOptions>) -> Result<()
                 } else {
                     row
                 };
-                println!();
-                println!("{}", "Found row:".green().bold());
-                print_row(&row, args.json)?;
+                let _ = writeln!(writer);
+                let _ = writeln!(writer, "{}", "Found row:".green().bold());
+                write_row(&mut writer, &row, args.json)?;
             }
             None => {
-                println!();
-                println!("{}", "No matching row found.".yellow());
+                let _ = writeln!(writer);
+                let _ = writeln!(writer, "{}", "No matching row found.".yellow());
             }
         }
     } else {
         // Range query using --where (or full scan if no filters)
-        if !args.json && !stats_mode && where_filters.is_empty() && intervals.is_none() {
+        if !args.json && !stats_mode && !summary_mode && where_filters.is_empty() && intervals.is_none() {
             eprintln!(
                 "{}",
                 "Warning: No filters specified. This may scan all partitions.".yellow()
@@ -189,8 +199,8 @@ pub fn run_query(args: QueryArgs, cache_opts: Option<CacheOptions>) -> Result<()
             Box::new(iterator)
         };
 
-        // Progress bar (stderr only, hidden in --json and --stats-json modes)
-        let pb = if !args.json && !stats_mode {
+        // Progress bar (stderr only, hidden in --json, --stats-json, and --summary modes)
+        let pb = if !args.json && !stats_mode && !summary_mode {
             let pb = ProgressBar::new_spinner();
             pb.set_style(
                 ProgressStyle::default_spinner()
@@ -203,9 +213,16 @@ pub fn run_query(args: QueryArgs, cache_opts: Option<CacheOptions>) -> Result<()
             None
         };
 
+        let mut accumulator = if summary_mode {
+            Some(StatsAccumulator::new())
+        } else {
+            None
+        };
+
         let consume_start = std::time::Instant::now();
         let mut count = 0;
-        let mut serialize_ns: u64 = 0;
+        let mut _serialize_ns: u64 = 0;
+        let mut broken_pipe = false;
         for row_result in iterator {
             let row = row_result?;
             count += 1;
@@ -222,9 +239,20 @@ pub fn run_query(args: QueryArgs, cache_opts: Option<CacheOptions>) -> Result<()
                 continue;
             }
 
+            if summary_mode {
+                let row = if let Some(ref proj) = projection {
+                    proj.apply(&row)
+                } else {
+                    row
+                };
+                accumulator.as_mut().unwrap().process_row(&row);
+                continue;
+            }
+
             if !args.json {
-                println!();
-                println!(
+                let _ = writeln!(writer);
+                let _ = writeln!(
+                    writer,
                     "{} {} {}",
                     "---".dimmed(),
                     format!("Row {}", count).cyan(),
@@ -237,13 +265,30 @@ pub fn run_query(args: QueryArgs, cache_opts: Option<CacheOptions>) -> Result<()
                 row
             };
             let ser_start = std::time::Instant::now();
-            print_row(&row, args.json)?;
-            serialize_ns += ser_start.elapsed().as_nanos() as u64;
+            if let Err(e) = write_row(&mut writer, &row, args.json) {
+                if e.kind() == std::io::ErrorKind::BrokenPipe {
+                    broken_pipe = true;
+                    break;
+                }
+                return Err(e.into());
+            }
+            _serialize_ns += ser_start.elapsed().as_nanos() as u64;
         }
         let consume_elapsed = consume_start.elapsed();
 
         if let Some(pb) = pb {
             pb.finish_and_clear();
+        }
+
+        // Flush writer (ignore BrokenPipe on flush too)
+        if !broken_pipe {
+            if let Err(e) = writer.flush() {
+                if e.kind() == std::io::ErrorKind::BrokenPipe {
+                    broken_pipe = true;
+                } else {
+                    return Err(e.into());
+                }
+            }
         }
 
         if stats_mode {
@@ -256,12 +301,84 @@ pub fn run_query(args: QueryArgs, cache_opts: Option<CacheOptions>) -> Result<()
                 "total_time_ms": total_time_ms,
             });
             println!("{}", stats);
+        } else if summary_mode {
+            let acc = accumulator.unwrap();
+            if args.json {
+                // Machine-readable JSON summary
+                let mut fields_json = serde_json::Map::new();
+                for key in acc.sorted_fields() {
+                    let s = &acc.stats[key];
+                    fields_json.insert(
+                        key.clone(),
+                        serde_json::json!({
+                            "count": s.count,
+                            "null_count": s.null_count,
+                            "min": s.min,
+                            "max": s.max,
+                            "distinct_sample": s.distinct_sample,
+                        }),
+                    );
+                }
+                let output = serde_json::json!({
+                    "rows": count,
+                    "time_secs": consume_elapsed.as_secs_f64(),
+                    "fields": fields_json,
+                });
+                println!("{}", serde_json::to_string_pretty(&output).unwrap());
+            } else {
+                // Pretty-printed summary
+                eprintln!(
+                    "{} {} rows in {:.1}s",
+                    "✓".green(),
+                    count.to_string().bright_white(),
+                    consume_elapsed.as_secs_f64()
+                );
+                println!();
+                println!(
+                    "{:<50} | {:>10} | {:>10} | {:>20} | {:>20}",
+                    "Field".cyan(),
+                    "Count".cyan(),
+                    "Nulls".cyan(),
+                    "Min".cyan(),
+                    "Max".cyan()
+                );
+                println!("{}", "-".repeat(120).dimmed());
+
+                for key in acc.sorted_fields() {
+                    let s = &acc.stats[key];
+                    let field_display = if key.len() > 48 {
+                        format!("...{}", &key[key.len() - 45..])
+                    } else {
+                        key.clone()
+                    };
+                    let min_display = match &s.min {
+                        Some(m) if m.len() > 18 => format!("{}...", &m[..15]),
+                        Some(m) => m.clone(),
+                        None => String::new(),
+                    };
+                    let max_display = match &s.max {
+                        Some(m) if m.len() > 18 => format!("{}...", &m[..15]),
+                        Some(m) => m.clone(),
+                        None => String::new(),
+                    };
+                    println!(
+                        "{:<50} | {:>10} | {:>10} | {:>20} | {:>20}",
+                        field_display, s.count, s.null_count, min_display, max_display
+                    );
+                }
+            }
         } else {
+            // Standard row output mode — print summary to stderr
+            let output_suffix = match args.output.as_deref() {
+                Some("-") | None => String::new(),
+                Some(path) => format!(" → {}", path),
+            };
             eprintln!(
-                "{} {} rows in {:.1}s",
+                "{} {} rows in {:.1}s{}",
                 "✓".green(),
                 count.to_string().bright_white(),
-                consume_elapsed.as_secs_f64()
+                consume_elapsed.as_secs_f64(),
+                output_suffix
             );
         }
     }
@@ -350,52 +467,53 @@ fn looks_like_string_field(field_name: &str) -> bool {
         .any(|&s| field_name.to_lowercase().contains(s))
 }
 
-fn print_row(row: &EncodedValue, json_output: bool) -> Result<()> {
+/// Write a row to the writer, returning io::Result to allow BrokenPipe detection.
+fn write_row(writer: &mut dyn Write, row: &EncodedValue, json_output: bool) -> std::io::Result<()> {
     if json_output {
-        println!("{}", encoded_value_to_json(row));
+        writeln!(writer, "{}", encoded_value_to_json(row))
     } else {
-        print_encoded_value(row, 0);
+        write_encoded_value(writer, row, 0)
     }
-    Ok(())
 }
 
-fn print_encoded_value(value: &EncodedValue, indent: usize) {
+fn write_encoded_value(writer: &mut dyn Write, value: &EncodedValue, indent: usize) -> std::io::Result<()> {
     let prefix = "  ".repeat(indent);
     match value {
-        EncodedValue::Null => println!("{}{}", prefix, "null".dimmed()),
+        EncodedValue::Null => writeln!(writer, "{}{}", prefix, "null".dimmed()),
         EncodedValue::Binary(b) => {
             let s = String::from_utf8_lossy(b);
-            println!("{}\"{}\"", prefix, s.bright_white())
+            writeln!(writer, "{}\"{}\"", prefix, s.bright_white())
         }
-        EncodedValue::Int32(i) => println!("{}{}", prefix, i.to_string().cyan()),
-        EncodedValue::Int64(i) => println!("{}{}", prefix, i.to_string().cyan()),
-        EncodedValue::Float32(f) => println!("{}{}", prefix, f.to_string().cyan()),
-        EncodedValue::Float64(f) => println!("{}{}", prefix, f.to_string().cyan()),
+        EncodedValue::Int32(i) => writeln!(writer, "{}{}", prefix, i.to_string().cyan()),
+        EncodedValue::Int64(i) => writeln!(writer, "{}{}", prefix, i.to_string().cyan()),
+        EncodedValue::Float32(f) => writeln!(writer, "{}{}", prefix, f.to_string().cyan()),
+        EncodedValue::Float64(f) => writeln!(writer, "{}{}", prefix, f.to_string().cyan()),
         EncodedValue::Boolean(b) => {
             if *b {
-                println!("{}{}", prefix, "true".green());
+                writeln!(writer, "{}{}", prefix, "true".green())
             } else {
-                println!("{}{}", prefix, "false".yellow());
+                writeln!(writer, "{}{}", prefix, "false".yellow())
             }
         }
         EncodedValue::Struct(fields) => {
             for (name, val) in fields {
-                print!("{}{}: ", prefix, name.green());
+                write!(writer, "{}{}: ", prefix, name.green())?;
                 match val {
                     EncodedValue::Struct(_) | EncodedValue::Array(_) => {
-                        println!();
-                        print_encoded_value(val, indent + 1);
+                        writeln!(writer)?;
+                        write_encoded_value(writer, val, indent + 1)?;
                     }
-                    _ => print_encoded_value(val, 0),
+                    _ => write_encoded_value(writer, val, 0)?,
                 }
             }
+            Ok(())
         }
         EncodedValue::Array(elements) => {
-            println!("{}[", prefix);
+            writeln!(writer, "{}[", prefix)?;
             for elem in elements {
-                print_encoded_value(elem, indent + 1);
+                write_encoded_value(writer, elem, indent + 1)?;
             }
-            println!("{}]", prefix);
+            writeln!(writer, "{}]", prefix)
         }
     }
 }
