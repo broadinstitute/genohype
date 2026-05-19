@@ -7,7 +7,7 @@ use crate::codec::{EncodedType, EncodedValue, ETypeParser};
 use crate::datasource::DataSource;
 use crate::index::IndexReader;
 use crate::io::join_path;
-use crate::metadata::{RVDComponentSpec, TableMetadata};
+use crate::metadata::{CacheOptions, MetadataCache, RVDComponentSpec, TableMetadata};
 use crate::projection::ProjectionTree;
 use crate::query::{filter_partitions, filter_partitions_with_intervals, IntervalList, KeyRange, KeyValue, PartitionStream};
 use crate::HailError;
@@ -126,6 +126,10 @@ pub struct HailTableSource {
     partition_counts: Option<Vec<usize>>,
     /// Top-level table metadata (version info, references path)
     table_metadata: Option<TableMetadata>,
+    /// Metadata cache for index file caching
+    metadata_cache: Option<Arc<MetadataCache>>,
+    /// Cache options
+    cache_opts: Option<CacheOptions>,
 }
 
 impl HailTableSource {
@@ -134,15 +138,31 @@ impl HailTableSource {
     /// # Arguments
     /// * `table_path` - Path to the table directory (local or cloud URL)
     pub fn new(table_path: &str) -> Result<Self> {
-        let _span = info_span!("HailTableSource::new", table_path).entered();
+        Self::open(table_path, None)
+    }
+
+    /// Open a Hail table with optional metadata caching.
+    ///
+    /// When `cache_opts` is provided, metadata files are cached on the local
+    /// filesystem to avoid re-downloading on every CLI invocation.
+    pub fn open(table_path: &str, cache_opts: Option<CacheOptions>) -> Result<Self> {
+        let _span = info_span!("HailTableSource::open", table_path).entered();
 
         let table_path = table_path.trim_end_matches('/').to_string();
         let rows_path = join_path(&table_path, "rows");
 
+        // Set up cache if options provided
+        let cache = cache_opts.as_ref().and_then(|_| MetadataCache::new());
+
         // Load RVD metadata
         let metadata_path = join_path(&rows_path, "metadata.json.gz");
         debug!("Loading RVD metadata from {}", metadata_path);
-        let rvd_spec = RVDComponentSpec::from_path(&metadata_path)?;
+        let rvd_spec = RVDComponentSpec::from_path_cached(
+            &metadata_path,
+            &table_path,
+            cache.as_ref(),
+            cache_opts.as_ref(),
+        )?;
         debug!("RVD metadata loaded: {} partitions, {} range bounds", rvd_spec.part_files.len(), rvd_spec.range_bounds.len());
 
         // Parse the row type from the codec spec
@@ -151,7 +171,12 @@ impl HailTableSource {
         // Load top-level metadata for partition counts and version info
         let top_metadata_path = join_path(&table_path, "metadata.json.gz");
         debug!("Loading table metadata from {}", top_metadata_path);
-        let table_metadata = TableMetadata::from_path(&top_metadata_path).ok();
+        let table_metadata = TableMetadata::from_path_cached(
+            &top_metadata_path,
+            &table_path,
+            cache.as_ref(),
+            cache_opts.as_ref(),
+        ).ok();
         let partition_counts = table_metadata.as_ref().and_then(|m| m.partition_counts());
         debug!("Partition counts from metadata: {}", if partition_counts.is_some() { "available" } else { "unavailable" });
 
@@ -164,6 +189,8 @@ impl HailTableSource {
             block_maps: Arc::new(Mutex::new(HashMap::new())),
             partition_counts,
             table_metadata,
+            metadata_cache: cache.map(Arc::new),
+            cache_opts,
         })
     }
 
@@ -242,7 +269,12 @@ impl HailTableSource {
         let index_base = join_path(&self.table_path, index_rel_path);
         let index_path = join_path(&index_base, &index_dir_name);
 
-        let reader = Arc::new(IndexReader::new_from_path(&index_path, index_spec)?);
+        let reader = Arc::new(IndexReader::new_from_path_cached(
+            &index_path,
+            index_spec,
+            self.metadata_cache.as_deref(),
+            self.cache_opts.as_ref(),
+        )?);
         cache.insert(partition_idx, reader.clone());
         Ok(reader)
     }
@@ -494,6 +526,8 @@ impl DataSource for HailTableSource {
         let table_path = self.table_path.clone();
         let index_spec = self.rvd_spec.index_spec.clone();
         let key_fields = self.rvd_spec.key.clone();
+        let metadata_cache = self.metadata_cache.clone();
+        let cache_opts = self.cache_opts.clone();
 
         // Pre-compute seek key from intervals (if available)
         let seek_key = intervals.as_ref().and_then(|ivl| {
@@ -525,7 +559,12 @@ impl DataSource for HailTableSource {
                 let index_rel_path = spec.rel_path.trim_start_matches("../");
                 let index_base = join_path(&table_path, index_rel_path);
                 let index_path = join_path(&index_base, &index_dir_name);
-                let reader = Arc::new(IndexReader::new_from_path(&index_path, spec)?);
+                let reader = Arc::new(IndexReader::new_from_path_cached(
+                    &index_path,
+                    spec,
+                    metadata_cache.as_deref(),
+                    cache_opts.as_ref(),
+                )?);
                 let mut cache = index_readers.lock().unwrap();
                 cache.insert(partition_idx, reader.clone());
                 Ok(reader)
@@ -583,23 +622,26 @@ impl DataSource for HailTableSource {
                     };
 
                     let open_start = std::time::Instant::now();
-                    let buffer_and_offset = match seek_result {
-                        Some((file_offset, local_offset)) => {
-                            // Seeked path: open reader at the target block
-                            (|| -> crate::Result<_> {
-                                let mut reader = crate::io::get_reader(&part_path)?;
-                                use std::io::Seek;
-                                reader.seek(std::io::SeekFrom::Start(file_offset))?;
-                                let buffer = BufferBuilder::from_reader(reader)
-                                    .with_leb128()
-                                    .build();
-                                Ok((buffer, local_offset))
-                            })()
-                        }
-                        None => {
-                            // Fallback: full scan from offset 0
-                            BufferBuilder::from_path(&part_path)
-                                .map(|b| (b.with_leb128().build(), 0usize))
+                    let buffer_and_offset = {
+                        let _open_span = info_span!("partition_open", partition = idx).entered();
+                        match seek_result {
+                            Some((file_offset, local_offset)) => {
+                                // Seeked path: open reader at the target block
+                                (|| -> crate::Result<_> {
+                                    let mut reader = crate::io::get_reader(&part_path)?;
+                                    use std::io::Seek;
+                                    reader.seek(std::io::SeekFrom::Start(file_offset))?;
+                                    let buffer = BufferBuilder::from_reader(reader)
+                                        .with_leb128()
+                                        .build();
+                                    Ok((buffer, local_offset))
+                                })()
+                            }
+                            None => {
+                                // Fallback: full scan from offset 0
+                                BufferBuilder::from_path(&part_path)
+                                    .map(|b| (b.with_leb128().build(), 0usize))
+                            }
                         }
                     };
                     let open_elapsed = open_start.elapsed();
@@ -618,6 +660,7 @@ impl DataSource for HailTableSource {
                                 local_offset,
                             );
 
+                            let _decode_span = info_span!("partition_decode", partition = idx).entered();
                             let decode_start = std::time::Instant::now();
                             let mut row_count = 0;
                             for row in stream {
@@ -675,6 +718,8 @@ impl DataSource for HailTableSource {
         let table_path = self.table_path.clone();
         let index_spec = self.rvd_spec.index_spec.clone();
         let key_fields = self.rvd_spec.key.clone();
+        let metadata_cache = self.metadata_cache.clone();
+        let cache_opts = self.cache_opts.clone();
 
         let seek_key = intervals.as_ref().and_then(|ivl| {
             build_seek_key_from_intervals(ivl, &key_fields)
@@ -703,7 +748,12 @@ impl DataSource for HailTableSource {
                 let index_rel_path = spec.rel_path.trim_start_matches("../");
                 let index_base = join_path(&table_path, index_rel_path);
                 let index_path = join_path(&index_base, &index_dir_name);
-                let reader = Arc::new(IndexReader::new_from_path(&index_path, spec)?);
+                let reader = Arc::new(IndexReader::new_from_path_cached(
+                    &index_path,
+                    spec,
+                    metadata_cache.as_deref(),
+                    cache_opts.as_ref(),
+                )?);
                 let mut cache = index_readers.lock().unwrap();
                 cache.insert(partition_idx, reader.clone());
                 Ok(reader)
@@ -737,26 +787,30 @@ impl DataSource for HailTableSource {
                         None
                     };
 
-                    let buffer_and_offset = match seek_result {
-                        Some((file_offset, local_offset)) => {
-                            (|| -> crate::Result<_> {
-                                let mut reader = crate::io::get_reader(&part_path)?;
-                                use std::io::Seek;
-                                reader.seek(std::io::SeekFrom::Start(file_offset))?;
-                                let buffer = BufferBuilder::from_reader(reader)
-                                    .with_leb128()
-                                    .build();
-                                Ok((buffer, local_offset))
-                            })()
-                        }
-                        None => {
-                            BufferBuilder::from_path(&part_path)
-                                .map(|b| (b.with_leb128().build(), 0usize))
+                    let buffer_and_offset = {
+                        let _open_span = info_span!("partition_open", partition = idx).entered();
+                        match seek_result {
+                            Some((file_offset, local_offset)) => {
+                                (|| -> crate::Result<_> {
+                                    let mut reader = crate::io::get_reader(&part_path)?;
+                                    use std::io::Seek;
+                                    reader.seek(std::io::SeekFrom::Start(file_offset))?;
+                                    let buffer = BufferBuilder::from_reader(reader)
+                                        .with_leb128()
+                                        .build();
+                                    Ok((buffer, local_offset))
+                                })()
+                            }
+                            None => {
+                                BufferBuilder::from_path(&part_path)
+                                    .map(|b| (b.with_leb128().build(), 0usize))
+                            }
                         }
                     };
 
                     match buffer_and_offset {
                         Ok((buffer, local_offset)) => {
+                            let _decode_span = info_span!("partition_decode", partition = idx).entered();
                             let stream = PartitionStream::with_intervals(
                                 buffer,
                                 row_type.clone(),

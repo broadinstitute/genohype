@@ -4,7 +4,7 @@ use crate::buffer::{InputBuffer, LEB128Buffer};
 use crate::codec::{EncodedType, ETypeParser};
 use crate::index::{IndexMetadata, IndexNode, InternalNode, LeafNode};
 use crate::io::join_path;
-use crate::metadata::IndexSpec;
+use crate::metadata::{CacheOptions, IndexSpec, MetadataCache};
 use crate::HailError;
 use crate::Result;
 use std::collections::HashMap;
@@ -73,6 +73,81 @@ impl IndexReader {
             _internal_type: internal_type,
             node_cache,
         })
+    }
+
+    /// Create a new index reader with optional local file caching.
+    ///
+    /// When a cache is provided, index files (metadata.json.gz and index data)
+    /// are downloaded to the local filesystem on first access and served from
+    /// there on subsequent calls. This avoids ~670ms cloud reads per file.
+    pub fn new_from_path_cached(
+        index_dir: &str,
+        spec: &IndexSpec,
+        cache: Option<&MetadataCache>,
+        cache_opts: Option<&CacheOptions>,
+    ) -> Result<Self> {
+        let cache_opts_default = CacheOptions::default();
+        let opts = cache_opts.unwrap_or(&cache_opts_default);
+
+        match cache {
+            Some(c) if opts.enabled => {
+                // Cache the metadata.json.gz file locally
+                let metadata_url = join_path(index_dir, "metadata.json.gz");
+                let metadata_local = c.get_or_fetch_file(
+                    index_dir,
+                    "metadata.json.gz",
+                    opts,
+                    || {
+                        let mut reader = crate::io::get_reader(&metadata_url)?;
+                        let mut data = Vec::new();
+                        reader.read_to_end(&mut data)?;
+                        Ok(data)
+                    },
+                )?;
+
+                let metadata_local_str = metadata_local.to_string_lossy().to_string();
+                let metadata = crate::index::IndexMetadata::from_path(&metadata_local_str)?;
+
+                let leaf_type = ETypeParser::parse(&spec.leaf_codec.e_type)?;
+                let internal_type = ETypeParser::parse(&spec.internal_node_codec.e_type)?;
+
+                // Cache the index data file locally
+                let index_url = join_path(index_dir, &metadata.index_path);
+                let index_local = c.get_or_fetch_file(
+                    index_dir,
+                    &metadata.index_path,
+                    opts,
+                    || {
+                        let mut reader = crate::io::get_reader(&index_url)?;
+                        let mut data = Vec::new();
+                        reader.read_to_end(&mut data)?;
+                        Ok(data)
+                    },
+                )?;
+
+                // Load nodes from the cached local file (will use MmapReader)
+                let index_local_str = index_local.to_string_lossy().to_string();
+                let mut reader = crate::io::get_reader(&index_local_str)?;
+                let mut data = Vec::new();
+                reader.read_to_end(&mut data)?;
+                let mut cursor = std::io::Cursor::new(data);
+                let node_cache = Self::load_all_nodes_from_reader(
+                    &mut cursor,
+                    &metadata,
+                    &leaf_type,
+                    &internal_type,
+                )?;
+
+                Ok(IndexReader {
+                    _index_dir: index_dir.to_string(),
+                    metadata,
+                    _leaf_type: leaf_type,
+                    _internal_type: internal_type,
+                    node_cache,
+                })
+            }
+            _ => Self::new_from_path(index_dir, spec),
+        }
     }
 
     /// Load all nodes from the index file into a cache (local path version)
