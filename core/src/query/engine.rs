@@ -7,7 +7,7 @@ use crate::bed::BedDataSource;
 use crate::codec::{EncodedType, EncodedValue};
 use crate::datasource::DataSource;
 use crate::hail_adapter::HailTableSource;
-use crate::metadata::RVDComponentSpec;
+use crate::metadata::{CacheOptions, RVDComponentSpec};
 use crate::projection::ProjectionTree;
 use crate::query::{IntervalList, KeyRange};
 use crate::vcf::VcfDataSource;
@@ -99,6 +99,36 @@ impl QueryEngine {
             // Assume Hail Table - single instance used for both trait and direct access
             let hail_source = HailTableSource::new(table_path)?;
 
+            Ok(QueryEngine {
+                source: Box::new(hail_source.clone()),
+                hail_source: Some(hail_source),
+            })
+        }
+    }
+
+    /// Open a data source with optional metadata caching.
+    ///
+    /// For Hail tables, metadata files are cached on the local filesystem
+    /// to avoid re-downloading on every CLI invocation.
+    #[instrument(skip_all, fields(path = table_path))]
+    pub fn open_path_cached(table_path: &str, cache_opts: Option<CacheOptions>) -> Result<Self> {
+        if table_path.ends_with(".vcf")
+            || table_path.ends_with(".vcf.gz")
+            || table_path.ends_with(".vcf.bgz")
+        {
+            let vcf_source = VcfDataSource::new(table_path)?;
+            Ok(QueryEngine {
+                source: Box::new(vcf_source),
+                hail_source: None,
+            })
+        } else if table_path.ends_with(".bed.gz") || table_path.ends_with(".bed.bgz") {
+            let bed_source = BedDataSource::new(table_path)?;
+            Ok(QueryEngine {
+                source: Box::new(bed_source),
+                hail_source: None,
+            })
+        } else {
+            let hail_source = HailTableSource::open(table_path, cache_opts)?;
             Ok(QueryEngine {
                 source: Box::new(hail_source.clone()),
                 hail_source: Some(hail_source),

@@ -65,6 +65,9 @@ tracing = "0.1"
 # UUID generation (for temp files)
 uuid = { version = "1.0", features = ["v4"] }
 
+# Platform cache/config directory detection
+dirs = "5"
+
 # Progress bars (used by parquet converter, VCF reader, validation)
 indicatif = "0.17"
 
@@ -84,3 +87,4 @@ google-cloud-auth = { version = "0.19", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+filetime = "0.2"

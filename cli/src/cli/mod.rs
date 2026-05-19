@@ -33,6 +33,10 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub profile: Option<String>,
 
+    /// Bypass metadata cache (always download fresh, but still populate cache)
+    #[arg(long, global = true)]
+    pub no_cache: bool,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -125,6 +129,18 @@ pub enum Commands {
         command: IngestCommands,
     },
 
+    /// Manage the local metadata cache
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommands,
+    },
+
     /// Synthetic workload for testing cluster telemetry
     Stress(StressArgs),
+}
+
+#[derive(Subcommand)]
+pub enum CacheCommands {
+    /// Remove all cached metadata files
+    Clear,
 }

@@ -3,6 +3,7 @@
 use crate::cli::QueryArgs;
 use crate::commands::utils::{parse_interval_list, parse_where_condition, progress_style_spinner};
 use genohype_core::codec::EncodedValue;
+use genohype_core::metadata::CacheOptions;
 use genohype_core::projection::Projection;
 use genohype_core::query::{IntervalList, KeyRange, QueryEngine};
 use genohype_core::Result;
@@ -10,7 +11,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use owo_colors::OwoColorize;
 use std::sync::Arc;
 
-pub fn run_query(args: QueryArgs) -> Result<()> {
+pub fn run_query(args: QueryArgs, cache_opts: Option<CacheOptions>) -> Result<()> {
     let table_path = &args.table;
     let mut key_filters: Vec<(String, String)> = Vec::new();
     let mut where_filters: Vec<KeyRange> = Vec::new();
@@ -46,7 +47,7 @@ pub fn run_query(args: QueryArgs) -> Result<()> {
     let intervals = parse_interval_list(args.intervals_file.as_deref(), &args.interval)?;
 
     // Open the table (supports both local and cloud paths)
-    let show_spinner = !args.json;
+    let show_spinner = !args.json && !args.stats_json;
     let spinner = if show_spinner {
         let s = ProgressBar::new_spinner();
         s.set_style(progress_style_spinner());
@@ -58,18 +59,22 @@ pub fn run_query(args: QueryArgs) -> Result<()> {
     };
 
     let load_start = std::time::Instant::now();
-    let mut engine = QueryEngine::open_path(table_path)?;
+    let mut engine = QueryEngine::open_path_cached(table_path, cache_opts)?;
     let load_elapsed = load_start.elapsed();
+
+    let num_partitions = engine.num_partitions();
 
     if let Some(s) = spinner {
         s.finish_and_clear();
     }
-    eprintln!(
-        "{} Loaded {} partitions in {:.1}s",
-        "✓".green(),
-        engine.num_partitions().to_string().bright_white(),
-        load_elapsed.as_secs_f64()
-    );
+    if !args.stats_json {
+        eprintln!(
+            "{} Loaded {} partitions in {:.1}s",
+            "✓".green(),
+            num_partitions.to_string().bright_white(),
+            load_elapsed.as_secs_f64()
+        );
+    }
 
     // Parse and validate projection
     let projection = if let Some(ref fields_str) = args.fields {
@@ -97,21 +102,25 @@ pub fn run_query(args: QueryArgs) -> Result<()> {
     };
 
     // Show filter info
-    if let Some(ref ivl) = intervals {
-        eprintln!(
-            "{} {} interval(s)",
-            "✓".green(),
-            ivl.len().to_string().bright_white()
-        );
+    if !args.stats_json {
+        if let Some(ref ivl) = intervals {
+            eprintln!(
+                "{} {} interval(s)",
+                "✓".green(),
+                ivl.len().to_string().bright_white()
+            );
+        }
+        if !where_filters.is_empty() {
+            eprintln!(
+                "{} {} filter(s): {:?}",
+                "✓".green(),
+                where_filters.len().to_string().bright_white(),
+                where_filters.iter().map(|r| r.field_path_str()).collect::<Vec<_>>()
+            );
+        }
     }
-    if !where_filters.is_empty() {
-        eprintln!(
-            "{} {} filter(s): {:?}",
-            "✓".green(),
-            where_filters.len().to_string().bright_white(),
-            where_filters.iter().map(|r| r.field_path_str()).collect::<Vec<_>>()
-        );
-    }
+
+    let stats_mode = args.stats_json;
 
     // Execute query
     if !key_filters.is_empty() {
@@ -148,7 +157,7 @@ pub fn run_query(args: QueryArgs) -> Result<()> {
         }
     } else {
         // Range query using --where (or full scan if no filters)
-        if !args.json && where_filters.is_empty() && intervals.is_none() {
+        if !args.json && !stats_mode && where_filters.is_empty() && intervals.is_none() {
             eprintln!(
                 "{}",
                 "Warning: No filters specified. This may scan all partitions.".yellow()
@@ -180,8 +189,8 @@ pub fn run_query(args: QueryArgs) -> Result<()> {
             Box::new(iterator)
         };
 
-        // Progress bar (stderr only, hidden in --json mode)
-        let pb = if !args.json {
+        // Progress bar (stderr only, hidden in --json and --stats-json modes)
+        let pb = if !args.json && !stats_mode {
             let pb = ProgressBar::new_spinner();
             pb.set_style(
                 ProgressStyle::default_spinner()
@@ -208,6 +217,11 @@ pub fn run_query(args: QueryArgs) -> Result<()> {
                 }
             }
 
+            if stats_mode {
+                // In stats mode, consume rows but don't print them
+                continue;
+            }
+
             if !args.json {
                 println!();
                 println!(
@@ -232,12 +246,24 @@ pub fn run_query(args: QueryArgs) -> Result<()> {
             pb.finish_and_clear();
         }
 
-        eprintln!(
-            "{} {} rows in {:.1}s",
-            "✓".green(),
-            count.to_string().bright_white(),
-            consume_elapsed.as_secs_f64()
-        );
+        if stats_mode {
+            let total_time_ms = (load_elapsed + consume_elapsed).as_secs_f64() * 1000.0;
+            let stats = serde_json::json!({
+                "rows": count,
+                "partitions": num_partitions,
+                "metadata_load_time_ms": load_elapsed.as_secs_f64() * 1000.0,
+                "query_execution_time_ms": consume_elapsed.as_secs_f64() * 1000.0,
+                "total_time_ms": total_time_ms,
+            });
+            println!("{}", stats);
+        } else {
+            eprintln!(
+                "{} {} rows in {:.1}s",
+                "✓".green(),
+                count.to_string().bright_white(),
+                consume_elapsed.as_secs_f64()
+            );
+        }
     }
 
     Ok(())

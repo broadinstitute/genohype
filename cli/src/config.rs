@@ -27,6 +27,10 @@ pub struct Config {
     #[serde(default)]
     pub export: ExportDefaults,
 
+    /// Cache settings for remote metadata
+    #[serde(default)]
+    pub cache: CacheConfig,
+
     /// Named pool profiles
     #[serde(default)]
     pub pools: HashMap<String, PoolProfile>,
@@ -38,6 +42,26 @@ pub struct Config {
     /// Cluster configurations for multi-environment deployments (legacy)
     #[serde(default)]
     pub clusters: ClustersConfig,
+}
+
+/// Cache configuration for remote metadata files.
+#[derive(Debug, Deserialize, Clone)]
+pub struct CacheConfig {
+    /// Cache TTL in hours (default: 24)
+    #[serde(default = "default_ttl_hours")]
+    pub ttl_hours: u64,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            ttl_hours: default_ttl_hours(),
+        }
+    }
+}
+
+fn default_ttl_hours() -> u64 {
+    24
 }
 
 /// Global default settings.

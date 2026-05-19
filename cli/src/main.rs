@@ -24,9 +24,10 @@ mod ingest;
 pub use genohype_core::{HailError, Result};
 
 use clap::Parser;
-use cli::{Cli, ClickHouseCommands, ClusterCommands, Commands, EnvCommands, ExportCommands};
+use cli::{Cli, CacheCommands, ClickHouseCommands, ClusterCommands, Commands, EnvCommands, ExportCommands};
 #[cfg(feature = "clickhouse")]
 use cli::IngestCommands;
+use genohype_core::metadata::CacheOptions;
 use owo_colors::OwoColorize;
 
 // Import command handlers from the commands module
@@ -65,10 +66,22 @@ fn main() -> Result<()> {
     // Load configuration from file
     let config = config::Config::load_from_path(cli.config.as_deref());
 
+    // Build cache options from config + CLI flags
+    let cache_ttl_secs = std::env::var("GENOHYPE_CACHE_TTL")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|h| h * 3600)
+        .unwrap_or(config.cache.ttl_hours * 3600);
+    let cache_opts = Some(CacheOptions {
+        enabled: true,
+        ttl_secs: cache_ttl_secs,
+        force_refresh: cli.no_cache,
+    });
+
     match cli.command {
-        Commands::Info { path, json, count, globals } => show_info(&path, json, count, globals)?,
-        Commands::Summary { path } => run_summary(&path)?,
-        Commands::Query(args) => run_query(args)?,
+        Commands::Info { path, json, count, globals } => show_info(&path, json, count, globals, cache_opts)?,
+        Commands::Summary { path } => run_summary(&path, cache_opts)?,
+        Commands::Query(args) => run_query(args, cache_opts)?,
         Commands::Export { command } => match command {
             ExportCommands::Parquet(args) => run_export_parquet(args)?,
             ExportCommands::Json(args) => run_export_json(args)?,
@@ -137,6 +150,19 @@ fn main() -> Result<()> {
             } => env::init_env(&config, &name, storage.as_deref(), clickhouse.as_deref())?,
             EnvCommands::Show => env::show_env(&config)?,
             EnvCommands::Verify => env::verify_env(&config)?,
+        },
+        Commands::Cache { command } => match command {
+            CacheCommands::Clear => {
+                if let Some(cache) = genohype_core::metadata::MetadataCache::new() {
+                    let cache_dir = cache.cache_dir().to_path_buf();
+                    cache.clear().map_err(|e| {
+                        genohype_core::HailError::Io(e)
+                    })?;
+                    println!("Cache cleared: {}", cache_dir.display());
+                } else {
+                    eprintln!("Could not determine cache directory");
+                }
+            }
         },
         Commands::Service { command } => run_service_command(command)?,
         #[cfg(feature = "clickhouse")]

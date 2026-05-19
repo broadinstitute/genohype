@@ -6,6 +6,8 @@
 //! - Index specifications for B-tree indexes (_indexSpec)
 //! - Codec specifications for encoding/decoding
 
+pub mod cache;
 mod structures;
 
+pub use cache::{CacheOptions, MetadataCache};
 pub use structures::*;

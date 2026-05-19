@@ -2,6 +2,7 @@
 
 use crate::commands::utils::{format_bytes, progress_style_bar};
 use genohype_core::io::{get_file_size, join_path};
+use genohype_core::metadata::CacheOptions;
 use genohype_core::query::QueryEngine;
 use genohype_core::summary::{format_schema_clean, StatsAccumulator};
 use genohype_core::Result;
@@ -11,7 +12,7 @@ use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Run the summary command
-pub fn run_summary(table_path: &str) -> Result<()> {
+pub fn run_summary(table_path: &str, cache_opts: Option<CacheOptions>) -> Result<()> {
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(
         ProgressStyle::default_spinner()
@@ -21,7 +22,7 @@ pub fn run_summary(table_path: &str) -> Result<()> {
     spinner.set_message("Loading table metadata...");
     spinner.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    let engine = QueryEngine::open_path(table_path)?;
+    let engine = QueryEngine::open_path_cached(table_path, cache_opts)?;
 
     spinner.finish_and_clear();
 

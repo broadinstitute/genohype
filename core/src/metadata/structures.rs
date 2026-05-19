@@ -168,6 +168,32 @@ impl TableMetadata {
             .or_else(|_| Self::from_json(&data))
     }
 
+    /// Load metadata with optional caching support.
+    ///
+    /// When cache and opts are provided and the path is a cloud URL,
+    /// metadata is read from/written to the local cache.
+    pub fn from_path_cached(
+        path: &str,
+        table_url: &str,
+        cache: Option<&super::cache::MetadataCache>,
+        opts: Option<&super::cache::CacheOptions>,
+    ) -> Result<Self> {
+        match (cache, opts) {
+            (Some(c), Some(o)) if o.enabled && crate::io::is_cloud_path(path) => {
+                let data = c.get_or_fetch(table_url, "table_metadata.json.gz", o, || {
+                    let start = std::time::Instant::now();
+                    let mut reader = crate::io::get_reader(path)?;
+                    let mut buf = Vec::new();
+                    reader.read_to_end(&mut buf)?;
+                    debug!("TableMetadata fetched {} bytes in {:?}", buf.len(), start.elapsed());
+                    Ok(buf)
+                })?;
+                Self::from_gzipped_json(&data).or_else(|_| Self::from_json(&data))
+            }
+            _ => Self::from_path(path),
+        }
+    }
+
     /// Extract per-partition row counts from the `components.partition_counts.counts` field.
     ///
     /// Returns `None` if the metadata doesn't contain partition counts (e.g., older Hail versions).
@@ -227,6 +253,29 @@ impl RVDComponentSpec {
             .or_else(|_| Self::from_json(&data));
         debug!("RVDComponentSpec::from_path parsed JSON in {:?}", parse_start.elapsed());
         result
+    }
+
+    /// Load RVD spec with optional caching support.
+    pub fn from_path_cached(
+        path: &str,
+        table_url: &str,
+        cache: Option<&super::cache::MetadataCache>,
+        opts: Option<&super::cache::CacheOptions>,
+    ) -> Result<Self> {
+        match (cache, opts) {
+            (Some(c), Some(o)) if o.enabled && crate::io::is_cloud_path(path) => {
+                let data = c.get_or_fetch(table_url, "rows_metadata.json.gz", o, || {
+                    let start = std::time::Instant::now();
+                    let mut reader = crate::io::get_reader(path)?;
+                    let mut buf = Vec::new();
+                    reader.read_to_end(&mut buf)?;
+                    debug!("RVDComponentSpec fetched {} bytes in {:?}", buf.len(), start.elapsed());
+                    Ok(buf)
+                })?;
+                Self::from_gzipped_json(&data).or_else(|_| Self::from_json(&data))
+            }
+            _ => Self::from_path(path),
+        }
     }
 }
 

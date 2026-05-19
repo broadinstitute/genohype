@@ -1,6 +1,7 @@
 //! Table information display command.
 
 use crate::commands::utils::progress_style_spinner;
+use genohype_core::metadata::CacheOptions;
 use genohype_core::query::QueryEngine;
 use genohype_core::summary::format_schema_clean;
 use genohype_core::Result;
@@ -20,12 +21,12 @@ fn format_number(n: usize) -> String {
     result
 }
 
-pub fn show_info(table_path: &str, json: bool, count: bool, globals: bool) -> Result<()> {
+pub fn show_info(table_path: &str, json: bool, count: bool, globals: bool, cache_opts: Option<CacheOptions>) -> Result<()> {
     if globals {
-        return show_globals(table_path);
+        return show_globals(table_path, cache_opts);
     }
     if json {
-        return show_info_json(table_path, count);
+        return show_info_json(table_path, count, cache_opts);
     }
 
     // Check if this is a VCF or BED file
@@ -41,7 +42,7 @@ pub fn show_info(table_path: &str, json: bool, count: bool, globals: bool) -> Re
         println!("{} {}", "Path:".green(), table_path.bright_white());
         println!();
 
-        let engine = QueryEngine::open_path(table_path)?;
+        let engine = QueryEngine::open_path_cached(table_path, cache_opts.clone())?;
 
         println!(
             "{} {}",
@@ -59,7 +60,7 @@ pub fn show_info(table_path: &str, json: bool, count: bool, globals: bool) -> Re
     spinner.set_message("Loading table metadata...");
     spinner.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    let engine = QueryEngine::open_path(table_path)?;
+    let engine = QueryEngine::open_path_cached(table_path, cache_opts)?;
 
     spinner.finish_and_clear();
 
@@ -205,7 +206,7 @@ pub fn show_info(table_path: &str, json: bool, count: bool, globals: bool) -> Re
     Ok(())
 }
 
-fn show_info_json(table_path: &str, count: bool) -> Result<()> {
+fn show_info_json(table_path: &str, count: bool, cache_opts: Option<CacheOptions>) -> Result<()> {
     let is_vcf = table_path.ends_with(".vcf")
         || table_path.ends_with(".vcf.gz")
         || table_path.ends_with(".vcf.bgz");
@@ -213,7 +214,7 @@ fn show_info_json(table_path: &str, count: bool) -> Result<()> {
 
     if is_vcf || is_bed {
         let format = if is_vcf { "vcf" } else { "bed" };
-        let engine = QueryEngine::open_path(table_path)?;
+        let engine = QueryEngine::open_path_cached(table_path, cache_opts.clone())?;
         let info = serde_json::json!({
             "path": table_path,
             "format": format,
@@ -225,7 +226,7 @@ fn show_info_json(table_path: &str, count: bool) -> Result<()> {
     }
 
     // Hail Table - single QueryEngine load
-    let engine = QueryEngine::open_path(table_path)?;
+    let engine = QueryEngine::open_path_cached(table_path, cache_opts)?;
 
     let mut info = serde_json::json!({
         "path": table_path,
@@ -262,8 +263,8 @@ fn show_info_json(table_path: &str, count: bool) -> Result<()> {
     Ok(())
 }
 
-fn show_globals(table_path: &str) -> Result<()> {
-    let engine = QueryEngine::open_path(table_path)?;
+fn show_globals(table_path: &str, cache_opts: Option<CacheOptions>) -> Result<()> {
+    let engine = QueryEngine::open_path_cached(table_path, cache_opts)?;
     let globals = engine.globals()?;
     let json = serde_json::to_string_pretty(&globals)?;
     println!("{}", json);

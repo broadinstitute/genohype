@@ -44,6 +44,10 @@ pub struct QueryArgs {
     /// Exclude top-level fields (comma-separated, e.g., vep,vep115,histograms)
     #[arg(long, conflicts_with = "fields")]
     pub exclude: Option<String>,
+
+    /// Output structured performance metrics as JSON instead of row data
+    #[arg(long)]
+    pub stats_json: bool,
 }
 
 #[cfg(feature = "validation")]
