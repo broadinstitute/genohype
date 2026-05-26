@@ -3,6 +3,8 @@
 use clap::{Args, Subcommand};
 
 use super::shared::{CommonExportArgs, HasCommonExportArgs};
+#[cfg(feature = "vep")]
+use super::shared::VepArgs;
 
 #[derive(Subcommand)]
 pub enum ExportCommands {
@@ -46,6 +48,10 @@ pub struct ExportParquetArgs {
     /// Collect and display system metrics during export (CPU, memory, I/O)
     #[arg(long)]
     pub benchmark: bool,
+
+    #[cfg(feature = "vep")]
+    #[command(flatten)]
+    pub vep: VepArgs,
 }
 
 impl HasCommonExportArgs for ExportParquetArgs {
@@ -73,6 +79,10 @@ pub struct ExportJsonArgs {
     /// Group rows by field value and write to separate files (not yet implemented)
     #[arg(long)]
     pub group_by: Option<String>,
+
+    #[cfg(feature = "vep")]
+    #[command(flatten)]
+    pub vep: VepArgs,
 }
 
 impl HasCommonExportArgs for ExportJsonArgs {
@@ -92,6 +102,10 @@ pub struct ExportVcfArgs {
     /// Compress output with BGZF
     #[arg(long)]
     pub bgzip: bool,
+
+    #[cfg(feature = "vep")]
+    #[command(flatten)]
+    pub vep: VepArgs,
 }
 
 impl HasCommonExportArgs for ExportVcfArgs {
@@ -107,6 +121,10 @@ pub struct ExportHailArgs {
 
     /// Output Hail table directory path
     pub output: String,
+
+    #[cfg(feature = "vep")]
+    #[command(flatten)]
+    pub vep: VepArgs,
 }
 
 impl HasCommonExportArgs for ExportHailArgs {

@@ -55,6 +55,16 @@ pub fn run_export_parquet(args: ExportParquetArgs) -> Result<()> {
 
     // Open the query engine to get metadata
     let engine = QueryEngine::open_path(&args.common.input)?;
+
+    // Wrap with VEP annotation if requested
+    #[cfg(feature = "vep")]
+    let engine = if let Some(vep_opts) = args.vep.to_init_options() {
+        eprintln!("{} {}", "VEP annotation:".cyan(), "enabled".green());
+        engine.with_vep(vep_opts)?
+    } else {
+        engine
+    };
+
     let row_type = engine.row_type().clone();
     let num_partitions = engine.num_partitions();
     println!(

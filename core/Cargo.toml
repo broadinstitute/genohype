@@ -13,6 +13,7 @@ http = ["object_store/http"]
 validation = ["dep:jsonschema"]
 export = []
 genomic = ["dep:lru"]
+vep = ["dep:fastvep-core", "dep:fastvep-io", "dep:fastvep-annotate"]
 clickhouse = ["export", "dep:reqwest"]
 bigquery = ["export", "dep:google-cloud-bigquery", "dep:google-cloud-storage", "dep:google-cloud-auth"]
 
@@ -79,6 +80,11 @@ moka = { version = "0.12", features = ["future"] }
 
 # LRU Cache for the genomic client (genomic feature)
 lru = { version = "0.12", optional = true }
+
+# fastVEP types for VEP integration (vep feature)
+fastvep-core = { path = "/Users/msolomon/code/genohype-eco/fastVEP/crates/fastvep-core", optional = true }
+fastvep-io = { path = "/Users/msolomon/code/genohype-eco/fastVEP/crates/fastvep-io", optional = true }
+fastvep-annotate = { path = "/Users/msolomon/code/genohype-eco/fastVEP/crates/fastvep-annotate", optional = true }
 
 # HTTP Client for ClickHouse export (clickhouse feature)
 reqwest = { version = "0.11", default-features = false, features = ["blocking", "json", "rustls-tls"], optional = true }

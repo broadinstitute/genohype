@@ -3,6 +3,9 @@
 //! This module defines the `DataSource` trait which provides a unified interface
 //! for reading data from various formats (Hail Tables, VCFs, etc.).
 
+#[cfg(feature = "vep")]
+pub mod annotating;
+
 use crate::codec::{EncodedType, EncodedValue};
 use crate::projection::ProjectionTree;
 use crate::query::{IntervalList, KeyRange};

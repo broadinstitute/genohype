@@ -60,3 +60,47 @@ pub struct CommonExportArgs {
 pub trait HasCommonExportArgs {
     fn common(&self) -> &CommonExportArgs;
 }
+
+/// VEP annotation arguments, flattened into export commands.
+///
+/// When `--vep-gff3` is provided, the QueryEngine wraps its data source
+/// in AnnotatingDataSource, adding a `vep` field to every row.
+#[cfg(feature = "vep")]
+#[derive(Args, Clone)]
+pub struct VepArgs {
+    /// Path to GFF3 transcript annotation file (enables VEP annotation)
+    #[arg(long)]
+    pub vep_gff3: Option<String>,
+
+    /// Path to reference FASTA file (enables HGVS notations in VEP output)
+    #[arg(long)]
+    pub vep_fasta: Option<String>,
+
+    /// Path to supplementary annotation directory (ClinVar, gnomAD, etc.)
+    #[arg(long)]
+    pub vep_sa_dir: Option<String>,
+
+    /// Maximum distance (bp) from transcript for upstream/downstream annotation
+    #[arg(long, default_value = "5000")]
+    pub vep_distance: u64,
+
+    /// Select one consequence per variant (canonical transcript preferred)
+    #[arg(long)]
+    pub vep_pick: bool,
+}
+
+#[cfg(feature = "vep")]
+impl VepArgs {
+    /// Convert to VepInitOptions if VEP annotation is requested.
+    pub fn to_init_options(&self) -> Option<genohype_core::datasource::annotating::VepInitOptions> {
+        self.vep_gff3.as_ref().map(|gff3| {
+            genohype_core::datasource::annotating::VepInitOptions {
+                gff3: gff3.clone(),
+                fasta: self.vep_fasta.clone(),
+                sa_dir: self.vep_sa_dir.clone(),
+                distance: self.vep_distance,
+                pick: self.vep_pick,
+            }
+        })
+    }
+}

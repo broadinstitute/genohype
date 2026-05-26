@@ -430,6 +430,22 @@ impl QueryEngine {
     pub fn sample_random(&self, sample_size: usize) -> Result<Vec<EncodedValue>> {
         self.source.sample_random(sample_size)
     }
+
+    /// Wrap the data source with VEP annotation.
+    ///
+    /// All subsequent queries will have a `vep` field appended to each row
+    /// containing transcript-level consequence predictions from fastVEP.
+    ///
+    /// The AnnotationContext (GFF3, FASTA) is lazily loaded on first row access.
+    #[cfg(feature = "vep")]
+    pub fn with_vep(mut self, options: crate::datasource::annotating::VepInitOptions) -> Result<Self> {
+        let annotating = crate::datasource::annotating::AnnotatingDataSource::new(
+            self.source,
+            options,
+        )?;
+        self.source = Box::new(annotating);
+        Ok(self)
+    }
 }
 
 #[cfg(test)]

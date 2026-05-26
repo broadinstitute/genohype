@@ -24,6 +24,15 @@ pub fn run_export_vcf(args: ExportVcfArgs) -> Result<()> {
 
     // Open the query engine
     let engine = QueryEngine::open_path(&args.common.input)?;
+
+    #[cfg(feature = "vep")]
+    let engine = if let Some(vep_opts) = args.vep.to_init_options() {
+        eprintln!("{} {}", "VEP annotation:".cyan(), "enabled".green());
+        engine.with_vep(vep_opts)?
+    } else {
+        engine
+    };
+
     let row_type = engine.row_type().clone();
     println!(
         "{} {}",

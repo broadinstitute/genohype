@@ -22,6 +22,15 @@ pub fn run_export_hail(args: ExportHailArgs) -> Result<()> {
 
     // Open the query engine
     let engine = QueryEngine::open_path(&args.common.input)?;
+
+    #[cfg(feature = "vep")]
+    let engine = if let Some(vep_opts) = args.vep.to_init_options() {
+        eprintln!("{} {}", "VEP annotation:".cyan(), "enabled".green());
+        engine.with_vep(vep_opts)?
+    } else {
+        engine
+    };
+
     let row_type = engine.row_type().clone();
     let key_fields = engine.key_fields().to_vec();
     let rvd_spec = engine.rvd_spec().cloned();

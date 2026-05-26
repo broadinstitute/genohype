@@ -43,6 +43,9 @@ pub mod export;
 #[cfg(feature = "genomic")]
 pub mod genomic;
 
+#[cfg(feature = "vep")]
+pub mod vep;
+
 pub use error::{HailError, Result};
 
 /// Version of the Hail format this decoder supports

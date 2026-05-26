@@ -20,6 +20,7 @@ validation = ["genohype-core/validation"]
 
 # Genomic high-level API
 genomic = ["genohype-core/genomic"]
+vep = ["genohype-core/vep", "dep:fastvep-annotate", "dep:fastvep-core", "dep:fastvep-io"]
 clickhouse = ["genohype-core/clickhouse", "reqwest/blocking"]
 bigquery = ["gcp", "genohype-core/bigquery"]
 benchmark = []  # sysinfo is now always included
@@ -28,7 +29,7 @@ benchmark = []  # sysinfo is now always included
 server = ["dep:axum-extra", "dep:async-stream", "dep:tokio-stream"]
 
 # All features
-full = ["gcp", "aws", "http", "validation", "clickhouse", "bigquery", "server", "benchmark"]
+full = ["gcp", "aws", "http", "validation", "clickhouse", "bigquery", "server", "benchmark", "vep"]
 
 [dependencies]
 # Core library
@@ -120,6 +121,11 @@ dirs = "5.0"
 
 # TOML config file parsing
 toml = "0.8"
+
+# fastVEP annotation engine (vep feature)
+fastvep-annotate = { path = "/Users/msolomon/code/genohype-eco/fastVEP/crates/fastvep-annotate", optional = true }
+fastvep-core = { path = "/Users/msolomon/code/genohype-eco/fastVEP/crates/fastvep-core", optional = true }
+fastvep-io = { path = "/Users/msolomon/code/genohype-eco/fastVEP/crates/fastvep-io", optional = true }
 
 
 [[bin]]

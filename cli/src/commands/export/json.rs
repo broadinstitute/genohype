@@ -34,6 +34,15 @@ pub fn run_export_json(args: ExportJsonArgs) -> Result<()> {
 
     // Open the query engine to get metadata
     let engine = QueryEngine::open_path(&args.common.input)?;
+
+    #[cfg(feature = "vep")]
+    let engine = if let Some(vep_opts) = args.vep.to_init_options() {
+        eprintln!("{} {}", "VEP annotation:".cyan(), "enabled".green());
+        engine.with_vep(vep_opts)?
+    } else {
+        engine
+    };
+
     let num_partitions = engine.num_partitions();
     println!(
         "{} {}",

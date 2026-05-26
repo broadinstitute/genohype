@@ -27,6 +27,8 @@ use clap::Parser;
 use cli::{Cli, CacheCommands, ClickHouseCommands, ClusterCommands, Commands, EnvCommands, ExportCommands};
 #[cfg(feature = "clickhouse")]
 use cli::IngestCommands;
+#[cfg(feature = "vep")]
+use commands::annotate::run_annotate;
 use genohype_core::metadata::CacheOptions;
 use owo_colors::OwoColorize;
 
@@ -161,6 +163,8 @@ fn main() -> Result<()> {
         Commands::Service { command } => run_service_command(command)?,
         #[cfg(feature = "clickhouse")]
         Commands::Ingest { command } => run_ingest_command(command)?,
+        #[cfg(feature = "vep")]
+        Commands::Annotate(args) => run_annotate(args)?,
         Commands::Stress(args) => {
             println!(
                 "{} The stress command is designed to be run via a worker pool:",

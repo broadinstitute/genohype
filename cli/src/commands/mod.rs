@@ -1,5 +1,7 @@
 //! CLI command handlers extracted from main.rs for better organization.
 
+#[cfg(feature = "vep")]
+pub mod annotate;
 pub mod export;
 pub mod info;
 #[cfg(feature = "clickhouse")]

@@ -7,6 +7,9 @@ pub mod misc;
 pub mod pool;
 pub mod shared;
 
+#[cfg(feature = "vep")]
+pub mod annotate;
+
 // Re-export everything so `main.rs` doesn't break
 pub use cluster::*;
 pub use export::*;
@@ -14,6 +17,9 @@ pub use manhattan::*;
 pub use misc::*;
 pub use pool::*;
 pub use shared::*;
+
+#[cfg(feature = "vep")]
+pub use annotate::*;
 
 use clap::{Parser, Subcommand};
 
@@ -134,6 +140,10 @@ pub enum Commands {
         #[command(subcommand)]
         command: CacheCommands,
     },
+
+    /// Annotate variants with VEP consequence predictions
+    #[cfg(feature = "vep")]
+    Annotate(AnnotateArgs),
 
     /// Synthetic workload for testing cluster telemetry
     Stress(StressArgs),
