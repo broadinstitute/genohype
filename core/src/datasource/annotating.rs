@@ -24,6 +24,8 @@ pub struct VepInitOptions {
     pub sa_dir: Option<String>,
     pub distance: u64,
     pub pick: bool,
+    /// Enable LOFTEE loss-of-function annotation (runs with default config / no conservation providers).
+    pub loftee: bool,
 }
 
 /// A DataSource wrapper that adds VEP annotations to every row.
@@ -58,9 +60,10 @@ impl AnnotatingDataSource {
 
     /// Get or initialize the annotation context.
     fn get_context(&self) -> Result<&AnnotationContext> {
+        let loftee = self.options.loftee;
         self.context
             .get_or_try_init(|| {
-                AnnotationContext::new(
+                let mut ctx = AnnotationContext::new(
                     Some(self.options.gff3.as_str()),
                     self.options.fasta.as_deref(),
                     self.options.sa_dir.as_deref(),
@@ -71,7 +74,11 @@ impl AnnotatingDataSource {
                         "Failed to initialize VEP context: {}",
                         e
                     ))
-                })
+                })?;
+                if loftee {
+                    ctx.loftee_config = Some(fastvep_loftee::LofteeConfig::default());
+                }
+                Ok(ctx)
             })
     }
 
@@ -215,6 +222,7 @@ mod tests {
             sa_dir: None,
             distance: 5000,
             pick: false,
+            loftee: false,
         };
 
         let annotating = AnnotatingDataSource::new(Box::new(vcf_source), options).unwrap();

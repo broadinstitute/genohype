@@ -23,7 +23,13 @@ pub fn append_vep_to_row(row: EncodedValue, vf: &VariationFeature) -> Result<Enc
     };
 
     let vep_array = transcript_variations_to_encoded(vf);
-    fields.push(("vep".to_string(), vep_array));
+    // Replace existing `vep` field if present (e.g. Canadian HT has a minimal vep struct),
+    // otherwise append.
+    if let Some(pos) = fields.iter().position(|(k, _)| k == "vep") {
+        fields[pos] = ("vep".to_string(), vep_array);
+    } else {
+        fields.push(("vep".to_string(), vep_array));
+    }
     Ok(EncodedValue::Struct(fields))
 }
 

@@ -100,6 +100,7 @@ impl VepArgs {
                 sa_dir: self.vep_sa_dir.clone(),
                 distance: self.vep_distance,
                 pick: self.vep_pick,
+                loftee: false,
             }
         })
     }
