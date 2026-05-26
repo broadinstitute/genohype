@@ -37,6 +37,9 @@ pub fn vep_field() -> EncodedField {
         opt_str_field("cdna_position", 22),
         opt_str_field("cds_position", 23),
         opt_str_field("protein_position", 24),
+        opt_str_field("lof", 25),
+        opt_str_field("lof_filter", 26),
+        opt_str_field("lof_flags", 27),
     ];
 
     EncodedField {

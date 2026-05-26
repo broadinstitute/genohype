@@ -118,6 +118,30 @@ fn transcript_variations_to_encoded(vf: &VariationFeature) -> EncodedValue {
                     "protein_position".into(),
                     opt_str_val(protein_pos.as_deref()),
                 ),
+                (
+                    "lof".into(),
+                    opt_str_val(aa.loftee.as_ref().map(|l| l.confidence.as_str())),
+                ),
+                (
+                    "lof_filter".into(),
+                    opt_str_val(aa.loftee.as_ref().and_then(|l| {
+                        if l.filters.is_empty() {
+                            None
+                        } else {
+                            Some(l.filters.join(","))
+                        }
+                    }).as_deref()),
+                ),
+                (
+                    "lof_flags".into(),
+                    opt_str_val(aa.loftee.as_ref().and_then(|l| {
+                        if l.flags.is_empty() {
+                            None
+                        } else {
+                            Some(l.flags.join(","))
+                        }
+                    }).as_deref()),
+                ),
             ]);
 
             elements.push(element);
