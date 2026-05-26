@@ -51,6 +51,18 @@ pub fn set_prefetch_depth(depth: usize) {
     PREFETCH_DEPTH.store(depth.clamp(MIN_PREFETCH_DEPTH, MAX_PREFETCH_DEPTH), Ordering::Relaxed);
 }
 
+/// Global byte-weighted chunk cache for cloud IO.
+///
+/// Both foreground (projected) and background (unprojected) queries hitting the same
+/// genomic intervals will request identical chunk ranges. This cache eliminates the
+/// redundant GCS download on the second pass.
+static CHUNK_CACHE: Lazy<moka::future::Cache<String, bytes::Bytes>> = Lazy::new(|| {
+    moka::future::Cache::builder()
+        .weigher(|_k: &String, v: &bytes::Bytes| v.len() as u32)
+        .max_capacity(512 * 1024 * 1024) // 512 MB ceiling
+        .build()
+});
+
 /// Shared Tokio runtime for IO operations
 ///
 /// This runtime is used for all async cloud storage operations,
@@ -342,12 +354,23 @@ impl PrefetchingCloudReader {
                     let store = store_ref.clone();
                     let path = path_ref.clone();
                     async move {
+                        let cache_key = format!("{}|{}|{}", path.as_ref(), offset, len);
+                        // Check chunk cache first
+                        if let Some(cached) = CHUNK_CACHE.get(&cache_key).await {
+                            trace!("PrefetchingCloudReader: cache hit for range {}..{}", offset, offset + len as u64);
+                            return Ok(cached);
+                        }
                         trace!("PrefetchingCloudReader: fetching range {}..{}", offset, offset + len as u64);
                         let start_time = std::time::Instant::now();
                         let result = store.get_range(&path, range).await;
                         trace!("PrefetchingCloudReader: fetch completed in {:?}", start_time.elapsed());
-                        result
-                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                        match result {
+                            Ok(bytes) => {
+                                CHUNK_CACHE.insert(cache_key, bytes.clone()).await;
+                                Ok(bytes)
+                            }
+                            Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())),
+                        }
                     }
                 })
                 .buffered(depth);
