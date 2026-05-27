@@ -173,10 +173,34 @@ pub struct GeneSummary {
 /// Gene constraint metrics from gnomAD.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeneConstraint {
-    pub pli: Option<f64>,
-    pub loeuf: Option<f64>,
+    // Expected variant counts
+    pub exp_lof: Option<f64>,
+    pub exp_mis: Option<f64>,
+    pub exp_syn: Option<f64>,
+    // Observed variant counts
+    pub obs_lof: Option<i64>,
+    pub obs_mis: Option<i64>,
+    pub obs_syn: Option<i64>,
+    // Observed/expected ratios with confidence intervals
+    pub oe_lof: Option<f64>,
+    pub oe_lof_lower: Option<f64>,
+    pub oe_lof_upper: Option<f64>,
+    pub oe_mis: Option<f64>,
+    pub oe_mis_lower: Option<f64>,
+    pub oe_mis_upper: Option<f64>,
+    pub oe_syn: Option<f64>,
+    pub oe_syn_lower: Option<f64>,
+    pub oe_syn_upper: Option<f64>,
+    // Z scores
+    pub lof_z: Option<f64>,
     pub mis_z: Option<f64>,
     pub syn_z: Option<f64>,
+    // pLI and LOEUF (convenience aliases)
+    pub pli: Option<f64>,
+    pub loeuf: Option<f64>,
+    // Constraint flags
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flags: Option<Vec<String>>,
 }
 
 /// Tissue-level expression data for a gene.
