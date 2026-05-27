@@ -1,47 +1,208 @@
-/**
- * MCP tool execution state for rendering in the chat stream.
- */
-export interface MCPToolState {
-  /** Tool name being executed. */
-  toolName: string;
+import React, { useState } from 'react'
+import { useCopilotAction } from '@copilotkit/react-core'
+import styled from 'styled-components'
 
-  /** Current status of the tool call. */
-  status: "pending" | "executing" | "completed" | "error";
+const ToolStateContainer = styled.div<{ isExecuting: boolean }>`
+  border: 1px solid ${props => props.isExecuting ? '#007bff' : '#28a745'};
+  border-radius: 8px;
+  padding: 16px;
+  margin: 8px 0;
+  background: ${props => props.isExecuting ? '#f0f8ff' : '#f8fff8'};
+  transition: all 0.3s ease;
+`
 
-  /** Tool input arguments (JSON). */
-  args?: Record<string, unknown>;
+const ToolHeader = styled.div`
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+`
 
-  /** Tool result (available when status is "completed"). */
-  result?: unknown;
+const StatusIcon = styled.div<{ isExecuting: boolean }>`
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: ${props => props.isExecuting ? '#e3f2fd' : '#e8f5e8'};
+  margin-top: 4px;
+`
 
-  /** Error message (available when status is "error"). */
-  error?: string;
+const StatusIndicator = styled.div`
+  width: 12px;
+  height: 12px;
+  background: #007bff;
+  border-radius: 50%;
+  animation: mcp-pulse 1.5s ease-in-out infinite;
+
+  @keyframes mcp-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+  }
+`
+
+const ToolContent = styled.div`
+  flex: 1;
+`
+
+const ToolTitle = styled.h4<{ isExecuting: boolean }>`
+  font-size: 14px;
+  font-weight: 600;
+  margin: 0 0 8px 0;
+  color: ${props => props.isExecuting ? '#0056b3' : '#155724'};
+`
+
+const StatusLine = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: #6c757d;
+  margin-bottom: 4px;
+`
+
+const StatusArrow = styled.span`
+  color: #adb5bd;
+`
+
+const StatusText = styled.span`
+  font-family: 'SF Mono', 'Monaco', 'Inconsolata', 'Roboto Mono', monospace;
+`
+
+const ParametersToggle = styled.button`
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: none;
+  border: none;
+  font-size: 12px;
+  color: #6c757d;
+  cursor: pointer;
+  padding: 4px 0;
+  font-family: 'SF Mono', 'Monaco', 'Inconsolata', 'Roboto Mono', monospace;
+
+  &:hover { color: #495057; }
+`
+
+const ChevronIcon = styled.svg<{ expanded: boolean }>`
+  width: 12px;
+  height: 12px;
+  transition: transform 0.2s ease;
+  transform: ${props => props.expanded ? 'rotate(90deg)' : 'rotate(0deg)'};
+`
+
+const ParametersContent = styled.pre`
+  margin: 8px 0 0 24px;
+  padding: 8px;
+  background: #f8f9fa;
+  border-radius: 4px;
+  font-size: 11px;
+  overflow-x: auto;
+  border: 1px solid #e9ecef;
+`
+
+const ProcessingLine = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: #6c757d;
+  animation: mcp-pulse 1.5s ease-in-out infinite;
+`
+
+const SuccessLine = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: #28a745;
+`
+
+interface ToolStateDisplayProps {
+  name: string
+  status: string
+  args: any
+}
+
+function ToolStateDisplay({ name, status, args }: ToolStateDisplayProps) {
+  const [isExpanded, setIsExpanded] = useState(false)
+  const isExecuting = status === 'executing'
+  const isComplete = status === 'complete'
+
+  const chevron = React.createElement(ChevronIcon, {
+    expanded: isExpanded,
+    fill: 'none',
+    stroke: 'currentColor',
+    viewBox: '0 0 24 24',
+  }, React.createElement('path', {
+    strokeLinecap: 'round',
+    strokeLinejoin: 'round',
+    strokeWidth: 2,
+    d: 'M9 5l7 7-7 7',
+  }))
+
+  const paramsSection = React.createElement(React.Fragment, null,
+    React.createElement(StatusLine, null,
+      React.createElement(ParametersToggle, { onClick: () => setIsExpanded(!isExpanded) },
+        React.createElement(StatusArrow, null, '\u203A'),
+        React.createElement(StatusText, null, 'Parameters'),
+        chevron,
+      ),
+    ),
+    isExpanded && React.createElement(ParametersContent, null,
+      args ? JSON.stringify(args, null, 2) : 'No parameters'
+    ),
+  )
+
+  return React.createElement(ToolStateContainer, { isExecuting },
+    React.createElement(ToolHeader, null,
+      React.createElement(StatusIcon, { isExecuting },
+        isExecuting
+          ? React.createElement(StatusIndicator)
+          : React.createElement('svg', {
+              width: 16, height: 16, fill: 'none', stroke: '#28a745', viewBox: '0 0 24 24',
+            }, React.createElement('path', {
+              strokeLinecap: 'round', strokeLinejoin: 'round', strokeWidth: 2, d: 'M5 13l4 4L19 7',
+            })),
+      ),
+      React.createElement(ToolContent, null,
+        React.createElement(ToolTitle, { isExecuting }, `Tool: ${name}`),
+        isExecuting && React.createElement(React.Fragment, null,
+          React.createElement(StatusLine, null,
+            React.createElement(StatusArrow, null, '\u203A'),
+            React.createElement(StatusText, null, 'Calling MCP server...'),
+          ),
+          paramsSection,
+          React.createElement(ProcessingLine, null,
+            React.createElement(StatusArrow, null, '\u203A'),
+            React.createElement(StatusText, null, 'Processing request...'),
+          ),
+        ),
+        isComplete && React.createElement(React.Fragment, null,
+          React.createElement(SuccessLine, null,
+            React.createElement('span', { style: { color: '#28a745' } }, '\u2713'),
+            React.createElement(StatusText, null, 'Tool completed successfully'),
+          ),
+          paramsSection,
+        ),
+      ),
+    ),
+  )
 }
 
 /**
- * Hook for rendering MCP tool execution state inline in the chat stream.
+ * Hook that registers a wildcard CopilotKit action to render MCP tool
+ * execution states inline in the chat stream.
  *
- * Returns a render function that the CopilotKit chat component can use
- * to display tool calls as they execute — showing loading spinners,
- * argument previews, and formatted results.
- *
- * ```tsx
- * const renderToolState = useMCPStateRender();
- * // Pass to CopilotChat as a custom renderer
- * ```
+ * Shows a pulsing indicator while tools execute and a success state
+ * when complete, with expandable parameter details.
  */
 export function useMCPStateRender() {
-  // TODO: Implement tool state tracking and rendering
-  // This will subscribe to MCP tool call events from the CopilotKit runtime
-  // and return React elements for each tool execution state.
-  return {
-    /** Currently active tool calls. */
-    activeTools: [] as MCPToolState[],
-
-    /** Render function for a single tool state. */
-    renderToolState: (_state: MCPToolState): null => {
-      // TODO: Return React element with tool execution visualization
-      return null;
+  useCopilotAction({
+    name: '*',
+    render: ({ name, status, args }: { name: string; status: string; args: any }) => {
+      if (status === 'idle') return React.createElement(React.Fragment)
+      return React.createElement(ToolStateDisplay, { name, status, args })
     },
-  };
+  })
 }
