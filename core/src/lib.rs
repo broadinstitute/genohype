@@ -43,6 +43,9 @@ pub mod export;
 #[cfg(feature = "genomic")]
 pub mod genomic;
 
+#[cfg(feature = "mcp")]
+pub mod mcp;
+
 #[cfg(feature = "vep")]
 pub mod vep;
 
