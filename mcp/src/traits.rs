@@ -1,33 +1,6 @@
-use std::sync::Arc;
-
 use async_trait::async_trait;
-use serde_json::Value;
 
-use super::types::*;
-
-/// A single MCP tool that can be registered with [`McpServer`].
-///
-/// Each tool declares its name, description, and JSON Schema for input
-/// validation. Execution receives parsed arguments and a data provider
-/// to fetch genomic data from whatever backend the host application uses.
-#[async_trait]
-pub trait McpTool: Send + Sync {
-    /// Machine-readable tool name (e.g., "get_variant_details").
-    fn name(&self) -> &'static str;
-
-    /// Human-readable description shown to the AI model.
-    fn description(&self) -> &'static str;
-
-    /// JSON Schema describing the tool's input parameters.
-    fn input_schema(&self) -> Value;
-
-    /// Execute the tool with the given arguments.
-    async fn execute(
-        &self,
-        args: Value,
-        provider: Arc<dyn GenomicDataProvider>,
-    ) -> anyhow::Result<Value>;
-}
+use crate::types::*;
 
 /// Trait for providing genomic data to MCP tools.
 ///
