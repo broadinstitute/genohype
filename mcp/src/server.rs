@@ -4,7 +4,7 @@ use rmcp::{
     ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{ServerCapabilities, ServerInfo},
-    tool, tool_router,
+    tool, tool_handler, tool_router,
 };
 
 use crate::tools::{
@@ -193,6 +193,7 @@ impl GenomicToolServer {
 // ServerHandler implementation
 // ---------------------------------------------------------------------------
 
+#[tool_handler]
 impl ServerHandler for GenomicToolServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
