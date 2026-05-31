@@ -297,6 +297,11 @@ impl CloudProvider for GcpClient {
                     cmd.args(["--subnet", subnet]);
                 }
 
+                // Service account
+                if let Some(ref sa) = config.service_account {
+                    cmd.arg(format!("--service-account={}", sa));
+                }
+
                 let output = cmd.output().map_err(HailError::Io)?;
 
                 if !output.status.success() {
@@ -422,6 +427,11 @@ impl CloudProvider for GcpClient {
                 }
                 if let Some(ref subnet) = setup.subnet {
                     cmd.args(["--subnet", subnet]);
+                }
+
+                // Service account
+                if let Some(ref sa) = setup.service_account {
+                    cmd.arg(format!("--service-account={}", sa));
                 }
 
                 let output = cmd.output().map_err(HailError::Io)?;

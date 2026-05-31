@@ -383,6 +383,7 @@ pub async fn scale_cluster(
                 network: net.clone(),
                 subnet: sub.clone(),
                 project_id: project.clone(),
+                service_account: None,
             })
             .collect();
 

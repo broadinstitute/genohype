@@ -56,6 +56,8 @@ pub struct PoolConfig {
     pub pool_db_path: Option<String>,
     /// GCS URL for pre-staged binary (downloaded by VMs on startup)
     pub binary_gcs_url: Option<String>,
+    /// GCP service account email to attach to VMs
+    pub service_account: Option<String>,
 }
 
 /// Information about a cloud instance.
@@ -133,6 +135,8 @@ pub struct InstanceSetup {
     pub subnet: Option<String>,
     /// GCP project ID
     pub project_id: String,
+    /// GCP service account email to attach to the VM
+    pub service_account: Option<String>,
 }
 
 /// Configuration for scaling operations.
@@ -157,6 +161,8 @@ pub struct ScalingConfig {
     pub pool_db_path: Option<String>,
     /// Path to a custom binary to deploy to workers instead of the coordinator binary
     pub worker_binary: Option<String>,
+    /// GCP service account email to attach to VMs
+    pub service_account: Option<String>,
 }
 
 /// Abstract interface for cloud infrastructure operations.

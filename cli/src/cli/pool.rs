@@ -53,6 +53,10 @@ pub enum PoolCommands {
         /// Create a dedicated coordinator node for distributed processing
         #[arg(long)]
         with_coordinator: bool,
+
+        /// GCP service account email to attach to worker VMs
+        #[arg(long)]
+        service_account: Option<String>,
     },
 
     /// Submit a job to run on the worker pool

@@ -349,6 +349,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                     network: config.network.clone(),
                     subnet: config.subnet.clone(),
                     project_id: project_id.clone(),
+                    service_account: config.service_account.clone(),
                 });
 
                 existing_indices.push(next_idx);

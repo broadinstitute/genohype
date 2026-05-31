@@ -144,6 +144,8 @@ pub struct PoolProfile {
     pub update_api_port: Option<u16>,
     /// Path to a custom binary to deploy to workers instead of the coordinator binary
     pub worker_binary: Option<String>,
+    /// GCP service account email to attach to worker VMs
+    pub service_account: Option<String>,
 }
 
 /// A named ClickHouse instance profile.
@@ -438,6 +440,7 @@ impl Config {
                 update_via_api: profile.update_via_api.unwrap_or(false),
                 update_api_port: profile.update_api_port.unwrap_or(3000),
                 worker_binary: profile.worker_binary.clone(),
+                service_account: profile.service_account.clone(),
             }
         })
     }
@@ -536,6 +539,8 @@ pub struct ResolvedPoolConfig {
     pub update_api_port: u16,
     /// Path to a custom binary to deploy to workers instead of the coordinator binary
     pub worker_binary: Option<String>,
+    /// GCP service account email to attach to worker VMs
+    pub service_account: Option<String>,
 }
 
 /// Status of a cluster deployment.

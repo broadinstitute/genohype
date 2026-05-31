@@ -37,6 +37,7 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
             wait,
             skip_build,
             with_coordinator,
+            service_account,
         } => {
             // Try to load pool profile from config (if exists)
             let profile = app_config.get_pool(&name);
@@ -110,6 +111,9 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
                 );
             }
 
+            let resolved_service_account = service_account
+                .or_else(|| profile.as_ref().and_then(|p| p.service_account.clone()));
+
             let pool_config = PoolConfig {
                 name,
                 worker_count: resolved_workers,
@@ -123,6 +127,7 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
                 wireguard,
                 pool_db_path: profile.as_ref().and_then(|p| p.pool_db_path.clone()),
                 binary_gcs_url: None, // Set by create() after staging
+                service_account: resolved_service_account,
             };
 
             manager.create(&pool_config, wait, skip_build)?;
@@ -272,6 +277,7 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
                     with_coordinator: p.with_coordinator,
                     pool_db_path: p.pool_db_path.clone(),
                     worker_binary: p.worker_binary.clone(),
+                    service_account: p.service_account.clone(),
                 }
             });
             // Resolve worker binary: CLI flag > config profile
@@ -322,6 +328,7 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
                 with_coordinator: pool_config.with_coordinator,
                 pool_db_path: pool_config.pool_db_path.clone(),
                 worker_binary: pool_config.worker_binary.clone(),
+                service_account: pool_config.service_account.clone(),
             };
 
             let resolved_zone = resolve_zone(zone, &name, app_config);
