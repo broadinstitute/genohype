@@ -12,6 +12,7 @@
 //! - `writer`: Converts `EncodedValue` rows back to VCF records
 
 pub mod codec;
+pub mod index;
 pub mod reader;
 pub mod schema;
 pub mod writer;

@@ -24,7 +24,7 @@ mod ingest;
 pub use genohype_core::{HailError, Result};
 
 use clap::Parser;
-use cli::{Cli, CacheCommands, ClickHouseCommands, ClusterCommands, Commands, EnvCommands, ExportCommands};
+use cli::{Cli, CacheCommands, ClickHouseCommands, ClusterCommands, Commands, EnvCommands, ExportCommands, VcfCommands};
 #[cfg(feature = "clickhouse")]
 use cli::IngestCommands;
 #[cfg(feature = "vep")]
@@ -48,6 +48,7 @@ use commands::query::run_query;
 use commands::schema::{run_generate_schema, run_validate};
 use commands::service::run_service_command;
 use commands::summary::run_summary;
+use commands::vcf::run_vcf_index;
 
 fn main() -> Result<()> {
     // Suppress gcloud warnings (e.g., the IAP NumPy warning) globally for all child processes
@@ -165,6 +166,9 @@ fn main() -> Result<()> {
         Commands::Ingest { command } => run_ingest_command(command)?,
         #[cfg(feature = "vep")]
         Commands::Annotate(args) => run_annotate(args)?,
+        Commands::Vcf { command } => match command {
+            VcfCommands::Index { path, output } => run_vcf_index(&path, output.as_deref())?,
+        },
         Commands::Stress(args) => {
             println!(
                 "{} The stress command is designed to be run via a worker pool:",

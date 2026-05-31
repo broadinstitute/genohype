@@ -14,3 +14,4 @@ pub mod schema;
 pub mod service;
 pub mod summary;
 pub mod utils;
+pub mod vcf;

@@ -6,6 +6,7 @@ pub mod manhattan;
 pub mod misc;
 pub mod pool;
 pub mod shared;
+pub mod vcf;
 
 #[cfg(feature = "vep")]
 pub mod annotate;
@@ -17,6 +18,7 @@ pub use manhattan::*;
 pub use misc::*;
 pub use pool::*;
 pub use shared::*;
+pub use vcf::*;
 
 #[cfg(feature = "vep")]
 pub use annotate::*;
@@ -144,6 +146,12 @@ pub enum Commands {
     /// Annotate variants with VEP consequence predictions
     #[cfg(feature = "vep")]
     Annotate(AnnotateArgs),
+
+    /// VCF utilities (indexing, etc.)
+    Vcf {
+        #[command(subcommand)]
+        command: VcfCommands,
+    },
 
     /// Synthetic workload for testing cluster telemetry
     Stress(StressArgs),
