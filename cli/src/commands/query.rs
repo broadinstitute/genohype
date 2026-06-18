@@ -4,7 +4,7 @@ use crate::cli::QueryArgs;
 use crate::commands::utils::{parse_interval_list, parse_where_condition, progress_style_spinner};
 use genohype_core::codec::EncodedValue;
 use genohype_core::metadata::CacheOptions;
-use genohype_core::projection::Projection;
+use genohype_core::projection::{Projection, SchemaWidth};
 use genohype_core::query::{IntervalList, KeyRange, QueryEngine};
 use genohype_core::summary::StatsAccumulator;
 use genohype_core::Result;
@@ -84,8 +84,28 @@ pub fn run_query(args: QueryArgs, cache_opts: Option<CacheOptions>) -> Result<()
         );
     }
 
-    // Parse and validate projection
-    let projection = if let Some(ref fields_str) = args.fields {
+    // Parse and validate projection.
+    // `--width` is mutually exclusive with `--fields`/`--exclude` (enforced by clap).
+    let projection = if let Some(ref width_str) = args.width {
+        let width = SchemaWidth::parse(width_str).unwrap_or_else(|e| {
+            eprintln!("{} Invalid --width: {}", "Error:".red().bold(), e);
+            std::process::exit(1);
+        });
+        match width {
+            // Full width => no projection, decode everything.
+            SchemaWidth::Full => None,
+            // Browser-minimal => strict allowlist intersected with the actual
+            // source schema (tolerates exomes-vs-genomes field differences).
+            SchemaWidth::BrowserMinimal => {
+                let proj = Projection::browser_minimal_present_in(engine.row_type());
+                proj.validate(engine.row_type()).unwrap_or_else(|e| {
+                    eprintln!("{} {}", "Error:".red().bold(), e);
+                    std::process::exit(1);
+                });
+                Some(proj)
+            }
+        }
+    } else if let Some(ref fields_str) = args.fields {
         let proj = Projection::from_fields_str(fields_str).unwrap_or_else(|e| {
             eprintln!("{} Invalid --fields: {}", "Error:".red().bold(), e);
             std::process::exit(1);

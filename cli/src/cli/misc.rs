@@ -45,6 +45,12 @@ pub struct QueryArgs {
     #[arg(long, conflicts_with = "fields")]
     pub exclude: Option<String>,
 
+    /// Schema-width preset: `full` (decode everything, the default) or
+    /// `browser-minimal` (strict allowlist of only the fields the gnomAD browser
+    /// API returns). Cannot be combined with --fields/--exclude.
+    #[arg(long, conflicts_with = "fields", conflicts_with = "exclude")]
+    pub width: Option<String>,
+
     /// Output structured performance metrics as JSON instead of row data
     #[arg(long)]
     pub stats_json: bool,

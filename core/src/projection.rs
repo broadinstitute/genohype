@@ -413,6 +413,44 @@ impl Projection {
         )))
     }
 
+    /// Build the canonical `browser-minimal` strict inclusion-list projection.
+    ///
+    /// Keeps only [`BROWSER_MINIMAL_FIELDS`] (each in full) and drops everything
+    /// else. This is the single source of truth for the `browser-minimal` schema
+    /// width used by the sizing probe and the per-backend loaders, so they don't
+    /// each re-specify the field list. Strict: [`Projection::validate`] against a
+    /// table that lacks one of these fields will error — see
+    /// [`Projection::browser_minimal_present_in`] for the schema-tolerant variant.
+    pub fn browser_minimal() -> Self {
+        let paths: Vec<FieldPath> = BROWSER_MINIMAL_FIELDS
+            .iter()
+            .map(|f| FieldPath::parse(f).expect("static browser-minimal field path must parse"))
+            .collect();
+        Projection::Fields(ProjectionTree::from_fields(&paths))
+    }
+
+    /// Build the `browser-minimal` projection restricted to the fields actually
+    /// present as top-level fields in `schema`.
+    ///
+    /// This stays strict (it never includes a field outside [`BROWSER_MINIMAL_FIELDS`])
+    /// but tolerates the schema differences between the gnomAD v4 exomes and genomes
+    /// sites tables, so the same width definition can be applied to either without a
+    /// validation failure on an absent field (e.g. a missing `coverage` or `joint`).
+    pub fn browser_minimal_present_in(schema: &EncodedType) -> Self {
+        let available: Vec<&str> = match schema {
+            EncodedType::EBaseStruct { fields, .. } => {
+                fields.iter().map(|f| f.name.as_str()).collect()
+            }
+            _ => Vec::new(),
+        };
+        let paths: Vec<FieldPath> = BROWSER_MINIMAL_FIELDS
+            .iter()
+            .filter(|f| available.contains(*f))
+            .map(|f| FieldPath::parse(f).expect("static browser-minimal field path must parse"))
+            .collect();
+        Projection::Fields(ProjectionTree::from_fields(&paths))
+    }
+
     /// Parse --exclude argument into a Projection.
     pub fn from_exclude_str(exclude_str: &str) -> Result<Self> {
         let names: Vec<String> = exclude_str
@@ -435,6 +473,96 @@ impl Projection {
         match self {
             Projection::Fields(tree) => tree.project(value),
             Projection::Exclude(names) => exclude_fields(value, names),
+        }
+    }
+}
+
+/// A named schema-width preset for the gnomAD datastore benchmark (Phase 0).
+///
+/// The benchmark sweeps a `{full, browser-minimal}` width dimension to test the
+/// hypothesis that storing the whole Hail document (prod's ES practice) costs far
+/// more disk/ingest than storing only what the browser API returns, and hurts
+/// row/document stores (ES `_source`, Postgres-JSONB de-TOAST) much more than
+/// columnar stores.
+///
+/// - [`SchemaWidth::Full`] decodes every field in the source table (no projection).
+/// - [`SchemaWidth::BrowserMinimal`] applies a *strict inclusion-list* over
+///   [`BROWSER_MINIMAL_FIELDS`] — keep only those fields, drop everything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaWidth {
+    /// Decode the entire row (all ~238 leaves of the gnomAD v4 sites table).
+    Full,
+    /// Strict allowlist of only the fields the gnomAD browser API returns.
+    BrowserMinimal,
+}
+
+/// The canonical `browser-minimal` top-level inclusion list.
+///
+/// These are the *top-level* fields the gnomAD browser variant API actually
+/// returns, derived from the columns the browser backend reads in
+/// `gnomad-browser-lite/backend/src/backend/duckdb.rs`:
+///
+/// - region/list view (`get_variants`): `locus`, `alleles`, `rsids`, `variant_id`,
+///   `exome.freq`, `genome.freq`, `transcript_consequences`.
+/// - variant-detail view (`get_variant_detail`): additionally `caid`, the full
+///   `exome` / `genome` / `joint` structs (all population-stratified frequencies
+///   shown in the detail page), `in_silico_predictors`, and `coverage`.
+///
+/// Each entry is kept *in full*: the browser serializes whole structs (e.g. every
+/// ancestry-group frequency under `exome`/`genome`), so projecting to whole
+/// top-level fields — rather than individual leaves — is intentional and matches
+/// the API payload. The giant unused leaves dropped here are the raw `vep` array,
+/// the VCF `info` struct, and the quality `histograms` struct, which together
+/// account for the bulk of the ~238 leaves in the full schema.
+///
+/// **Strictness / schema differences:** the gnomAD v4 *exomes* and *genomes* sites
+/// tables do not carry identical top-level fields (e.g. coverage may live in a
+/// separate joined table). Building the projection with [`Projection::browser_minimal`]
+/// is strict and will fail validation if a listed field is absent; use
+/// [`Projection::browser_minimal_present_in`] to intersect this allowlist with a
+/// concrete schema when extracting from a table that lacks some fields.
+pub const BROWSER_MINIMAL_FIELDS: &[&str] = &[
+    "locus",
+    "alleles",
+    "variant_id",
+    "rsids",
+    "caid",
+    "exome",
+    "genome",
+    "joint",
+    "transcript_consequences",
+    "in_silico_predictors",
+    "coverage",
+];
+
+impl SchemaWidth {
+    /// Parse a width name (`full` or `browser-minimal`, underscores accepted).
+    pub fn parse(s: &str) -> Result<Self> {
+        match s.trim() {
+            "full" => Ok(SchemaWidth::Full),
+            "browser-minimal" | "browser_minimal" => Ok(SchemaWidth::BrowserMinimal),
+            other => Err(HailError::InvalidFormat(format!(
+                "Unknown schema width '{other}'. Expected 'full' or 'browser-minimal'."
+            ))),
+        }
+    }
+
+    /// The string name for this width (inverse of [`SchemaWidth::parse`]).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SchemaWidth::Full => "full",
+            SchemaWidth::BrowserMinimal => "browser-minimal",
+        }
+    }
+
+    /// Build the projection for this width.
+    ///
+    /// `Full` => `None` (decode everything, no projection applied).
+    /// `BrowserMinimal` => the strict [`Projection::browser_minimal`] inclusion list.
+    pub fn projection(&self) -> Option<Projection> {
+        match self {
+            SchemaWidth::Full => None,
+            SchemaWidth::BrowserMinimal => Some(Projection::browser_minimal()),
         }
     }
 }
@@ -779,6 +907,119 @@ mod tests {
         } else {
             panic!("Expected struct");
         }
+    }
+
+    #[test]
+    fn test_schema_width_parse_roundtrip() {
+        assert_eq!(SchemaWidth::parse("full").unwrap(), SchemaWidth::Full);
+        assert_eq!(
+            SchemaWidth::parse("browser-minimal").unwrap(),
+            SchemaWidth::BrowserMinimal
+        );
+        // underscore alias + surrounding whitespace
+        assert_eq!(
+            SchemaWidth::parse(" browser_minimal ").unwrap(),
+            SchemaWidth::BrowserMinimal
+        );
+        assert!(SchemaWidth::parse("minimal").is_err());
+        assert_eq!(SchemaWidth::Full.as_str(), "full");
+        assert_eq!(SchemaWidth::BrowserMinimal.as_str(), "browser-minimal");
+    }
+
+    #[test]
+    fn test_full_width_means_no_projection() {
+        assert!(SchemaWidth::Full.projection().is_none());
+        assert!(SchemaWidth::BrowserMinimal.projection().is_some());
+    }
+
+    #[test]
+    fn test_browser_minimal_keeps_kept_drops_rest() {
+        // A row with browser fields plus a giant `vep`/`info`-like field that must be dropped.
+        let row = EncodedValue::Struct(vec![
+            (
+                "locus".to_string(),
+                EncodedValue::Struct(vec![
+                    ("contig".to_string(), EncodedValue::Binary(b"chr22".to_vec())),
+                    ("position".to_string(), EncodedValue::Int32(16050075)),
+                ]),
+            ),
+            (
+                "alleles".to_string(),
+                EncodedValue::Array(vec![
+                    EncodedValue::Binary(b"A".to_vec()),
+                    EncodedValue::Binary(b"G".to_vec()),
+                ]),
+            ),
+            ("variant_id".to_string(), EncodedValue::Binary(b"22-16050075-A-G".to_vec())),
+            (
+                "exome".to_string(),
+                EncodedValue::Struct(vec![(
+                    "freq".to_string(),
+                    EncodedValue::Struct(vec![(
+                        "all".to_string(),
+                        EncodedValue::Struct(vec![
+                            ("ac".to_string(), EncodedValue::Int32(3)),
+                            ("an".to_string(), EncodedValue::Int32(100)),
+                        ]),
+                    )]),
+                )]),
+            ),
+            // Fields that browser-minimal must drop:
+            ("vep".to_string(), EncodedValue::Array(vec![EncodedValue::Int32(0)])),
+            ("info".to_string(), EncodedValue::Struct(vec![])),
+            ("histograms".to_string(), EncodedValue::Struct(vec![])),
+        ]);
+
+        let projected = Projection::browser_minimal().apply(&row);
+        if let EncodedValue::Struct(fields) = &projected {
+            let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+            // Kept (present-and-in-allowlist):
+            assert!(names.contains(&"locus"));
+            assert!(names.contains(&"alleles"));
+            assert!(names.contains(&"variant_id"));
+            assert!(names.contains(&"exome"));
+            // Dropped:
+            assert!(!names.contains(&"vep"));
+            assert!(!names.contains(&"info"));
+            assert!(!names.contains(&"histograms"));
+            // `exome` is kept whole (the API returns all population frequencies).
+            let exome = &fields.iter().find(|(n, _)| n == "exome").unwrap().1;
+            if let EncodedValue::Struct(exome_fields) = exome {
+                assert_eq!(exome_fields[0].0, "freq");
+            } else {
+                panic!("expected exome struct kept whole");
+            }
+        } else {
+            panic!("expected struct");
+        }
+    }
+
+    #[test]
+    fn test_browser_minimal_present_in_is_schema_tolerant() {
+        // Schema with only locus + alleles (no coverage/joint/etc.).
+        let schema = EncodedType::EBaseStruct {
+            required: true,
+            fields: vec![
+                EncodedField {
+                    name: "locus".to_string(),
+                    encoded_type: EncodedType::EBinary { required: true },
+                    index: 0,
+                },
+                EncodedField {
+                    name: "alleles".to_string(),
+                    encoded_type: EncodedType::EArray {
+                        required: true,
+                        element: Box::new(EncodedType::EBinary { required: true }),
+                    },
+                    index: 1,
+                },
+            ],
+        };
+        // Strict variant references absent fields -> validation fails.
+        assert!(Projection::browser_minimal().validate(&schema).is_err());
+        // Schema-tolerant variant only references present fields -> validates.
+        let proj = Projection::browser_minimal_present_in(&schema);
+        assert!(proj.validate(&schema).is_ok());
     }
 
     #[test]
