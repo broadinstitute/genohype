@@ -16,7 +16,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Convert EncodedValue to a JSON Value.
-fn to_json_value(value: &EncodedValue) -> serde_json::Value {
+///
+/// Shared with the Elasticsearch exporter (`super::elasticsearch`) so document
+/// `_source` bodies use the exact same Hail→JSON value conversion as NDJSON export.
+pub(crate) fn to_json_value(value: &EncodedValue) -> serde_json::Value {
     match value {
         EncodedValue::Null => serde_json::Value::Null,
         EncodedValue::Binary(b) => {

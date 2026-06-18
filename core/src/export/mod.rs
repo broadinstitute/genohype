@@ -15,6 +15,8 @@ pub mod json;
 pub mod bigquery;
 #[cfg(feature = "clickhouse")]
 pub mod clickhouse;
+#[cfg(feature = "elasticsearch")]
+pub mod elasticsearch;
 
 pub use json::{hail_to_json_sharded_full, JsonWriter};
 
@@ -22,3 +24,8 @@ pub use json::{hail_to_json_sharded_full, JsonWriter};
 pub use bigquery::{BigQueryClient, BigQueryError};
 #[cfg(feature = "clickhouse")]
 pub use clickhouse::{generate_create_table, ClickHouseClient};
+#[cfg(feature = "elasticsearch")]
+pub use elasticsearch::{
+    build_document, build_request_body, hail_type_to_es_mapping, parse_index_fields, BulkInserter,
+    ElasticsearchClient, ElasticsearchError, IndexField,
+};

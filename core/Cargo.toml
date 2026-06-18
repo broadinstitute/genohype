@@ -15,6 +15,7 @@ export = []
 genomic = ["dep:lru"]
 vep = ["dep:fastvep-core", "dep:fastvep-io", "dep:fastvep-annotate", "dep:fastvep-loftee"]
 clickhouse = ["export", "dep:reqwest"]
+elasticsearch = ["export", "dep:reqwest"]
 bigquery = ["export", "dep:google-cloud-bigquery", "dep:google-cloud-storage", "dep:google-cloud-auth"]
 
 [dependencies]

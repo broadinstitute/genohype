@@ -24,6 +24,10 @@ pub enum ExportCommands {
     #[cfg(feature = "clickhouse")]
     Clickhouse(ExportClickhouseArgs),
 
+    /// Export to Elasticsearch (prod-shaped variant index via _bulk)
+    #[cfg(feature = "elasticsearch")]
+    Elasticsearch(ExportElasticsearchArgs),
+
     /// Export to BigQuery
     #[cfg(feature = "bigquery")]
     Bigquery(ExportBigqueryArgs),
@@ -158,6 +162,79 @@ pub struct ExportClickhouseArgs {
 
 #[cfg(feature = "clickhouse")]
 impl HasCommonExportArgs for ExportClickhouseArgs {
+    fn common(&self) -> &CommonExportArgs {
+        &self.common
+    }
+}
+
+/// Default index (hoisted + indexed) fields for the gnomAD v4 variant index.
+///
+/// Mirrors the prod `index_fields` for `gnomad_v4_variants`
+/// (`data-pipeline/.../export_to_elasticsearch.py`). These are exactly the fields
+/// the prod query DSL filters/sorts on: `locus` (region range + sort),
+/// `transcript_consequences.gene_id` (gene term), `variant_id`/`rsids`/`caid`/
+/// `vrs.alt.allele_id`→`allele_id` (the variant-by-id `chooseIdField` paths).
+///
+/// Index fields absent from the source schema are skipped (schema-tolerant), so
+/// `vrs.alt.allele_id` is hoisted as `allele_id` when the table carries VRS and
+/// quietly omitted otherwise. Prod's computed `document_id` (a compressed variant
+/// id added by the pipeline) is intentionally not here — the raw sites HT lacks
+/// it; the unique `variant_id` serves as the document `_id` instead.
+#[cfg(feature = "elasticsearch")]
+pub const DEFAULT_ES_INDEX_FIELDS: &str =
+    "variant_id,rsids,caid,locus,transcript_consequences.gene_id,transcript_consequences.transcript_id,vrs.alt.allele_id";
+
+#[cfg(feature = "elasticsearch")]
+#[derive(Args)]
+pub struct ExportElasticsearchArgs {
+    #[command(flatten)]
+    pub common: CommonExportArgs,
+
+    /// Elasticsearch URL (e.g., http://localhost:9200, or http://user:pass@host:9200)
+    pub url: String,
+
+    /// Target index name
+    pub index: String,
+
+    /// Number of primary shards. For a single benchmark VM this should match the
+    /// VM's vCPU count (one Lucene shard per core) — NOT prod's 48, which assumes
+    /// a multi-node cluster and would handicap a single VM with context switching.
+    #[arg(long, default_value = "1")]
+    pub shards: usize,
+
+    /// Schema-width preset: `full` (decode everything, default) or
+    /// `browser-minimal` (strict allowlist of only the fields the gnomAD browser
+    /// API returns). Cannot be combined with --fields/--exclude (none here, so
+    /// it only narrows the document `_source`).
+    #[arg(long)]
+    pub width: Option<String>,
+
+    /// Comma-separated dotted paths to hoist to the top level and index. The
+    /// top-level key is the last path segment. Defaults to the gnomAD v4 variant
+    /// index fields.
+    #[arg(long, default_value = DEFAULT_ES_INDEX_FIELDS)]
+    pub index_fields: String,
+
+    /// Field used as the document `_id` (stable id → idempotent re-loads).
+    #[arg(long, default_value = "variant_id")]
+    pub id_field: String,
+
+    /// Number of documents per `_bulk` request.
+    #[arg(long, default_value = "1000")]
+    pub batch_size: usize,
+
+    /// Delete and recreate the index if it already exists. Without this, an
+    /// existing index is reused (re-loads stay idempotent via stable `_id`).
+    #[arg(long)]
+    pub recreate: bool,
+
+    /// Force-merge the index after loading (compacts segments, like prod).
+    #[arg(long)]
+    pub forcemerge: bool,
+}
+
+#[cfg(feature = "elasticsearch")]
+impl HasCommonExportArgs for ExportElasticsearchArgs {
     fn common(&self) -> &CommonExportArgs {
         &self.common
     }

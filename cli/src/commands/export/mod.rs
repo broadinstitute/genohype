@@ -8,6 +8,9 @@ pub mod hail;
 #[cfg(feature = "clickhouse")]
 pub mod clickhouse;
 
+#[cfg(feature = "elasticsearch")]
+pub mod elasticsearch;
+
 #[cfg(feature = "bigquery")]
 pub mod bigquery;
 
@@ -18,6 +21,9 @@ pub use hail::run_export_hail;
 
 #[cfg(feature = "clickhouse")]
 pub use clickhouse::run_export_clickhouse;
+
+#[cfg(feature = "elasticsearch")]
+pub use elasticsearch::run_export_elasticsearch;
 
 #[cfg(feature = "bigquery")]
 pub use bigquery::run_export_bigquery;

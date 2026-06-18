@@ -38,6 +38,8 @@ use commands::export::{run_export_hail, run_export_json, run_export_parquet, run
 use commands::export::run_export_bigquery;
 #[cfg(feature = "clickhouse")]
 use commands::export::run_export_clickhouse;
+#[cfg(feature = "elasticsearch")]
+use commands::export::run_export_elasticsearch;
 use commands::info::show_info;
 #[cfg(feature = "clickhouse")]
 use commands::ingest::run_ingest_command;
@@ -86,6 +88,8 @@ fn main() -> Result<()> {
             ExportCommands::Hail(args) => run_export_hail(args)?,
             #[cfg(feature = "clickhouse")]
             ExportCommands::Clickhouse(args) => run_export_clickhouse(args)?,
+            #[cfg(feature = "elasticsearch")]
+            ExportCommands::Elasticsearch(args) => run_export_elasticsearch(args)?,
             #[cfg(feature = "bigquery")]
             ExportCommands::Bigquery(args) => run_export_bigquery(args)?,
         },
