@@ -125,9 +125,9 @@ dirs = "5.0"
 toml = "0.8"
 
 # fastVEP annotation engine (vep feature)
-fastvep-annotate = { path = "/Users/msolomon/code/genohype-eco/fastVEP/crates/fastvep-annotate", optional = true }
-fastvep-core = { path = "/Users/msolomon/code/genohype-eco/fastVEP/crates/fastvep-core", optional = true }
-fastvep-io = { path = "/Users/msolomon/code/genohype-eco/fastVEP/crates/fastvep-io", optional = true }
+fastvep-annotate = { path = "../../fastVEP/crates/fastvep-annotate", optional = true }
+fastvep-core = { path = "../../fastVEP/crates/fastvep-core", optional = true }
+fastvep-io = { path = "../../fastVEP/crates/fastvep-io", optional = true }
 
 
 [[bin]]
