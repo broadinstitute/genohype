@@ -32,6 +32,20 @@ pub enum ExportCommands {
     #[cfg(feature = "postgres")]
     Postgres(ExportPostgresArgs),
 
+    /// Load the genes lookup table into Postgres (Phase 4 — closes the
+    /// genes-table gap for the `postgres`/`tiered-*` arms)
+    #[cfg(feature = "postgres")]
+    GenesPostgres(ExportGenesPostgresArgs),
+
+    /// Load the genes lookup index into Elasticsearch (Phase 4 — closes the
+    /// genes-table gap for the `es` arm)
+    #[cfg(feature = "elasticsearch")]
+    GenesElasticsearch(ExportGenesElasticsearchArgs),
+
+    /// Build the materialized gene-view cache (`gcs-cache` arm): write one
+    /// `{gene_id}.json` GeneVariantsResponse blob per gene to a dir or `gs://`
+    CacheBuild(ExportCacheBuildArgs),
+
     /// Export to BigQuery
     #[cfg(feature = "bigquery")]
     Bigquery(ExportBigqueryArgs),
@@ -283,6 +297,97 @@ impl HasCommonExportArgs for ExportPostgresArgs {
     fn common(&self) -> &CommonExportArgs {
         &self.common
     }
+}
+
+#[cfg(feature = "postgres")]
+#[derive(Args)]
+pub struct ExportGenesPostgresArgs {
+    /// `common.input` is the genes Hail table path.
+    #[command(flatten)]
+    pub common: CommonExportArgs,
+
+    /// Postgres connection URL.
+    pub url: String,
+
+    /// Target genes table name (the backend queries `genes`).
+    #[arg(default_value = "genes")]
+    pub table: String,
+
+    /// Rows per COPY batch.
+    #[arg(long, default_value = "2000")]
+    pub batch_size: usize,
+
+    /// Drop and recreate the table if it already exists (makes the load idempotent).
+    #[arg(long)]
+    pub recreate: bool,
+
+    /// Skip creating the `upper(gencode_symbol)` index after load.
+    #[arg(long)]
+    pub no_indexes: bool,
+}
+
+#[cfg(feature = "postgres")]
+impl HasCommonExportArgs for ExportGenesPostgresArgs {
+    fn common(&self) -> &CommonExportArgs {
+        &self.common
+    }
+}
+
+#[cfg(feature = "elasticsearch")]
+#[derive(Args)]
+pub struct ExportGenesElasticsearchArgs {
+    /// `common.input` is the genes Hail table path.
+    #[command(flatten)]
+    pub common: CommonExportArgs,
+
+    /// Elasticsearch URL.
+    pub url: String,
+
+    /// Target genes index name (the backend defaults to `genes_grch38`).
+    #[arg(default_value = "genes_grch38")]
+    pub index: String,
+
+    /// Number of primary shards (match the VM vCPU count).
+    #[arg(long, default_value = "1")]
+    pub shards: usize,
+
+    /// Documents per `_bulk` request.
+    #[arg(long, default_value = "1000")]
+    pub batch_size: usize,
+
+    /// Delete and recreate the index if it already exists.
+    #[arg(long)]
+    pub recreate: bool,
+}
+
+#[cfg(feature = "elasticsearch")]
+impl HasCommonExportArgs for ExportGenesElasticsearchArgs {
+    fn common(&self) -> &CommonExportArgs {
+        &self.common
+    }
+}
+
+#[derive(Args)]
+pub struct ExportCacheBuildArgs {
+    /// Genes Hail table path (iterated for gene boundaries + metadata).
+    pub genes: String,
+
+    /// Variants Hail table path (scanned per gene interval).
+    pub variants: String,
+
+    /// Output prefix for the `{gene_id}.json` blobs: a local directory or a
+    /// `gs://<bucket>/cache/variants` prefix.
+    pub output: String,
+
+    /// Restrict the build to these comma-separated gene IDs. Omit to build the
+    /// whole genes table.
+    #[arg(long)]
+    pub gene_ids: Option<String>,
+
+    /// File with one gene_id per line — the per-task chunk a pool worker
+    /// receives. Mutually exclusive with --gene-ids.
+    #[arg(long, conflicts_with = "gene_ids")]
+    pub gene_ids_file: Option<String>,
 }
 
 #[cfg(feature = "bigquery")]

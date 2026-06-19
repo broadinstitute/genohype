@@ -33,15 +33,17 @@ use genohype_core::metadata::CacheOptions;
 use owo_colors::OwoColorize;
 
 // Import command handlers from the commands module
-use commands::export::{run_export_hail, run_export_json, run_export_parquet, run_export_vcf};
+use commands::export::{
+    run_export_cache_build, run_export_hail, run_export_json, run_export_parquet, run_export_vcf,
+};
 #[cfg(feature = "bigquery")]
 use commands::export::run_export_bigquery;
 #[cfg(feature = "clickhouse")]
 use commands::export::run_export_clickhouse;
 #[cfg(feature = "elasticsearch")]
-use commands::export::run_export_elasticsearch;
+use commands::export::{run_export_elasticsearch, run_export_genes_elasticsearch};
 #[cfg(feature = "postgres")]
-use commands::export::run_export_postgres;
+use commands::export::{run_export_genes_postgres, run_export_postgres};
 use commands::info::show_info;
 #[cfg(feature = "clickhouse")]
 use commands::ingest::run_ingest_command;
@@ -94,6 +96,11 @@ fn main() -> Result<()> {
             ExportCommands::Elasticsearch(args) => run_export_elasticsearch(args)?,
             #[cfg(feature = "postgres")]
             ExportCommands::Postgres(args) => run_export_postgres(args)?,
+            #[cfg(feature = "postgres")]
+            ExportCommands::GenesPostgres(args) => run_export_genes_postgres(args)?,
+            #[cfg(feature = "elasticsearch")]
+            ExportCommands::GenesElasticsearch(args) => run_export_genes_elasticsearch(args)?,
+            ExportCommands::CacheBuild(args) => run_export_cache_build(args)?,
             #[cfg(feature = "bigquery")]
             ExportCommands::Bigquery(args) => run_export_bigquery(args)?,
         },

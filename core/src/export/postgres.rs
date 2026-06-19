@@ -265,6 +265,119 @@ pub fn extract_columns(row: &EncodedValue) -> Result<VariantColumns> {
 }
 
 // ---------------------------------------------------------------------------
+// Genes lookup table (Phase 4 — closes the genes-table gap)
+// ---------------------------------------------------------------------------
+//
+// The Phase-1a Postgres backend answers `get_gene` / `get_gene_by_symbol` /
+// `search_genes` against a SEPARATE `genes` table that the variants loader above
+// does not create. Without it, gene-view queries — the dominant browser workload —
+// fail on the `postgres` / `tiered-*` arms. This section loads that table.
+//
+// The columns mirror the backend's SELECT exactly
+// (`gnomad-browser-lite/backend/src/backend/postgres.rs`): scalar lookup columns
+// are hoisted, and the api-shaped gene (with `transcripts`) lands in `data` JSONB,
+// which the backend reads as `(data->'transcripts')::text`. The gene mapping is
+// reused from [`crate::export::cache_builder::extract_gene`] so the `transcripts`
+// shape matches `api::Transcript` (the backend deserializes it directly).
+
+/// Hoisted/indexed columns of the `genes` table, in `COPY` order. `data JSONB`
+/// (the full api-shaped gene) is appended after these.
+pub const GENE_COLUMNS: [&str; 7] = [
+    "gene_id",
+    "gencode_symbol",
+    "chrom",
+    "start",
+    "stop",
+    "strand",
+    "canonical_transcript_id",
+];
+
+/// `CREATE TABLE IF NOT EXISTS` for the genes lookup table. Not partitioned (only
+/// ~20k rows); `gene_id` is the primary key (point lookups + idempotent reload).
+pub fn generate_create_genes_table(table: &str) -> String {
+    let t = quote_ident(table);
+    format!(
+        "CREATE TABLE IF NOT EXISTS {t} (\n    \
+         gene_id TEXT PRIMARY KEY,\n    \
+         gencode_symbol TEXT,\n    \
+         chrom TEXT NOT NULL,\n    \
+         start INTEGER NOT NULL,\n    \
+         stop INTEGER NOT NULL,\n    \
+         strand TEXT,\n    \
+         canonical_transcript_id TEXT,\n    \
+         data JSONB\n\
+         )"
+    )
+}
+
+/// Index backing `upper(gencode_symbol) = upper($1)` (get_gene_by_symbol) and
+/// `upper(gencode_symbol) LIKE upper($1)` (search_genes); `text_pattern_ops` makes
+/// the expression index usable for the prefix `LIKE`.
+pub fn generate_genes_indexes(table: &str) -> Vec<String> {
+    let t = quote_ident(table);
+    vec![format!(
+        "CREATE INDEX IF NOT EXISTS {} ON {t} (upper(gencode_symbol) text_pattern_ops)",
+        quote_ident(&format!("{table}_gencode_symbol_idx"))
+    )]
+}
+
+/// Hoisted scalar columns pulled from a decoded genes-HT row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GeneColumns {
+    pub gene_id: String,
+    pub gencode_symbol: Option<String>,
+    pub chrom: String,
+    pub start: i32,
+    pub stop: i32,
+    pub strand: Option<String>,
+    pub canonical_transcript_id: Option<String>,
+}
+
+/// Extract the genes hoisted columns + the api-shaped `data` JSONB from a decoded
+/// genes-HT row. Returns `None` for a row with no `gene_id` (skipped, not an error).
+///
+/// `gencode_symbol` falls back to the gene's `gene_symbol` so the symbol-lookup
+/// column is populated even on tables that only carry the GENCODE `symbol` field.
+pub fn extract_gene_columns(row: &EncodedValue) -> Option<(GeneColumns, serde_json::Value)> {
+    let gene = crate::export::cache_builder::extract_gene(row)?;
+    let data = serde_json::to_value(&gene).ok()?;
+    let cols = GeneColumns {
+        gene_id: gene.gene_id,
+        gencode_symbol: gene.gencode_symbol.or(gene.gene_symbol),
+        chrom: gene.chrom,
+        start: gene.start as i32,
+        stop: gene.stop as i32,
+        strand: gene.strand,
+        canonical_transcript_id: gene.canonical_transcript_id,
+    };
+    Some((cols, data))
+}
+
+/// Append one genes `COPY` text row. `None` text columns use the COPY NULL token.
+fn append_genes_copy_row(buf: &mut String, cols: &GeneColumns, data_json: &str) {
+    let push_opt = |buf: &mut String, v: &Option<String>| match v {
+        Some(s) => buf.push_str(&copy_escape(s)),
+        None => buf.push_str("\\N"),
+    };
+    buf.push_str(&copy_escape(&cols.gene_id));
+    buf.push('\t');
+    push_opt(buf, &cols.gencode_symbol);
+    buf.push('\t');
+    buf.push_str(&copy_escape(&cols.chrom));
+    buf.push('\t');
+    buf.push_str(&cols.start.to_string());
+    buf.push('\t');
+    buf.push_str(&cols.stop.to_string());
+    buf.push('\t');
+    push_opt(buf, &cols.strand);
+    buf.push('\t');
+    push_opt(buf, &cols.canonical_transcript_id);
+    buf.push('\t');
+    buf.push_str(&copy_escape(data_json));
+    buf.push('\n');
+}
+
+// ---------------------------------------------------------------------------
 // COPY text-format encoding
 // ---------------------------------------------------------------------------
 
@@ -419,6 +532,40 @@ mod client {
             })
         }
 
+        /// Create the (non-partitioned) genes lookup table.
+        pub fn create_genes_table(&mut self, table: &str) -> Result<()> {
+            self.execute(&generate_create_genes_table(table))?;
+            Ok(())
+        }
+
+        /// Create the `upper(gencode_symbol)` index backing symbol lookup/search.
+        pub fn create_genes_indexes(&mut self, table: &str) -> Result<()> {
+            for stmt in generate_genes_indexes(table) {
+                self.execute(&stmt)?;
+            }
+            Ok(())
+        }
+
+        /// `COPY` a genes batch body directly into `table` (text format). The genes
+        /// table is not partitioned and `--recreate` empties it first, so a direct
+        /// COPY suffices — no staging/partition routing like the variants path.
+        fn copy_genes_batch(&mut self, table: &str, body: &str) -> Result<()> {
+            let copy_sql = format!(
+                "COPY {} (gene_id, gencode_symbol, chrom, start, stop, strand, canonical_transcript_id, data) FROM STDIN WITH (FORMAT text)",
+                quote_ident(table)
+            );
+            let runtime = &self.runtime;
+            let conn = &mut self.conn;
+            let body = body.to_string();
+            runtime.block_on(async move {
+                let mut copy = conn.copy_in_raw(&copy_sql).await?;
+                copy.send(body.as_bytes()).await?;
+                copy.finish().await?;
+                Ok::<(), PostgresError>(())
+            })?;
+            Ok(())
+        }
+
         /// Create the `TEMP` staging table (matching the wide-table columns, no
         /// constraints, `UNLOGGED` semantics via `TEMP`). Dropped automatically
         /// when the connection closes.
@@ -563,10 +710,80 @@ mod client {
             self.flush()
         }
     }
+
+    /// Buffers genes rows as `COPY` text and flushes batches directly into the
+    /// (recreated) genes table. Rows without a `gene_id` are skipped.
+    pub struct GenesCopyInserter<'a> {
+        client: &'a mut PostgresClient,
+        table: String,
+        batch_size: usize,
+        buffer: String,
+        buffered_rows: usize,
+        /// Total genes rows successfully COPYd.
+        pub total_rows: usize,
+        /// Rows skipped because they carried no `gene_id`.
+        pub skipped_rows: usize,
+        /// Number of COPY batches flushed.
+        pub flush_count: usize,
+        /// Accumulated time spent in COPY (ms).
+        pub insert_time_ms: u64,
+    }
+
+    impl<'a> GenesCopyInserter<'a> {
+        pub fn new(client: &'a mut PostgresClient, table: &str, batch_size: usize) -> Result<Self> {
+            Ok(Self {
+                client,
+                table: table.to_string(),
+                batch_size: batch_size.max(1),
+                buffer: String::new(),
+                buffered_rows: 0,
+                total_rows: 0,
+                skipped_rows: 0,
+                flush_count: 0,
+                insert_time_ms: 0,
+            })
+        }
+
+        /// Buffer one decoded genes row. Returns `false` if the row was skipped
+        /// (no `gene_id`). Auto-flushes at the batch size.
+        pub fn add(&mut self, row: &EncodedValue) -> Result<bool> {
+            let Some((cols, data)) = extract_gene_columns(row) else {
+                self.skipped_rows += 1;
+                return Ok(false);
+            };
+            append_genes_copy_row(&mut self.buffer, &cols, &data.to_string());
+            self.buffered_rows += 1;
+            if self.buffered_rows >= self.batch_size {
+                self.flush()?;
+            }
+            Ok(true)
+        }
+
+        /// Flush buffered genes rows (direct COPY into the target).
+        pub fn flush(&mut self) -> Result<()> {
+            if self.buffered_rows == 0 {
+                return Ok(());
+            }
+            let body = std::mem::take(&mut self.buffer);
+            let rows = self.buffered_rows;
+            let start = std::time::Instant::now();
+            self.client.copy_genes_batch(&self.table, &body)?;
+            self.insert_time_ms += start.elapsed().as_millis() as u64;
+            self.total_rows += rows;
+            self.flush_count += 1;
+            self.buffered_rows = 0;
+            Ok(())
+        }
+
+        /// Flush any remaining buffered rows.
+        pub fn finish(&mut self) -> Result<()> {
+            self.flush()
+        }
+    }
 }
 
 #[cfg(feature = "postgres")]
-pub use client::{CopyInserter, PostgresClient};
+pub use client::{CopyInserter, GenesCopyInserter, PostgresClient};
 
 #[cfg(test)]
 mod tests {
@@ -669,5 +886,64 @@ mod tests {
         let mut buf = String::new();
         append_copy_row(&mut buf, &cols, "{\"x\":1}");
         assert_eq!(buf, "chr22\t100\t22-100-A-G\tA\t\\N\t{\"x\":1}\n");
+    }
+
+    // --- genes lookup table ---
+
+    fn gene_row(gene_id: &str, symbol: &str) -> EncodedValue {
+        EncodedValue::Struct(vec![
+            ("gene_id".to_string(), EncodedValue::Binary(gene_id.as_bytes().to_vec())),
+            ("symbol".to_string(), EncodedValue::Binary(symbol.as_bytes().to_vec())),
+            ("chrom".to_string(), EncodedValue::Binary(b"chr1".to_vec())),
+            ("start".to_string(), EncodedValue::Int32(100)),
+            ("stop".to_string(), EncodedValue::Int32(200)),
+            ("strand".to_string(), EncodedValue::Binary(b"+".to_vec())),
+        ])
+    }
+
+    #[test]
+    fn test_genes_ddl_matches_backend_columns() {
+        let ddl = generate_create_genes_table("genes");
+        assert!(ddl.contains("gene_id TEXT PRIMARY KEY"));
+        assert!(ddl.contains("gencode_symbol TEXT"));
+        assert!(ddl.contains("canonical_transcript_id TEXT"));
+        assert!(ddl.contains("data JSONB"));
+        // Not partitioned (only ~20k rows).
+        assert!(!ddl.contains("PARTITION"));
+        let idx = generate_genes_indexes("genes");
+        assert!(idx.iter().any(|s| s.contains("upper(gencode_symbol)")));
+    }
+
+    #[test]
+    fn test_extract_gene_columns_hoists_symbol_and_carries_data() {
+        let (cols, data) = extract_gene_columns(&gene_row("ENSG1", "PCSK9")).unwrap();
+        assert_eq!(cols.gene_id, "ENSG1");
+        // `gencode_symbol` falls back to the gene's symbol so symbol-lookup works.
+        assert_eq!(cols.gencode_symbol.as_deref(), Some("PCSK9"));
+        assert_eq!(cols.chrom, "chr1");
+        assert_eq!(cols.start, 100);
+        assert_eq!(cols.stop, 200);
+        // `data` is the api-shaped gene (carries the fields the backend reads as
+        // `data->'transcripts'`); it must at least round-trip gene_id.
+        assert_eq!(data["gene_id"], "ENSG1");
+    }
+
+    #[test]
+    fn test_append_genes_copy_row_layout_and_nulls() {
+        let cols = GeneColumns {
+            gene_id: "ENSG1".to_string(),
+            gencode_symbol: Some("PCSK9".to_string()),
+            chrom: "chr1".to_string(),
+            start: 100,
+            stop: 200,
+            strand: Some("+".to_string()),
+            canonical_transcript_id: None,
+        };
+        let mut buf = String::new();
+        append_genes_copy_row(&mut buf, &cols, "{\"gene_id\":\"ENSG1\"}");
+        assert_eq!(
+            buf,
+            "ENSG1\tPCSK9\tchr1\t100\t200\t+\t\\N\t{\"gene_id\":\"ENSG1\"}\n"
+        );
     }
 }

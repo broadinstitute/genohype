@@ -264,6 +264,71 @@ pub fn build_document(row: &EncodedValue, index_fields: &[IndexField]) -> Value 
     Value::Object(doc)
 }
 
+// ---------------------------------------------------------------------------
+// Genes index (Phase 4 — closes the genes-table gap for the `es` arm)
+// ---------------------------------------------------------------------------
+//
+// The Phase-1b ES backend answers gene-view queries against a separate genes
+// index (`gnomad-browser-lite/backend/src/backend/elasticsearch.rs`,
+// `DEFAULT_GENES_INDEX`). It `term`-queries `gene_id` and `symbol_upper_case`,
+// `prefix`-queries `search_terms`, and reconstructs the api `Gene` from
+// `_source.value`. This section produces that index + its documents, reusing the
+// shared gene mapping from [`crate::export::cache_builder::extract_gene`] so the
+// `value.transcripts` shape matches what the backend deserializes.
+
+/// Build the genes index request body. `value` is `enabled: false` (stored, not
+/// indexed) exactly like the variants index; the queried fields are hoisted
+/// keywords. `num_shards` should match the VM vCPU count.
+pub fn build_genes_request_body(num_shards: usize) -> Value {
+    json!({
+        "mappings": { "properties": {
+            "gene_id": { "type": "keyword" },
+            "symbol_upper_case": { "type": "keyword" },
+            "search_terms": { "type": "keyword" },
+            "value": { "type": "object", "enabled": false },
+        }},
+        "settings": {
+            "index.codec": "best_compression",
+            "index.number_of_replicas": 0,
+            "index.number_of_shards": num_shards,
+            "index.refresh_interval": -1,
+        }
+    })
+}
+
+/// Build one genes ES document `{ gene_id, symbol_upper_case, search_terms, value }`
+/// from a decoded genes-HT row, or `None` if the row has no `gene_id`. `value` is
+/// the api-shaped gene the backend rebuilds from `_source.value`; its
+/// `gencode_symbol` is set to the resolved symbol so the backend's symbol lookup
+/// (`gencode_symbol`/`symbol`) finds it.
+pub fn build_gene_document(row: &EncodedValue) -> Option<Value> {
+    let gene = crate::export::cache_builder::extract_gene(row)?;
+    let symbol = gene
+        .gencode_symbol
+        .clone()
+        .or_else(|| gene.gene_symbol.clone());
+    let symbol_upper = symbol.as_ref().map(|s| s.to_uppercase());
+
+    let mut search_terms: Vec<String> = vec![gene.gene_id.to_uppercase()];
+    if let Some(su) = &symbol_upper {
+        if !search_terms.contains(su) {
+            search_terms.push(su.clone());
+        }
+    }
+
+    let mut value = serde_json::to_value(&gene).ok()?;
+    if let (Value::Object(obj), Some(sym)) = (&mut value, &symbol) {
+        obj.insert("gencode_symbol".to_string(), Value::String(sym.clone()));
+    }
+
+    Some(json!({
+        "gene_id": gene.gene_id,
+        "symbol_upper_case": symbol_upper,
+        "search_terms": search_terms,
+        "value": value,
+    }))
+}
+
 /// Navigate a dotted path within an [`EncodedValue`], treating arrays as
 /// transparent and collecting a deduplicated set when a path crosses an array.
 fn extract_path_value(value: &EncodedValue, path: &[String]) -> Value {
@@ -873,5 +938,44 @@ mod tests {
         );
         assert_eq!(document_id(&doc, "n"), Some("5".to_string()));
         assert_eq!(document_id(&doc, "missing"), None);
+    }
+
+    // --- genes index ---
+
+    fn gene_es_row() -> EncodedValue {
+        EncodedValue::Struct(vec![
+            ("gene_id".to_string(), EncodedValue::Binary(b"ENSG1".to_vec())),
+            ("symbol".to_string(), EncodedValue::Binary(b"PCSK9".to_vec())),
+            ("chrom".to_string(), EncodedValue::Binary(b"chr1".to_vec())),
+            ("start".to_string(), EncodedValue::Int32(100)),
+            ("stop".to_string(), EncodedValue::Int32(200)),
+        ])
+    }
+
+    #[test]
+    fn test_genes_request_body_shape() {
+        let body = build_genes_request_body(16);
+        let props = &body["mappings"]["properties"];
+        assert_eq!(props["gene_id"]["type"], "keyword");
+        assert_eq!(props["symbol_upper_case"]["type"], "keyword");
+        assert_eq!(props["search_terms"]["type"], "keyword");
+        assert_eq!(props["value"]["enabled"], false);
+        assert_eq!(body["settings"]["index.number_of_shards"], 16);
+    }
+
+    #[test]
+    fn test_build_gene_document_hoists_query_fields() {
+        let doc = build_gene_document(&gene_es_row()).unwrap();
+        // Backend term-queries gene_id + symbol_upper_case, prefix-queries search_terms.
+        assert_eq!(doc["gene_id"], "ENSG1");
+        assert_eq!(doc["symbol_upper_case"], "PCSK9");
+        let terms: Vec<String> =
+            serde_json::from_value(doc["search_terms"].clone()).unwrap();
+        assert!(terms.contains(&"PCSK9".to_string()));
+        assert!(terms.contains(&"ENSG1".to_string()));
+        // Backend rebuilds the gene from `_source.value`; gencode_symbol must be present.
+        assert_eq!(doc["value"]["gene_id"], "ENSG1");
+        assert_eq!(doc["value"]["gencode_symbol"], "PCSK9");
+        assert_eq!(doc["value"]["chrom"], "chr1");
     }
 }
