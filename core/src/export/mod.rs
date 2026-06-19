@@ -17,6 +17,8 @@ pub mod bigquery;
 pub mod clickhouse;
 #[cfg(feature = "elasticsearch")]
 pub mod elasticsearch;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 
 pub use json::{hail_to_json_sharded_full, JsonWriter};
 
@@ -28,4 +30,9 @@ pub use clickhouse::{generate_create_table, ClickHouseClient};
 pub use elasticsearch::{
     build_document, build_request_body, hail_type_to_es_mapping, parse_index_fields, BulkInserter,
     ElasticsearchClient, ElasticsearchError, IndexField,
+};
+#[cfg(feature = "postgres")]
+pub use postgres::{
+    extract_columns, generate_create_table as generate_pg_create_table, CopyInserter,
+    PostgresClient, PostgresError, VariantColumns,
 };

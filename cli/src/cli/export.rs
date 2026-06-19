@@ -28,6 +28,10 @@ pub enum ExportCommands {
     #[cfg(feature = "elasticsearch")]
     Elasticsearch(ExportElasticsearchArgs),
 
+    /// Export to Postgres (partitioned JSONB wide table via COPY)
+    #[cfg(feature = "postgres")]
+    Postgres(ExportPostgresArgs),
+
     /// Export to BigQuery
     #[cfg(feature = "bigquery")]
     Bigquery(ExportBigqueryArgs),
@@ -235,6 +239,47 @@ pub struct ExportElasticsearchArgs {
 
 #[cfg(feature = "elasticsearch")]
 impl HasCommonExportArgs for ExportElasticsearchArgs {
+    fn common(&self) -> &CommonExportArgs {
+        &self.common
+    }
+}
+
+#[cfg(feature = "postgres")]
+#[derive(Args)]
+pub struct ExportPostgresArgs {
+    #[command(flatten)]
+    pub common: CommonExportArgs,
+
+    /// Postgres connection URL (e.g. postgres://user:pass@localhost:5432/gnomad)
+    pub url: String,
+
+    /// Target table name (created as a partitioned JSONB wide table)
+    #[arg(default_value = "variants")]
+    pub table: String,
+
+    /// Schema-width preset: `full` (decode everything, default) or
+    /// `browser-minimal` (only the fields the gnomAD browser API returns). Narrows
+    /// the `data` JSONB payload; the hoisted columns are always extracted.
+    #[arg(long)]
+    pub width: Option<String>,
+
+    /// Rows per COPY+upsert batch.
+    #[arg(long, default_value = "5000")]
+    pub batch_size: usize,
+
+    /// Drop and recreate the table if it already exists. Without this, an existing
+    /// table is reused (re-loads stay idempotent via ON CONFLICT upsert).
+    #[arg(long)]
+    pub recreate: bool,
+
+    /// Skip creating the secondary `(contig,pos)` / `variant_id` indexes after
+    /// load (e.g. to add them manually once the full dataset is staged).
+    #[arg(long)]
+    pub no_indexes: bool,
+}
+
+#[cfg(feature = "postgres")]
+impl HasCommonExportArgs for ExportPostgresArgs {
     fn common(&self) -> &CommonExportArgs {
         &self.common
     }

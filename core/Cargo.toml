@@ -16,6 +16,7 @@ genomic = ["dep:lru"]
 vep = ["dep:fastvep-core", "dep:fastvep-io", "dep:fastvep-annotate", "dep:fastvep-loftee"]
 clickhouse = ["export", "dep:reqwest"]
 elasticsearch = ["export", "dep:reqwest"]
+postgres = ["export", "dep:sqlx"]
 bigquery = ["export", "dep:google-cloud-bigquery", "dep:google-cloud-storage", "dep:google-cloud-auth"]
 
 [dependencies]
@@ -90,6 +91,11 @@ fastvep-loftee = { path = "/Users/msolomon/code/genohype-eco/fastVEP/crates/fast
 
 # HTTP Client for ClickHouse export (clickhouse feature)
 reqwest = { version = "0.11", default-features = false, features = ["blocking", "json", "rustls-tls"], optional = true }
+
+# Postgres client for the Postgres loader (postgres feature). No macros: the
+# loader uses the runtime query/COPY API, not compile-time-checked queries, so no
+# DATABASE_URL is needed at build time. TLS via rustls to match reqwest.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres"], optional = true }
 
 # Google Cloud for BigQuery export (bigquery feature)
 google-cloud-bigquery = { version = "0.13", optional = true }

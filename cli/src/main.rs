@@ -40,6 +40,8 @@ use commands::export::run_export_bigquery;
 use commands::export::run_export_clickhouse;
 #[cfg(feature = "elasticsearch")]
 use commands::export::run_export_elasticsearch;
+#[cfg(feature = "postgres")]
+use commands::export::run_export_postgres;
 use commands::info::show_info;
 #[cfg(feature = "clickhouse")]
 use commands::ingest::run_ingest_command;
@@ -90,6 +92,8 @@ fn main() -> Result<()> {
             ExportCommands::Clickhouse(args) => run_export_clickhouse(args)?,
             #[cfg(feature = "elasticsearch")]
             ExportCommands::Elasticsearch(args) => run_export_elasticsearch(args)?,
+            #[cfg(feature = "postgres")]
+            ExportCommands::Postgres(args) => run_export_postgres(args)?,
             #[cfg(feature = "bigquery")]
             ExportCommands::Bigquery(args) => run_export_bigquery(args)?,
         },

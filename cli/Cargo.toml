@@ -23,6 +23,7 @@ genomic = ["genohype-core/genomic"]
 vep = ["genohype-core/vep", "dep:fastvep-annotate", "dep:fastvep-core", "dep:fastvep-io"]
 clickhouse = ["genohype-core/clickhouse", "reqwest/blocking"]
 elasticsearch = ["genohype-core/elasticsearch", "reqwest/blocking"]
+postgres = ["genohype-core/postgres"]
 bigquery = ["gcp", "genohype-core/bigquery"]
 benchmark = []  # sysinfo is now always included
 
@@ -30,7 +31,7 @@ benchmark = []  # sysinfo is now always included
 server = ["dep:axum-extra", "dep:async-stream", "dep:tokio-stream"]
 
 # All features
-full = ["gcp", "aws", "http", "validation", "clickhouse", "elasticsearch", "bigquery", "server", "benchmark", "vep"]
+full = ["gcp", "aws", "http", "validation", "clickhouse", "elasticsearch", "postgres", "bigquery", "server", "benchmark", "vep"]
 
 [dependencies]
 # Core library

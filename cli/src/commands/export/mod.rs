@@ -11,6 +11,9 @@ pub mod clickhouse;
 #[cfg(feature = "elasticsearch")]
 pub mod elasticsearch;
 
+#[cfg(feature = "postgres")]
+pub mod postgres;
+
 #[cfg(feature = "bigquery")]
 pub mod bigquery;
 
@@ -24,6 +27,9 @@ pub use clickhouse::run_export_clickhouse;
 
 #[cfg(feature = "elasticsearch")]
 pub use elasticsearch::run_export_elasticsearch;
+
+#[cfg(feature = "postgres")]
+pub use postgres::run_export_postgres;
 
 #[cfg(feature = "bigquery")]
 pub use bigquery::run_export_bigquery;
