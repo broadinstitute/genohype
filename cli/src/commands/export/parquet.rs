@@ -5,7 +5,7 @@ use crate::cli::ExportParquetArgs;
 use crate::commands::utils::{
     format_bytes, parse_export_filters, parse_export_intervals, progress_style_spinner,
 };
-use genohype_core::io::{get_file_size, join_path};
+use genohype_core::io::{get_file_size, is_cloud_path, join_path, StreamingCloudWriter};
 use genohype_core::parquet::{
     build_record_batch, hail_to_parquet_sharded_full, hail_to_parquet_with_options, ParquetWriter,
 };
@@ -264,10 +264,6 @@ pub fn run_export_parquet(args: ExportParquetArgs) -> Result<()> {
             // Fall back to sequential streaming for filtered exports
             println!("{}", "Using sequential export (filtered)...".dimmed());
 
-            // Create writer and get schema
-            let mut writer = ParquetWriter::new(&args.output, &row_type)?;
-            let arrow_schema = writer.schema().clone();
-
             // Use streaming query with filters and intervals
             let iterator = engine.query_iter_with_intervals(&where_filters, intervals)?;
 
@@ -278,36 +274,68 @@ pub fn run_export_parquet(args: ExportParquetArgs) -> Result<()> {
                 Box::new(iterator)
             };
 
-            // Collect rows in batches for efficient parquet writing
-            let batch_size = 10000;
-            let mut batch_rows = Vec::with_capacity(batch_size);
-            let mut total_rows = 0;
-
             // Progress indicator
             let pb = ProgressBar::new_spinner();
             pb.set_style(progress_style_spinner());
 
-            for row_result in iterator {
-                let row = row_result?;
-                batch_rows.push(row);
-                total_rows += 1;
+            // Drive the same 10k-row batch loop against either a cloud or local
+            // writer. Both branches mirror each other (and the sharded branch).
+            macro_rules! drive_sequential {
+                ($writer:expr, $arrow_schema:expr) => {{
+                    let mut writer = $writer;
+                    let arrow_schema = $arrow_schema;
 
-                if batch_rows.len() >= batch_size {
-                    pb.set_message(format!("{} rows processed...", total_rows));
-                    let batch = build_record_batch(&batch_rows, &row_type, arrow_schema.clone())?;
-                    writer.write_batch(&batch)?;
-                    batch_rows.clear();
-                }
+                    let batch_size = 10000;
+                    let mut batch_rows = Vec::with_capacity(batch_size);
+                    let mut total_rows = 0;
+
+                    for row_result in iterator {
+                        let row = row_result?;
+                        batch_rows.push(row);
+                        total_rows += 1;
+
+                        if batch_rows.len() >= batch_size {
+                            pb.set_message(format!("{} rows processed...", total_rows));
+                            let batch =
+                                build_record_batch(&batch_rows, &row_type, arrow_schema.clone())?;
+                            writer.write_batch(&batch)?;
+                            batch_rows.clear();
+                        }
+                    }
+
+                    // Write remaining rows
+                    if !batch_rows.is_empty() {
+                        let batch =
+                            build_record_batch(&batch_rows, &row_type, arrow_schema.clone())?;
+                        writer.write_batch(&batch)?;
+                    }
+
+                    (writer, total_rows)
+                }};
             }
 
-            // Write remaining rows
-            if !batch_rows.is_empty() {
-                let batch = build_record_batch(&batch_rows, &row_type, arrow_schema.clone())?;
-                writer.write_batch(&batch)?;
-            }
+            let total_rows = if is_cloud_path(&args.output) {
+                // Cloud output: stream via multipart upload (mirrors sharded branch)
+                let cloud_writer = StreamingCloudWriter::new(&args.output)?;
+                let writer = ParquetWriter::from_writer(cloud_writer, &row_type)?;
+                let arrow_schema = writer.schema().clone();
+
+                let (writer, total_rows) = drive_sequential!(writer, arrow_schema);
+
+                let cloud_writer = writer.into_inner()?;
+                cloud_writer.finish()?;
+                total_rows
+            } else {
+                // Local output: write to file
+                let writer = ParquetWriter::new(&args.output, &row_type)?;
+                let arrow_schema = writer.schema().clone();
+
+                let (writer, total_rows) = drive_sequential!(writer, arrow_schema);
+                writer.close()?;
+                total_rows
+            };
 
             pb.finish_and_clear();
-            writer.close()?;
             total_rows
         };
         (total_rows, false)

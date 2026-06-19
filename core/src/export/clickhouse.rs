@@ -226,7 +226,7 @@ impl ClickHouseClient {
     pub fn insert_parquet_bytes(&self, table_name: &str, data: Vec<u8>) -> Result<()> {
         // Build the insert URL
         let url = format!(
-            "{}/?query=INSERT%20INTO%20`{}`%20FORMAT%20Parquet",
+            "{}/?input_format_parquet_max_block_size=8192&max_insert_block_size=8192&max_memory_usage=8000000000&query=INSERT%20INTO%20`{}`%20FORMAT%20Parquet",
             self.base_url, table_name
         );
 

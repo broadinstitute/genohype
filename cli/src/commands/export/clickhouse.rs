@@ -5,13 +5,12 @@ use crate::commands::utils::{parse_export_filters, parse_export_intervals, progr
 use genohype_core::codec::{EncodedField, EncodedType, EncodedValue};
 use genohype_core::export::clickhouse::generate_create_table;
 use genohype_core::export::ClickHouseClient;
-use genohype_core::parquet::{build_record_batch, ParquetWriter};
+use genohype_core::parquet::{build_record_batch, InMemoryParquetWriter};
 use genohype_core::query::QueryEngine;
 use genohype_core::Result;
 use indicatif::ProgressBar;
 use owo_colors::OwoColorize;
 use std::path::Path;
-use uuid::Uuid;
 
 /// Check if a path is a cloud URL (gs://, s3://, http://, https://)
 fn is_cloud_path(path: &str) -> bool {
@@ -205,11 +204,17 @@ fn export_single_file(
         println!("  {}", "Table created (or already exists)".green());
     }
 
-    // Convert filtered rows to temporary Parquet file
-    let temp_path = format!("/tmp/hail_export_{}.parquet", Uuid::new_v4());
+    // Stream filtered rows to ClickHouse in chunked, in-memory Parquet POSTs.
+    // This avoids buffering an entire file's worth of rows into one INSERT (OOM).
+    let chunk_size: usize = std::env::var("HAIL_DECODER_CLICKHOUSE_CHUNK_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(25_000);
+    const PARQUET_BATCH_SIZE: usize = 4096;
 
-    let mut writer = ParquetWriter::new(&temp_path, &effective_schema)?;
-    let arrow_schema = writer.schema().clone();
+    let arrow_schema = std::sync::Arc::new(genohype_core::parquet::schema::create_schema(
+        &effective_schema,
+    )?);
 
     let iterator = engine.query_iter_with_intervals(&where_filters, intervals)?;
 
@@ -219,14 +224,35 @@ fn export_single_file(
         Box::new(iterator)
     };
 
-    let batch_size = 10000;
-    let mut batch_rows = Vec::with_capacity(batch_size);
-    let mut total_rows: u64 = 0;
-
     let filename_stem = extract_filename_stem(file_path);
 
     let pb = ProgressBar::new_spinner();
     pb.set_style(progress_style_spinner());
+
+    // Flush a chunk of rows as a single in-memory Parquet POST to ClickHouse.
+    let flush_chunk = |rows: &[EncodedValue]| -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut writer = InMemoryParquetWriter::new(&effective_schema)?;
+        for start in (0..rows.len()).step_by(PARQUET_BATCH_SIZE) {
+            let end = (start + PARQUET_BATCH_SIZE).min(rows.len());
+            let batch = build_record_batch(&rows[start..end], &effective_schema, arrow_schema.clone())?;
+            writer.write_batch(&batch)?;
+        }
+        let bytes = writer.finish()?;
+        client
+            .insert_parquet_bytes(&args.table, bytes)
+            .map_err(|e| {
+                genohype_core::HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                ))
+            })
+    };
+
+    let mut chunk_rows: Vec<EncodedValue> = Vec::with_capacity(chunk_size);
+    let mut total_rows: u64 = 0;
 
     for row_result in iterator {
         let row = row_result?;
@@ -234,44 +260,20 @@ fn export_single_file(
             Some(col) => augment_row(row, col, &filename_stem),
             None => row,
         };
-        batch_rows.push(row);
+        chunk_rows.push(row);
         total_rows += 1;
 
-        if batch_rows.len() >= batch_size {
+        if chunk_rows.len() >= chunk_size {
             pb.set_message(format!("{} rows processed...", total_rows));
-            let batch = build_record_batch(&batch_rows, &effective_schema, arrow_schema.clone())?;
-            writer.write_batch(&batch)?;
-            batch_rows.clear();
+            flush_chunk(&chunk_rows)?;
+            chunk_rows.clear();
         }
     }
 
-    if !batch_rows.is_empty() {
-        let batch = build_record_batch(&batch_rows, &effective_schema, arrow_schema.clone())?;
-        writer.write_batch(&batch)?;
-    }
+    // Final trailing flush
+    flush_chunk(&chunk_rows)?;
 
     pb.finish_and_clear();
-    writer.close()?;
-
-    // Insert into ClickHouse
-    if total_rows > 0 {
-        client.insert_parquet(&args.table, &temp_path).map_err(|e| {
-            genohype_core::HailError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                e.to_string(),
-            ))
-        })?;
-    }
-
-    // Clean up temp file
-    if let Err(e) = std::fs::remove_file(&temp_path) {
-        eprintln!(
-            "{} Failed to remove temp file {}: {}",
-            "Warning:".yellow(),
-            temp_path,
-            e
-        );
-    }
 
     println!(
         "  {} {}",

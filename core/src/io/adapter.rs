@@ -80,6 +80,41 @@ pub(crate) static IO_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
 static GCS_CLIENT_CACHE: Lazy<Mutex<HashMap<String, Arc<dyn ObjectStore>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+/// Fetch a byte range with app-level retries for transient mid-stream failures.
+///
+/// object_store's built-in RetryConfig does NOT retry body-decode failures that
+/// occur mid-stream (e.g. "error decoding response body"). This helper wraps
+/// `get_range` and retries such transient errors with exponential backoff.
+async fn get_range_retrying(
+    store: &Arc<dyn ObjectStore>,
+    path: &ObjPath,
+    range: std::ops::Range<usize>,
+) -> object_store::Result<bytes::Bytes> {
+    const MAX_ATTEMPTS: u32 = 6;
+    let mut backoff = std::time::Duration::from_millis(500);
+    let mut attempt = 0;
+    loop {
+        match store.get_range(path, range.clone()).await {
+            Ok(b) => return Ok(b),
+            Err(e) => {
+                attempt += 1;
+                let m = e.to_string();
+                let transient = m.contains("error decoding response body")
+                    || m.contains("decoding response")
+                    || m.contains("connection")
+                    || m.contains("timed out")
+                    || m.contains("broken pipe")
+                    || m.contains("reset");
+                if attempt >= MAX_ATTEMPTS || !transient {
+                    return Err(e);
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = std::cmp::min(backoff * 2, std::time::Duration::from_secs(30));
+            }
+        }
+    }
+}
+
 /// Get or create a GCS client for the given bucket.
 ///
 /// Clients are cached and reused to avoid repeated token fetches from
@@ -195,7 +230,7 @@ impl CloudReader {
 
         let start_time = std::time::Instant::now();
         let bytes = IO_RUNTIME.block_on(async {
-            store.get_range(&path, range).await
+            get_range_retrying(&store, &path, range).await
         }).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
         trace!("CloudReader: fetch completed in {:?}", start_time.elapsed());
@@ -362,7 +397,7 @@ impl PrefetchingCloudReader {
                         }
                         trace!("PrefetchingCloudReader: fetching range {}..{}", offset, offset + len as u64);
                         let start_time = std::time::Instant::now();
-                        let result = store.get_range(&path, range).await;
+                        let result = get_range_retrying(&store, &path, range).await;
                         trace!("PrefetchingCloudReader: fetch completed in {:?}", start_time.elapsed());
                         match result {
                             Ok(bytes) => {
@@ -674,7 +709,7 @@ fn range_read_cloud(url_str: &str, offset: u64, length: usize) -> Result<Vec<u8>
 
     let range = offset as usize..(offset as usize + length);
     let bytes = IO_RUNTIME.block_on(async {
-        store.get_range(&path, range).await
+        get_range_retrying(&store, &path, range).await
     }).map_err(|e| HailError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
 
     Ok(bytes.to_vec())
