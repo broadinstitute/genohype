@@ -388,6 +388,12 @@ pub struct ExportCacheBuildArgs {
     /// receives. Mutually exclusive with --gene-ids.
     #[arg(long, conflicts_with = "gene_ids")]
     pub gene_ids_file: Option<String>,
+
+    /// Genomic interval(s) (chr:start-end, repeatable) scoping the build to genes
+    /// whose body overlaps the region. The genes HT is keyed by gene_id, so this
+    /// is applied post-decode. Omit to build every gene (full-scale default).
+    #[arg(long)]
+    pub interval: Vec<String>,
 }
 
 #[cfg(feature = "bigquery")]

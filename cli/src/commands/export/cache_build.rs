@@ -6,6 +6,7 @@
 
 use crate::cli::ExportCacheBuildArgs;
 use genohype_core::export::build_cache;
+use genohype_core::query::IntervalList;
 use genohype_core::Result;
 use owo_colors::OwoColorize;
 
@@ -45,9 +46,29 @@ pub fn run_export_cache_build(args: ExportCacheBuildArgs) -> Result<()> {
             ids.len().to_string().bright_white()
         );
     }
+
+    // Optional region scoping (smoke/subset): build only genes overlapping these
+    // intervals. The genes HT is gene_id-keyed, so this is a post-decode filter.
+    let intervals = if args.interval.is_empty() {
+        None
+    } else {
+        let list = IntervalList::from_strings(&args.interval)?;
+        println!(
+            "  {} {}",
+            "Interval(s):".cyan(),
+            args.interval.join(", ").bright_white()
+        );
+        Some(list)
+    };
     println!();
 
-    let stats = build_cache(&args.genes, &args.variants, &args.output, gene_ids.as_deref())?;
+    let stats = build_cache(
+        &args.genes,
+        &args.variants,
+        &args.output,
+        gene_ids.as_deref(),
+        intervals.as_ref(),
+    )?;
 
     println!("{}", "Cache build complete!".green().bold());
     println!(

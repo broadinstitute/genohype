@@ -2,7 +2,7 @@
 
 use crate::cli::HasCommonExportArgs;
 use genohype_core::codec::EncodedValue;
-use genohype_core::export::cache_builder::extract_gene;
+use genohype_core::export::cache_builder::{extract_gene, gene_overlaps};
 use genohype_core::query::{IntervalList, KeyRange};
 use genohype_core::Result;
 use indicatif::ProgressStyle;
@@ -23,17 +23,7 @@ pub use genohype_core::query::filter::parse_where_condition;
 /// chr-prefixed (`"chr21"`), so we test both conventions. A row with no
 /// extractable gene/locus is treated as non-overlapping (dropped under a filter).
 pub fn gene_row_in_intervals(row: &EncodedValue, intervals: &IntervalList) -> bool {
-    let Some(gene) = extract_gene(row) else {
-        return false;
-    };
-    let start = gene.start as i32;
-    let stop = gene.stop as i32;
-    let chrom = gene.chrom.as_str();
-    let bare = chrom.strip_prefix("chr").unwrap_or(chrom);
-    let prefixed = format!("chr{bare}");
-    intervals.overlaps(chrom, start, stop)
-        || intervals.overlaps(bare, start, stop)
-        || intervals.overlaps(&prefixed, start, stop)
+    extract_gene(row).is_some_and(|gene| gene_overlaps(intervals, &gene))
 }
 
 /// Create a standard progress bar style (no emojis)

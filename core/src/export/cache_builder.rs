@@ -543,12 +543,30 @@ pub struct CacheBuildStats {
     pub total_bytes: usize,
 }
 
+/// Whether a gene's `[start, stop]` body overlaps any of `intervals`.
+///
+/// The genes Hail table is keyed by `gene_id`, so a Hail interval scan can't
+/// slice it by locus — callers that want to scope the cache to a region (smoke/
+/// subset) must filter post-decode. Genes carry an UNPREFIXED contig (`"21"`)
+/// while intervals are usually chr-prefixed (`"chr21"`), so both are tested.
+pub fn gene_overlaps(intervals: &IntervalList, gene: &CacheGene) -> bool {
+    let start = gene.start as i32;
+    let stop = gene.stop as i32;
+    let chrom = gene.chrom.as_str();
+    let bare = chrom.strip_prefix("chr").unwrap_or(chrom);
+    let prefixed = format!("chr{bare}");
+    intervals.overlaps(chrom, start, stop)
+        || intervals.overlaps(bare, start, stop)
+        || intervals.overlaps(&prefixed, start, stop)
+}
+
 /// Build the materialized gene-view cache.
 ///
 /// Opens the genes and variants tables, then for each gene (optionally restricted
-/// to `gene_ids` — the per-task chunk the pool worker receives) builds and writes
+/// to `gene_ids` — the per-task chunk the pool worker receives, AND/OR scoped to
+/// `intervals` — the active scale's region) builds and writes
 /// `{output_prefix}/{gene_id}.json`. When `gene_ids` is `None` the whole genes
-/// table is iterated.
+/// table is iterated (then filtered by `intervals` if given).
 ///
 /// For a local `output_prefix` the directory is created if needed; for a `gs://`
 /// prefix the blobs are uploaded directly.
@@ -557,6 +575,7 @@ pub fn build_cache(
     variants_path: &str,
     output_prefix: &str,
     gene_ids: Option<&[String]>,
+    intervals: Option<&IntervalList>,
 ) -> Result<CacheBuildStats> {
     if !is_cloud_path(output_prefix) {
         std::fs::create_dir_all(output_prefix.trim_end_matches('/'))?;
@@ -581,6 +600,11 @@ pub fn build_cache(
                 let Some(gene) = extract_gene(&row) else {
                     continue;
                 };
+                if let Some(iv) = intervals {
+                    if !gene_overlaps(iv, &gene) {
+                        continue;
+                    }
+                }
                 accumulate(&mut stats, output_prefix, gene, &variants_engine)?;
             }
         }
@@ -594,6 +618,11 @@ pub fn build_cache(
                 let Some(gene) = extract_gene(row) else {
                     continue;
                 };
+                if let Some(iv) = intervals {
+                    if !gene_overlaps(iv, &gene) {
+                        continue;
+                    }
+                }
                 accumulate(&mut stats, output_prefix, gene, &variants_engine)?;
             }
         }
