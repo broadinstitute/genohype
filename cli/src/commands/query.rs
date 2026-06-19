@@ -1,6 +1,6 @@
 //! Query command for streaming data from tables.
 
-use crate::cli::QueryArgs;
+use crate::cli::{QueryArgs, QueryFormat};
 use crate::commands::utils::{parse_interval_list, parse_where_condition, progress_style_spinner};
 use genohype_core::codec::EncodedValue;
 use genohype_core::metadata::CacheOptions;
@@ -15,6 +15,20 @@ use std::sync::Arc;
 
 pub fn run_query(args: QueryArgs, cache_opts: Option<CacheOptions>) -> Result<()> {
     let table_path = &args.table;
+
+    // Resolve the effective output format. `--count` suppresses row data
+    // entirely; otherwise `--format` wins, falling back to the legacy `--json`
+    // flag, then to pretty output.
+    let count_only = args.count;
+    let format = match args.format {
+        Some(f) => f,
+        None if args.json => QueryFormat::Json,
+        None => QueryFormat::Pretty,
+    };
+    // Machine-readable modes write only data to stdout (no spinners/progress).
+    let quiet = count_only || matches!(format, QueryFormat::Json | QueryFormat::Tsv);
+    let json_output = matches!(format, QueryFormat::Json);
+    let tsv_output = matches!(format, QueryFormat::Tsv);
     let mut key_filters: Vec<(String, String)> = Vec::new();
     let mut where_filters: Vec<KeyRange> = Vec::new();
 
@@ -55,7 +69,7 @@ pub fn run_query(args: QueryArgs, cache_opts: Option<CacheOptions>) -> Result<()
     };
 
     // Open the table (supports both local and cloud paths)
-    let show_spinner = !args.json && !args.stats_json;
+    let show_spinner = !quiet && !args.stats_json;
     let spinner = if show_spinner {
         let s = ProgressBar::new_spinner();
         s.set_style(progress_style_spinner());
@@ -75,7 +89,7 @@ pub fn run_query(args: QueryArgs, cache_opts: Option<CacheOptions>) -> Result<()
     if let Some(s) = spinner {
         s.finish_and_clear();
     }
-    if !args.stats_json {
+    if !args.stats_json && !quiet {
         eprintln!(
             "{} Loaded {} partitions in {:.1}s",
             "✓".green(),
@@ -130,7 +144,7 @@ pub fn run_query(args: QueryArgs, cache_opts: Option<CacheOptions>) -> Result<()
     };
 
     // Show filter info
-    if !args.stats_json {
+    if !args.stats_json && !quiet {
         if let Some(ref ivl) = intervals {
             eprintln!(
                 "{} {} interval(s)",
@@ -155,39 +169,52 @@ pub fn run_query(args: QueryArgs, cache_opts: Option<CacheOptions>) -> Result<()
     if !key_filters.is_empty() {
         // Point lookup using --key
         let key = build_key_from_filters(&key_filters, engine.key_fields())?;
-        let _ = writeln!(writer, "{} {:?}", "Point lookup for key:".cyan(), key_filters);
+        if !quiet {
+            let _ = writeln!(writer, "{} {:?}", "Point lookup for key:".cyan(), key_filters);
+        }
 
-        match engine.lookup(&key)? {
+        // Resolve the matched row (if any), applying the interval filter.
+        let matched: Option<EncodedValue> = match engine.lookup(&key)? {
             Some(row) => {
-                // Apply interval filter to lookup result if specified
                 if let Some(ref ivl) = intervals {
                     if !row_matches_intervals(&row, ivl) {
-                        let _ = writeln!(writer);
-                        let _ = writeln!(
-                            writer,
-                            "{}",
-                            "Row found but filtered out by interval list.".yellow()
-                        );
-                        return Ok(());
+                        None
+                    } else {
+                        Some(row)
                     }
-                }
-                let row = if let Some(ref proj) = projection {
-                    proj.apply(&row)
                 } else {
-                    row
-                };
+                    Some(row)
+                }
+            }
+            None => None,
+        };
+
+        if count_only {
+            // Print just 0/1 to stdout.
+            println!("{}", matched.is_some() as u32);
+        } else if let Some(row) = matched {
+            let row = if let Some(ref proj) = projection {
+                proj.apply(&row)
+            } else {
+                row
+            };
+            if tsv_output {
+                write_tsv_header(&mut writer, &row)?;
+                write_tsv_row(&mut writer, &row)?;
+            } else if json_output {
+                write_row(&mut writer, &row, true)?;
+            } else {
                 let _ = writeln!(writer);
                 let _ = writeln!(writer, "{}", "Found row:".green().bold());
-                write_row(&mut writer, &row, args.json)?;
+                write_row(&mut writer, &row, false)?;
             }
-            None => {
-                let _ = writeln!(writer);
-                let _ = writeln!(writer, "{}", "No matching row found.".yellow());
-            }
+        } else if !quiet {
+            let _ = writeln!(writer);
+            let _ = writeln!(writer, "{}", "No matching row found.".yellow());
         }
     } else {
         // Range query using --where (or full scan if no filters)
-        if !args.json && !stats_mode && !summary_mode && where_filters.is_empty() && intervals.is_none() {
+        if !quiet && !stats_mode && !summary_mode && where_filters.is_empty() && intervals.is_none() {
             eprintln!(
                 "{}",
                 "Warning: No filters specified. This may scan all partitions.".yellow()
@@ -219,8 +246,9 @@ pub fn run_query(args: QueryArgs, cache_opts: Option<CacheOptions>) -> Result<()
             Box::new(iterator)
         };
 
-        // Progress bar (stderr only, hidden in --json, --stats-json, and --summary modes)
-        let pb = if !args.json && !stats_mode && !summary_mode {
+        // Progress bar (stderr only, hidden in machine-readable, --stats-json,
+        // --count and --summary modes)
+        let pb = if !quiet && !stats_mode && !summary_mode {
             let pb = ProgressBar::new_spinner();
             pb.set_style(
                 ProgressStyle::default_spinner()
@@ -243,6 +271,7 @@ pub fn run_query(args: QueryArgs, cache_opts: Option<CacheOptions>) -> Result<()
         let mut count = 0;
         let mut _serialize_ns: u64 = 0;
         let mut broken_pipe = false;
+        let mut tsv_header_written = false;
         for row_result in iterator {
             let row = row_result?;
             count += 1;
@@ -254,8 +283,8 @@ pub fn run_query(args: QueryArgs, cache_opts: Option<CacheOptions>) -> Result<()
                 }
             }
 
-            if stats_mode {
-                // In stats mode, consume rows but don't print them
+            if stats_mode || count_only {
+                // Consume rows but don't print them (just tally the count).
                 continue;
             }
 
@@ -269,23 +298,38 @@ pub fn run_query(args: QueryArgs, cache_opts: Option<CacheOptions>) -> Result<()
                 continue;
             }
 
-            if !args.json {
-                let _ = writeln!(writer);
-                let _ = writeln!(
-                    writer,
-                    "{} {} {}",
-                    "---".dimmed(),
-                    format!("Row {}", count).cyan(),
-                    "---".dimmed()
-                );
-            }
             let row = if let Some(ref proj) = projection {
                 proj.apply(&row)
             } else {
                 row
             };
             let ser_start = std::time::Instant::now();
-            if let Err(e) = write_row(&mut writer, &row, args.json) {
+            let write_result = if tsv_output {
+                if !tsv_header_written {
+                    if let Err(e) = write_tsv_header(&mut writer, &row) {
+                        if e.kind() == std::io::ErrorKind::BrokenPipe {
+                            broken_pipe = true;
+                            break;
+                        }
+                        return Err(e.into());
+                    }
+                    tsv_header_written = true;
+                }
+                write_tsv_row(&mut writer, &row)
+            } else {
+                if !json_output {
+                    let _ = writeln!(writer);
+                    let _ = writeln!(
+                        writer,
+                        "{} {} {}",
+                        "---".dimmed(),
+                        format!("Row {}", count).cyan(),
+                        "---".dimmed()
+                    );
+                }
+                write_row(&mut writer, &row, json_output)
+            };
+            if let Err(e) = write_result {
                 if e.kind() == std::io::ErrorKind::BrokenPipe {
                     broken_pipe = true;
                     break;
@@ -311,7 +355,10 @@ pub fn run_query(args: QueryArgs, cache_opts: Option<CacheOptions>) -> Result<()
             }
         }
 
-        if stats_mode {
+        if count_only {
+            // Print only the matching row count to stdout.
+            println!("{}", count);
+        } else if stats_mode {
             let total_time_ms = (load_elapsed + consume_elapsed).as_secs_f64() * 1000.0;
             let stats = serde_json::json!({
                 "rows": count,
@@ -323,7 +370,7 @@ pub fn run_query(args: QueryArgs, cache_opts: Option<CacheOptions>) -> Result<()
             println!("{}", stats);
         } else if summary_mode {
             let acc = accumulator.unwrap();
-            if args.json {
+            if json_output {
                 // Machine-readable JSON summary
                 let mut fields_json = serde_json::Map::new();
                 for key in acc.sorted_fields() {
@@ -485,6 +532,63 @@ fn looks_like_string_field(field_name: &str) -> bool {
     string_fields
         .iter()
         .any(|&s| field_name.to_lowercase().contains(s))
+}
+
+/// Collect the leaf (scalar) values of a row in depth-first order, alongside
+/// their dotted field paths. Used to flatten a projected struct into a flat TSV
+/// record. Nested structs contribute `parent.child` paths; arrays are rendered
+/// as a single compact-JSON cell so the column count stays stable.
+fn collect_tsv_leaves(value: &EncodedValue, prefix: &str, out: &mut Vec<(String, String)>) {
+    match value {
+        EncodedValue::Struct(fields) => {
+            for (name, val) in fields {
+                let path = if prefix.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{}.{}", prefix, name)
+                };
+                match val {
+                    EncodedValue::Struct(_) => collect_tsv_leaves(val, &path, out),
+                    _ => out.push((path, tsv_scalar(val))),
+                }
+            }
+        }
+        // A bare (unprojected-to-struct) value: emit it as a single column.
+        other => out.push((prefix.to_string(), tsv_scalar(other))),
+    }
+}
+
+/// Render an `EncodedValue` as a single TSV cell. Tabs/newlines in binary
+/// values are stripped to keep the record line-oriented; arrays become compact
+/// JSON so the column layout is preserved.
+fn tsv_scalar(value: &EncodedValue) -> String {
+    match value {
+        EncodedValue::Null => String::new(),
+        EncodedValue::Binary(b) => String::from_utf8_lossy(b)
+            .replace(['\t', '\n', '\r'], " "),
+        EncodedValue::Int32(i) => i.to_string(),
+        EncodedValue::Int64(i) => i.to_string(),
+        EncodedValue::Float32(f) => f.to_string(),
+        EncodedValue::Float64(f) => f.to_string(),
+        EncodedValue::Boolean(b) => b.to_string(),
+        EncodedValue::Array(_) | EncodedValue::Struct(_) => encoded_value_to_json(value),
+    }
+}
+
+/// Write the TSV header row (tab-joined leaf field paths) derived from a row.
+fn write_tsv_header(writer: &mut dyn Write, row: &EncodedValue) -> std::io::Result<()> {
+    let mut leaves = Vec::new();
+    collect_tsv_leaves(row, "", &mut leaves);
+    let header: Vec<&str> = leaves.iter().map(|(k, _)| k.as_str()).collect();
+    writeln!(writer, "{}", header.join("\t"))
+}
+
+/// Write a single TSV data row (tab-joined leaf values).
+fn write_tsv_row(writer: &mut dyn Write, row: &EncodedValue) -> std::io::Result<()> {
+    let mut leaves = Vec::new();
+    collect_tsv_leaves(row, "", &mut leaves);
+    let cells: Vec<&str> = leaves.iter().map(|(_, v)| v.as_str()).collect();
+    writeln!(writer, "{}", cells.join("\t"))
 }
 
 /// Write a row to the writer, returning io::Result to allow BrokenPipe detection.

@@ -1,12 +1,24 @@
 //! Miscellaneous command argument definitions.
 
-use clap::Args;
+use clap::{Args, ValueEnum};
 
 #[cfg(feature = "clickhouse")]
 use super::shared::PartitioningArgs;
 
 #[cfg(any(feature = "validation", feature = "clickhouse"))]
 use clap::Subcommand;
+
+/// Output format for `query` row data.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum QueryFormat {
+    /// Colorized, indented human-readable output (the default).
+    Pretty,
+    /// NDJSON — one JSON object per row.
+    Json,
+    /// Tab-separated values — a header row of field names followed by one
+    /// tab-separated record per row (best paired with `--fields`).
+    Tsv,
+}
 
 #[derive(Args)]
 pub struct QueryArgs {
@@ -25,9 +37,21 @@ pub struct QueryArgs {
     #[arg(long)]
     pub limit: Option<usize>,
 
-    /// Output as JSON
+    /// Output as JSON (shorthand for --format json)
     #[arg(long)]
     pub json: bool,
+
+    /// Output format for row data: `pretty` (default, colorized), `json`
+    /// (NDJSON, one object per line) or `tsv` (one tab-separated record per
+    /// line, with a header row of the projected field names). `tsv` pairs with
+    /// `--fields` to emit a flat, parseable column stream.
+    #[arg(long, value_enum)]
+    pub format: Option<QueryFormat>,
+
+    /// Print only the number of matching rows (no row data). Honors --interval,
+    /// --where and --fields; ignores output-format flags.
+    #[arg(long)]
+    pub count: bool,
 
     /// Genomic interval (chr:start-end format, can be specified multiple times)
     #[arg(long)]
