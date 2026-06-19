@@ -1,6 +1,8 @@
 //! Shared CLI utilities (progress bars, formatting, filter parsing).
 
 use crate::cli::HasCommonExportArgs;
+use genohype_core::codec::EncodedValue;
+use genohype_core::export::cache_builder::extract_gene;
 use genohype_core::query::{IntervalList, KeyRange};
 use genohype_core::Result;
 use indicatif::ProgressStyle;
@@ -9,6 +11,30 @@ use std::sync::Arc;
 
 // Re-export filter parser from core for use across modules
 pub use genohype_core::query::filter::parse_where_condition;
+
+/// Whether a decoded genes-HT row overlaps any of `intervals`.
+///
+/// The genes Hail table is keyed by `gene_id`, so a Hail interval scan can't
+/// slice it by genomic position — `--interval` is a silent no-op there and the
+/// loader would otherwise pull every gene genome-wide. This post-decode check
+/// restores interval scoping for the gene loaders (smoke/subset).
+///
+/// Genes carry an UNPREFIXED contig (`"21"`) while intervals are usually
+/// chr-prefixed (`"chr21"`), so we test both conventions. A row with no
+/// extractable gene/locus is treated as non-overlapping (dropped under a filter).
+pub fn gene_row_in_intervals(row: &EncodedValue, intervals: &IntervalList) -> bool {
+    let Some(gene) = extract_gene(row) else {
+        return false;
+    };
+    let start = gene.start as i32;
+    let stop = gene.stop as i32;
+    let chrom = gene.chrom.as_str();
+    let bare = chrom.strip_prefix("chr").unwrap_or(chrom);
+    let prefixed = format!("chr{bare}");
+    intervals.overlaps(chrom, start, stop)
+        || intervals.overlaps(bare, start, stop)
+        || intervals.overlaps(&prefixed, start, stop)
+}
 
 /// Create a standard progress bar style (no emojis)
 pub fn progress_style_bar() -> ProgressStyle {

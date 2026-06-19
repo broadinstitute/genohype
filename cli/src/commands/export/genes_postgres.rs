@@ -4,7 +4,9 @@
 //! gene-view requests. See [`genohype_core::export::postgres`] for the schema.
 
 use crate::cli::ExportGenesPostgresArgs;
-use crate::commands::utils::{parse_export_filters, parse_export_intervals, progress_style_spinner};
+use crate::commands::utils::{
+    gene_row_in_intervals, parse_export_filters, parse_export_intervals, progress_style_spinner,
+};
 use genohype_core::export::postgres::{GenesCopyInserter, PostgresClient};
 use genohype_core::query::QueryEngine;
 use genohype_core::Result;
@@ -25,6 +27,9 @@ pub fn run_export_genes_postgres(args: ExportGenesPostgresArgs) -> Result<()> {
 
     let where_filters = parse_export_filters(&args);
     let intervals = parse_export_intervals(&args)?;
+    // The genes HT is keyed by gene_id, so the Hail interval scan can't slice by
+    // position — keep the parsed intervals to filter overlapping genes post-decode.
+    let locus_filter = intervals.clone();
 
     let engine = QueryEngine::open_path(&args.common.input)?;
 
@@ -48,8 +53,15 @@ pub fn run_export_genes_postgres(args: ExportGenesPostgresArgs) -> Result<()> {
     let pb = ProgressBar::new_spinner();
     pb.set_style(progress_style_spinner());
 
+    let mut filtered_out = 0usize;
     for row_result in iterator {
         let row = row_result?;
+        if let Some(iv) = &locus_filter {
+            if !gene_row_in_intervals(&row, iv) {
+                filtered_out += 1;
+                continue;
+            }
+        }
         inserter.add(&row).map_err(pg_err)?;
         if inserter.total_rows > 0 && inserter.total_rows.is_multiple_of(5_000) {
             pb.set_message(format!("{} genes loaded...", inserter.total_rows));
@@ -60,6 +72,7 @@ pub fn run_export_genes_postgres(args: ExportGenesPostgresArgs) -> Result<()> {
 
     let total = inserter.total_rows;
     let skipped = inserter.skipped_rows;
+    let deduped = inserter.deduped_rows;
 
     if !args.no_indexes {
         println!("  {}", "Building upper(gencode_symbol) index...".dimmed());
@@ -71,10 +84,12 @@ pub fn run_export_genes_postgres(args: ExportGenesPostgresArgs) -> Result<()> {
     println!();
     println!("{}", "Genes load complete!".green().bold());
     println!(
-        "  {} {} genes loaded ({} rows skipped, no gene_id)",
+        "  {} {} genes loaded ({} rows skipped, no gene_id; {} duplicate gene_ids dropped; {} outside interval)",
         "Loaded:".cyan(),
         total.to_string().bright_white(),
         skipped,
+        deduped,
+        filtered_out,
     );
     println!(
         "  {} {}",

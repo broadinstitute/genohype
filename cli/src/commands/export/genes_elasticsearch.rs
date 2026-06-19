@@ -4,7 +4,9 @@
 //! requests. See [`genohype_core::export::elasticsearch`] for the index shape.
 
 use crate::cli::ExportGenesElasticsearchArgs;
-use crate::commands::utils::{parse_export_filters, parse_export_intervals, progress_style_spinner};
+use crate::commands::utils::{
+    gene_row_in_intervals, parse_export_filters, parse_export_intervals, progress_style_spinner,
+};
 use genohype_core::export::elasticsearch::{
     build_gene_document, build_genes_request_body, BulkInserter, ElasticsearchClient,
 };
@@ -28,6 +30,9 @@ pub fn run_export_genes_elasticsearch(args: ExportGenesElasticsearchArgs) -> Res
 
     let where_filters = parse_export_filters(&args);
     let intervals = parse_export_intervals(&args)?;
+    // The genes HT is keyed by gene_id, so the Hail interval scan can't slice by
+    // position — keep the parsed intervals to filter overlapping genes post-decode.
+    let locus_filter = intervals.clone();
 
     let engine = QueryEngine::open_path(&args.common.input)?;
 
@@ -52,12 +57,19 @@ pub fn run_export_genes_elasticsearch(args: ExportGenesElasticsearchArgs) -> Res
     // The genes index uses `gene_id` as the document `_id` (stable → idempotent).
     let mut inserter = BulkInserter::new(&client, &args.index, Some("gene_id".to_string()), args.batch_size);
     let mut skipped = 0usize;
+    let mut filtered_out = 0usize;
 
     let pb = ProgressBar::new_spinner();
     pb.set_style(progress_style_spinner());
 
     for row_result in iterator {
         let row = row_result?;
+        if let Some(iv) = &locus_filter {
+            if !gene_row_in_intervals(&row, iv) {
+                filtered_out += 1;
+                continue;
+            }
+        }
         match build_gene_document(&row) {
             Some(doc) => inserter.add(&doc).map_err(es_err)?,
             None => skipped += 1,
@@ -75,10 +87,11 @@ pub fn run_export_genes_elasticsearch(args: ExportGenesElasticsearchArgs) -> Res
     println!();
     println!("{}", "Genes index complete!".green().bold());
     println!(
-        "  {} {} genes indexed ({} rows skipped, no gene_id)",
+        "  {} {} genes indexed ({} rows skipped, no gene_id; {} outside interval)",
         "Indexed:".cyan(),
         total.to_string().bright_white(),
         skipped,
+        filtered_out,
     );
     println!(
         "  {} {}",

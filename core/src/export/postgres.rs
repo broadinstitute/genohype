@@ -719,10 +719,19 @@ mod client {
         batch_size: usize,
         buffer: String,
         buffered_rows: usize,
+        /// gene_ids already buffered/flushed this load. The genes table has
+        /// `gene_id` as PRIMARY KEY and a direct COPY (no ON CONFLICT), but the
+        /// source genes HT carries a handful of duplicate gene_ids (e.g. PAR /
+        /// multi-record genes — ~46 genome-wide). Without dedupe the COPY hits
+        /// `duplicate key value violates unique constraint "genes_pkey"`. First
+        /// occurrence wins; later duplicates are dropped.
+        seen_gene_ids: HashSet<String>,
         /// Total genes rows successfully COPYd.
         pub total_rows: usize,
         /// Rows skipped because they carried no `gene_id`.
         pub skipped_rows: usize,
+        /// Rows dropped as duplicate `gene_id`s (see `seen_gene_ids`).
+        pub deduped_rows: usize,
         /// Number of COPY batches flushed.
         pub flush_count: usize,
         /// Accumulated time spent in COPY (ms).
@@ -737,20 +746,28 @@ mod client {
                 batch_size: batch_size.max(1),
                 buffer: String::new(),
                 buffered_rows: 0,
+                seen_gene_ids: HashSet::new(),
                 total_rows: 0,
                 skipped_rows: 0,
+                deduped_rows: 0,
                 flush_count: 0,
                 insert_time_ms: 0,
             })
         }
 
         /// Buffer one decoded genes row. Returns `false` if the row was skipped
-        /// (no `gene_id`). Auto-flushes at the batch size.
+        /// (no `gene_id`) or dropped as a duplicate `gene_id`. Auto-flushes at
+        /// the batch size.
         pub fn add(&mut self, row: &EncodedValue) -> Result<bool> {
             let Some((cols, data)) = extract_gene_columns(row) else {
                 self.skipped_rows += 1;
                 return Ok(false);
             };
+            // Drop duplicate gene_ids (PK) — the COPY has no ON CONFLICT.
+            if !self.seen_gene_ids.insert(cols.gene_id.clone()) {
+                self.deduped_rows += 1;
+                return Ok(false);
+            }
             append_genes_copy_row(&mut self.buffer, &cols, &data.to_string());
             self.buffered_rows += 1;
             if self.buffered_rows >= self.batch_size {
