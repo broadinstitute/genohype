@@ -6,11 +6,41 @@ use genohype_core::codec::{EncodedField, EncodedType, EncodedValue};
 use genohype_core::export::clickhouse::generate_create_table;
 use genohype_core::export::ClickHouseClient;
 use genohype_core::parquet::{build_record_batch, InMemoryParquetWriter};
+use genohype_core::projection::{Projection, SchemaWidth};
 use genohype_core::query::QueryEngine;
 use genohype_core::Result;
 use indicatif::ProgressBar;
 use owo_colors::OwoColorize;
 use std::path::Path;
+use std::sync::Arc;
+
+/// Resolve the `--width` flag into an optional projection against `row_type`
+/// (mirrors the postgres/elasticsearch exports). `None`/`full` => no projection.
+fn resolve_width_projection(
+    width: Option<&str>,
+    row_type: &genohype_core::codec::EncodedType,
+) -> Option<Projection> {
+    match width {
+        None | Some("full") => None,
+        Some(other) => {
+            let width = SchemaWidth::parse(other).unwrap_or_else(|e| {
+                eprintln!("{} invalid --width: {}", "Error:".red().bold(), e);
+                std::process::exit(1);
+            });
+            match width {
+                SchemaWidth::Full => None,
+                SchemaWidth::BrowserMinimal => {
+                    let proj = Projection::browser_minimal_present_in(row_type);
+                    proj.validate(row_type).unwrap_or_else(|e| {
+                        eprintln!("{} {}", "Error:".red().bold(), e);
+                        std::process::exit(1);
+                    });
+                    Some(proj)
+                }
+            }
+        }
+    }
+}
 
 /// Check if a path is a cloud URL (gs://, s3://, http://, https://)
 fn is_cloud_path(path: &str) -> bool {
@@ -182,10 +212,28 @@ fn export_single_file(
     let engine = QueryEngine::open_path(file_path)?;
     let row_type = engine.row_type().clone();
 
-    // Augment schema if filename column is requested
-    let effective_schema = match filename_column {
-        Some(col) => augment_schema(&row_type, col),
+    // Resolve the schema-width projection (defaults to full = no projection). For
+    // browser-minimal the stored ClickHouse schema is narrowed to match the
+    // projected rows, so the disk/$ footprint is apples-to-apples with the other
+    // browser-minimal arms.
+    let projection = resolve_width_projection(args.width.as_deref(), &row_type);
+    let projected_row_type = match &projection {
+        Some(proj) => proj.project_type(&row_type),
         None => row_type.clone(),
+    };
+    if projection.is_some() {
+        println!(
+            "  {} {}",
+            "Schema width:".cyan(),
+            args.width.as_deref().unwrap_or("full").bright_white()
+        );
+    }
+
+    // Augment schema if filename column is requested (after projection so the
+    // injected column survives the browser-minimal allowlist).
+    let effective_schema = match filename_column {
+        Some(col) => augment_schema(&projected_row_type, col),
+        None => projected_row_type.clone(),
     };
 
     // Create table on first file only
@@ -216,7 +264,22 @@ fn export_single_file(
         &effective_schema,
     )?);
 
-    let iterator = engine.query_iter_with_intervals(&where_filters, intervals)?;
+    // Build the decode-time projection (Level 2) for browser-minimal so dropped
+    // fields are never decoded. Keep the ORDER BY / key columns (e.g. locus,
+    // alleles) so they survive projection.
+    let decode_projection = match &projection {
+        Some(Projection::Fields(tree)) => {
+            let mut decode_tree = tree.clone();
+            for key in engine.key_fields() {
+                decode_tree.ensure_field(key);
+            }
+            Some(Arc::new(decode_tree))
+        }
+        _ => None,
+    };
+
+    let iterator =
+        engine.query_iter_with_projection(&where_filters, intervals, decode_projection)?;
 
     let iterator: Box<dyn Iterator<Item = _>> = if let Some(n) = args.common.limit {
         Box::new(iterator.take(n))
@@ -256,6 +319,14 @@ fn export_single_file(
 
     for row_result in iterator {
         let row = row_result?;
+        // Apply the output projection so the row's top-level fields exactly match
+        // `projected_row_type` (drops any key field the decode projection kept but
+        // the browser-minimal allowlist excludes), preserving the positional
+        // row→schema alignment `build_record_batch` relies on.
+        let row = match &projection {
+            Some(proj) => proj.apply(&row),
+            None => row,
+        };
         let row = match filename_column {
             Some(col) => augment_row(row, col, &filename_stem),
             None => row,

@@ -10,10 +10,12 @@ use genohype_core::parquet::{
     build_record_batch, hail_to_parquet_sharded_full, hail_to_parquet_with_options, ParquetWriter,
 };
 use genohype_core::partitioning::PartitionAllocator;
+use genohype_core::projection::{Projection, SchemaWidth};
 use genohype_core::query::QueryEngine;
 use genohype_core::Result;
 use indicatif::ProgressBar;
 use owo_colors::OwoColorize;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub fn run_export_parquet(args: ExportParquetArgs) -> Result<()> {
@@ -66,6 +68,33 @@ pub fn run_export_parquet(args: ExportParquetArgs) -> Result<()> {
     };
 
     let row_type = engine.row_type().clone();
+
+    // Resolve the schema-width projection (defaults to full = no projection). For
+    // browser-minimal both the Parquet/Arrow schema and the rows written are
+    // narrowed, so the parquet the duckdb arm reads is apples-to-apples with the
+    // other browser-minimal arms. Only the sequential (filtered/interval) path
+    // honors this; the parallel/sharded converters export the full schema.
+    let width_projection: Option<Projection> = match args.width.as_deref() {
+        None | Some("full") => None,
+        Some(other) => {
+            let width = SchemaWidth::parse(other).unwrap_or_else(|e| {
+                eprintln!("{} invalid --width: {}", "Error:".red().bold(), e);
+                std::process::exit(1);
+            });
+            match width {
+                SchemaWidth::Full => None,
+                SchemaWidth::BrowserMinimal => {
+                    let proj = Projection::browser_minimal_present_in(&row_type);
+                    proj.validate(&row_type).unwrap_or_else(|e| {
+                        eprintln!("{} {}", "Error:".red().bold(), e);
+                        std::process::exit(1);
+                    });
+                    Some(proj)
+                }
+            }
+        }
+    };
+
     let num_partitions = engine.num_partitions();
     println!(
         "{} {}",
@@ -119,6 +148,23 @@ pub fn run_export_parquet(args: ExportParquetArgs) -> Result<()> {
         );
     }
     println!();
+
+    // `--width browser-minimal` narrows the schema, which only the sequential
+    // streaming path implements. The parallel/sharded converters bypass the
+    // per-row batch loop and always export the full schema, so reject the combo
+    // up front rather than silently writing a full-width parquet.
+    if width_projection.is_some()
+        && (use_sharded
+            || (where_filters.is_empty() && intervals.is_none() && args.common.limit.is_none()))
+    {
+        eprintln!(
+            "{} --width browser-minimal is only supported for the streaming export path \
+             (with --where/--interval/--limit); it is not supported with --per-partition, \
+             --shard-count, or a full-table export.",
+            "Error:".red().bold()
+        );
+        std::process::exit(1);
+    }
 
     // Check for incompatible options with sharded export
     if use_sharded
@@ -264,8 +310,47 @@ pub fn run_export_parquet(args: ExportParquetArgs) -> Result<()> {
             // Fall back to sequential streaming for filtered exports
             println!("{}", "Using sequential export (filtered)...".dimmed());
 
-            // Use streaming query with filters and intervals
-            let iterator = engine.query_iter_with_intervals(&where_filters, intervals)?;
+            // For browser-minimal, narrow the schema to match the projected rows
+            // (writer + record-batch builder both key off this `row_type`).
+            let row_type = match &width_projection {
+                Some(proj) => proj.project_type(&row_type),
+                None => row_type,
+            };
+            if width_projection.is_some() {
+                println!(
+                    "{} {}",
+                    "Schema width:".cyan(),
+                    args.width.as_deref().unwrap_or("full").bright_white()
+                );
+            }
+
+            // Build the decode-time projection so dropped fields are never
+            // decoded; keep `locus` for interval filtering.
+            let decode_projection = match &width_projection {
+                Some(Projection::Fields(tree)) => {
+                    let mut decode_tree = tree.clone();
+                    decode_tree.ensure_field("locus");
+                    Some(Arc::new(decode_tree))
+                }
+                _ => None,
+            };
+
+            // Use streaming query with filters, intervals, and decode projection.
+            let iterator = engine.query_iter_with_projection(
+                &where_filters,
+                intervals,
+                decode_projection,
+            )?;
+
+            // Apply the output projection so each row's top-level fields exactly
+            // match the (narrowed) `row_type`, preserving positional alignment.
+            let width_projection_ref = width_projection.clone();
+            let iterator = iterator.map(move |row_result| {
+                row_result.map(|row| match &width_projection_ref {
+                    Some(proj) => proj.apply(&row),
+                    None => row,
+                })
+            });
 
             // Apply limit if specified
             let iterator: Box<dyn Iterator<Item = _>> = if let Some(n) = args.common.limit {

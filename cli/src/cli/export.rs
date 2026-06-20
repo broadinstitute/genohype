@@ -64,6 +64,15 @@ pub struct ExportParquetArgs {
     /// Output Parquet file path (or directory if --per-partition or --shard-count is used)
     pub output: String,
 
+    /// Schema-width preset: `full` (write every field, default) or
+    /// `browser-minimal` (only the fields the gnomAD browser API returns). Narrows
+    /// both the Arrow/Parquet schema and the rows written so the stored parquet
+    /// (read by the duckdb arm) is apples-to-apples with the other browser-minimal
+    /// arms. Only supported for the streaming (filtered/interval) path, since the
+    /// parallel/sharded converters export the full schema directly.
+    #[arg(long)]
+    pub width: Option<String>,
+
     /// Write each partition to a separate file in the output directory
     #[arg(long)]
     pub per_partition: bool,
@@ -171,6 +180,15 @@ pub struct ExportClickhouseArgs {
 
     /// Target table name in ClickHouse
     pub table: String,
+
+    /// Schema-width preset: `full` (decode/store every field, default) or
+    /// `browser-minimal` (only the fields the gnomAD browser API returns). Narrows
+    /// both the `CREATE TABLE` DDL / Arrow schema and the rows inserted, so the
+    /// stored ClickHouse table is apples-to-apples with the other browser-minimal
+    /// arms. The nested fields the backend reads (locus, exome.freq, genome.freq,
+    /// transcript_consequences) are all kept whole by browser-minimal.
+    #[arg(long)]
+    pub width: Option<String>,
 
     /// Glob pattern to match multiple input files (e.g., "*.bed.gz")
     /// When specified, input is treated as a directory and files matching the glob are processed

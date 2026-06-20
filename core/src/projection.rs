@@ -3,7 +3,7 @@
 //! Supports dot-separated paths (`freq.AF`), array indexing (`[0]`),
 //! and head slicing (`[:3]`).
 
-use crate::codec::encoded_type::{EncodedType, EncodedValue};
+use crate::codec::encoded_type::{EncodedField, EncodedType, EncodedValue};
 use crate::error::{HailError, Result};
 use std::collections::HashMap;
 
@@ -473,6 +473,58 @@ impl Projection {
         match self {
             Projection::Fields(tree) => tree.project(value),
             Projection::Exclude(names) => exclude_fields(value, names),
+        }
+    }
+
+    /// Project a top-level `EncodedType` to mirror what [`Projection::apply`]
+    /// produces for rows of that type.
+    ///
+    /// Used by the schema-materializing loaders (ClickHouse `CREATE TABLE`, the
+    /// parquet/duckdb Arrow schema) so the *stored* schema matches the projected
+    /// rows. The `browser-minimal` width keeps each retained top-level field
+    /// *whole* (its subtree is `select_all`), so this filters the struct's
+    /// top-level fields — preserving their original order, which the positional
+    /// row→schema mapping in `build_record_batch` relies on — and re-indexes
+    /// them. Nested narrowing (e.g. `freq.AF`) is intentionally not reflected in
+    /// the type here because `browser-minimal` never narrows below the top level.
+    pub fn project_type(&self, schema: &EncodedType) -> EncodedType {
+        match (self, schema) {
+            (Projection::Fields(tree), EncodedType::EBaseStruct { required, fields }) => {
+                if tree.is_select_all() && !tree.has_children() {
+                    return schema.clone();
+                }
+                let kept: Vec<EncodedField> = fields
+                    .iter()
+                    .filter(|f| tree.get_child(&f.name).is_some())
+                    .enumerate()
+                    .map(|(index, f)| EncodedField {
+                        name: f.name.clone(),
+                        encoded_type: f.encoded_type.clone(),
+                        index,
+                    })
+                    .collect();
+                EncodedType::EBaseStruct {
+                    required: *required,
+                    fields: kept,
+                }
+            }
+            (Projection::Exclude(names), EncodedType::EBaseStruct { required, fields }) => {
+                let kept: Vec<EncodedField> = fields
+                    .iter()
+                    .filter(|f| !names.iter().any(|n| n == &f.name))
+                    .enumerate()
+                    .map(|(index, f)| EncodedField {
+                        name: f.name.clone(),
+                        encoded_type: f.encoded_type.clone(),
+                        index,
+                    })
+                    .collect();
+                EncodedType::EBaseStruct {
+                    required: *required,
+                    fields: kept,
+                }
+            }
+            _ => schema.clone(),
         }
     }
 }
@@ -1020,6 +1072,43 @@ mod tests {
         // Schema-tolerant variant only references present fields -> validates.
         let proj = Projection::browser_minimal_present_in(&schema);
         assert!(proj.validate(&schema).is_ok());
+    }
+
+    #[test]
+    fn test_project_type_matches_projected_row_order() {
+        // `project_type` must filter top-level fields in their ORIGINAL order and
+        // re-index them, so the positional row→schema mapping in
+        // `build_record_batch` stays aligned with the projected rows.
+        let schema = sample_schema(); // locus, alleles, freq, vep (in that order)
+        let proj = Projection::Fields(ProjectionTree::from_fields(&[
+            FieldPath::parse("freq").unwrap(),
+            FieldPath::parse("locus").unwrap(),
+        ]));
+        let projected_type = proj.project_type(&schema);
+        if let EncodedType::EBaseStruct { fields, .. } = &projected_type {
+            // Original order preserved (locus before freq), re-indexed 0..n.
+            assert_eq!(
+                fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+                vec!["locus", "freq"]
+            );
+            assert_eq!(fields[0].index, 0);
+            assert_eq!(fields[1].index, 1);
+        } else {
+            panic!("expected struct");
+        }
+
+        // The projected row keeps the same fields in the same order, so the i-th
+        // schema field aligns with the i-th row field.
+        let row = sample_row();
+        let projected_row = proj.apply(&row);
+        if let EncodedValue::Struct(row_fields) = &projected_row {
+            assert_eq!(
+                row_fields.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+                vec!["locus", "freq"]
+            );
+        } else {
+            panic!("expected struct row");
+        }
     }
 
     #[test]
