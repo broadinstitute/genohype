@@ -39,7 +39,7 @@ use commands::export::{
 #[cfg(feature = "bigquery")]
 use commands::export::run_export_bigquery;
 #[cfg(feature = "clickhouse")]
-use commands::export::run_export_clickhouse;
+use commands::export::{run_export_clickhouse, run_export_genes_clickhouse};
 #[cfg(feature = "elasticsearch")]
 use commands::export::{run_export_elasticsearch, run_export_genes_elasticsearch};
 #[cfg(feature = "postgres")]
@@ -100,6 +100,8 @@ fn main() -> Result<()> {
             ExportCommands::GenesPostgres(args) => run_export_genes_postgres(args)?,
             #[cfg(feature = "elasticsearch")]
             ExportCommands::GenesElasticsearch(args) => run_export_genes_elasticsearch(args)?,
+            #[cfg(feature = "clickhouse")]
+            ExportCommands::GenesClickhouse(args) => run_export_genes_clickhouse(args)?,
             ExportCommands::CacheBuild(args) => run_export_cache_build(args)?,
             #[cfg(feature = "bigquery")]
             ExportCommands::Bigquery(args) => run_export_bigquery(args)?,

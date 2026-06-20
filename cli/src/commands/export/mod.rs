@@ -8,6 +8,8 @@ pub mod cache_build;
 
 #[cfg(feature = "clickhouse")]
 pub mod clickhouse;
+#[cfg(feature = "clickhouse")]
+pub mod genes_clickhouse;
 
 #[cfg(feature = "elasticsearch")]
 pub mod elasticsearch;
@@ -30,6 +32,8 @@ pub use cache_build::run_export_cache_build;
 
 #[cfg(feature = "clickhouse")]
 pub use clickhouse::run_export_clickhouse;
+#[cfg(feature = "clickhouse")]
+pub use genes_clickhouse::run_export_genes_clickhouse;
 
 #[cfg(feature = "elasticsearch")]
 pub use elasticsearch::run_export_elasticsearch;

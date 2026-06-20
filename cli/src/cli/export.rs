@@ -42,6 +42,11 @@ pub enum ExportCommands {
     #[cfg(feature = "elasticsearch")]
     GenesElasticsearch(ExportGenesElasticsearchArgs),
 
+    /// Load the flat genes lookup table into ClickHouse (closes the genes-table
+    /// gap for the `clickhouse` arm)
+    #[cfg(feature = "clickhouse")]
+    GenesClickhouse(ExportGenesClickhouseArgs),
+
     /// Build the materialized gene-view cache (`gcs-cache` arm): write one
     /// `{gene_id}.json` GeneVariantsResponse blob per gene to a dir or `gs://`
     CacheBuild(ExportCacheBuildArgs),
@@ -362,6 +367,36 @@ pub struct ExportGenesElasticsearchArgs {
 
 #[cfg(feature = "elasticsearch")]
 impl HasCommonExportArgs for ExportGenesElasticsearchArgs {
+    fn common(&self) -> &CommonExportArgs {
+        &self.common
+    }
+}
+
+#[cfg(feature = "clickhouse")]
+#[derive(Args)]
+pub struct ExportGenesClickhouseArgs {
+    /// `common.input` is the genes Hail table path.
+    #[command(flatten)]
+    pub common: CommonExportArgs,
+
+    /// ClickHouse HTTP URL (e.g., http://localhost:8123).
+    pub url: String,
+
+    /// Target genes table name (the backend queries `genes`).
+    #[arg(default_value = "genes")]
+    pub table: String,
+
+    /// Rows per JSONEachRow INSERT batch.
+    #[arg(long, default_value = "2000")]
+    pub batch_size: usize,
+
+    /// Drop and recreate the table if it already exists (makes the load idempotent).
+    #[arg(long)]
+    pub recreate: bool,
+}
+
+#[cfg(feature = "clickhouse")]
+impl HasCommonExportArgs for ExportGenesClickhouseArgs {
     fn common(&self) -> &CommonExportArgs {
         &self.common
     }

@@ -224,16 +224,54 @@ impl ClickHouseClient {
     /// * `table_name` - Target table name
     /// * `data` - Parquet file contents as bytes
     pub fn insert_parquet_bytes(&self, table_name: &str, data: Vec<u8>) -> Result<()> {
+        // Per-INSERT server-side memory cap. The deeply-nested gnomAD variant
+        // schema (Array(Tuple(...)) columns) makes the Parquet→native conversion
+        // memory-hungry; on a small VM where ClickHouse already holds a sizeable
+        // resident set, an 8 GB cap can push total usage past physical RAM and
+        // OOM-kill the server. Default to a conservative 4 GB and let the loader
+        // override via HAIL_DECODER_CLICKHOUSE_MAX_MEMORY (bytes) on bigger boxes.
+        let max_memory_usage: u64 = std::env::var("HAIL_DECODER_CLICKHOUSE_MAX_MEMORY")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4_000_000_000);
         // Build the insert URL
         let url = format!(
-            "{}/?input_format_parquet_max_block_size=8192&max_insert_block_size=8192&max_memory_usage=8000000000&query=INSERT%20INTO%20`{}`%20FORMAT%20Parquet",
-            self.base_url, table_name
+            "{}/?input_format_parquet_max_block_size=8192&max_insert_block_size=8192&max_memory_usage={}&query=INSERT%20INTO%20`{}`%20FORMAT%20Parquet",
+            self.base_url, max_memory_usage, table_name
         );
 
         let response = self
             .request(&url)
             .header("Content-Type", "application/octet-stream")
             .body(data)
+            .send()?;
+
+        let status = response.status();
+        let text = response.text()?;
+
+        if !status.is_success() {
+            return Err(ClickHouseError::Query(text));
+        }
+
+        Ok(())
+    }
+
+    /// Insert rows supplied as newline-delimited JSON (ClickHouse `JSONEachRow`).
+    ///
+    /// Used by the flat `genes` loader: each line is one JSON object whose keys
+    /// match the target table's column names. Suited to small tables (the genes
+    /// lookup is ~20k rows); for the large nested `variants` table use
+    /// [`Self::insert_parquet_bytes`].
+    pub fn insert_json_each_row(&self, table_name: &str, ndjson: &str) -> Result<()> {
+        let url = format!(
+            "{}/?query=INSERT%20INTO%20`{}`%20FORMAT%20JSONEachRow",
+            self.base_url, table_name
+        );
+
+        let response = self
+            .request(&url)
+            .header("Content-Type", "application/x-ndjson")
+            .body(ndjson.to_string())
             .send()?;
 
         let status = response.status();
