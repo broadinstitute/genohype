@@ -503,10 +503,25 @@ pub fn build_gene_blob(
     let interval_strs = dual_contig_intervals(&gene.chrom, gene.start, gene.stop);
     let intervals = IntervalList::from_strings(&interval_strs)?;
 
-    let variant_list: Vec<CacheVariant> = variants
-        .query_iter_with_intervals(&[], Some(Arc::new(intervals)))?
-        .filter_map(|res| res.ok().and_then(|row| extract_variant(&row)))
-        .collect();
+    // IMPORTANT: do NOT swallow row-level errors here. A previous `res.ok()`
+    // dropped any row that failed to read/decode — including *transient* GCS read
+    // errors mid-scan — so a flaky network silently produced a truncated blob with
+    // no failure signal (observed: BAGE2 wrote 69,973 of 75,635 variants, a clean
+    // cutoff where the scan started erroring, and even 0-variant blobs during bad
+    // GCS windows). That makes the gene-view cache non-deterministic and breaks the
+    // cross-arm equivalence oracle. Propagate the error so the build fails loudly
+    // and is retried, rather than persisting an incomplete blob.
+    //
+    // A *decoded* row that `extract_variant` can't map (returns `None`) is a
+    // legitimate per-row skip (e.g. a row with no `locus`/`alleles`), not an I/O
+    // failure, so those are still dropped.
+    let mut variant_list: Vec<CacheVariant> = Vec::new();
+    for res in variants.query_iter_with_intervals(&[], Some(Arc::new(intervals)))? {
+        let row = res?;
+        if let Some(variant) = extract_variant(&row) {
+            variant_list.push(variant);
+        }
+    }
 
     Ok(CacheGeneVariantsResponse {
         total: variant_list.len(),
