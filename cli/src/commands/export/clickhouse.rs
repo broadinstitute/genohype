@@ -177,6 +177,27 @@ fn augment_schema(schema: &EncodedType, column_name: &str) -> EncodedType {
     }
 }
 
+/// Build the ClickHouse `ORDER BY` key list, substituting the scalar `xpos` for a
+/// leading `locus` key. The source key is `(locus, alleles)` where `locus` is a
+/// `Tuple` ClickHouse can't range-prune; `xpos` (a scalar derived from `locus`)
+/// gives equivalent ordering with a prunable primary index, so we sort
+/// `(xpos, alleles)`. A non-`locus` key (e.g. already scalar) is passed through
+/// unchanged with `xpos` prepended so range queries still have a sort key.
+fn xpos_order_by(key_fields: &[String]) -> Vec<String> {
+    let xpos = genohype_core::export::xpos::XPOS_FIELD.to_string();
+    if key_fields.first().map(|k| k.as_str()) == Some("locus") {
+        let mut out = vec![xpos];
+        out.extend(key_fields.iter().skip(1).cloned());
+        out
+    } else if key_fields.is_empty() {
+        vec![xpos]
+    } else {
+        let mut out = vec![xpos];
+        out.extend(key_fields.iter().cloned());
+        out
+    }
+}
+
 /// Add a filename column value to each row
 fn augment_row(row: EncodedValue, column_name: &str, value: &str) -> EncodedValue {
     match row {
@@ -236,10 +257,22 @@ fn export_single_file(
         None => projected_row_type.clone(),
     };
 
+    // Materialize a scalar `xpos` Int64 column (appended last). The gnomAD key is
+    // `(locus, alleles)` where `locus` is a ClickHouse `Tuple(contig, position)`;
+    // a MergeTree `ORDER BY (locus, alleles)` CANNOT prune `position` range
+    // predicates (no index access on `locus.2`). Adding a scalar `xpos` and
+    // sorting on it restores primary-index range pruning for region/gene queries,
+    // matching the BKD-indexed ES arm. xpos is derived from each row's locus, so
+    // query *results* are unchanged.
+    let effective_schema = genohype_core::export::xpos::augment_type_with_xpos(&effective_schema);
+
     // Create table on first file only
     if !table_created {
         println!("{}", "  Generating CREATE TABLE DDL...".dimmed());
-        let ddl = generate_create_table(&args.table, &effective_schema, engine.key_fields())
+        // Replace a leading `locus` key (an unprunable Tuple) with the scalar
+        // `xpos`, keeping any remaining key columns (e.g. `alleles`) after it.
+        let order_by = xpos_order_by(engine.key_fields());
+        let ddl = generate_create_table(&args.table, &effective_schema, &order_by)
             .map_err(|e| genohype_core::HailError::InvalidFormat(e.to_string()))?;
         println!("{}", ddl.dimmed());
 
@@ -331,6 +364,9 @@ fn export_single_file(
             Some(col) => augment_row(row, col, &filename_stem),
             None => row,
         };
+        // Append the derived `xpos` last, aligned with the schema augmentation
+        // above (positional row→schema mapping in `build_record_batch`).
+        let row = genohype_core::export::xpos::augment_row_with_xpos(row);
         chunk_rows.push(row);
         total_rows += 1;
 

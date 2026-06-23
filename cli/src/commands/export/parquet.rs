@@ -324,6 +324,19 @@ pub fn run_export_parquet(args: ExportParquetArgs) -> Result<()> {
                 );
             }
 
+            // Materialize a scalar `xpos` Int64 column (appended last) and SORT the
+            // rows by it before writing. gnomAD rows arrive locus-sorted but the
+            // key is `(locus, alleles)` with `locus` a struct, so parquet row-group
+            // min/max statistics on the struct can't prune a `position` range scan.
+            // A scalar `xpos` column + xpos-sorted row order gives DuckDB usable
+            // row-group statistics for region/gene range queries (apples-to-apples
+            // with the BKD-indexed ES arm). xpos is derived per row, so query
+            // *results* are unchanged. NOTE: the sequential path buffers all rows to
+            // sort — fine at smoke scale (~554k rows); see the full-scale caveat in
+            // the punch-list.
+            let row_type =
+                genohype_core::export::xpos::augment_type_with_xpos(&row_type);
+
             // Build the decode-time projection so dropped fields are never
             // decoded; keep `locus` for interval filtering.
             let decode_projection = match &width_projection {
@@ -343,12 +356,16 @@ pub fn run_export_parquet(args: ExportParquetArgs) -> Result<()> {
             )?;
 
             // Apply the output projection so each row's top-level fields exactly
-            // match the (narrowed) `row_type`, preserving positional alignment.
+            // match the (narrowed) `row_type`, then append the derived `xpos`
+            // (aligned with the schema augmentation above).
             let width_projection_ref = width_projection.clone();
             let iterator = iterator.map(move |row_result| {
-                row_result.map(|row| match &width_projection_ref {
-                    Some(proj) => proj.apply(&row),
-                    None => row,
+                row_result.map(|row| {
+                    let row = match &width_projection_ref {
+                        Some(proj) => proj.apply(&row),
+                        None => row,
+                    };
+                    genohype_core::export::xpos::augment_row_with_xpos(row)
                 })
             });
 
@@ -363,35 +380,38 @@ pub fn run_export_parquet(args: ExportParquetArgs) -> Result<()> {
             let pb = ProgressBar::new_spinner();
             pb.set_style(progress_style_spinner());
 
-            // Drive the same 10k-row batch loop against either a cloud or local
-            // writer. Both branches mirror each other (and the sharded branch).
+            // Buffer all (xpos-augmented) rows, sort by `xpos`, then write in 10k
+            // batches. Buffering is required so parquet row groups are written in
+            // global xpos order — giving each row group a tight `xpos` min/max so
+            // DuckDB can skip groups outside a region/gene range. Stable sort keeps
+            // the within-locus (allele) order, so results are byte-identical aside
+            // from row ordering. Memory caveat (full scale) is noted in the report.
             macro_rules! drive_sequential {
                 ($writer:expr, $arrow_schema:expr) => {{
                     let mut writer = $writer;
                     let arrow_schema = $arrow_schema;
 
-                    let batch_size = 10000;
-                    let mut batch_rows = Vec::with_capacity(batch_size);
-                    let mut total_rows = 0;
-
+                    let mut all_rows: Vec<genohype_core::codec::EncodedValue> = Vec::new();
                     for row_result in iterator {
-                        let row = row_result?;
-                        batch_rows.push(row);
-                        total_rows += 1;
-
-                        if batch_rows.len() >= batch_size {
-                            pb.set_message(format!("{} rows processed...", total_rows));
-                            let batch =
-                                build_record_batch(&batch_rows, &row_type, arrow_schema.clone())?;
-                            writer.write_batch(&batch)?;
-                            batch_rows.clear();
+                        all_rows.push(row_result?);
+                        if all_rows.len() % 100_000 == 0 {
+                            pb.set_message(format!("{} rows buffered...", all_rows.len()));
                         }
                     }
 
-                    // Write remaining rows
-                    if !batch_rows.is_empty() {
+                    // Sort by the derived xpos (re-read from each row's locus).
+                    pb.set_message(format!("sorting {} rows by xpos...", all_rows.len()));
+                    all_rows.sort_by_key(|row| {
+                        genohype_core::export::xpos::compute_xpos_for_row(row).unwrap_or(0)
+                    });
+
+                    let total_rows = all_rows.len();
+                    let batch_size = 10000;
+                    for start in (0..all_rows.len()).step_by(batch_size) {
+                        let end = (start + batch_size).min(all_rows.len());
+                        pb.set_message(format!("{} / {} rows written...", end, total_rows));
                         let batch =
-                            build_record_batch(&batch_rows, &row_type, arrow_schema.clone())?;
+                            build_record_batch(&all_rows[start..end], &row_type, arrow_schema.clone())?;
                         writer.write_batch(&batch)?;
                     }
 

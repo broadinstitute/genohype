@@ -11,6 +11,7 @@
 pub mod cache_builder;
 pub mod hail;
 pub mod json;
+pub mod xpos;
 
 #[cfg(feature = "bigquery")]
 pub mod bigquery;
@@ -26,6 +27,7 @@ pub use cache_builder::{
     CacheGeneVariantsResponse, CacheVariant,
 };
 pub use json::{hail_to_json_sharded_full, JsonWriter};
+pub use xpos::{compute_xpos, compute_xpos_for_row, contig_to_int};
 
 #[cfg(feature = "bigquery")]
 pub use bigquery::{BigQueryClient, BigQueryError};

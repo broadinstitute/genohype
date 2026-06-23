@@ -77,8 +77,10 @@ pub type Result<T> = std::result::Result<T, PostgresError>;
 // ---------------------------------------------------------------------------
 
 /// The hoisted/indexed columns of the wide variants table, in `COPY` order. The
-/// remaining `data JSONB` column is appended after these.
-pub const COLUMNS: [&str; 5] = ["contig", "pos", "variant_id", "ref", "alt"];
+/// remaining `data JSONB` column is appended after these. `xpos` is the scalar
+/// global coordinate (`contig*1e9 + pos`) that backs fair region/gene range
+/// pruning; the backend's "typed" mode also reads it directly.
+pub const COLUMNS: [&str; 6] = ["contig", "pos", "variant_id", "ref", "alt", "xpos"];
 
 /// Quote a SQL identifier (double-quote, doubling any embedded quote). Used so
 /// `ref` (a non-reserved keyword) and lazily-generated partition names are always
@@ -107,6 +109,7 @@ pub fn generate_create_table(table: &str) -> String {
          variant_id TEXT NOT NULL,\n    \
          \"ref\" TEXT,\n    \
          \"alt\" TEXT,\n    \
+         xpos BIGINT NOT NULL,\n    \
          data JSONB,\n    \
          PRIMARY KEY (contig, variant_id)\n\
          ) PARTITION BY LIST (contig)"
@@ -140,6 +143,12 @@ fn partition_name(table: &str, contig: &str) -> String {
 /// during ingest). On a partitioned parent these cascade to every partition.
 ///
 /// - `(contig, pos)` composite B-tree — region/gene range queries.
+/// - `xpos` B-tree — scalar global-coordinate range pruning. A `(contig, pos)`
+///   index already prunes a single-contig region range; the dedicated `xpos`
+///   index is what the backend's "typed" mode (which hoists a generated `t_xpos`
+///   column / sorts on `xpos`) uses, and gives cross-contig range scans a single
+///   contiguous index path — the relational analogue of the ClickHouse `ORDER BY
+///   xpos` / parquet xpos-sort done in the other arms.
 /// - `variant_id` B-tree — variant-by-id point lookups.
 ///
 /// The `(contig, variant_id)` PK index already exists from `CREATE TABLE`.
@@ -149,6 +158,10 @@ pub fn generate_indexes(table: &str) -> Vec<String> {
         format!(
             "CREATE INDEX IF NOT EXISTS {} ON {t} (contig, pos)",
             quote_ident(&format!("{table}_contig_pos_idx"))
+        ),
+        format!(
+            "CREATE INDEX IF NOT EXISTS {} ON {t} (xpos)",
+            quote_ident(&format!("{table}_xpos_idx"))
         ),
         format!(
             "CREATE INDEX IF NOT EXISTS {} ON {t} (variant_id)",
@@ -169,6 +182,8 @@ pub struct VariantColumns {
     pub variant_id: String,
     pub ref_allele: Option<String>,
     pub alt_allele: Option<String>,
+    /// Scalar global coordinate `contig*1e9 + pos`; see [`crate::export::xpos`].
+    pub xpos: i64,
 }
 
 /// Look up a field by name in a struct value.
@@ -255,12 +270,17 @@ pub fn extract_columns(row: &EncodedValue) -> Result<VariantColumns> {
         ),
     };
 
+    // Derive the scalar global coordinate from the (already-resolved) contig+pos
+    // so it's consistent with the hoisted columns even on the variant_id fallback.
+    let xpos = crate::export::xpos::compute_xpos(&contig, pos as i64);
+
     Ok(VariantColumns {
         contig,
         pos,
         variant_id,
         ref_allele,
         alt_allele,
+        xpos,
     })
 }
 
@@ -428,6 +448,8 @@ fn append_copy_row(buf: &mut String, cols: &VariantColumns, data_json: &str) {
         None => buf.push_str("\\N"),
     }
     buf.push('\t');
+    buf.push_str(&cols.xpos.to_string());
+    buf.push('\t');
     buf.push_str(&copy_escape(data_json));
     buf.push('\n');
 }
@@ -572,7 +594,7 @@ mod client {
         fn ensure_staging(&mut self) -> Result<()> {
             let sql = format!(
                 "CREATE TEMP TABLE IF NOT EXISTS {staging} (\
-                 contig TEXT, pos INTEGER, variant_id TEXT, \"ref\" TEXT, \"alt\" TEXT, data JSONB) \
+                 contig TEXT, pos INTEGER, variant_id TEXT, \"ref\" TEXT, \"alt\" TEXT, xpos BIGINT, data JSONB) \
                  ON COMMIT PRESERVE ROWS",
                 staging = STAGING_TABLE
             );
@@ -590,14 +612,14 @@ mod client {
             }
 
             let copy_sql = format!(
-                "COPY {staging} (contig, pos, variant_id, \"ref\", \"alt\", data) FROM STDIN WITH (FORMAT text)",
+                "COPY {staging} (contig, pos, variant_id, \"ref\", \"alt\", xpos, data) FROM STDIN WITH (FORMAT text)",
                 staging = STAGING_TABLE
             );
             let upsert_sql = format!(
-                "INSERT INTO {target} (contig, pos, variant_id, \"ref\", \"alt\", data) \
-                 SELECT contig, pos, variant_id, \"ref\", \"alt\", data FROM {staging} \
+                "INSERT INTO {target} (contig, pos, variant_id, \"ref\", \"alt\", xpos, data) \
+                 SELECT contig, pos, variant_id, \"ref\", \"alt\", xpos, data FROM {staging} \
                  ON CONFLICT (contig, variant_id) DO UPDATE SET \
-                 pos = excluded.pos, \"ref\" = excluded.\"ref\", \"alt\" = excluded.\"alt\", data = excluded.data",
+                 pos = excluded.pos, \"ref\" = excluded.\"ref\", \"alt\" = excluded.\"alt\", xpos = excluded.xpos, data = excluded.data",
                 target = quote_ident(table),
                 staging = STAGING_TABLE
             );
@@ -833,6 +855,7 @@ mod tests {
         assert!(ddl.contains("CREATE TABLE IF NOT EXISTS \"variants\""));
         assert!(ddl.contains("contig TEXT NOT NULL"));
         assert!(ddl.contains("pos INTEGER NOT NULL"));
+        assert!(ddl.contains("xpos BIGINT NOT NULL"));
         assert!(ddl.contains("data JSONB"));
         assert!(ddl.contains("PRIMARY KEY (contig, variant_id)"));
         assert!(ddl.contains("PARTITION BY LIST (contig)"));
@@ -849,6 +872,7 @@ mod tests {
     fn test_indexes_cover_region_and_point_lookups() {
         let idx = generate_indexes("variants");
         assert!(idx.iter().any(|s| s.contains("(contig, pos)")));
+        assert!(idx.iter().any(|s| s.contains("(xpos)")));
         assert!(idx.iter().any(|s| s.contains("(variant_id)")));
     }
 
@@ -861,6 +885,8 @@ mod tests {
         assert_eq!(cols.variant_id, "22-16050075-A-G");
         assert_eq!(cols.ref_allele.as_deref(), Some("A"));
         assert_eq!(cols.alt_allele.as_deref(), Some("G"));
+        // xpos = 22 * 1e9 + pos (chr prefix stripped).
+        assert_eq!(cols.xpos, 22_000_000_000 + 16050075);
     }
 
     #[test]
@@ -875,6 +901,7 @@ mod tests {
         assert_eq!(cols.pos, 12345);
         assert_eq!(cols.ref_allele.as_deref(), Some("AC"));
         assert_eq!(cols.alt_allele.as_deref(), Some("T"));
+        assert_eq!(cols.xpos, 1_000_012_345);
     }
 
     #[test]
@@ -899,10 +926,14 @@ mod tests {
             variant_id: "22-100-A-G".to_string(),
             ref_allele: Some("A".to_string()),
             alt_allele: None,
+            xpos: 22_000_000_100,
         };
         let mut buf = String::new();
         append_copy_row(&mut buf, &cols, "{\"x\":1}");
-        assert_eq!(buf, "chr22\t100\t22-100-A-G\tA\t\\N\t{\"x\":1}\n");
+        assert_eq!(
+            buf,
+            "chr22\t100\t22-100-A-G\tA\t\\N\t22000000100\t{\"x\":1}\n"
+        );
     }
 
     // --- genes lookup table ---

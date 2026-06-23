@@ -209,6 +209,15 @@ pub fn build_index_mapping(row_schema: &EncodedType, index_fields: &[IndexField]
         // Absent field: schema-tolerant skip (e.g. exomes vs genomes differences).
     }
 
+    // Hoist a derived scalar `xpos` (`long`) alongside `locus.position` for
+    // uniformity with the other arms (ClickHouse `ORDER BY xpos`, parquet xpos
+    // sort, Postgres `xpos` index). ES region/gene range queries already prune via
+    // the BKD-indexed `locus.position`; mapping `xpos` as a `long` gives it its own
+    // BKD tree so a single global-coordinate `range` predicate is equally prunable.
+    // This is an extra *indexed* top-level field; it does not touch the
+    // `value: enabled:false` `_source` payload, so prod fidelity is preserved.
+    properties.insert("xpos".to_string(), json!({ "type": "long" }));
+
     // `value` = the whole row, stored but not indexed (prod: disable_fields=("value",)).
     let mut value_mapping = hail_type_to_es_mapping(row_schema);
     if let Value::Object(ref mut obj) = value_mapping {
@@ -259,6 +268,13 @@ pub fn build_document(row: &EncodedValue, index_fields: &[IndexField]) -> Value 
     let mut doc = Map::new();
     for field in index_fields {
         doc.insert(field.key.clone(), extract_path_value(row, &field.path));
+    }
+    // Hoist the derived scalar `xpos` (mapped `long` in `build_index_mapping`) so a
+    // global-coordinate range query is BKD-prunable, matching the other arms. Rows
+    // without resolvable coordinates are simply omitted (no `xpos` key), never
+    // dropped — query results are unchanged.
+    if let Some(xpos) = crate::export::xpos::compute_xpos_for_row(row) {
+        doc.insert("xpos".to_string(), Value::Number(xpos.into()));
     }
     doc.insert("value".to_string(), to_json_value(row));
     Value::Object(doc)
@@ -826,6 +842,9 @@ mod tests {
         // `transcript_consequences.gene_id` hoisted to top-level key `gene_id`.
         assert_eq!(props["gene_id"]["type"], "keyword");
 
+        // Derived scalar `xpos` hoisted as a `long` (BKD-prunable range field).
+        assert_eq!(props["xpos"]["type"], "long");
+
         // The whole row is nested under `value` and disabled (stored, not indexed).
         assert_eq!(props["value"]["enabled"], false);
         assert!(props["value"]["properties"].is_object());
@@ -893,6 +912,8 @@ mod tests {
             doc["gene_id"],
             json!(["ENSG00000100053", "ENSG00000999999"])
         );
+        // Derived scalar xpos hoisted (22 * 1e9 + 16050075).
+        assert_eq!(doc["xpos"], json!(22_000_000_000i64 + 16050075));
         // The full row nested under `value` (what the browser reads as _source.value).
         assert_eq!(doc["value"]["variant_id"], "22-16050075-A-G");
         assert_eq!(doc["value"]["locus"]["position"], 16050075);
