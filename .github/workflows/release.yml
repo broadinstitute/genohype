@@ -25,7 +25,7 @@ jobs:
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -70,13 +70,13 @@ jobs:
       GENOHYPE_GIT_SHA: ${{ github.sha }}
       RELEASE_VERSION: ${{ needs.validate.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
           cache: npm
@@ -175,7 +175,7 @@ jobs:
           mkdir -p "staging/$TARGET"
           cp "target/$TARGET/release/genohype" "staging/$TARGET/genohype"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: genohype-${{ matrix.target }}
           path: staging/${{ matrix.target }}/genohype
@@ -186,9 +186,9 @@ jobs:
     needs: [validate, build]
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: genohype-*
           path: built
@@ -198,7 +198,7 @@ jobs:
           RELEASE_TAG: ${{ needs.validate.outputs.tag }}
         run: ./scripts/package-release.sh "$RELEASE_TAG" built dist
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-assets-${{ needs.validate.outputs.tag }}
           path: dist/
@@ -212,9 +212,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: release-assets-${{ needs.validate.outputs.tag }}
           path: dist
