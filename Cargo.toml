@@ -1,3 +1,10 @@
 [workspace]
 members = ["core", "cli", "pool", "mcp"]
 resolver = "2"
+
+[workspace.dependencies]
+# Keep every fastVEP crate on the same immutable integration revision.
+fastvep-annotate = { git = "https://github.com/mattsolo1/fastVEP.git", rev = "58f6c498be34b4b26a84a299195467c8b10fe155" }
+fastvep-core = { git = "https://github.com/mattsolo1/fastVEP.git", rev = "58f6c498be34b4b26a84a299195467c8b10fe155" }
+fastvep-io = { git = "https://github.com/mattsolo1/fastVEP.git", rev = "58f6c498be34b4b26a84a299195467c8b10fe155" }
+fastvep-loftee = { git = "https://github.com/mattsolo1/fastVEP.git", rev = "58f6c498be34b4b26a84a299195467c8b10fe155" }

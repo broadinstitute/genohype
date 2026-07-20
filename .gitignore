@@ -6,7 +6,6 @@ test_hail_data/__pycache__
 
 # Rust
 target/
-Cargo.lock
 
 # The tiny Hail test fixture includes directories named `parts`, which may be
 # ignored by contributor-level Git configuration. Keep its required data files.
