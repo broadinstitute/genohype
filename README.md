@@ -14,15 +14,40 @@ A fast, memory-efficient toolkit for genomic data processing. Read Hail tables a
 
 ## Installation
 
+Install the latest prebuilt release on Apple Silicon macOS, Intel macOS, or x86-64 Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/broadinstitute/genohype/main/scripts/install.sh | sh
+genohype --version
+```
+
+The installer verifies SHA-256 checksums and installs to `${GENOHYPE_INSTALL_DIR:-$HOME/.local/bin}`. On macOS it also installs the Linux worker binary used by `genohype pool`. To select a specific release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/broadinstitute/genohype/main/scripts/install.sh \
+  | GENOHYPE_VERSION=v0.1.0 sh
+```
+
+To inspect the installer before running it:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/broadinstitute/genohype/main/scripts/install.sh
+less install.sh
+sh install.sh
+```
+
+To build from source instead:
+
 ```bash
 # Default build (GCS support)
-cargo build --release
+./scripts/build-dashboard.sh
+cargo build --release --locked
 
 # Local files only (fastest compile)
-cargo build --release --no-default-features
+cargo build --release --locked --no-default-features
 
 # Build with all features
-cargo build --release --features full
+cargo build --release --locked --features full
 ```
 
 ## Quick Start
@@ -257,6 +282,8 @@ cargo test --workspace --all-features
 # Build the existing pool dashboard and run the complete local CI suite
 ./scripts/verify.sh
 ```
+
+Release maintainers should follow [RELEASING.md](RELEASING.md).
 
 ## Architecture
 

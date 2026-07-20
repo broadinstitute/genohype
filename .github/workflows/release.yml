@@ -1,0 +1,242 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Stable version to build (for example, v0.1.0)
+        required: true
+        default: v0.1.0
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.release_tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: release
+        name: Validate tag, package versions, and release notes
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          ./scripts/check-release-version.sh "$RELEASE_TAG"
+
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]] && \
+             ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "error: release tags must point to a commit on main" >&2
+            exit 1
+          fi
+
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            use_zig: false
+            use_rosetta: false
+          - runner: macos-15
+            target: x86_64-apple-darwin
+            use_zig: false
+            use_rosetta: true
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            use_zig: true
+            use_rosetta: false
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+      GENOHYPE_GIT_SHA: ${{ github.sha }}
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/pool-dashboard/package-lock.json
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build embedded pool dashboard
+        run: ./scripts/build-dashboard.sh
+
+      - name: Install Zig build tools
+        if: matrix.use_zig
+        run: |
+          python3 -m pip install --user --disable-pip-version-check ziglang==0.15.2
+          cargo install cargo-zigbuild --version 0.21.4 --locked
+
+      - name: Verify Rosetta for the Intel macOS smoke test
+        if: matrix.use_rosetta
+        run: |
+          if [[ "$(uname -m)" != "arm64" ]]; then
+            echo "error: macos-15 must be an arm64 runner for this cross-build" >&2
+            exit 1
+          fi
+          /usr/bin/pgrep oahd >/dev/null
+
+      - name: Build full-featured CLI
+        env:
+          TARGET: ${{ matrix.target }}
+          USE_ZIG: ${{ matrix.use_zig }}
+        run: |
+          if [[ "$USE_ZIG" == "true" ]]; then
+            cargo zigbuild \
+              --release \
+              --locked \
+              --package genohype-cli \
+              --bin genohype \
+              --features full \
+              --target "${TARGET}.2.17"
+          else
+            export MACOSX_DEPLOYMENT_TARGET=12.0
+            cargo build \
+              --release \
+              --locked \
+              --package genohype-cli \
+              --bin genohype \
+              --features full \
+              --target "$TARGET"
+          fi
+
+      - name: Verify binary identity and startup
+        env:
+          TARGET: ${{ matrix.target }}
+          USE_ROSETTA: ${{ matrix.use_rosetta }}
+          USE_ZIG: ${{ matrix.use_zig }}
+        run: |
+          binary="target/$TARGET/release/genohype"
+          test -x "$binary"
+          file "$binary"
+
+          if [[ "$USE_ROSETTA" == "true" ]]; then
+            version_output="$(arch -x86_64 "$binary" --version)"
+            arch -x86_64 "$binary" --help >/dev/null
+          else
+            version_output="$("$binary" --version)"
+            "$binary" --help >/dev/null
+          fi
+
+          echo "$version_output"
+          escaped_version="${RELEASE_VERSION//./\\.}"
+          if ! grep -Eq "^genohype ${escaped_version} \\([0-9a-f]{7}\\)$" <<< "$version_output"; then
+            echo "error: binary version does not match v$RELEASE_VERSION" >&2
+            exit 1
+          fi
+
+          if [[ "$USE_ZIG" == "true" ]]; then
+            ldd "$binary"
+            highest_glibc="$(
+              strings "$binary" \
+                | grep -Eo 'GLIBC_[0-9]+(\\.[0-9]+)+' \
+                | cut -d_ -f2 \
+                | sort -Vu \
+                | tail -1
+            )"
+            if [[ "$(printf '2.17\\n%s\\n' "$highest_glibc" | sort -Vu | tail -1)" != "2.17" ]]; then
+              echo "error: Linux binary requires glibc $highest_glibc; expected at most 2.17" >&2
+              exit 1
+            fi
+          fi
+
+      - name: Stage binary
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p "staging/$TARGET"
+          cp "target/$TARGET/release/genohype" "staging/$TARGET/genohype"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: genohype-${{ matrix.target }}
+          path: staging/${{ matrix.target }}/genohype
+          if-no-files-found: error
+          retention-days: 7
+
+  package:
+    needs: [validate, build]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: genohype-*
+          path: built
+
+      - name: Create release archives and checksums
+        env:
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+        run: ./scripts/package-release.sh "$RELEASE_TAG" built dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-${{ needs.validate.outputs.tag }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    if: github.event_name == 'push'
+    needs: [validate, package]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets-${{ needs.validate.outputs.tag }}
+          path: dist
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          notes="release-notes/${RELEASE_TAG}.md"
+          title="Genohype ${RELEASE_TAG}"
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+            gh release edit "$RELEASE_TAG" \
+              --title "$title" \
+              --notes-file "$notes" \
+              --latest
+          else
+            gh release create "$RELEASE_TAG" dist/* \
+              --verify-tag \
+              --title "$title" \
+              --notes-file "$notes" \
+              --latest
+          fi
