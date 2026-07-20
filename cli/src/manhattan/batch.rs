@@ -14,7 +14,7 @@ pub struct AssetEntry {
     pub ancestry_group: String,
     pub analysis_id: String,
     pub uri: String,
-    pub asset_type: String,      // "variant", "gene", "variant_exp_p", etc.
+    pub asset_type: String, // "variant", "gene", "variant_exp_p", etc.
     pub sequencing_type: Option<String>, // "exomes", "genomes" (only for variant)
 }
 
@@ -72,7 +72,10 @@ impl BatchSummary {
 
         for input in inputs {
             // Count by ancestry
-            *summary.by_ancestry.entry(input.ancestry.clone()).or_insert(0) += 1;
+            *summary
+                .by_ancestry
+                .entry(input.ancestry.clone())
+                .or_insert(0) += 1;
 
             // Count by input type
             let has_exome = input.exome_path.is_some();
@@ -105,12 +108,21 @@ impl BatchSummary {
 ///
 /// Fetch bytes from an object store path.
 #[cfg(feature = "gcp")]
-async fn fetch_bytes(client: &std::sync::Arc<dyn object_store::ObjectStore>, path: &object_store::path::Path) -> Result<Vec<u8>> {
+async fn fetch_bytes(
+    client: &std::sync::Arc<dyn object_store::ObjectStore>,
+    path: &object_store::path::Path,
+) -> Result<Vec<u8>> {
     let result = client.get(path).await.map_err(|e| {
-        HailError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("GCS get failed: {}", e)))
+        HailError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("GCS get failed: {}", e),
+        ))
     })?;
     let bytes = result.bytes().await.map_err(|e| {
-        HailError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("GCS read failed: {}", e)))
+        HailError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("GCS read failed: {}", e),
+        ))
     })?;
     Ok(bytes.to_vec())
 }
@@ -122,10 +134,16 @@ fn read_gcs_file(gs_path: &str) -> Result<Vec<u8>> {
     use object_store::path::Path as ObjPath;
 
     let url = url::Url::parse(gs_path).map_err(|e| {
-        HailError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("Invalid GCS URL: {}", e)))
+        HailError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("Invalid GCS URL: {}", e),
+        ))
     })?;
     let bucket = url.host_str().ok_or_else(|| {
-        HailError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Missing bucket in GCS URL"))
+        HailError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Missing bucket in GCS URL",
+        ))
     })?;
     let obj_path = ObjPath::from(url.path());
     let client = get_gcs_client(bucket)?;
@@ -136,7 +154,10 @@ fn read_gcs_file(gs_path: &str) -> Result<Vec<u8>> {
         tokio::task::block_in_place(|| handle.block_on(fetch_bytes(&client, &obj_path)))
     } else {
         let rt = tokio::runtime::Runtime::new().map_err(|e| {
-            HailError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+            HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string(),
+            ))
         })?;
         rt.block_on(fetch_bytes(&client, &obj_path))
     }
@@ -185,7 +206,7 @@ pub fn load_and_group_assets(
         serde_json::from_value(assets_array.clone())?
     } else {
         return Err(HailError::InvalidFormat(
-            "Assets JSON must be an array or an object with an 'assets' field".to_string()
+            "Assets JSON must be an array or an object with an 'assets' field".to_string(),
         ));
     };
 
@@ -341,7 +362,7 @@ pub fn create_specs(inputs: Vec<PhenotypeInput>, config: &BatchConfig) -> Vec<Ma
                 // Runtime fields (filled by coordinator)
                 layout: None,
                 y_scale: None,
-                contig_lengths: None, // Filled by coordinator
+                contig_lengths: None,  // Filled by coordinator
                 skip_composite: false, // Batch mode assumes we want the final output
                 exome_partitions: None,
                 genome_partitions: None,

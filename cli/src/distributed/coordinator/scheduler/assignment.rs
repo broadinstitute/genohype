@@ -4,11 +4,11 @@
 //! including phenotype activation and task distribution for
 //! batch, Manhattan pipeline, and ingestion jobs.
 
+use crate::distributed::coordinator::scheduler::determine_batch_size;
 use crate::distributed::coordinator::{
     ActiveTask, BatchState, CoordinatorData, IngestionState, ManhattanPhase,
     ManhattanPipelineState, WorkerStatus, AGGREGATE_BATCH_SIZE, BATCH_ACTIVE_LIMIT,
 };
-use crate::distributed::coordinator::scheduler::determine_batch_size;
 use crate::distributed::message::{
     ActiveTaskInfo, JobSpec, ManhattanAggregateSpec, ManhattanScanSpec, ManhattanSource,
     PartitionOp, PhenotypeOp, TaskDescriptor, TaskType, WorkResponse,
@@ -70,7 +70,9 @@ pub(crate) fn activate_next_phenotypes(batch: &mut BatchState) {
             status.stage = "scanning".to_string();
             status.partitions_total = exome_partitions + genome_partitions;
         }
-        batch.phenotype_start_times.insert(phenotype_id.clone(), Instant::now());
+        batch
+            .phenotype_start_times
+            .insert(phenotype_id.clone(), Instant::now());
         batch.phenotype_cpu_secs.insert(phenotype_id.clone(), 0.0);
 
         // Initialize the pipeline state
@@ -108,8 +110,8 @@ fn count_partitions_if_present(path: Option<&str>, source: &str, phenotype_id: &
     let path = path.to_string();
     let source = source.to_string();
     let phenotype_id = phenotype_id.to_string();
-    tokio::task::block_in_place(move || {
-        match genohype_core::query::QueryEngine::open_path(&path) {
+    tokio::task::block_in_place(
+        move || match genohype_core::query::QueryEngine::open_path(&path) {
             Ok(engine) => {
                 let n = engine.num_partitions();
                 println!("  Counted {} {} partitions for {}", n, source, phenotype_id);
@@ -122,8 +124,8 @@ fn count_partitions_if_present(path: Option<&str>, source: &str, phenotype_id: &
                 );
                 0
             }
-        }
-    })
+        },
+    )
 }
 
 /// Get work for an ingestion job.
@@ -147,7 +149,9 @@ pub(crate) fn get_ingestion_work(
         return axum::Json(WorkResponse::Wait);
     }
 
-    let batch_size = ingestion.dynamic_batch_size.min(ingestion.pending_tasks.len());
+    let batch_size = ingestion
+        .dynamic_batch_size
+        .min(ingestion.pending_tasks.len());
 
     let now = Instant::now();
     let mut task_descriptors = Vec::with_capacity(batch_size);
@@ -220,7 +224,11 @@ pub(crate) fn get_ingestion_work(
         event_type: "assigned".to_string(),
         worker_id: Some(worker_id.to_string()),
         phenotype_id: None,
-        details: format!("Assigned {} ingest tasks: {}", ingest_tasks.len(), task_names.join(", ")),
+        details: format!(
+            "Assigned {} ingest tasks: {}",
+            ingest_tasks.len(),
+            task_names.join(", ")
+        ),
     });
 
     let job_spec = JobSpec::IngestManhattanBatch {
@@ -252,11 +260,21 @@ pub(crate) fn get_batch_work(
         .get(worker_id)
         .and_then(|w| w.hardware.as_ref());
 
-    let max_batch_size = determine_batch_size(data.config.batch_size, worker_hw, &data.config.job_spec, data.config.memory_weight_mb);
+    let max_batch_size = determine_batch_size(
+        data.config.batch_size,
+        worker_hw,
+        &data.config.job_spec,
+        data.config.memory_weight_mb,
+    );
     // Respect learned capacity ceiling if it exists
-    let worker_cap = data.worker_registry.get(worker_id).and_then(|w| w.max_batch_capacity);
+    let worker_cap = data
+        .worker_registry
+        .get(worker_id)
+        .and_then(|w| w.max_batch_capacity);
     let effective_max = worker_cap.unwrap_or(max_batch_size).min(max_batch_size);
-    let partition_batch_size = data.worker_registry.get(worker_id)
+    let partition_batch_size = data
+        .worker_registry
+        .get(worker_id)
         .and_then(|w| w.current_batch_size)
         .unwrap_or_else(|| (effective_max / 10).max(2).min(effective_max));
 
@@ -265,20 +283,29 @@ pub(crate) fn get_batch_work(
 
     // Step 2: Priority 1 - Check for aggregation batches
     // If we have enough ready or no other work available
-    let has_scan_work = batch.active_phenotypes.values().any(|state| {
-        !state.exome_pending.is_empty() || !state.genome_pending.is_empty()
-    });
+    let has_scan_work = batch
+        .active_phenotypes
+        .values()
+        .any(|state| !state.exome_pending.is_empty() || !state.genome_pending.is_empty());
 
     let should_aggregate = batch.ready_to_aggregate.len() >= AGGREGATE_BATCH_SIZE
-        || (!batch.ready_to_aggregate.is_empty() && !has_scan_work && batch.pending_queue.is_empty());
+        || (!batch.ready_to_aggregate.is_empty()
+            && !has_scan_work
+            && batch.pending_queue.is_empty());
 
     if should_aggregate {
         // Drain aggregation specs (up to batch size)
         let count = std::cmp::min(batch.ready_to_aggregate.len(), AGGREGATE_BATCH_SIZE);
         let specs_to_aggregate: Vec<_> = batch.ready_to_aggregate.drain(..count).collect();
 
-        let phenotype_ids: Vec<String> = specs_to_aggregate.iter().map(|(id, _)| id.clone()).collect();
-        let aggregate_specs: Vec<ManhattanAggregateSpec> = specs_to_aggregate.into_iter().map(|(_, spec)| spec).collect();
+        let phenotype_ids: Vec<String> = specs_to_aggregate
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect();
+        let aggregate_specs: Vec<ManhattanAggregateSpec> = specs_to_aggregate
+            .into_iter()
+            .map(|(_, spec)| spec)
+            .collect();
 
         let task_id = Uuid::new_v4().to_string();
 
@@ -331,11 +358,7 @@ pub(crate) fn get_batch_work(
             .enumerate()
             .map(|(i, pid)| {
                 // First task uses coordinator's task_id for active_tasks lookup
-                let descriptor_id = if i == 0 {
-                    task_id.clone()
-                } else {
-                    pid.clone()
-                };
+                let descriptor_id = if i == 0 { task_id.clone() } else { pid.clone() };
                 TaskType::Phenotype {
                     phenotype_id: pid.clone(),
                     ancestry: None,
@@ -353,7 +376,10 @@ pub(crate) fn get_batch_work(
         return axum::Json(WorkResponse::Task {
             tasks,
             input_path: String::new(),
-            payload: serde_json::to_value(&JobSpec::ManhattanAggregateBatch { specs: aggregate_specs }).unwrap_or_default(),
+            payload: serde_json::to_value(&JobSpec::ManhattanAggregateBatch {
+                specs: aggregate_specs,
+            })
+            .unwrap_or_default(),
             total_tasks: phenotype_ids.len(),
             filters: Vec::new(),
             intervals: Vec::new(),
@@ -390,44 +416,49 @@ pub(crate) fn get_batch_work(
         };
 
         // Try exome first, then genome
-        let (source, partitions, table_path) = if let Some(part_id) = state.exome_pending.pop_front() {
-            let mut parts = vec![part_id];
-            while parts.len() < partition_batch_size {
-                if let Some(p) = state.exome_pending.pop_front() {
-                    parts.push(p);
-                } else {
-                    break;
+        let (source, partitions, table_path) =
+            if let Some(part_id) = state.exome_pending.pop_front() {
+                let mut parts = vec![part_id];
+                while parts.len() < partition_batch_size {
+                    if let Some(p) = state.exome_pending.pop_front() {
+                        parts.push(p);
+                    } else {
+                        break;
+                    }
                 }
-            }
-            for &p in &parts {
-                state.exome_processing.insert(p, (worker_id.to_string(), now));
-            }
-            (
-                ManhattanSource::Exome,
-                parts,
-                state.original_spec.exome.clone().unwrap_or_default(),
-            )
-        } else if let Some(part_id) = state.genome_pending.pop_front() {
-            let mut parts = vec![part_id];
-            while parts.len() < partition_batch_size {
-                if let Some(p) = state.genome_pending.pop_front() {
-                    parts.push(p);
-                } else {
-                    break;
+                for &p in &parts {
+                    state
+                        .exome_processing
+                        .insert(p, (worker_id.to_string(), now));
                 }
-            }
-            for &p in &parts {
-                state.genome_processing.insert(p, (worker_id.to_string(), now));
-            }
-            (
-                ManhattanSource::Genome,
-                parts,
-                state.original_spec.genome.clone().unwrap_or_default(),
-            )
-        } else {
-            // No pending work for this phenotype, continue to next
-            continue;
-        };
+                (
+                    ManhattanSource::Exome,
+                    parts,
+                    state.original_spec.exome.clone().unwrap_or_default(),
+                )
+            } else if let Some(part_id) = state.genome_pending.pop_front() {
+                let mut parts = vec![part_id];
+                while parts.len() < partition_batch_size {
+                    if let Some(p) = state.genome_pending.pop_front() {
+                        parts.push(p);
+                    } else {
+                        break;
+                    }
+                }
+                for &p in &parts {
+                    state
+                        .genome_processing
+                        .insert(p, (worker_id.to_string(), now));
+                }
+                (
+                    ManhattanSource::Genome,
+                    parts,
+                    state.original_spec.genome.clone().unwrap_or_default(),
+                )
+            } else {
+                // No pending work for this phenotype, continue to next
+                continue;
+            };
 
         // Advance round-robin for next assignment
         batch.scan_round_robin += 1;
@@ -512,9 +543,15 @@ pub(crate) fn get_batch_work(
 
         // Build ManhattanScanSpec with identity metadata
         // Extract phenotype and ancestry from the original spec, with fallbacks
-        let phenotype = state.original_spec.phenotype.clone()
+        let phenotype = state
+            .original_spec
+            .phenotype
+            .clone()
             .unwrap_or_else(|| phenotype_id.clone());
-        let ancestry = state.original_spec.ancestry.clone()
+        let ancestry = state
+            .original_spec
+            .ancestry
+            .clone()
             .unwrap_or_else(|| "unknown".to_string());
 
         // Resolve style based on source type
@@ -587,11 +624,21 @@ pub(crate) fn get_manhattan_work(
         .get(worker_id)
         .and_then(|w| w.hardware.as_ref());
 
-    let max_batch_size = determine_batch_size(data.config.batch_size, worker_hw, &data.config.job_spec, data.config.memory_weight_mb);
+    let max_batch_size = determine_batch_size(
+        data.config.batch_size,
+        worker_hw,
+        &data.config.job_spec,
+        data.config.memory_weight_mb,
+    );
     // Respect learned capacity ceiling if it exists
-    let worker_cap = data.worker_registry.get(worker_id).and_then(|w| w.max_batch_capacity);
+    let worker_cap = data
+        .worker_registry
+        .get(worker_id)
+        .and_then(|w| w.max_batch_capacity);
     let effective_max = worker_cap.unwrap_or(max_batch_size).min(max_batch_size);
-    let batch_size = data.worker_registry.get(worker_id)
+    let batch_size = data
+        .worker_registry
+        .get(worker_id)
         .and_then(|w| w.current_batch_size)
         .unwrap_or_else(|| (effective_max / 10).max(2).min(effective_max));
 
@@ -612,7 +659,9 @@ pub(crate) fn get_manhattan_work(
                         }
                     }
                     for &p in &parts {
-                        manhattan.exome_processing.insert(p, (worker_id.to_string(), now));
+                        manhattan
+                            .exome_processing
+                            .insert(p, (worker_id.to_string(), now));
                     }
                     (
                         ManhattanSource::Exome,
@@ -629,7 +678,9 @@ pub(crate) fn get_manhattan_work(
                         }
                     }
                     for &p in &parts {
-                        manhattan.genome_processing.insert(p, (worker_id.to_string(), now));
+                        manhattan
+                            .genome_processing
+                            .insert(p, (worker_id.to_string(), now));
                     }
                     (
                         ManhattanSource::Genome,
@@ -665,9 +716,14 @@ pub(crate) fn get_manhattan_work(
             };
 
             // Build identity metadata for dashboard task mapping
-            let phenotype = manhattan.original_spec.phenotype.clone()
+            let phenotype = manhattan
+                .original_spec
+                .phenotype
+                .clone()
                 .unwrap_or_else(|| {
-                    manhattan.original_spec.output_path
+                    manhattan
+                        .original_spec
+                        .output_path
                         .trim_end_matches('/')
                         .rsplit('/')
                         .next()
@@ -712,8 +768,10 @@ pub(crate) fn get_manhattan_work(
             }
 
             let pending_scans = manhattan.exome_pending.len() + manhattan.genome_pending.len();
-            let processing_scans = manhattan.exome_processing.len() + manhattan.genome_processing.len();
-            let completed_scans = manhattan.exome_completed.len() + manhattan.genome_completed.len();
+            let processing_scans =
+                manhattan.exome_processing.len() + manhattan.genome_processing.len();
+            let completed_scans =
+                manhattan.exome_completed.len() + manhattan.genome_completed.len();
             println!(
                 "Assigned {} {} scan task(s) to {} [{}] ({} pending, {} processing, {} done)",
                 tasks.len(),
@@ -726,7 +784,10 @@ pub(crate) fn get_manhattan_work(
             );
 
             // Build ManhattanScanSpec with identity metadata
-            let ancestry = manhattan.original_spec.ancestry.clone()
+            let ancestry = manhattan
+                .original_spec
+                .ancestry
+                .clone()
                 .unwrap_or_else(|| "unknown".to_string());
 
             // Resolve style based on source type
@@ -755,7 +816,8 @@ pub(crate) fn get_manhattan_work(
             axum::Json(WorkResponse::Task {
                 tasks,
                 input_path: String::new(), // Not used for ManhattanScan
-                payload: serde_json::to_value(&JobSpec::ManhattanScan(scan_spec)).unwrap_or_default(),
+                payload: serde_json::to_value(&JobSpec::ManhattanScan(scan_spec))
+                    .unwrap_or_default(),
                 total_tasks: manhattan.exome_total_tasks + manhattan.genome_total_tasks,
                 filters: Vec::new(),
                 intervals: Vec::new(),
@@ -781,7 +843,11 @@ pub(crate) fn get_manhattan_work(
             // Dispatch aggregate task
             manhattan.aggregate_dispatched = true;
 
-            let phenotype_id = manhattan.original_spec.phenotype.clone().unwrap_or_default();
+            let phenotype_id = manhattan
+                .original_spec
+                .phenotype
+                .clone()
+                .unwrap_or_default();
             let ancestry = manhattan.original_spec.ancestry.clone();
 
             // Update worker status and task info for visibility
@@ -799,8 +865,7 @@ pub(crate) fn get_manhattan_work(
 
             println!(
                 "Assigned 1 aggregate task to {} [{}] (final aggregation)",
-                worker_id,
-                phenotype_id
+                worker_id, phenotype_id
             );
 
             // Build ManhattanAggregateSpec
@@ -831,7 +896,11 @@ pub(crate) fn get_manhattan_work(
             };
 
             // Create TaskDescriptor for aggregate task
-            let phenotype_id = manhattan.original_spec.phenotype.clone().unwrap_or_default();
+            let phenotype_id = manhattan
+                .original_spec
+                .phenotype
+                .clone()
+                .unwrap_or_default();
             let task = TaskType::Phenotype {
                 phenotype_id: phenotype_id.clone(),
                 ancestry: manhattan.original_spec.ancestry.clone(),
@@ -847,7 +916,8 @@ pub(crate) fn get_manhattan_work(
             axum::Json(WorkResponse::Task {
                 tasks: vec![task],
                 input_path: String::new(),
-                payload: serde_json::to_value(&JobSpec::ManhattanAggregate(aggregate_spec)).unwrap_or_default(),
+                payload: serde_json::to_value(&JobSpec::ManhattanAggregate(aggregate_spec))
+                    .unwrap_or_default(),
                 total_tasks: 1,
                 filters: Vec::new(),
                 intervals: Vec::new(),

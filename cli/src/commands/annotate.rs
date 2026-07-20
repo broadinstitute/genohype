@@ -1,7 +1,9 @@
 //! VEP annotation command.
 
 use crate::cli::AnnotateArgs;
-use crate::commands::utils::{parse_export_filters, parse_export_intervals, progress_style_spinner};
+use crate::commands::utils::{
+    parse_export_filters, parse_export_intervals, progress_style_spinner,
+};
 use fastvep_annotate::AnnotationContext;
 use fastvep_io::output::{self, DEFAULT_CSQ_FIELDS};
 use genohype_core::query::QueryEngine;
@@ -23,11 +25,7 @@ pub fn run_annotate(args: AnnotateArgs) -> Result<()> {
     );
 
     // Initialize annotation context
-    eprintln!(
-        "{} {}",
-        "Loading GFF3:".cyan(),
-        args.gff3.bright_white()
-    );
+    eprintln!("{} {}", "Loading GFF3:".cyan(), args.gff3.bright_white());
     if let Some(ref fasta) = args.fasta {
         eprintln!("{} {}", "Loading FASTA:".cyan(), fasta.bright_white());
     }
@@ -38,7 +36,9 @@ pub fn run_annotate(args: AnnotateArgs) -> Result<()> {
         args.sa_dir.as_deref(),
         args.distance,
     )
-    .map_err(|e| genohype_core::HailError::InvalidFormat(format!("Failed to init VEP context: {}", e)))?;
+    .map_err(|e| {
+        genohype_core::HailError::InvalidFormat(format!("Failed to init VEP context: {}", e))
+    })?;
 
     // Open the query engine
     let engine = QueryEngine::open_path(&args.common.input)?;
@@ -65,11 +65,7 @@ pub fn run_annotate(args: AnnotateArgs) -> Result<()> {
         );
     }
     if let Some(l) = args.common.limit {
-        eprintln!(
-            "{} {}",
-            "Row limit:".cyan(),
-            l.to_string().bright_white()
-        );
+        eprintln!("{} {}", "Row limit:".cyan(), l.to_string().bright_white());
     }
     eprintln!();
 
@@ -91,8 +87,7 @@ pub fn run_annotate(args: AnnotateArgs) -> Result<()> {
         "vcf" => {
             let writer: Box<dyn Write> = if let Some(ref path) = args.output {
                 Box::new(BufWriter::new(
-                    std::fs::File::create(path)
-                        .map_err(|e| genohype_core::HailError::Io(e))?,
+                    std::fs::File::create(path).map_err(|e| genohype_core::HailError::Io(e))?,
                 ))
             } else {
                 Box::new(BufWriter::new(io::stdout().lock()))
@@ -100,10 +95,14 @@ pub fn run_annotate(args: AnnotateArgs) -> Result<()> {
             let mut writer = writer;
 
             // Write VCF header
-            writeln!(writer, "##fileformat=VCFv4.2").map_err(|e| genohype_core::HailError::Io(e))?;
-            writeln!(writer, "##source=genohype-annotate+fastVEP").map_err(|e| genohype_core::HailError::Io(e))?;
-            writeln!(writer, "{}", output::csq_header_line(DEFAULT_CSQ_FIELDS)).map_err(|e| genohype_core::HailError::Io(e))?;
-            writeln!(writer, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO").map_err(|e| genohype_core::HailError::Io(e))?;
+            writeln!(writer, "##fileformat=VCFv4.2")
+                .map_err(|e| genohype_core::HailError::Io(e))?;
+            writeln!(writer, "##source=genohype-annotate+fastVEP")
+                .map_err(|e| genohype_core::HailError::Io(e))?;
+            writeln!(writer, "{}", output::csq_header_line(DEFAULT_CSQ_FIELDS))
+                .map_err(|e| genohype_core::HailError::Io(e))?;
+            writeln!(writer, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO")
+                .map_err(|e| genohype_core::HailError::Io(e))?;
 
             for row_result in iterator {
                 let row = row_result?;
@@ -117,8 +116,11 @@ pub fn run_annotate(args: AnnotateArgs) -> Result<()> {
                     }
                 };
 
-                context.annotate_variant(&mut vf, args.pick, &[])
-                    .map_err(|e| genohype_core::HailError::InvalidFormat(format!("Annotation error: {}", e)))?;
+                context
+                    .annotate_variant(&mut vf, args.pick, &[])
+                    .map_err(|e| {
+                        genohype_core::HailError::InvalidFormat(format!("Annotation error: {}", e))
+                    })?;
 
                 // Apply pick filtering
                 if args.pick {
@@ -163,13 +165,14 @@ pub fn run_annotate(args: AnnotateArgs) -> Result<()> {
                 }
             }
 
-            writer.flush().map_err(|e| genohype_core::HailError::Io(e))?;
+            writer
+                .flush()
+                .map_err(|e| genohype_core::HailError::Io(e))?;
         }
         "json" => {
             let writer: Box<dyn Write> = if let Some(ref path) = args.output {
                 Box::new(BufWriter::new(
-                    std::fs::File::create(path)
-                        .map_err(|e| genohype_core::HailError::Io(e))?,
+                    std::fs::File::create(path).map_err(|e| genohype_core::HailError::Io(e))?,
                 ))
             } else {
                 Box::new(BufWriter::new(io::stdout().lock()))
@@ -188,8 +191,11 @@ pub fn run_annotate(args: AnnotateArgs) -> Result<()> {
                     }
                 };
 
-                context.annotate_variant(&mut vf, args.pick, &[])
-                    .map_err(|e| genohype_core::HailError::InvalidFormat(format!("Annotation error: {}", e)))?;
+                context
+                    .annotate_variant(&mut vf, args.pick, &[])
+                    .map_err(|e| {
+                        genohype_core::HailError::InvalidFormat(format!("Annotation error: {}", e))
+                    })?;
 
                 if args.pick {
                     let mut kept = Vec::new();
@@ -216,8 +222,9 @@ pub fn run_annotate(args: AnnotateArgs) -> Result<()> {
                 }
 
                 let json = output::format_json(&vf, false);
-                serde_json::to_writer(&mut writer, &json)
-                    .map_err(|e| genohype_core::HailError::InvalidFormat(format!("JSON write error: {}", e)))?;
+                serde_json::to_writer(&mut writer, &json).map_err(|e| {
+                    genohype_core::HailError::InvalidFormat(format!("JSON write error: {}", e))
+                })?;
                 writeln!(writer).map_err(|e| genohype_core::HailError::Io(e))?;
 
                 if total_rows % 1000 == 0 {
@@ -225,13 +232,14 @@ pub fn run_annotate(args: AnnotateArgs) -> Result<()> {
                 }
             }
 
-            writer.flush().map_err(|e| genohype_core::HailError::Io(e))?;
+            writer
+                .flush()
+                .map_err(|e| genohype_core::HailError::Io(e))?;
         }
         "tab" => {
             let writer: Box<dyn Write> = if let Some(ref path) = args.output {
                 Box::new(BufWriter::new(
-                    std::fs::File::create(path)
-                        .map_err(|e| genohype_core::HailError::Io(e))?,
+                    std::fs::File::create(path).map_err(|e| genohype_core::HailError::Io(e))?,
                 ))
             } else {
                 Box::new(BufWriter::new(io::stdout().lock()))
@@ -257,8 +265,11 @@ pub fn run_annotate(args: AnnotateArgs) -> Result<()> {
                     }
                 };
 
-                context.annotate_variant(&mut vf, args.pick, &[])
-                    .map_err(|e| genohype_core::HailError::InvalidFormat(format!("Annotation error: {}", e)))?;
+                context
+                    .annotate_variant(&mut vf, args.pick, &[])
+                    .map_err(|e| {
+                        genohype_core::HailError::InvalidFormat(format!("Annotation error: {}", e))
+                    })?;
 
                 if args.pick {
                     let mut kept = Vec::new();
@@ -284,7 +295,11 @@ pub fn run_annotate(args: AnnotateArgs) -> Result<()> {
                     annotated_rows += 1;
                 }
 
-                for line in output::format_tab_line(&vf, &output::LoadedSupplementarySpecs::new(&[], &[]), false) {
+                for line in output::format_tab_line(
+                    &vf,
+                    &output::LoadedSupplementarySpecs::new(&[], &[]),
+                    false,
+                ) {
                     writeln!(writer, "{}", line).map_err(|e| genohype_core::HailError::Io(e))?;
                 }
 
@@ -293,7 +308,9 @@ pub fn run_annotate(args: AnnotateArgs) -> Result<()> {
                 }
             }
 
-            writer.flush().map_err(|e| genohype_core::HailError::Io(e))?;
+            writer
+                .flush()
+                .map_err(|e| genohype_core::HailError::Io(e))?;
         }
         _ => unreachable!("clap enforces valid output formats"),
     }
@@ -319,11 +336,7 @@ pub fn run_annotate(args: AnnotateArgs) -> Result<()> {
         intergenic_rows.to_string().bright_white()
     );
     if let Some(ref path) = args.output {
-        eprintln!(
-            "  {} {}",
-            "Output file:".cyan(),
-            path.bright_white()
-        );
+        eprintln!("  {} {}", "Output file:".cyan(), path.bright_white());
     }
 
     Ok(())

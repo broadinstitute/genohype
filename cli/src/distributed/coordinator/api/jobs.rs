@@ -9,8 +9,8 @@ use crate::distributed::coordinator::state::{
 };
 use crate::distributed::message::{
     CancelRequest, CancelResponse, EventsResponse, ExportMetricsRequest, ExportMetricsResponse,
-    FailuresResponse, JobConfigRequest, JobConfigResponse, JobResultResponse,
-    JobSpec, UpdateFleetRequest,
+    FailuresResponse, JobConfigRequest, JobConfigResponse, JobResultResponse, JobSpec,
+    UpdateFleetRequest,
 };
 
 /// Query parameters for incremental GET endpoints
@@ -154,10 +154,13 @@ pub(crate) async fn submit_job(
         if let Some(job_config) = config {
             let state_clone = state.clone();
             let cfg = job_config.clone();
-            std::thread::spawn(move || {
-                match services::catalog::load_catalog_from_config(cfg) {
+            std::thread::spawn(
+                move || match services::catalog::load_catalog_from_config(cfg) {
                     Ok((catalog, completed, ingested)) => {
-                        println!("Auto-loaded catalog with {} phenotypes", catalog.entries.len());
+                        println!(
+                            "Auto-loaded catalog with {} phenotypes",
+                            catalog.entries.len()
+                        );
                         let mut data = state_clone.lock().expect("state lock poisoned");
                         data.completed_phenotypes.extend(completed);
                         data.ingested_phenotypes.extend(ingested);
@@ -166,8 +169,8 @@ pub(crate) async fn submit_job(
                     Err(e) => {
                         println!("Warning: Failed to auto-load catalog: {}", e);
                     }
-                }
-            });
+                },
+            );
         }
     }
 
@@ -233,11 +236,9 @@ pub(crate) async fn submit_job(
 
                 #[cfg(feature = "clickhouse")]
                 {
-                    data.job_state = JobExecutionState::Ingestion(services::create_ingestion_state(
-                        phenotypes,
-                        clickhouse_url,
-                        database,
-                    ));
+                    data.job_state = JobExecutionState::Ingestion(
+                        services::create_ingestion_state(phenotypes, clickhouse_url, database),
+                    );
                 }
             }
             Err(e) => {

@@ -237,10 +237,7 @@ mod tests {
         );
 
         let json_int = serde_json::json!(42);
-        assert_eq!(
-            KeyValue::from_json(&json_int),
-            Some(KeyValue::Int32(42))
-        );
+        assert_eq!(KeyValue::from_json(&json_int), Some(KeyValue::Int32(42)));
     }
 
     #[test]

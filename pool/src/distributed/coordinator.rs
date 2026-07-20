@@ -92,7 +92,12 @@ async fn handle_work(
 ) -> impl IntoResponse {
     match state.plugin.get_work(&request.worker_id).await {
         Some(assignment) => {
-            let total_tasks = assignment.tasks.iter().filter_map(|t| t.total).max().unwrap_or(0);
+            let total_tasks = assignment
+                .tasks
+                .iter()
+                .filter_map(|t| t.total)
+                .max()
+                .unwrap_or(0);
             let response = WorkResponse::Task {
                 tasks: assignment.tasks,
                 input_path: assignment.input_path.unwrap_or_default(),
@@ -131,12 +136,17 @@ async fn handle_complete(
         .complete_work(&request.worker_id, &request.tasks, result)
         .await
     {
-        Ok(()) => (StatusCode::OK, Json(CompleteResponse { acknowledged: true })),
+        Ok(()) => (
+            StatusCode::OK,
+            Json(CompleteResponse { acknowledged: true }),
+        ),
         Err(e) => {
             eprintln!("Error completing work: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(CompleteResponse { acknowledged: false }),
+                Json(CompleteResponse {
+                    acknowledged: false,
+                }),
             )
         }
     }

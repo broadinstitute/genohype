@@ -1,7 +1,7 @@
 //! Hail schema representation and parsing
 
-use serde::{Deserialize, Serialize};
 use crate::Result;
+use serde::{Deserialize, Serialize};
 
 /// Hail table metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,14 +43,10 @@ pub enum HailType {
     },
 
     #[serde(rename = "struct")]
-    Struct {
-        fields: Vec<Field>,
-    },
+    Struct { fields: Vec<Field> },
 
     #[serde(rename = "tuple")]
-    Tuple {
-        types: Vec<HailType>,
-    },
+    Tuple { types: Vec<HailType> },
 
     #[serde(rename = "locus")]
     Locus {

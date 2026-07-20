@@ -1,8 +1,8 @@
+use crate::distributed::message::TelemetrySnapshot;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, Networks, RefreshKind, System};
-use crate::distributed::message::TelemetrySnapshot;
 
 pub struct SystemMetrics {
     sys: Mutex<System>,

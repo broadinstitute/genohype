@@ -30,9 +30,7 @@ pub enum BufferSpec {
     },
 
     /// LEB128 encoding
-    LEB128BufferSpec {
-        child: Box<BufferSpec>,
-    },
+    LEB128BufferSpec { child: Box<BufferSpec> },
 
     /// Blocking buffer
     BlockingBufferSpec {

@@ -56,10 +56,7 @@ pub trait GenomicDataProvider: Send + Sync {
     ) -> anyhow::Result<Vec<VariantSummary>>;
 
     /// Get tissue-level expression data for a gene.
-    async fn get_gene_expression(
-        &self,
-        gene_id: &str,
-    ) -> anyhow::Result<Option<GeneExpression>>;
+    async fn get_gene_expression(&self, gene_id: &str) -> anyhow::Result<Option<GeneExpression>>;
 
     /// Get variants in a genomic region.
     async fn get_region_variants(
@@ -71,10 +68,7 @@ pub trait GenomicDataProvider: Send + Sync {
     ) -> anyhow::Result<Vec<VariantSummary>>;
 
     /// List transcripts for a gene.
-    async fn list_gene_transcripts(
-        &self,
-        gene_id: &str,
-    ) -> anyhow::Result<Vec<TranscriptSummary>>;
+    async fn list_gene_transcripts(&self, gene_id: &str) -> anyhow::Result<Vec<TranscriptSummary>>;
 
     /// Get details for a specific transcript.
     async fn get_transcript_details(

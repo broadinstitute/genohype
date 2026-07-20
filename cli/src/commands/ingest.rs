@@ -15,7 +15,11 @@ pub fn run_ingest_command(command: IngestCommands) -> Result<()> {
             println!("  Database: {}", args.database);
 
             // Discover phenotypes
-            let phenotypes = crate::distributed::coordinator::services::discover_phenotypes_for_ingestion(&args.input_dir, None)?;
+            let phenotypes =
+                crate::distributed::coordinator::services::discover_phenotypes_for_ingestion(
+                    &args.input_dir,
+                    None,
+                )?;
 
             if phenotypes.is_empty() {
                 println!("No phenotypes found in {}", args.input_dir);

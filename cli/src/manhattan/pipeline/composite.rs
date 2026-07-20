@@ -28,7 +28,14 @@ pub fn composite_partial_pngs(
     height: u32,
     threshold: f64,
 ) -> Result<()> {
-    composite_partial_pngs_with_style(parts_dir, output_path, width, height, threshold, &BackgroundStyle::White)
+    composite_partial_pngs_with_style(
+        parts_dir,
+        output_path,
+        width,
+        height,
+        threshold,
+        &BackgroundStyle::White,
+    )
 }
 
 /// Composite multiple partial PNG images into a final Manhattan plot with configurable background.
@@ -48,7 +55,11 @@ pub fn composite_partial_pngs_with_style(
     let list_start = Instant::now();
     let png_files = list_partial_png_files(parts_dir)?;
     let list_duration = list_start.elapsed();
-    println!("Found {} partial images (listed in {:.1}s)", png_files.len(), list_duration.as_secs_f64());
+    println!(
+        "Found {} partial images (listed in {:.1}s)",
+        png_files.len(),
+        list_duration.as_secs_f64()
+    );
 
     if png_files.is_empty() {
         return Err(HailError::Io(std::io::Error::new(
@@ -79,7 +90,11 @@ pub fn composite_partial_pngs_with_style(
 
     pb.finish_with_message("downloaded");
     let download_duration = download_start.elapsed();
-    let total_bytes: usize = downloaded.iter().filter_map(|r| r.as_ref().ok()).map(|v| v.len()).sum();
+    let total_bytes: usize = downloaded
+        .iter()
+        .filter_map(|r| r.as_ref().ok())
+        .map(|v| v.len())
+        .sum();
     println!(
         "Downloaded {:.1} MB in {:.1}s ({:.1} MB/s)",
         total_bytes as f64 / 1_000_000.0,
@@ -160,7 +175,8 @@ pub fn composite_partial_pngs_with_style(
     println!();
     println!("=== Composite Summary ===");
     println!("  Images:      {}", png_files.len());
-    println!("  Downloaded:  {:.1} MB in {:.1}s ({:.1} MB/s)",
+    println!(
+        "  Downloaded:  {:.1} MB in {:.1}s ({:.1} MB/s)",
         total_bytes as f64 / 1_000_000.0,
         download_duration.as_secs_f64(),
         total_bytes as f64 / 1_000_000.0 / download_duration.as_secs_f64()

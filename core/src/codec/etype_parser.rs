@@ -203,7 +203,7 @@ impl ETypeParser {
                 }
                 None => {
                     return Err(HailError::ParseError(
-                        "Unexpected end of input while parsing struct fields".to_string()
+                        "Unexpected end of input while parsing struct fields".to_string(),
                     ));
                 }
             }
@@ -261,8 +261,14 @@ mod tests {
             assert_eq!(fields.len(), 2);
             assert_eq!(fields[0].name, "field1");
             assert_eq!(fields[1].name, "field2");
-            assert!(matches!(fields[0].encoded_type, EncodedType::EBinary { required: true }));
-            assert!(matches!(fields[1].encoded_type, EncodedType::EInt32 { required: false }));
+            assert!(matches!(
+                fields[0].encoded_type,
+                EncodedType::EBinary { required: true }
+            ));
+            assert!(matches!(
+                fields[1].encoded_type,
+                EncodedType::EInt32 { required: false }
+            ));
         } else {
             panic!("Expected EBaseStruct");
         }
@@ -270,16 +276,20 @@ mod tests {
 
     #[test]
     fn test_parse_nested_struct() {
-        let result = ETypeParser::parse(
-            "EBaseStruct{locus:+EBaseStruct{contig:+EBinary,position:+EInt32}}"
-        ).unwrap();
+        let result =
+            ETypeParser::parse("EBaseStruct{locus:+EBaseStruct{contig:+EBinary,position:+EInt32}}")
+                .unwrap();
 
         if let EncodedType::EBaseStruct { required, fields } = result {
             assert!(!required);
             assert_eq!(fields.len(), 1);
             assert_eq!(fields[0].name, "locus");
 
-            if let EncodedType::EBaseStruct { required: inner_required, fields: inner_fields } = &fields[0].encoded_type {
+            if let EncodedType::EBaseStruct {
+                required: inner_required,
+                fields: inner_fields,
+            } = &fields[0].encoded_type
+            {
                 assert!(inner_required);
                 assert_eq!(inner_fields.len(), 2);
                 assert_eq!(inner_fields[0].name, "contig");
@@ -296,17 +306,31 @@ mod tests {
     fn test_parse_backtick_quoted_field_names() {
         // Hail uses backticks for field names with special characters like dots
         let result = ETypeParser::parse(
-            "EBaseStruct{normal_field:EInt32,`p.value.NA`:EFloat64,`Is.SPA`:EBoolean}"
-        ).unwrap();
+            "EBaseStruct{normal_field:EInt32,`p.value.NA`:EFloat64,`Is.SPA`:EBoolean}",
+        )
+        .unwrap();
 
-        if let EncodedType::EBaseStruct { required: _, fields } = result {
+        if let EncodedType::EBaseStruct {
+            required: _,
+            fields,
+        } = result
+        {
             assert_eq!(fields.len(), 3);
             assert_eq!(fields[0].name, "normal_field");
             assert_eq!(fields[1].name, "p.value.NA");
             assert_eq!(fields[2].name, "Is.SPA");
-            assert!(matches!(fields[0].encoded_type, EncodedType::EInt32 { required: false }));
-            assert!(matches!(fields[1].encoded_type, EncodedType::EFloat64 { required: false }));
-            assert!(matches!(fields[2].encoded_type, EncodedType::EBoolean { required: false }));
+            assert!(matches!(
+                fields[0].encoded_type,
+                EncodedType::EInt32 { required: false }
+            ));
+            assert!(matches!(
+                fields[1].encoded_type,
+                EncodedType::EFloat64 { required: false }
+            ));
+            assert!(matches!(
+                fields[2].encoded_type,
+                EncodedType::EBoolean { required: false }
+            ));
         } else {
             panic!("Expected EBaseStruct");
         }
@@ -319,7 +343,11 @@ mod tests {
             "EBaseStruct{Pvalue_log10:EFloat64,`p.value.NA`:EFloat64,`Is.SPA`:EBoolean,AF_case:EFloat64,AF_ctrl:EFloat64}"
         ).unwrap();
 
-        if let EncodedType::EBaseStruct { required: _, fields } = result {
+        if let EncodedType::EBaseStruct {
+            required: _,
+            fields,
+        } = result
+        {
             assert_eq!(fields.len(), 5);
             assert_eq!(fields[0].name, "Pvalue_log10");
             assert_eq!(fields[1].name, "p.value.NA");

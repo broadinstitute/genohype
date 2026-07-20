@@ -102,7 +102,8 @@ pub fn run_export_postgres(args: ExportPostgresArgs) -> Result<()> {
         Box::new(iterator)
     };
 
-    let mut inserter = CopyInserter::new(&mut client, &args.table, args.batch_size).map_err(pg_err)?;
+    let mut inserter =
+        CopyInserter::new(&mut client, &args.table, args.batch_size).map_err(pg_err)?;
 
     let pb = ProgressBar::new_spinner();
     pb.set_style(progress_style_spinner());
@@ -124,7 +125,10 @@ pub fn run_export_postgres(args: ExportPostgresArgs) -> Result<()> {
     // Build the secondary indexes after the bulk load (faster than maintaining
     // them during ingest).
     if !args.no_indexes {
-        println!("  {}", "Building indexes (contig,pos) + variant_id...".dimmed());
+        println!(
+            "  {}",
+            "Building indexes (contig,pos) + variant_id...".dimmed()
+        );
         client.create_indexes(&args.table).map_err(pg_err)?;
     }
 

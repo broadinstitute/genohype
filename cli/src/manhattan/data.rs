@@ -175,7 +175,10 @@ fn get_nested_field<'a>(value: &'a EncodedValue, path: &[&str]) -> Option<&'a En
     let mut current = value;
     for &field_name in path {
         if let EncodedValue::Struct(fields) = current {
-            current = fields.iter().find(|(n, _)| n == field_name).map(|(_, v)| v)?;
+            current = fields
+                .iter()
+                .find(|(n, _)| n == field_name)
+                .map(|(_, v)| v)?;
         } else {
             return None;
         }

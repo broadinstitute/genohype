@@ -15,8 +15,8 @@ use noodles::vcf::variant::record::Ids as IdsRecord;
 use noodles::vcf::variant::record_buf::info::field::Value as InfoValueBuf;
 use noodles::vcf::variant::record_buf::samples::sample::value::Value as SampleValueBuf;
 use noodles::vcf::variant::RecordBuf;
-use noodles::vcf::Record;
 use noodles::vcf::Header;
+use noodles::vcf::Record;
 
 /// Convert a VCF record to a Hail row (EncodedValue)
 ///
@@ -68,9 +68,7 @@ pub fn record_to_row(header: &Header, record: &RecordBuf) -> Result<EncodedValue
         EncodedValue::Null
     } else {
         // IdsRecord::iter returns &str items (may be Result in some versions)
-        let id_str: Vec<String> = IdsRecord::iter(&ids)
-            .map(|id| id.to_string())
-            .collect();
+        let id_str: Vec<String> = IdsRecord::iter(&ids).map(|id| id.to_string()).collect();
         if id_str.is_empty() {
             EncodedValue::Null
         } else {

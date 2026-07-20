@@ -87,7 +87,11 @@ impl FieldSizeStats {
     }
 
     pub fn avg_bytes(&self) -> f64 {
-        if self.count == 0 { 0.0 } else { self.sum_bytes as f64 / self.count as f64 }
+        if self.count == 0 {
+            0.0
+        } else {
+            self.sum_bytes as f64 / self.count as f64
+        }
     }
 }
 
@@ -135,7 +139,8 @@ impl RowSizeStats {
     /// Add per-field size samples from a row
     pub fn add_field_samples(&mut self, field_sizes: Vec<(String, usize, String)>) {
         for (name, size, type_desc) in field_sizes {
-            let stats = self.field_stats
+            let stats = self
+                .field_stats
                 .entry(name.clone())
                 .or_insert_with(|| FieldSizeStats::new(name, type_desc));
             stats.add_sample(size);
@@ -144,13 +149,21 @@ impl RowSizeStats {
 
     /// Get average row size in bytes
     pub fn avg_bytes(&self) -> f64 {
-        if self.sample_count == 0 { 0.0 } else { self.sum_bytes as f64 / self.sample_count as f64 }
+        if self.sample_count == 0 {
+            0.0
+        } else {
+            self.sum_bytes as f64 / self.sample_count as f64
+        }
     }
 
     /// Get field stats sorted by average size (descending)
     pub fn sorted_field_stats(&self) -> Vec<&FieldSizeStats> {
         let mut stats: Vec<_> = self.field_stats.values().collect();
-        stats.sort_by(|a, b| b.avg_bytes().partial_cmp(&a.avg_bytes()).unwrap_or(std::cmp::Ordering::Equal));
+        stats.sort_by(|a, b| {
+            b.avg_bytes()
+                .partial_cmp(&a.avg_bytes())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         stats
     }
 
@@ -168,9 +181,9 @@ impl RowSizeStats {
         }
         // Merge field stats
         for (name, other_stats) in &other.field_stats {
-            let stats = self.field_stats
-                .entry(name.clone())
-                .or_insert_with(|| FieldSizeStats::new(name.clone(), other_stats.type_desc.clone()));
+            let stats = self.field_stats.entry(name.clone()).or_insert_with(|| {
+                FieldSizeStats::new(name.clone(), other_stats.type_desc.clone())
+            });
             stats.sum_bytes += other_stats.sum_bytes;
             stats.count += other_stats.count;
             stats.min_bytes = stats.min_bytes.min(other_stats.min_bytes);

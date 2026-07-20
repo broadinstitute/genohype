@@ -93,15 +93,15 @@ pub struct VepArgs {
 impl VepArgs {
     /// Convert to VepInitOptions if VEP annotation is requested.
     pub fn to_init_options(&self) -> Option<genohype_core::datasource::annotating::VepInitOptions> {
-        self.vep_gff3.as_ref().map(|gff3| {
-            genohype_core::datasource::annotating::VepInitOptions {
+        self.vep_gff3.as_ref().map(
+            |gff3| genohype_core::datasource::annotating::VepInitOptions {
                 gff3: gff3.clone(),
                 fasta: self.vep_fasta.clone(),
                 sa_dir: self.vep_sa_dir.clone(),
                 distance: self.vep_distance,
                 pick: self.vep_pick,
                 loftee: false,
-            }
-        })
+            },
+        )
     }
 }

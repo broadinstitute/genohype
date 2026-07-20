@@ -16,19 +16,24 @@ pub fn run_vcf_index(vcf_path: &str, output: Option<&str>) -> Result<()> {
 
     let pb = ProgressBar::new_spinner();
     pb.set_style(
-        ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] {msg}")
-            .unwrap(),
+        ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] {msg}").unwrap(),
     );
     pb.set_message("Reading records...");
 
     let start = Instant::now();
-    let index = build_tabix_index(vcf_path, Some(&|count| {
-        if count % 100_000 == 0 {
-            pb.set_message(format!("{} records indexed", count));
-        }
-    }))?;
+    let index = build_tabix_index(
+        vcf_path,
+        Some(&|count| {
+            if count % 100_000 == 0 {
+                pb.set_message(format!("{} records indexed", count));
+            }
+        }),
+    )?;
 
-    pb.finish_with_message(format!("Indexing complete in {:.1}s", start.elapsed().as_secs_f64()));
+    pb.finish_with_message(format!(
+        "Indexing complete in {:.1}s",
+        start.elapsed().as_secs_f64()
+    ));
 
     write_tabix_index(&index, &output_path)?;
     println!("Wrote index to {}", output_path);

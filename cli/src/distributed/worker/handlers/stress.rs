@@ -27,7 +27,7 @@ pub fn process_stress(
     // Fail early if we can't possibly fit the batch (unless skip_memory_check is set)
     let max_parallel = if spec.memory_mb > 0 && !spec.skip_memory_check {
         let mut sys = System::new_with_specifics(
-            RefreshKind::new().with_memory(MemoryRefreshKind::new().with_ram())
+            RefreshKind::new().with_memory(MemoryRefreshKind::new().with_ram()),
         );
         sys.refresh_memory();
         let available_mb = sys.available_memory() / (1024 * 1024);
@@ -61,7 +61,9 @@ pub fn process_stress(
 
         println!(
             "Memory check passed: {} partitions, {} MB available, {} MB per partition",
-            partitions.len(), available_mb, per_partition_mb
+            partitions.len(),
+            available_mb,
+            per_partition_mb
         );
         safe_parallel
     } else if spec.skip_memory_check {
@@ -72,7 +74,11 @@ pub fn process_stress(
         rayon::current_num_threads()
     };
 
-    println!("Processing {} stress partitions (max {} parallel)...", partitions.len(), max_parallel);
+    println!(
+        "Processing {} stress partitions (max {} parallel)...",
+        partitions.len(),
+        max_parallel
+    );
 
     // Use a custom thread pool with limited parallelism
     let pool = rayon::ThreadPoolBuilder::new()
@@ -81,30 +87,33 @@ pub fn process_stress(
         .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap());
 
     let results: Vec<Result<usize>> = pool.install(|| {
-        partitions.par_iter().map(|&partition_id| {
-            // Wrap each partition's work in catch_unwind to handle OOM panics gracefully
-            let result = catch_unwind(AssertUnwindSafe(|| {
-                process_single_stress_partition(partition_id, spec, telemetry.as_ref())
-            }));
+        partitions
+            .par_iter()
+            .map(|&partition_id| {
+                // Wrap each partition's work in catch_unwind to handle OOM panics gracefully
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    process_single_stress_partition(partition_id, spec, telemetry.as_ref())
+                }));
 
-            match result {
-                Ok(inner_result) => inner_result,
-                Err(panic_info) => {
-                    let panic_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
-                        s.to_string()
-                    } else if let Some(s) = panic_info.downcast_ref::<String>() {
-                        s.clone()
-                    } else {
-                        "Unknown panic".to_string()
-                    };
-                    eprintln!("Partition {} panicked: {}", partition_id, panic_msg);
-                    Err(crate::HailError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Partition {} panicked: {}", partition_id, panic_msg),
-                    )))
+                match result {
+                    Ok(inner_result) => inner_result,
+                    Err(panic_info) => {
+                        let panic_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                            s.to_string()
+                        } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "Unknown panic".to_string()
+                        };
+                        eprintln!("Partition {} panicked: {}", partition_id, panic_msg);
+                        Err(crate::HailError::Io(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("Partition {} panicked: {}", partition_id, panic_msg),
+                        )))
+                    }
                 }
-            }
-        }).collect()
+            })
+            .collect()
     });
 
     let mut total_rows = 0;
@@ -124,7 +133,12 @@ pub fn process_stress(
         }
         return Err(crate::HailError::Io(std::io::Error::new(
             std::io::ErrorKind::Other,
-            format!("Partition {} failed: {} ({} other partitions also failed)", part, first_err, errors.len()),
+            format!(
+                "Partition {} failed: {} ({} other partitions also failed)",
+                part,
+                first_err,
+                errors.len()
+            ),
         )));
     }
 
@@ -137,12 +151,13 @@ fn process_single_stress_partition(
     spec: &crate::distributed::message::StressSpec,
     telemetry: Option<&Arc<TelemetryState>>,
 ) -> Result<usize> {
-    use std::time::Instant;
     use std::io::{Read, Write};
+    use std::time::Instant;
     use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
     // Tag this thread for the dashboard's per-core task view (stress task type)
-    let _core_guard = telemetry.map(|ts| CoreTaskGuard::custom(ts, "stress", partition_id.to_string()));
+    let _core_guard =
+        telemetry.map(|ts| CoreTaskGuard::custom(ts, "stress", partition_id.to_string()));
 
     // Calculate actual memory to allocate (with optional jitter)
     let actual_memory_mb = if let Some(pct) = spec.memory_jitter_pct {
@@ -170,7 +185,7 @@ fn process_single_stress_partition(
 
         // Check available memory before attempting allocation
         let mut sys = System::new_with_specifics(
-            RefreshKind::new().with_memory(MemoryRefreshKind::new().with_ram())
+            RefreshKind::new().with_memory(MemoryRefreshKind::new().with_ram()),
         );
         sys.refresh_memory();
         let available = sys.available_memory();
@@ -250,7 +265,11 @@ fn process_single_stress_partition(
     // 3. Generate read data if requested (write temp file, then read it back)
     let generated_read_path = if spec.generate_read_data {
         if let Some(write_dir) = &spec.write_dir {
-            let temp_path = format!("{}/stress_read_{}.bin", write_dir.trim_end_matches('/'), partition_id);
+            let temp_path = format!(
+                "{}/stress_read_{}.bin",
+                write_dir.trim_end_matches('/'),
+                partition_id
+            );
 
             // Write the temporary file
             if let Ok(mut writer) = StreamingCloudWriter::new(&temp_path) {
@@ -282,7 +301,9 @@ fn process_single_stress_partition(
         if let Ok(mut reader) = genohype_core::io::get_reader(read_path) {
             let mut buf = vec![0u8; 8 * 1024 * 1024]; // 8MB read buffer
             while let Ok(n) = reader.read(&mut buf) {
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
             }
         }
     }
@@ -292,10 +313,14 @@ fn process_single_stress_partition(
         // Only write stress output files if not in generate-read-data-only mode
         // or if we want both TX and generated read data
         if !spec.generate_read_data {
-            let out_path = format!("{}/stress_{}.bin", write_dir.trim_end_matches('/'), partition_id);
+            let out_path = format!(
+                "{}/stress_{}.bin",
+                write_dir.trim_end_matches('/'),
+                partition_id
+            );
             if let Ok(mut writer) = StreamingCloudWriter::new(&out_path) {
                 let buf = vec![0xAA; 8 * 1024 * 1024]; // 8MB block
-                // Write 4 chunks to simulate a 32MB file per partition
+                                                       // Write 4 chunks to simulate a 32MB file per partition
                 for _ in 0..4 {
                     let _ = writer.write(&buf);
                 }

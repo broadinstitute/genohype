@@ -326,27 +326,23 @@ impl VcfDataSource {
         let header_clone = header.clone();
         let ranges = ranges.to_vec();
         let records: Vec<Result<EncodedValue>> = query
-            .filter_map(|result| {
-                match result {
-                    Ok(record) => {
-                        match super::codec::record_to_row_lazy(&header_clone, &record) {
-                            Ok(row) => {
-                                if ranges.is_empty() || row_matches_ranges(&row, &ranges) {
-                                    Some(Ok(row))
-                                } else {
-                                    None
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Skipping VCF record (conversion error): {}", e);
-                                None
-                            }
+            .filter_map(|result| match result {
+                Ok(record) => match super::codec::record_to_row_lazy(&header_clone, &record) {
+                    Ok(row) => {
+                        if ranges.is_empty() || row_matches_ranges(&row, &ranges) {
+                            Some(Ok(row))
+                        } else {
+                            None
                         }
                     }
                     Err(e) => {
-                        warn!("Skipping VCF record (query error): {}", e);
+                        warn!("Skipping VCF record (conversion error): {}", e);
                         None
                     }
+                },
+                Err(e) => {
+                    warn!("Skipping VCF record (query error): {}", e);
+                    None
                 }
             })
             .collect();
@@ -354,7 +350,6 @@ impl VcfDataSource {
         info!("Indexed query returned {} records", records.len());
         Ok(Box::new(records.into_iter()))
     }
-
 
     /// Perform an indexed query on a remote file (GCS, S3, HTTP)
     fn indexed_query_remote(
@@ -385,27 +380,23 @@ impl VcfDataSource {
         let header_clone = header.clone();
         let ranges = ranges.to_vec();
         let records: Vec<Result<EncodedValue>> = query
-            .filter_map(|result| {
-                match result {
-                    Ok(record) => {
-                        match super::codec::record_to_row_lazy(&header_clone, &record) {
-                            Ok(row) => {
-                                if ranges.is_empty() || row_matches_ranges(&row, &ranges) {
-                                    Some(Ok(row))
-                                } else {
-                                    None
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Skipping VCF record (conversion error): {}", e);
-                                None
-                            }
+            .filter_map(|result| match result {
+                Ok(record) => match super::codec::record_to_row_lazy(&header_clone, &record) {
+                    Ok(row) => {
+                        if ranges.is_empty() || row_matches_ranges(&row, &ranges) {
+                            Some(Ok(row))
+                        } else {
+                            None
                         }
                     }
                     Err(e) => {
-                        warn!("Skipping VCF record (query error): {}", e);
+                        warn!("Skipping VCF record (conversion error): {}", e);
                         None
                     }
+                },
+                Err(e) => {
+                    warn!("Skipping VCF record (query error): {}", e);
+                    None
                 }
             })
             .collect();
@@ -511,8 +502,12 @@ fn compare_values(value: &EncodedValue, key: &KeyValue) -> std::cmp::Ordering {
     match (value, key) {
         (EncodedValue::Int32(v), KeyValue::Int32(k)) => v.cmp(k),
         (EncodedValue::Int64(v), KeyValue::Int64(k)) => v.cmp(k),
-        (EncodedValue::Float32(v), KeyValue::Float32(k)) => v.partial_cmp(k).unwrap_or(std::cmp::Ordering::Equal),
-        (EncodedValue::Float64(v), KeyValue::Float64(k)) => v.partial_cmp(k).unwrap_or(std::cmp::Ordering::Equal),
+        (EncodedValue::Float32(v), KeyValue::Float32(k)) => {
+            v.partial_cmp(k).unwrap_or(std::cmp::Ordering::Equal)
+        }
+        (EncodedValue::Float64(v), KeyValue::Float64(k)) => {
+            v.partial_cmp(k).unwrap_or(std::cmp::Ordering::Equal)
+        }
         (EncodedValue::Binary(v), KeyValue::String(k)) => {
             String::from_utf8_lossy(v).as_ref().cmp(k)
         }
@@ -566,7 +561,9 @@ impl DataSource for VcfDataSource {
             let index = self.index.as_ref().unwrap();
 
             // Create a region for this entire chromosome
-            let region: Region = contig.parse().unwrap_or_else(|_| Region::new(contig.clone(), ..));
+            let region: Region = contig
+                .parse()
+                .unwrap_or_else(|_| Region::new(contig.clone(), ..));
 
             // Check if this is a local file or remote
             let is_local = !self.path.starts_with("gs://")
@@ -574,10 +571,16 @@ impl DataSource for VcfDataSource {
                 && !self.path.starts_with("http");
 
             if is_local {
-                debug!("Scanning partition {} (contig {}) locally", partition_idx, contig);
+                debug!(
+                    "Scanning partition {} (contig {}) locally",
+                    partition_idx, contig
+                );
                 self.indexed_query_local(&region, index, ranges)
             } else {
-                debug!("Scanning partition {} (contig {}) remotely", partition_idx, contig);
+                debug!(
+                    "Scanning partition {} (contig {}) remotely",
+                    partition_idx, contig
+                );
                 self.indexed_query_remote(&region, index, ranges)
             }
         } else {
@@ -608,10 +611,7 @@ impl DataSource for VcfDataSource {
         debug!("Contigs for sampling: {:?}", self.contigs);
 
         // Calculate total genome length for weighted sampling
-        let total_length: usize = self.contig_lengths
-            .iter()
-            .filter_map(|l| *l)
-            .sum();
+        let total_length: usize = self.contig_lengths.iter().filter_map(|l| *l).sum();
 
         // If we don't have length info, fall back to uniform sampling across contigs
         let use_uniform = total_length == 0;
@@ -634,7 +634,7 @@ impl DataSource for VcfDataSource {
                 vcf::io::indexed_reader::Builder::default()
                     .set_index(index.clone())
                     .build_from_path(&self.path)
-                    .map_err(HailError::Io)?
+                    .map_err(HailError::Io)?,
             )
         } else {
             None
@@ -685,7 +685,11 @@ impl DataSource for VcfDataSource {
                     }
                 }
 
-                (selected_idx, self.contigs[selected_idx].clone(), selected_pos)
+                (
+                    selected_idx,
+                    self.contigs[selected_idx].clone(),
+                    selected_pos,
+                )
             };
 
             // Create a region around the selected position
@@ -699,7 +703,9 @@ impl DataSource for VcfDataSource {
             let region = Region::new(contig.clone(), start..=end);
 
             // Query the region - use optimized single-record fetch
-            let query_result = if let (Some(ref mut reader), Some(ref header)) = (&mut indexed_reader, &reader_header) {
+            let query_result = if let (Some(ref mut reader), Some(ref header)) =
+                (&mut indexed_reader, &reader_header)
+            {
                 // Use pre-opened reader for efficiency
                 let query = reader.query(header, &region).map_err(HailError::Io)?;
                 if let Some(result) = query.into_iter().next() {
@@ -729,7 +735,10 @@ impl DataSource for VcfDataSource {
                     // If no record found, we just retry with a different position
                 }
                 Err(e) => {
-                    debug!("Query error for contig {} position {}: {}", contig, position, e);
+                    debug!(
+                        "Query error for contig {} position {}: {}",
+                        contig, position, e
+                    );
                     // Continue trying other positions
                 }
             }
@@ -780,20 +789,25 @@ impl DataSource for VcfDataSource {
                     let mut all_results: Vec<EncodedValue> = Vec::new();
 
                     for contig in interval_list.contigs() {
-                        if let Some(ranges_for_contig) = interval_list.intervals_for_contig(contig) {
+                        if let Some(ranges_for_contig) = interval_list.intervals_for_contig(contig)
+                        {
                             for range in ranges_for_contig {
                                 let start = *range.start();
                                 let end = *range.end();
 
                                 // Build a region from the interval
-                                let start_pos = noodles::core::Position::try_from(start as usize).ok();
+                                let start_pos =
+                                    noodles::core::Position::try_from(start as usize).ok();
                                 let end_pos = noodles::core::Position::try_from(end as usize).ok();
 
                                 if let (Some(s), Some(e)) = (start_pos, end_pos) {
                                     let region = Region::new(contig.as_str(), s..=e);
 
                                     let iter_result = if is_local {
-                                        debug!("Tabix query for interval: {}:{}-{}", contig, start, end);
+                                        debug!(
+                                            "Tabix query for interval: {}:{}-{}",
+                                            contig, start, end
+                                        );
                                         self.indexed_query_local(&region, index, ranges)
                                     } else {
                                         self.indexed_query_remote(&region, index, ranges)
@@ -803,7 +817,9 @@ impl DataSource for VcfDataSource {
                                         for result in iter {
                                             if let Ok(row) = result {
                                                 // Apply any additional --where filters
-                                                if ranges.is_empty() || row_matches_ranges(&row, ranges) {
+                                                if ranges.is_empty()
+                                                    || row_matches_ranges(&row, ranges)
+                                                {
                                                     all_results.push(row);
                                                 }
                                             }
@@ -891,9 +907,10 @@ mod tests {
     #[test]
     fn test_ranges_to_region_contig_only() {
         // Create a minimal header
-        let header: vcf::Header = "##fileformat=VCFv4.3\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO"
-            .parse()
-            .unwrap();
+        let header: vcf::Header =
+            "##fileformat=VCFv4.3\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO"
+                .parse()
+                .unwrap();
         let (contigs, contig_lengths) = VcfDataSource::extract_contigs(&header);
         let schema = super::super::schema::extract_schema_from_header(&header).unwrap();
 
@@ -919,9 +936,10 @@ mod tests {
 
     #[test]
     fn test_has_index() {
-        let header: vcf::Header = "##fileformat=VCFv4.3\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO"
-            .parse()
-            .unwrap();
+        let header: vcf::Header =
+            "##fileformat=VCFv4.3\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO"
+                .parse()
+                .unwrap();
         let (contigs, contig_lengths) = VcfDataSource::extract_contigs(&header);
         let schema = super::super::schema::extract_schema_from_header(&header).unwrap();
 
@@ -952,9 +970,10 @@ mod tests {
 
     #[test]
     fn test_num_partitions_unindexed() {
-        let header: vcf::Header = "##fileformat=VCFv4.3\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO"
-            .parse()
-            .unwrap();
+        let header: vcf::Header =
+            "##fileformat=VCFv4.3\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO"
+                .parse()
+                .unwrap();
         let (contigs, contig_lengths) = VcfDataSource::extract_contigs(&header);
         let schema = super::super::schema::extract_schema_from_header(&header).unwrap();
 

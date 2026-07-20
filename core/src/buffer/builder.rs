@@ -101,9 +101,7 @@ impl<R: std::io::Read + Send + 'static> BufferBuilder<R> {
     ///
     /// Use this unless you have a specific reason not to.
     pub fn with_leb128(self) -> LEB128BufferStack<R> {
-        LEB128BufferStack {
-            builder: self,
-        }
+        LEB128BufferStack { builder: self }
     }
 
     /// Build the buffer stack WITHOUT LEB128 encoding
@@ -114,9 +112,7 @@ impl<R: std::io::Read + Send + 'static> BufferBuilder<R> {
     ///
     /// Most Hail data files REQUIRE LEB128 encoding.
     pub fn without_leb128(self) -> RawBufferStack<R> {
-        RawBufferStack {
-            builder: self,
-        }
+        RawBufferStack { builder: self }
     }
 }
 
@@ -166,9 +162,7 @@ mod tests {
         let cursor = Cursor::new(data);
 
         // Should compile and construct without panicking
-        let _buffer = BufferBuilder::from_reader(cursor)
-            .with_leb128()
-            .build();
+        let _buffer = BufferBuilder::from_reader(cursor).with_leb128().build();
     }
 
     #[test]

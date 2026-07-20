@@ -16,7 +16,12 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
     /// Returns (input_path, job_spec, filters, intervals)
     pub(crate) fn parse_command_to_job_spec(
         command: &[String],
-    ) -> Result<(String, crate::distributed::message::JobSpec, Vec<String>, Vec<String>)> {
+    ) -> Result<(
+        String,
+        crate::distributed::message::JobSpec,
+        Vec<String>,
+        Vec<String>,
+    )> {
         use crate::distributed::message::JobSpec;
 
         if command.is_empty() {
@@ -130,9 +135,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         }
 
         let job_spec = match export_type.as_str() {
-            "parquet" => JobSpec::ExportParquet {
-                output_path,
-            },
+            "parquet" => JobSpec::ExportParquet { output_path },
             "json" => JobSpec::ExportJson {
                 output_path,
                 group_by: None,
@@ -154,7 +157,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                     clickhouse_url,
                     table_name,
                 }
-            },
+            }
             other => {
                 return Err(HailError::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -175,7 +178,12 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
     /// Supports: manhattan --exome <path> --genome <path> --output <path> [--threshold ...] ...
     pub(crate) fn parse_manhattan_command(
         args: &[String],
-    ) -> Result<(String, crate::distributed::message::JobSpec, Vec<String>, Vec<String>)> {
+    ) -> Result<(
+        String,
+        crate::distributed::message::JobSpec,
+        Vec<String>,
+        Vec<String>,
+    )> {
         use crate::distributed::message::{JobSpec, ManhattanSpec};
 
         // Parse named arguments
@@ -387,11 +395,11 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             height,
             y_field,
             output_path,
-            layout: None,  // Computed by coordinator before dispatch
-            y_scale: None, // Computed by coordinator before dispatch
+            layout: None,         // Computed by coordinator before dispatch
+            y_scale: None,        // Computed by coordinator before dispatch
             contig_lengths: None, // Computed by submit_distributed
             skip_composite,
-            exome_partitions: None, // Computed by submit_distributed
+            exome_partitions: None,  // Computed by submit_distributed
             genome_partitions: None, // Computed by submit_distributed
             styling: crate::manhattan::config::ManhattanConfig::default(),
         };
@@ -404,7 +412,12 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             crate::distributed::message::ExecutionMode::Full
         };
 
-        Ok((input_path, JobSpec::Manhattan { spec, mode }, Vec::new(), Vec::new()))
+        Ok((
+            input_path,
+            JobSpec::Manhattan { spec, mode },
+            Vec::new(),
+            Vec::new(),
+        ))
     }
 
     /// Parse a `manhattan-batch` command into a ManhattanBatch job.
@@ -412,9 +425,14 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
     /// Supports: manhattan-batch --config <path> or --assets-json <path> --output-dir <path> [--analysis-ids <id,...>] ...
     pub(crate) fn parse_manhattan_batch_command(
         args: &[String],
-    ) -> Result<(String, crate::distributed::message::JobSpec, Vec<String>, Vec<String>)> {
+    ) -> Result<(
+        String,
+        crate::distributed::message::JobSpec,
+        Vec<String>,
+        Vec<String>,
+    )> {
         use crate::distributed::message::{JobSpec, ManhattanSpec};
-        use crate::manhattan::batch::{load_and_group_assets, create_specs, BatchConfig};
+        use crate::manhattan::batch::{create_specs, load_and_group_assets, BatchConfig};
         use crate::manhattan::config::ManhattanJobConfig;
 
         // Parse named arguments
@@ -673,7 +691,13 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         let styling = job_config.styling();
 
         // Load and group assets
-        let inputs = load_and_group_assets(&assets_json, analysis_ids.as_deref(), ancestries.as_deref(), sample, limit)?;
+        let inputs = load_and_group_assets(
+            &assets_json,
+            analysis_ids.as_deref(),
+            ancestries.as_deref(),
+            sample,
+            limit,
+        )?;
 
         if inputs.is_empty() {
             return Err(HailError::Io(std::io::Error::new(
@@ -723,9 +747,13 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             // Idle mode: skip asset loading entirely, return empty specs
             return Ok((
                 "idle_batch".to_string(),
-                JobSpec::ManhattanBatch { specs: vec![], mode: crate::distributed::message::ExecutionMode::Full, config: Some(job_config) },
+                JobSpec::ManhattanBatch {
+                    specs: vec![],
+                    mode: crate::distributed::message::ExecutionMode::Full,
+                    config: Some(job_config),
+                },
                 Vec::new(),
-                Vec::new()
+                Vec::new(),
             ));
         }
 
@@ -737,13 +765,27 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             crate::distributed::message::ExecutionMode::Full
         };
 
-        Ok((primary_input, JobSpec::ManhattanBatch { specs, mode, config: Some(job_config) }, Vec::new(), Vec::new()))
+        Ok((
+            primary_input,
+            JobSpec::ManhattanBatch {
+                specs,
+                mode,
+                config: Some(job_config),
+            },
+            Vec::new(),
+            Vec::new(),
+        ))
     }
 
     /// Parse a `loci` command into a LociSpec job.
     pub(crate) fn parse_loci_command(
         args: &[String],
-    ) -> Result<(String, crate::distributed::message::JobSpec, Vec<String>, Vec<String>)> {
+    ) -> Result<(
+        String,
+        crate::distributed::message::JobSpec,
+        Vec<String>,
+        Vec<String>,
+    )> {
         use crate::distributed::message::{JobSpec, LociSpec};
 
         let mut output_dir: Option<String> = None;
@@ -866,7 +908,12 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
     /// Parse a `stress` command into a StressSpec job.
     pub(crate) fn parse_stress_command(
         args: &[String],
-    ) -> Result<(String, crate::distributed::message::JobSpec, Vec<String>, Vec<String>)> {
+    ) -> Result<(
+        String,
+        crate::distributed::message::JobSpec,
+        Vec<String>,
+        Vec<String>,
+    )> {
         use crate::distributed::message::{JobSpec, StressSpec};
 
         let mut partitions = 100;
@@ -970,7 +1017,12 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         // Safety warning for dangerous memory options
         if skip_memory_check || leak_memory_mb.is_some() {
             use owo_colors::OwoColorize;
-            eprintln!("{}", "WARNING: Using unsafe memory options - worker may be killed by OOM".yellow().bold());
+            eprintln!(
+                "{}",
+                "WARNING: Using unsafe memory options - worker may be killed by OOM"
+                    .yellow()
+                    .bold()
+            );
         }
 
         let spec = StressSpec {
@@ -987,7 +1039,12 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         };
 
         // Use a dummy input path and empty filters since stress tests don't read Hail tables
-        Ok(("stress_synthetic".to_string(), JobSpec::Stress(spec), Vec::new(), Vec::new()))
+        Ok((
+            "stress_synthetic".to_string(),
+            JobSpec::Stress(spec),
+            Vec::new(),
+            Vec::new(),
+        ))
     }
 
     /// Parse an `ingest` command into an IngestManhattan job.
@@ -995,7 +1052,12 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
     /// Supports: ingest manhattan --input-dir <path> --clickhouse-url <url> [--database <db>]
     pub(crate) fn parse_ingest_command(
         args: &[String],
-    ) -> Result<(String, crate::distributed::message::JobSpec, Vec<String>, Vec<String>)> {
+    ) -> Result<(
+        String,
+        crate::distributed::message::JobSpec,
+        Vec<String>,
+        Vec<String>,
+    )> {
         if args.is_empty() {
             return Err(HailError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1021,7 +1083,12 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
     /// Parse `ingest manhattan` command arguments.
     pub(crate) fn parse_ingest_manhattan_command(
         args: &[String],
-    ) -> Result<(String, crate::distributed::message::JobSpec, Vec<String>, Vec<String>)> {
+    ) -> Result<(
+        String,
+        crate::distributed::message::JobSpec,
+        Vec<String>,
+        Vec<String>,
+    )> {
         use crate::distributed::message::{InitStrategy, JobSpec};
         use crate::manhattan::config::ManhattanJobConfig;
 
@@ -1154,7 +1221,12 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
     /// --tasks is ignored when --manifest is present (task count = manifest length).
     pub(crate) fn parse_custom_command(
         args: &[String],
-    ) -> Result<(String, crate::distributed::message::JobSpec, Vec<String>, Vec<String>)> {
+    ) -> Result<(
+        String,
+        crate::distributed::message::JobSpec,
+        Vec<String>,
+        Vec<String>,
+    )> {
         use crate::distributed::message::JobSpec;
 
         let mut payload_str = "{}".to_string();
@@ -1231,7 +1303,11 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             None
         };
 
-        let spec = JobSpec::Custom { payload, tasks, manifest };
+        let spec = JobSpec::Custom {
+            payload,
+            tasks,
+            manifest,
+        };
         Ok(("custom".to_string(), spec, Vec::new(), Vec::new()))
     }
 }

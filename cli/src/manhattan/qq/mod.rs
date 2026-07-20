@@ -92,12 +92,11 @@ pub fn scan_qq_to_parquet(
             };
 
             // Extract location - try locus first, then CHR/POS
-            let (contig, position) = extract_locus_fields(&fields)
-                .unwrap_or_else(|| {
-                    let chr = get_str("CHR").unwrap_or_default();
-                    let pos = get_i32("POS").unwrap_or(0);
-                    (chr, pos)
-                });
+            let (contig, position) = extract_locus_fields(&fields).unwrap_or_else(|| {
+                let chr = get_str("CHR").unwrap_or_default();
+                let pos = get_i32("POS").unwrap_or(0);
+                (chr, pos)
+            });
 
             // Extract alleles
             let (ref_allele, alt_allele) = extract_alleles(&fields);

@@ -55,9 +55,7 @@ pub struct ScaleResponse {
 }
 
 /// GET /api/cluster/config - Returns the current cluster configuration
-pub async fn get_config(
-    State(state): State<SharedState>,
-) -> Json<ClusterConfigResponse> {
+pub async fn get_config(State(state): State<SharedState>) -> Json<ClusterConfigResponse> {
     let data = state.lock().unwrap();
     Json(ClusterConfigResponse {
         pool_name: data.config.pool_name.clone(),
@@ -74,9 +72,7 @@ pub async fn get_config(
 const VM_CACHE_TTL_SECS: u64 = 15;
 
 /// GET /api/cluster/vms - Returns the current GCP VM state
-pub async fn get_vms(
-    State(state): State<SharedState>,
-) -> Json<serde_json::Value> {
+pub async fn get_vms(State(state): State<SharedState>) -> Json<serde_json::Value> {
     let (pool_name, cached) = {
         let data = state.lock().unwrap();
         let cached = data.cached_vms.as_ref().and_then(|(json, ts)| {
@@ -116,23 +112,35 @@ pub async fn get_vms(
             // Derive missing config from existing VMs
             {
                 let mut data = state.lock().unwrap();
-                let worker_instances: Vec<_> = instances.iter().filter(|i| i.name.contains("-worker-")).collect();
+                let worker_instances: Vec<_> = instances
+                    .iter()
+                    .filter(|i| i.name.contains("-worker-"))
+                    .collect();
 
                 if let Some(template_vm) = worker_instances.first().copied().or(instances.first()) {
                     if data.config.gcp_zone.is_none() {
-                        data.config.gcp_zone = Some(template_vm.zone.rsplit('/').next().unwrap_or(&template_vm.zone).to_string());
+                        data.config.gcp_zone = Some(
+                            template_vm
+                                .zone
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or(&template_vm.zone)
+                                .to_string(),
+                        );
                     }
                     if data.config.network.is_none() {
                         if let Some(ni) = template_vm.network_interfaces.first() {
                             if let Some(net) = &ni.network {
-                                data.config.network = Some(net.rsplit('/').next().unwrap_or(net).to_string());
+                                data.config.network =
+                                    Some(net.rsplit('/').next().unwrap_or(net).to_string());
                             }
                         }
                     }
                     if data.config.subnet.is_none() {
                         if let Some(ni) = template_vm.network_interfaces.first() {
                             if let Some(sub) = &ni.subnetwork {
-                                data.config.subnet = Some(sub.rsplit('/').next().unwrap_or(sub).to_string());
+                                data.config.subnet =
+                                    Some(sub.rsplit('/').next().unwrap_or(sub).to_string());
                             }
                         }
                     }
@@ -141,7 +149,8 @@ pub async fn get_vms(
                 if let Some(worker_vm) = worker_instances.first() {
                     if data.config.machine_type.is_none() {
                         if let Some(mt) = &worker_vm.machine_type {
-                            data.config.machine_type = Some(mt.rsplit('/').next().unwrap_or(mt).to_string());
+                            data.config.machine_type =
+                                Some(mt.rsplit('/').next().unwrap_or(mt).to_string());
                         }
                     }
                     if data.config.spot.is_none() {
@@ -184,18 +193,14 @@ pub async fn get_vms(
 
             Json(result)
         }
-        Ok(Err(e)) => {
-            Json(serde_json::json!({
-                "error": format!("Failed to list instances: {}", e),
-                "vms": []
-            }))
-        }
-        Err(e) => {
-            Json(serde_json::json!({
-                "error": format!("Task failed: {}", e),
-                "vms": []
-            }))
-        }
+        Ok(Err(e)) => Json(serde_json::json!({
+            "error": format!("Failed to list instances: {}", e),
+            "vms": []
+        })),
+        Err(e) => Json(serde_json::json!({
+            "error": format!("Task failed: {}", e),
+            "vms": []
+        })),
     }
 }
 
@@ -205,7 +210,16 @@ pub async fn scale_cluster(
     Json(req): Json<ScaleRequest>,
 ) -> Json<ScaleResponse> {
     // Extract config from state
-    let (pool_name, mut gcp_zone, gcp_project, mut network, mut subnet, binary_gcs_url, mut machine_type, mut spot) = {
+    let (
+        pool_name,
+        mut gcp_zone,
+        gcp_project,
+        mut network,
+        mut subnet,
+        binary_gcs_url,
+        mut machine_type,
+        mut spot,
+    ) = {
         let data = state.lock().unwrap();
         (
             data.config.pool_name.clone(),
@@ -272,7 +286,14 @@ pub async fn scale_cluster(
     // Derive missing config from existing worker VMs
     if let Some(template_vm) = worker_instances.first().copied().or(instances.first()) {
         if gcp_zone.is_none() {
-            gcp_zone = Some(template_vm.zone.rsplit('/').next().unwrap_or(&template_vm.zone).to_string());
+            gcp_zone = Some(
+                template_vm
+                    .zone
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&template_vm.zone)
+                    .to_string(),
+            );
         }
         if network.is_none() {
             if let Some(ni) = template_vm.network_interfaces.first() {
@@ -308,11 +329,21 @@ pub async fn scale_cluster(
     // Persist derived config back to state for UI
     {
         let mut data = state.lock().unwrap();
-        if data.config.gcp_zone.is_none() { data.config.gcp_zone = gcp_zone.clone(); }
-        if data.config.network.is_none() { data.config.network = network.clone(); }
-        if data.config.subnet.is_none() { data.config.subnet = subnet.clone(); }
-        if data.config.machine_type.is_none() { data.config.machine_type = machine_type.clone(); }
-        if data.config.spot.is_none() { data.config.spot = spot; }
+        if data.config.gcp_zone.is_none() {
+            data.config.gcp_zone = gcp_zone.clone();
+        }
+        if data.config.network.is_none() {
+            data.config.network = network.clone();
+        }
+        if data.config.subnet.is_none() {
+            data.config.subnet = subnet.clone();
+        }
+        if data.config.machine_type.is_none() {
+            data.config.machine_type = machine_type.clone();
+        }
+        if data.config.spot.is_none() {
+            data.config.spot = spot;
+        }
     }
 
     if target == current_count {
@@ -356,7 +387,10 @@ pub async fn scale_cluster(
         let pool_name_for_script = pool_name.clone();
         // Use GCS URL if available, otherwise fall back to downloading from coordinator HTTP
         let effective_binary_url = binary_gcs_url.or_else(|| {
-            Some(format!("http://{}-coordinator:3000/api/binary", pool_name_for_script))
+            Some(format!(
+                "http://{}-coordinator:3000/api/binary",
+                pool_name_for_script
+            ))
         });
         let startup_script = crate::cloud::startup::generate_worker_startup_script(
             effective_binary_url.as_deref(),
@@ -374,10 +408,7 @@ pub async fn scale_cluster(
                 name: format!("{}-worker-{}", pool_name, i),
                 machine_type: machine_type.clone(),
                 zone: zone_clone.clone(),
-                tags: vec![format!(
-                    "genohype-worker,pool-{},role-worker",
-                    pool_name
-                )],
+                tags: vec![format!("genohype-worker,pool-{},role-worker", pool_name)],
                 startup_script: startup_script.clone(),
                 spot,
                 network: net.clone(),
@@ -416,8 +447,18 @@ pub async fn scale_cluster(
 
         // Sort by index descending to remove highest first
         worker_instances.sort_by(|a, b| {
-            let idx_a = a.name.rsplit('-').next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
-            let idx_b = b.name.rsplit('-').next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+            let idx_a = a
+                .name
+                .rsplit('-')
+                .next()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(0);
+            let idx_b = b
+                .name
+                .rsplit('-')
+                .next()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(0);
             idx_b.cmp(&idx_a)
         });
 

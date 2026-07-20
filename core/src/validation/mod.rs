@@ -6,8 +6,8 @@
 
 use crate::codec::EncodedValue;
 use crate::query::QueryEngine;
-use crate::Result;
 use crate::HailError;
+use crate::Result;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use jsonschema::Validator;
 use rand::seq::SliceRandom;
@@ -125,9 +125,7 @@ impl SchemaValidator {
                         for err in self.validator.iter_errors(&json_val) {
                             report.errors.push(format!(
                                 "Row {}: {} at path '{}'",
-                                report.scanned_count,
-                                err,
-                                err.instance_path
+                                report.scanned_count, err, err.instance_path
                             ));
                             if report.errors.len() >= max_errors {
                                 break;
@@ -148,11 +146,7 @@ impl SchemaValidator {
     /// Validate a collection of pre-sampled rows
     ///
     /// Used by data sources that provide optimized random sampling (like indexed VCFs).
-    fn validate_rows(
-        &self,
-        rows: Vec<EncodedValue>,
-        fail_fast: bool,
-    ) -> Result<ValidationReport> {
+    fn validate_rows(&self, rows: Vec<EncodedValue>, fail_fast: bool) -> Result<ValidationReport> {
         let mut report = ValidationReport::default();
         let max_errors = 10;
 
@@ -228,13 +222,17 @@ impl SchemaValidator {
                 // Try to get locus info (common for VCF/genomic data)
                 let locus = fields.iter().find(|(n, _)| n == "locus");
                 if let Some((_, EncodedValue::Struct(locus_fields))) = locus {
-                    let contig = locus_fields.iter().find(|(n, _)| n == "contig")
+                    let contig = locus_fields
+                        .iter()
+                        .find(|(n, _)| n == "contig")
                         .map(|(_, v)| match v {
                             EncodedValue::Binary(b) => String::from_utf8_lossy(b).to_string(),
                             _ => "?".to_string(),
                         })
                         .unwrap_or_default();
-                    let pos = locus_fields.iter().find(|(n, _)| n == "position")
+                    let pos = locus_fields
+                        .iter()
+                        .find(|(n, _)| n == "position")
                         .map(|(_, v)| match v {
                             EncodedValue::Int32(i) => i.to_string(),
                             _ => "?".to_string(),
@@ -243,7 +241,8 @@ impl SchemaValidator {
                     format!("{}:{}", contig, pos)
                 } else if !key_fields.is_empty() {
                     // Fall back to key fields for Hail tables
-                    key_fields.iter()
+                    key_fields
+                        .iter()
                         .filter_map(|k| fields.iter().find(|(n, _)| n == k))
                         .map(|(_, v)| match v {
                             EncodedValue::Binary(b) => String::from_utf8_lossy(b).to_string(),
@@ -320,7 +319,7 @@ impl SchemaValidator {
         pb.set_style(
             ProgressStyle::default_spinner()
                 .template("{spinner:.green} {msg}")
-                .unwrap()
+                .unwrap(),
         );
         pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
@@ -419,8 +418,8 @@ impl SchemaValidator {
             sample_size,
             std::cmp::min(
                 num_partitions,
-                std::cmp::max(1, (sample_size as f64).sqrt().ceil() as usize)
-            )
+                std::cmp::max(1, (sample_size as f64).sqrt().ceil() as usize),
+            ),
         );
 
         let mut partition_indices: Vec<usize> = (0..num_partitions).collect();
@@ -473,7 +472,8 @@ impl SchemaValidator {
                 let max_errors = 10;
 
                 // Use reservoir sampling to select rows without loading entire partition
-                let mut reservoir: Vec<(usize, EncodedValue)> = Vec::with_capacity(rows_per_partition);
+                let mut reservoir: Vec<(usize, EncodedValue)> =
+                    Vec::with_capacity(rows_per_partition);
                 let mut rng = rand::thread_rng();
                 use rand::Rng;
 
@@ -539,10 +539,7 @@ impl SchemaValidator {
                             for err in self.validator.iter_errors(&json_val) {
                                 local_report.errors.push(format!(
                                     "Partition {}, Row {}: {} at path '{}'",
-                                    partition_idx,
-                                    row_idx,
-                                    err,
-                                    err.instance_path
+                                    partition_idx, row_idx, err, err.instance_path
                                 ));
                                 if local_report.errors.len() >= max_errors {
                                     break;
@@ -647,8 +644,7 @@ impl SchemaValidator {
         let mp = MultiProgress::new();
 
         // Create fixed worker bars (one per thread)
-        let idle_style = ProgressStyle::with_template("  {msg}")
-            .unwrap();
+        let idle_style = ProgressStyle::with_template("  {msg}").unwrap();
         let spinner_style = ProgressStyle::with_template("{spinner:.cyan} {msg}")
             .unwrap()
             .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏");
@@ -687,33 +683,46 @@ impl SchemaValidator {
                 return String::new();
             }
             if let EncodedValue::Struct(fields) = row {
-                let key_vals: Vec<String> = key_fields.iter().filter_map(|k| {
-                    fields.iter().find(|(name, _)| name == k).map(|(name, val)| {
-                        let val_str = match val {
-                            EncodedValue::Binary(b) => String::from_utf8_lossy(b).to_string(),
-                            EncodedValue::Int32(i) => i.to_string(),
-                            EncodedValue::Int64(i) => i.to_string(),
-                            EncodedValue::Float32(f) => f.to_string(),
-                            EncodedValue::Float64(f) => f.to_string(),
-                            EncodedValue::Boolean(b) => b.to_string(),
-                            EncodedValue::Null => "null".to_string(),
-                            EncodedValue::Struct(inner) => {
-                                let parts: Vec<String> = inner.iter().map(|(n, v)| {
-                                    let v_str = match v {
-                                        EncodedValue::Binary(b) => String::from_utf8_lossy(b).to_string(),
-                                        EncodedValue::Int32(i) => i.to_string(),
-                                        EncodedValue::Int64(i) => i.to_string(),
-                                        _ => format!("{:?}", v),
-                                    };
-                                    format!("{}={}", n, v_str)
-                                }).collect();
-                                format!("{{{}}}", parts.join(","))
-                            }
-                            _ => format!("{:?}", val),
-                        };
-                        format!("{}={}", name, val_str)
+                let key_vals: Vec<String> = key_fields
+                    .iter()
+                    .filter_map(|k| {
+                        fields
+                            .iter()
+                            .find(|(name, _)| name == k)
+                            .map(|(name, val)| {
+                                let val_str = match val {
+                                    EncodedValue::Binary(b) => {
+                                        String::from_utf8_lossy(b).to_string()
+                                    }
+                                    EncodedValue::Int32(i) => i.to_string(),
+                                    EncodedValue::Int64(i) => i.to_string(),
+                                    EncodedValue::Float32(f) => f.to_string(),
+                                    EncodedValue::Float64(f) => f.to_string(),
+                                    EncodedValue::Boolean(b) => b.to_string(),
+                                    EncodedValue::Null => "null".to_string(),
+                                    EncodedValue::Struct(inner) => {
+                                        let parts: Vec<String> = inner
+                                            .iter()
+                                            .map(|(n, v)| {
+                                                let v_str = match v {
+                                                    EncodedValue::Binary(b) => {
+                                                        String::from_utf8_lossy(b).to_string()
+                                                    }
+                                                    EncodedValue::Int32(i) => i.to_string(),
+                                                    EncodedValue::Int64(i) => i.to_string(),
+                                                    _ => format!("{:?}", v),
+                                                };
+                                                format!("{}={}", n, v_str)
+                                            })
+                                            .collect();
+                                        format!("{{{}}}", parts.join(","))
+                                    }
+                                    _ => format!("{:?}", val),
+                                };
+                                format!("{}={}", name, val_str)
+                            })
                     })
-                }).collect();
+                    .collect();
                 key_vals.join(" ")
             } else {
                 String::new()
@@ -835,7 +844,8 @@ impl SchemaValidator {
                 let val = valid_count.load(Ordering::Relaxed);
                 summary_bar.set_message(format!("{} ok, {} invalid", val, inv));
 
-                let errs: Vec<String> = self.validator
+                let errs: Vec<String> = self
+                    .validator
                     .iter_errors(&json_val)
                     .take(2)
                     .map(|e| format!("{} at '{}'", e, e.instance_path))
@@ -857,7 +867,10 @@ impl SchemaValidator {
                 let mut err_lock = errors.lock().unwrap();
                 for err in errs {
                     if err_lock.len() < 10 {
-                        err_lock.push(format!("Partition {}, Row {}: {}", partition_idx, row_idx, err));
+                        err_lock.push(format!(
+                            "Partition {}, Row {}: {}",
+                            partition_idx, row_idx, err
+                        ));
                     }
                 }
 
@@ -909,7 +922,10 @@ impl SchemaGenerator {
 
         // Add schema metadata
         if let Value::Object(ref mut map) = schema {
-            map.insert("$schema".to_string(), json!("http://json-schema.org/draft-07/schema#"));
+            map.insert(
+                "$schema".to_string(),
+                json!("http://json-schema.org/draft-07/schema#"),
+            );
             if let Some(t) = title {
                 map.insert("title".to_string(), json!(t));
             }
@@ -934,7 +950,10 @@ impl SchemaGenerator {
     }
 
     /// Generate a JSON schema from an EncodedType
-    pub fn from_encoded_type(row_type: &crate::codec::EncodedType, title: Option<&str>) -> Result<Value> {
+    pub fn from_encoded_type(
+        row_type: &crate::codec::EncodedType,
+        title: Option<&str>,
+    ) -> Result<Value> {
         use crate::codec::EncodedType;
 
         fn type_to_schema(t: &EncodedType) -> Value {
@@ -1027,21 +1046,21 @@ impl SchemaGenerator {
         // but VType doesn't have this - all VType fields can be null unless required)
 
         if s.starts_with("Struct{") && s.ends_with('}') {
-            let inner = &s[7..s.len()-1];
+            let inner = &s[7..s.len() - 1];
             let fields = Self::parse_struct_fields(inner)?;
             Ok(ParsedType::Struct(fields))
         } else if s.starts_with("Array[") && s.ends_with(']') {
-            let inner = &s[6..s.len()-1];
+            let inner = &s[6..s.len() - 1];
             let elem_type = Self::parse_type(inner)?;
             Ok(ParsedType::Array(Box::new(elem_type)))
         } else if s.starts_with("Set[") && s.ends_with(']') {
-            let inner = &s[4..s.len()-1];
+            let inner = &s[4..s.len() - 1];
             let elem_type = Self::parse_type(inner)?;
             Ok(ParsedType::Array(Box::new(elem_type))) // Sets are arrays in JSON
         } else if s.starts_with("Dict[") && s.ends_with(']') {
             // Dict[K,V] - in JSON this becomes an object or array of key-value pairs
             // For simplicity, treat as object with additionalProperties
-            let inner = &s[5..s.len()-1];
+            let inner = &s[5..s.len() - 1];
             let parts: Vec<&str> = Self::split_type_args(inner);
             if parts.len() == 2 {
                 let value_type = Self::parse_type(parts[1])?;
@@ -1050,14 +1069,14 @@ impl SchemaGenerator {
                 Ok(ParsedType::Dict(Box::new(ParsedType::Any)))
             }
         } else if s.starts_with("Locus(") && s.ends_with(')') {
-            let rg = &s[6..s.len()-1];
+            let rg = &s[6..s.len() - 1];
             Ok(ParsedType::Locus(rg.to_string()))
         } else if s.starts_with("Interval[") && s.ends_with(']') {
-            let inner = &s[9..s.len()-1];
+            let inner = &s[9..s.len() - 1];
             let point_type = Self::parse_type(inner)?;
             Ok(ParsedType::Interval(Box::new(point_type)))
         } else if s.starts_with("Tuple[") && s.ends_with(']') {
-            let inner = &s[6..s.len()-1];
+            let inner = &s[6..s.len() - 1];
             let parts = Self::split_type_args(inner);
             let types: Result<Vec<_>> = parts.iter().map(|p| Self::parse_type(p)).collect();
             Ok(ParsedType::Tuple(types?))
@@ -1122,11 +1141,14 @@ impl SchemaGenerator {
 
         if let Some(colon_pos) = s.find(':') {
             let name = s[..colon_pos].trim().to_string();
-            let type_str = s[colon_pos+1..].trim();
+            let type_str = s[colon_pos + 1..].trim();
             let parsed_type = Self::parse_type(type_str)?;
             Ok(Some((name, parsed_type)))
         } else {
-            Err(HailError::InvalidFormat(format!("Invalid field format: {}", s)))
+            Err(HailError::InvalidFormat(format!(
+                "Invalid field format: {}",
+                s
+            )))
         }
     }
 
@@ -1246,7 +1268,7 @@ impl SchemaGenerator {
                     "maxItems": types.len()
                 })
             }
-            ParsedType::Any => json!({})
+            ParsedType::Any => json!({}),
         }
     }
 
@@ -1255,15 +1277,14 @@ impl SchemaGenerator {
         match rg {
             "GRCh38" | "hg38" => vec![
                 "chr1", "chr2", "chr3", "chr4", "chr5", "chr6", "chr7", "chr8", "chr9", "chr10",
-                "chr11", "chr12", "chr13", "chr14", "chr15", "chr16", "chr17", "chr18", "chr19", "chr20",
-                "chr21", "chr22", "chrX", "chrY", "chrM"
+                "chr11", "chr12", "chr13", "chr14", "chr15", "chr16", "chr17", "chr18", "chr19",
+                "chr20", "chr21", "chr22", "chrX", "chrY", "chrM",
             ],
             "GRCh37" | "hg19" => vec![
-                "1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
-                "11", "12", "13", "14", "15", "16", "17", "18", "19", "20",
-                "21", "22", "X", "Y", "MT"
+                "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15",
+                "16", "17", "18", "19", "20", "21", "22", "X", "Y", "MT",
             ],
-            _ => vec![] // Unknown reference genome - no enum constraint
+            _ => vec![], // Unknown reference genome - no enum constraint
         }
     }
 }

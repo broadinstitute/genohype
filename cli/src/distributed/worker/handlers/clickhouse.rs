@@ -86,8 +86,8 @@ pub fn process_clickhouse_export(
     table: &str,
     telemetry: Option<Arc<TelemetryState>>,
 ) -> Result<(usize, Option<(String, QueryEngine)>)> {
-    use genohype_core::export::ClickHouseClient;
     use crossbeam_channel::bounded;
+    use genohype_core::export::ClickHouseClient;
     use rayon::prelude::*;
 
     // Configuration from environment (with defaults)
@@ -136,7 +136,9 @@ pub fn process_clickhouse_export(
         .par_iter()
         .map(|&partition_id| {
             // Track the active partition for this Rayon thread (RAII guard)
-            let _core_guard = telemetry.as_ref().map(|ts| CoreTaskGuard::partition(ts, partition_id));
+            let _core_guard = telemetry
+                .as_ref()
+                .map(|ts| CoreTaskGuard::partition(ts, partition_id));
 
             // Acquire semaphore permit - blocks if too many partitions in flight
             let _permit = semaphore.acquire();
@@ -162,10 +164,13 @@ pub fn process_clickhouse_export(
                                         batch.push(row);
                                         if batch.len() >= chunk_size_clone {
                                             // Send chunk - blocks if channel is full (backpressure)
-                                            if tx.send(Ok(std::mem::replace(
-                                                &mut batch,
-                                                Vec::with_capacity(chunk_size_clone),
-                                            ))).is_err() {
+                                            if tx
+                                                .send(Ok(std::mem::replace(
+                                                    &mut batch,
+                                                    Vec::with_capacity(chunk_size_clone),
+                                                )))
+                                                .is_err()
+                                            {
                                                 // Receiver dropped, stop reading
                                                 break;
                                             }
@@ -335,7 +340,10 @@ fn upload_chunk_to_clickhouse(
                 if attempts >= 3 {
                     return Err(crate::HailError::Io(std::io::Error::new(
                         std::io::ErrorKind::Other,
-                        format!("Failed to upload chunk to ClickHouse after 3 attempts: {}", e)
+                        format!(
+                            "Failed to upload chunk to ClickHouse after 3 attempts: {}",
+                            e
+                        ),
                     )));
                 }
                 std::thread::sleep(std::time::Duration::from_secs(2 * attempts as u64));

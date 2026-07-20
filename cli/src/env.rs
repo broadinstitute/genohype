@@ -99,16 +99,14 @@ pub fn show_env(config: &Config) -> Result<()> {
 
             // Show example output path
             let timestamp = "YYYYMMDD-HHMM";
-            println!(
-                "\n{} {}",
-                "Output dir:".cyan(),
-                env.output_dir(timestamp)
-            );
+            println!("\n{} {}", "Output dir:".cyan(), env.output_dir(timestamp));
         }
         None => {
             println!("{} No .genohype-env found", "Warning:".yellow());
             println!("\nCreate one with:");
-            println!("  genohype env init <name> --storage gs://bucket/prefix --clickhouse <instance>");
+            println!(
+                "  genohype env init <name> --storage gs://bucket/prefix --clickhouse <instance>"
+            );
         }
     }
 
@@ -124,10 +122,7 @@ pub fn verify_env(config: &Config) -> Result<()> {
         ))
     })?;
 
-    println!(
-        "Verifying environment '{}'...\n",
-        env.name.cyan()
-    );
+    println!("Verifying environment '{}'...\n", env.name.cyan());
 
     // 1. Check GCS storage
     print!("  Storage {}... ", env.storage);
@@ -146,9 +141,11 @@ pub fn verify_env(config: &Config) -> Result<()> {
         env.clickhouse.clone()
     } else {
         // Resolve instance name to URL
-        let project = config.defaults.project.as_ref().ok_or_else(|| {
-            genohype_core::HailError::Config("No project in defaults".into())
-        })?;
+        let project = config
+            .defaults
+            .project
+            .as_ref()
+            .ok_or_else(|| genohype_core::HailError::Config("No project in defaults".into()))?;
         let zone = config.defaults.zone.as_deref().unwrap_or("us-central1-a");
 
         let output = Command::new("gcloud")
@@ -210,4 +207,3 @@ pub fn verify_env(config: &Config) -> Result<()> {
 
     Ok(())
 }
-

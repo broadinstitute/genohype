@@ -505,7 +505,10 @@ mod client {
 
         /// Drop the table (and all its partitions) — used by `--recreate`.
         pub fn drop_table(&mut self, table: &str) -> Result<()> {
-            self.execute(&format!("DROP TABLE IF EXISTS {} CASCADE", quote_ident(table)))?;
+            self.execute(&format!(
+                "DROP TABLE IF EXISTS {} CASCADE",
+                quote_ident(table)
+            ))?;
             Ok(())
         }
 
@@ -662,11 +665,7 @@ mod client {
 
     impl<'a> CopyInserter<'a> {
         /// Create an inserter, ensuring the staging table exists.
-        pub fn new(
-            client: &'a mut PostgresClient,
-            table: &str,
-            batch_size: usize,
-        ) -> Result<Self> {
+        pub fn new(client: &'a mut PostgresClient, table: &str, batch_size: usize) -> Result<Self> {
             client.ensure_staging()?;
             Ok(Self {
                 client,
@@ -830,7 +829,10 @@ mod tests {
 
     fn locus(contig: &str, pos: i32) -> EncodedValue {
         EncodedValue::Struct(vec![
-            ("contig".to_string(), EncodedValue::Binary(contig.as_bytes().to_vec())),
+            (
+                "contig".to_string(),
+                EncodedValue::Binary(contig.as_bytes().to_vec()),
+            ),
             ("position".to_string(), EncodedValue::Int32(pos)),
         ])
     }
@@ -838,7 +840,10 @@ mod tests {
     fn variant_row(contig: &str, pos: i32, vid: &str, r: &str, a: &str) -> EncodedValue {
         EncodedValue::Struct(vec![
             ("locus".to_string(), locus(contig, pos)),
-            ("variant_id".to_string(), EncodedValue::Binary(vid.as_bytes().to_vec())),
+            (
+                "variant_id".to_string(),
+                EncodedValue::Binary(vid.as_bytes().to_vec()),
+            ),
             (
                 "alleles".to_string(),
                 EncodedValue::Array(vec![
@@ -940,8 +945,14 @@ mod tests {
 
     fn gene_row(gene_id: &str, symbol: &str) -> EncodedValue {
         EncodedValue::Struct(vec![
-            ("gene_id".to_string(), EncodedValue::Binary(gene_id.as_bytes().to_vec())),
-            ("symbol".to_string(), EncodedValue::Binary(symbol.as_bytes().to_vec())),
+            (
+                "gene_id".to_string(),
+                EncodedValue::Binary(gene_id.as_bytes().to_vec()),
+            ),
+            (
+                "symbol".to_string(),
+                EncodedValue::Binary(symbol.as_bytes().to_vec()),
+            ),
             ("chrom".to_string(), EncodedValue::Binary(b"chr1".to_vec())),
             ("start".to_string(), EncodedValue::Int32(100)),
             ("stop".to_string(), EncodedValue::Int32(200)),

@@ -1,5 +1,5 @@
-use crate::genomic::{LocusTable, VariantAssociation};
 use crate::error::Result;
+use crate::genomic::{LocusTable, VariantAssociation};
 use lru::LruCache;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -26,8 +26,9 @@ impl HailClient {
         }
 
         let path_owned = path.to_string();
-        let table =
-            tokio::task::spawn_blocking(move || LocusTable::open(&path_owned)).await.unwrap()?;
+        let table = tokio::task::spawn_blocking(move || LocusTable::open(&path_owned))
+            .await
+            .unwrap()?;
 
         let table = Arc::new(table);
 
@@ -49,11 +50,15 @@ impl HailClient {
         let table = self.get_or_open(table_path).await?;
         let contig_owned = contig.to_string();
 
-        let rows = tokio::task::spawn_blocking(move || table.query_interval(&contig_owned, start, end))
-            .await
-            .unwrap()?;
+        let rows =
+            tokio::task::spawn_blocking(move || table.query_interval(&contig_owned, start, end))
+                .await
+                .unwrap()?;
 
-        Ok(rows.iter().filter_map(VariantAssociation::from_encoded).collect())
+        Ok(rows
+            .iter()
+            .filter_map(VariantAssociation::from_encoded)
+            .collect())
     }
 
     pub async fn query_variant_typed(
@@ -70,11 +75,19 @@ impl HailClient {
         let alt_owned = alt_allele.map(String::from);
 
         let rows = tokio::task::spawn_blocking(move || {
-            table.query_variant(&contig_owned, position, ref_owned.as_deref(), alt_owned.as_deref())
+            table.query_variant(
+                &contig_owned,
+                position,
+                ref_owned.as_deref(),
+                alt_owned.as_deref(),
+            )
         })
         .await
         .unwrap()?;
 
-        Ok(rows.iter().filter_map(VariantAssociation::from_encoded).collect())
+        Ok(rows
+            .iter()
+            .filter_map(VariantAssociation::from_encoded)
+            .collect())
     }
 }

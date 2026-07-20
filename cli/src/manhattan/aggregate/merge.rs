@@ -10,10 +10,10 @@ use genohype_core::io::is_cloud_path;
 use std::path::Path;
 use std::time::Instant;
 
-use crate::manhattan::data::ManifestTopHit;
 use super::io::{
     list_cloud_parquet_files, list_local_parquet_files, read_parquet_file, write_parquet_batches,
 };
+use crate::manhattan::data::ManifestTopHit;
 
 /// Candidate for top hit found during parallel scan.
 #[derive(Clone)]
@@ -56,7 +56,10 @@ pub(crate) fn merge_significant_hits(
     }
 
     let start = Instant::now();
-    println!("    Reading {} sig.parquet files in parallel...", sig_files.len());
+    println!(
+        "    Reading {} sig.parquet files in parallel...",
+        sig_files.len()
+    );
 
     // Read all parquet files in parallel
     let results: Vec<Result<(Vec<RecordBatch>, Option<TopHitCandidate>)>> = sig_files
@@ -93,7 +96,11 @@ pub(crate) fn merge_significant_hits(
     }
 
     let read_time = start.elapsed();
-    println!("    Read {} batches in {:.1}s", all_batches.len(), read_time.as_secs_f64());
+    println!(
+        "    Read {} batches in {:.1}s",
+        all_batches.len(),
+        read_time.as_secs_f64()
+    );
 
     if all_batches.is_empty() {
         return Ok((0, None));
@@ -109,11 +116,18 @@ pub(crate) fn merge_significant_hits(
     // Write concatenated output (no sorting - files are already partition-sorted)
     let write_start = Instant::now();
     write_parquet_batches(&output_file, &schema, &all_batches)?;
-    println!("    Wrote {} rows in {:.1}s", total_count, write_start.elapsed().as_secs_f64());
+    println!(
+        "    Wrote {} rows in {:.1}s",
+        total_count,
+        write_start.elapsed().as_secs_f64()
+    );
 
     // Convert top candidate to ManifestTopHit
     let top_hit = global_top.map(|c| ManifestTopHit {
-        id: format!("{}:{}:{}:{}", c.contig, c.position, c.ref_allele, c.alt_allele),
+        id: format!(
+            "{}:{}:{}:{}",
+            c.contig, c.position, c.ref_allele, c.alt_allele
+        ),
         pvalue: c.pvalue,
         gene: None,
         consequence: None,
@@ -239,7 +253,10 @@ pub(crate) fn merge_and_combine_hits(
 
     // Convert top candidate to ManifestTopHit
     let top_hit = global_top.map(|c| ManifestTopHit {
-        id: format!("{}:{}:{}:{}", c.contig, c.position, c.ref_allele, c.alt_allele),
+        id: format!(
+            "{}:{}:{}:{}",
+            c.contig, c.position, c.ref_allele, c.alt_allele
+        ),
         pvalue: c.pvalue,
         gene: None,
         consequence: None,
@@ -262,15 +279,33 @@ pub(crate) fn find_top_hit_in_batches(batches: &[RecordBatch]) -> Option<TopHitC
         // Get column indices
         let pvalue_idx = schema.fields().iter().position(|f| f.name() == "pvalue")?;
         let contig_idx = schema.fields().iter().position(|f| f.name() == "contig")?;
-        let position_idx = schema.fields().iter().position(|f| f.name() == "position")?;
+        let position_idx = schema
+            .fields()
+            .iter()
+            .position(|f| f.name() == "position")?;
         let ref_idx = schema.fields().iter().position(|f| f.name() == "ref")?;
         let alt_idx = schema.fields().iter().position(|f| f.name() == "alt")?;
 
-        let pvalue_col = batch.column(pvalue_idx).as_any().downcast_ref::<Float64Array>()?;
-        let contig_col = batch.column(contig_idx).as_any().downcast_ref::<StringArray>()?;
-        let position_col = batch.column(position_idx).as_any().downcast_ref::<arrow::array::Int32Array>()?;
-        let ref_col = batch.column(ref_idx).as_any().downcast_ref::<StringArray>()?;
-        let alt_col = batch.column(alt_idx).as_any().downcast_ref::<StringArray>()?;
+        let pvalue_col = batch
+            .column(pvalue_idx)
+            .as_any()
+            .downcast_ref::<Float64Array>()?;
+        let contig_col = batch
+            .column(contig_idx)
+            .as_any()
+            .downcast_ref::<StringArray>()?;
+        let position_col = batch
+            .column(position_idx)
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()?;
+        let ref_col = batch
+            .column(ref_idx)
+            .as_any()
+            .downcast_ref::<StringArray>()?;
+        let alt_col = batch
+            .column(alt_idx)
+            .as_any()
+            .downcast_ref::<StringArray>()?;
 
         for i in 0..batch.num_rows() {
             if pvalue_col.is_null(i) {

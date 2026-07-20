@@ -20,10 +20,10 @@
 //! When output is a cloud path, each partition is buffered in memory and uploaded
 //! on completion, providing a truly diskless pipeline.
 
-use crate::progress::ProgressUpdate;
 use crate::io::{is_cloud_path, StreamingCloudWriter};
 use crate::parquet::{build_record_batch, ParquetWriter};
 use crate::partitioning::PartitionAllocator;
+use crate::progress::ProgressUpdate;
 use crate::query::QueryEngine;
 use crate::Result;
 use arrow::record_batch::RecordBatch;
@@ -173,52 +173,54 @@ pub fn hail_to_parquet_with_options(
     // Batch size for streaming - accumulate rows before building Arrow batch
     const BATCH_SIZE: usize = 4096;
 
-    let worker_result: Result<()> = (0..num_partitions)
-        .into_par_iter()
-        .try_for_each_with(tx, |sender, i| -> Result<()> {
-            // Stream partition rows instead of loading all into memory
-            let iter = engine_ref.scan_partition_iter(i, &[])?;
+    let worker_result: Result<()> =
+        (0..num_partitions)
+            .into_par_iter()
+            .try_for_each_with(tx, |sender, i| -> Result<()> {
+                // Stream partition rows instead of loading all into memory
+                let iter = engine_ref.scan_partition_iter(i, &[])?;
 
-            // Accumulate rows in batches to avoid OOM
-            let mut batch_rows = Vec::with_capacity(BATCH_SIZE);
+                // Accumulate rows in batches to avoid OOM
+                let mut batch_rows = Vec::with_capacity(BATCH_SIZE);
 
-            for row_result in iter {
-                let row = row_result?;
-                batch_rows.push(row);
+                for row_result in iter {
+                    let row = row_result?;
+                    batch_rows.push(row);
 
-                if batch_rows.len() >= BATCH_SIZE {
-                    // Build and send Arrow batch
+                    if batch_rows.len() >= BATCH_SIZE {
+                        // Build and send Arrow batch
+                        let batch =
+                            build_record_batch(&batch_rows, row_type_ref, schema_ref.clone())?;
+
+                        if sender.send(Ok(batch)).is_err() {
+                            return Err(crate::HailError::Io(std::io::Error::new(
+                                std::io::ErrorKind::BrokenPipe,
+                                "Writer thread disconnected",
+                            )));
+                        }
+
+                        batch_rows.clear();
+                    }
+                }
+
+                // Send remaining rows
+                if !batch_rows.is_empty() {
                     let batch = build_record_batch(&batch_rows, row_type_ref, schema_ref.clone())?;
-
                     if sender.send(Ok(batch)).is_err() {
                         return Err(crate::HailError::Io(std::io::Error::new(
                             std::io::ErrorKind::BrokenPipe,
                             "Writer thread disconnected",
                         )));
                     }
-
-                    batch_rows.clear();
                 }
-            }
 
-            // Send remaining rows
-            if !batch_rows.is_empty() {
-                let batch = build_record_batch(&batch_rows, row_type_ref, schema_ref.clone())?;
-                if sender.send(Ok(batch)).is_err() {
-                    return Err(crate::HailError::Io(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "Writer thread disconnected",
-                    )));
+                // Update progress after partition complete
+                if let Some(ref pb) = pb {
+                    pb.inc(1);
                 }
-            }
 
-            // Update progress after partition complete
-            if let Some(ref pb) = pb {
-                pb.inc(1);
-            }
-
-            Ok(())
-        });
+                Ok(())
+            });
 
     if let Some(pb) = &pb {
         pb.finish_and_clear();
@@ -506,7 +508,11 @@ pub fn hail_to_parquet_sharded_full(
                         batch_rows.push(row);
 
                         if batch_rows.len() >= BATCH_SIZE {
-                            let batch = build_record_batch(&batch_rows, row_type_ref, arrow_schema.clone())?;
+                            let batch = build_record_batch(
+                                &batch_rows,
+                                row_type_ref,
+                                arrow_schema.clone(),
+                            )?;
                             writer.write_batch(&batch)?;
                             shard_rows += batch_rows.len();
 
@@ -545,7 +551,8 @@ pub fn hail_to_parquet_sharded_full(
 
                 // Write remaining rows
                 if !batch_rows.is_empty() {
-                    let batch = build_record_batch(&batch_rows, row_type_ref, arrow_schema.clone())?;
+                    let batch =
+                        build_record_batch(&batch_rows, row_type_ref, arrow_schema.clone())?;
                     writer.write_batch(&batch)?;
                     shard_rows += batch_rows.len();
 

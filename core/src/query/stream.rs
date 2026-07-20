@@ -111,19 +111,20 @@ impl Iterator for PartitionStream {
             // Decode the row (with Level 2 projection if available)
             let row = match self.decode_projection {
                 Some(ref proj) => {
-                    match self.row_type.read_projected_value(&mut *self.buffer, Some(proj)) {
+                    match self
+                        .row_type
+                        .read_projected_value(&mut *self.buffer, Some(proj))
+                    {
                         Ok(r) => r,
                         Err(HailError::UnexpectedEof) => return None,
                         Err(e) => return Some(Err(e)),
                     }
                 }
-                None => {
-                    match self.row_type.read_present_value(&mut *self.buffer) {
-                        Ok(r) => r,
-                        Err(HailError::UnexpectedEof) => return None,
-                        Err(e) => return Some(Err(e)),
-                    }
-                }
+                None => match self.row_type.read_present_value(&mut *self.buffer) {
+                    Ok(r) => r,
+                    Err(HailError::UnexpectedEof) => return None,
+                    Err(e) => return Some(Err(e)),
+                },
             };
 
             // Apply key range filters
@@ -257,9 +258,7 @@ fn extract_field_by_path<'a>(value: &'a EncodedValue, path: &[String]) -> Option
 /// Convert an EncodedValue to a KeyValue for comparison
 fn encoded_to_key_value(value: &EncodedValue) -> Option<KeyValue> {
     match value {
-        EncodedValue::Binary(b) => {
-            Some(KeyValue::String(String::from_utf8_lossy(b).into_owned()))
-        }
+        EncodedValue::Binary(b) => Some(KeyValue::String(String::from_utf8_lossy(b).into_owned())),
         EncodedValue::Int32(i) => Some(KeyValue::Int32(*i)),
         EncodedValue::Int64(i) => Some(KeyValue::Int64(*i)),
         EncodedValue::Float32(f) => Some(KeyValue::Float32(*f)),
@@ -310,17 +309,13 @@ mod tests {
 
     #[test]
     fn test_row_matches_ranges_empty() {
-        let row = EncodedValue::Struct(vec![
-            ("field1".to_string(), EncodedValue::Int32(42)),
-        ]);
+        let row = EncodedValue::Struct(vec![("field1".to_string(), EncodedValue::Int32(42))]);
         assert!(row_matches_ranges(&row, &[]));
     }
 
     #[test]
     fn test_row_matches_ranges_point() {
-        let row = EncodedValue::Struct(vec![
-            ("field1".to_string(), EncodedValue::Int32(42)),
-        ]);
+        let row = EncodedValue::Struct(vec![("field1".to_string(), EncodedValue::Int32(42))]);
 
         let range = KeyRange::point("field1".to_string(), KeyValue::Int32(42));
         assert!(row_matches_ranges(&row, &[range]));
@@ -331,11 +326,13 @@ mod tests {
 
     #[test]
     fn test_row_matches_ranges_nested() {
-        let row = EncodedValue::Struct(vec![
-            ("outer".to_string(), EncodedValue::Struct(vec![
-                ("inner".to_string(), EncodedValue::Binary(b"test".to_vec())),
-            ])),
-        ]);
+        let row = EncodedValue::Struct(vec![(
+            "outer".to_string(),
+            EncodedValue::Struct(vec![(
+                "inner".to_string(),
+                EncodedValue::Binary(b"test".to_vec()),
+            )]),
+        )]);
 
         let range = KeyRange::point_nested(
             vec!["outer".to_string(), "inner".to_string()],
@@ -346,14 +343,23 @@ mod tests {
 
     fn create_locus_row(contig: &str, position: i32) -> EncodedValue {
         EncodedValue::Struct(vec![
-            ("locus".to_string(), EncodedValue::Struct(vec![
-                ("contig".to_string(), EncodedValue::Binary(contig.as_bytes().to_vec())),
-                ("position".to_string(), EncodedValue::Int32(position)),
-            ])),
-            ("alleles".to_string(), EncodedValue::Array(vec![
-                EncodedValue::Binary(b"A".to_vec()),
-                EncodedValue::Binary(b"G".to_vec()),
-            ])),
+            (
+                "locus".to_string(),
+                EncodedValue::Struct(vec![
+                    (
+                        "contig".to_string(),
+                        EncodedValue::Binary(contig.as_bytes().to_vec()),
+                    ),
+                    ("position".to_string(), EncodedValue::Int32(position)),
+                ]),
+            ),
+            (
+                "alleles".to_string(),
+                EncodedValue::Array(vec![
+                    EncodedValue::Binary(b"A".to_vec()),
+                    EncodedValue::Binary(b"G".to_vec()),
+                ]),
+            ),
         ])
     }
 
@@ -409,9 +415,7 @@ mod tests {
         let intervals = IntervalList::from_strings(&["chr1:100-200".to_string()]).unwrap();
 
         // Row without locus field should pass through
-        let row = EncodedValue::Struct(vec![
-            ("field1".to_string(), EncodedValue::Int32(42)),
-        ]);
+        let row = EncodedValue::Struct(vec![("field1".to_string(), EncodedValue::Int32(42))]);
         assert!(row_matches_intervals(&row, &intervals));
     }
 }

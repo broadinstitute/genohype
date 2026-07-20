@@ -54,7 +54,9 @@ pub fn process_parquet_export(
         .par_iter()
         .map(|&partition_id| {
             // Track the active partition for this Rayon thread (RAII guard)
-            let _core_guard = telemetry.as_ref().map(|ts| CoreTaskGuard::partition(ts, partition_id));
+            let _core_guard = telemetry
+                .as_ref()
+                .map(|ts| CoreTaskGuard::partition(ts, partition_id));
 
             // Determine the output file path
             let output_file = if output_is_cloud {
@@ -92,7 +94,11 @@ pub fn process_parquet_export(
                         batch_rows.push(row);
 
                         if batch_rows.len() >= BATCH_SIZE {
-                            let batch = build_record_batch(&batch_rows, row_type_ref, arrow_schema_ref.clone())?;
+                            let batch = build_record_batch(
+                                &batch_rows,
+                                row_type_ref,
+                                arrow_schema_ref.clone(),
+                            )?;
                             writer.write_batch(&batch)?;
                             partition_rows += batch_rows.len();
                             // Update telemetry row count
@@ -105,7 +111,11 @@ pub fn process_parquet_export(
 
                     // Write remaining rows
                     if !batch_rows.is_empty() {
-                        let batch = build_record_batch(&batch_rows, row_type_ref, arrow_schema_ref.clone())?;
+                        let batch = build_record_batch(
+                            &batch_rows,
+                            row_type_ref,
+                            arrow_schema_ref.clone(),
+                        )?;
                         writer.write_batch(&batch)?;
                         partition_rows += batch_rows.len();
                         if let Some(ref t) = ts {
@@ -194,7 +204,9 @@ pub fn process_json_export(
         .par_iter()
         .map(|&partition_id| {
             // Track the active partition for this Rayon thread (RAII guard)
-            let _core_guard = telemetry.as_ref().map(|ts| CoreTaskGuard::partition(ts, partition_id));
+            let _core_guard = telemetry
+                .as_ref()
+                .map(|ts| CoreTaskGuard::partition(ts, partition_id));
 
             let output_file = if output_is_cloud {
                 let base = output_path.trim_end_matches('/');
@@ -277,7 +289,11 @@ pub fn process_summary(
     partitions: &[usize],
     input_path: &str,
     telemetry: Option<Arc<TelemetryState>>,
-) -> Result<(usize, genohype_core::summary::stats::StatsAccumulator, Option<(String, QueryEngine)>)> {
+) -> Result<(
+    usize,
+    genohype_core::summary::stats::StatsAccumulator,
+    Option<(String, QueryEngine)>,
+)> {
     use genohype_core::summary::stats::StatsAccumulator;
     use rayon::prelude::*;
 
@@ -302,7 +318,9 @@ pub fn process_summary(
             || (0usize, StatsAccumulator::new()),
             |(mut rows, mut acc), &partition_id| {
                 // Track the active partition for this Rayon thread (RAII guard)
-                let _core_guard = telemetry.as_ref().map(|ts| CoreTaskGuard::partition(ts, partition_id));
+                let _core_guard = telemetry
+                    .as_ref()
+                    .map(|ts| CoreTaskGuard::partition(ts, partition_id));
 
                 match engine_ref.scan_partition_iter(partition_id, &[]) {
                     Ok(iter) => {
@@ -328,10 +346,7 @@ pub fn process_summary(
                         }
                     }
                     Err(e) => {
-                        eprintln!(
-                            "Warning: Failed to scan partition {}: {}",
-                            partition_id, e
-                        );
+                        eprintln!("Warning: Failed to scan partition {}: {}", partition_id, e);
                     }
                 }
                 (rows, acc)
@@ -345,7 +360,11 @@ pub fn process_summary(
             },
         );
 
-    println!("Summary complete: {} rows processed, {} fields tracked", total_rows, stats.stats.len());
+    println!(
+        "Summary complete: {} rows processed, {} fields tracked",
+        total_rows,
+        stats.stats.len()
+    );
 
     Ok((total_rows, stats, Some((input_path.to_string(), engine))))
 }

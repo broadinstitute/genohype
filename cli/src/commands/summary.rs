@@ -53,11 +53,7 @@ pub fn run_summary(table_path: &str, cache_opts: Option<CacheOptions>) -> Result
         println!("  {}", "(none)".dimmed());
     } else {
         for (i, key) in keys.iter().enumerate() {
-            println!(
-                "  {}. {}",
-                (i + 1).to_string().cyan(),
-                key.bright_white()
-            );
+            println!("  {}. {}", (i + 1).to_string().cyan(), key.bright_white());
         }
     }
     println!();

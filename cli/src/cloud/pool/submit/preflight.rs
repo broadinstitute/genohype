@@ -46,7 +46,9 @@ where
 ///
 /// The checkpoint file is a simple newline-delimited list of relative paths
 /// like "meta/height" or "afr/1234".
-pub fn read_completed_checkpoint(checkpoint_path: &str) -> Result<std::collections::HashSet<String>> {
+pub fn read_completed_checkpoint(
+    checkpoint_path: &str,
+) -> Result<std::collections::HashSet<String>> {
     use object_store::path::Path as ObjPath;
     use object_store::ObjectStore;
 

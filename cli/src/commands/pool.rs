@@ -9,11 +9,7 @@ use genohype_core::Result;
 use owo_colors::OwoColorize;
 
 /// Resolve zone: CLI arg > pool profile > config defaults > fallback
-fn resolve_zone(
-    zone: Option<String>,
-    pool_name: &str,
-    app_config: &config::Config,
-) -> String {
+fn resolve_zone(zone: Option<String>, pool_name: &str, app_config: &config::Config) -> String {
     zone.or_else(|| app_config.get_pool(pool_name).map(|p| p.zone.clone()))
         .or_else(|| app_config.defaults.zone.clone())
         .unwrap_or_else(|| "us-central1-a".to_string())
@@ -238,8 +234,8 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
                             job_config.job.output_dir = Some(new_output_dir.clone());
 
                             // Write modified config to temp file
-                            let temp_path = std::env::temp_dir()
-                                .join(format!("job-config-{}.toml", timestamp));
+                            let temp_path =
+                                std::env::temp_dir().join(format!("job-config-{}.toml", timestamp));
                             let content = toml::to_string_pretty(&job_config)
                                 .map_err(|e| genohype_core::HailError::Config(e.to_string()))?;
                             std::fs::write(&temp_path, content)?;
@@ -266,8 +262,9 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
             let resolved_zone = resolve_zone(zone, &name, app_config);
 
             // Convert ResolvedPoolConfig to ScalingConfig if available
-            let scaling_config = app_config.get_pool(&name).map(|p| {
-                crate::cloud::ScalingConfig {
+            let scaling_config = app_config
+                .get_pool(&name)
+                .map(|p| crate::cloud::ScalingConfig {
                     machine_type: p.machine_type.clone(),
                     workers: p.workers,
                     spot: p.spot,
@@ -278,11 +275,13 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
                     pool_db_path: p.pool_db_path.clone(),
                     worker_binary: p.worker_binary.clone(),
                     service_account: p.service_account.clone(),
-                }
-            });
+                });
             // Resolve worker binary: CLI flag > config profile
-            let resolved_worker_binary = worker_binary
-                .or_else(|| scaling_config.as_ref().and_then(|c| c.worker_binary.clone()));
+            let resolved_worker_binary = worker_binary.or_else(|| {
+                scaling_config
+                    .as_ref()
+                    .and_then(|c| c.worker_binary.clone())
+            });
 
             manager.submit(
                 &name,
@@ -333,9 +332,16 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
 
             let resolved_zone = resolve_zone(zone, &name, app_config);
             // Resolve worker binary: CLI flag > config profile
-            let resolved_worker_binary = worker_binary
-                .or(scaling_config.worker_binary.clone());
-            manager.scale(&name, workers, &resolved_zone, binary, resolved_worker_binary, skip_build, &scaling_config)?;
+            let resolved_worker_binary = worker_binary.or(scaling_config.worker_binary.clone());
+            manager.scale(
+                &name,
+                workers,
+                &resolved_zone,
+                binary,
+                resolved_worker_binary,
+                skip_build,
+                &scaling_config,
+            )?;
         }
         PoolCommands::Destroy {
             name,
@@ -368,8 +374,11 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
             let resolved_worker_binary = worker_binary
                 .or_else(|| pool_config.as_ref().and_then(|p| p.worker_binary.clone()));
             // CLI flag overrides config, config defaults to false
-            let use_api =
-                via_api || pool_config.as_ref().map(|p| p.update_via_api).unwrap_or(false);
+            let use_api = via_api
+                || pool_config
+                    .as_ref()
+                    .map(|p| p.update_via_api)
+                    .unwrap_or(false);
             // CLI port overrides config port
             let api_port = if via_api {
                 port // CLI explicitly set, use CLI port
@@ -388,7 +397,14 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
                     api_port,
                 )?;
             } else {
-                manager.update_binary(&name, &resolved_zone, binary, resolved_worker_binary, skip_build, pool_db_path.as_deref())?;
+                manager.update_binary(
+                    &name,
+                    &resolved_zone,
+                    binary,
+                    resolved_worker_binary,
+                    skip_build,
+                    pool_db_path.as_deref(),
+                )?;
             }
         }
         PoolCommands::Cancel { name, zone } => {

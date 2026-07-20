@@ -55,7 +55,12 @@ pub fn run_export_genes_elasticsearch(args: ExportGenesElasticsearchArgs) -> Res
     };
 
     // The genes index uses `gene_id` as the document `_id` (stable → idempotent).
-    let mut inserter = BulkInserter::new(&client, &args.index, Some("gene_id".to_string()), args.batch_size);
+    let mut inserter = BulkInserter::new(
+        &client,
+        &args.index,
+        Some("gene_id".to_string()),
+        args.batch_size,
+    );
     let mut skipped = 0usize;
     let mut filtered_out = 0usize;
 

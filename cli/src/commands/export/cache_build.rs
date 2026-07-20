@@ -11,10 +11,7 @@ use genohype_core::Result;
 use owo_colors::OwoColorize;
 
 pub fn run_export_cache_build(args: ExportCacheBuildArgs) -> Result<()> {
-    println!(
-        "{}",
-        "Building materialized gene-view cache".green().bold()
-    );
+    println!("{}", "Building materialized gene-view cache".green().bold());
     println!("  {} {}", "Genes:".cyan(), args.genes.bright_white());
     println!("  {} {}", "Variants:".cyan(), args.variants.bright_white());
     println!("  {} {}", "Output:".cyan(), args.output.bright_white());

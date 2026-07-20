@@ -1,10 +1,10 @@
 //! Index metadata structures
 
+use crate::Result;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
-use crate::Result;
 
 /// Index metadata from metadata.json.gz in index directory
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,8 +56,7 @@ impl IndexMetadata {
         file.read_to_end(&mut data)?;
 
         // Try gzipped first, fall back to plain JSON
-        Self::from_gzipped_json(&data)
-            .or_else(|_| Self::from_json(&data))
+        Self::from_gzipped_json(&data).or_else(|_| Self::from_json(&data))
     }
 
     /// Load index metadata from a path string (local or cloud URL)
@@ -73,8 +72,7 @@ impl IndexMetadata {
         reader.read_to_end(&mut data)?;
 
         // Try gzipped first, fall back to plain JSON
-        Self::from_gzipped_json(&data)
-            .or_else(|_| Self::from_json(&data))
+        Self::from_gzipped_json(&data).or_else(|_| Self::from_json(&data))
     }
 }
 

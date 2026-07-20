@@ -3,11 +3,11 @@
 //! This writer produces Parquet files that match the ClickHouse `gene_associations`
 //! table schema for efficient ingestion into the data store.
 
-use genohype_core::error::Result;
 use crate::manhattan::data::GeneAssociationRow;
 use arrow::array::{ArrayRef, Float64Builder, Int32Builder, Int64Builder, StringBuilder};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use genohype_core::error::Result;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use std::fs::File;

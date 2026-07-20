@@ -43,7 +43,10 @@ pub fn create_instance(
         name.cyan()
     );
     println!("  Machine type: {}", resolved.machine_type);
-    println!("  Disk: {} GB ({})", resolved.disk_size_gb, resolved.disk_type);
+    println!(
+        "  Disk: {} GB ({})",
+        resolved.disk_size_gb, resolved.disk_type
+    );
     println!("  Zone: {}", resolved.zone);
     if resolved.spot {
         println!("  Spot: {}", "yes".yellow());
@@ -125,9 +128,7 @@ echo "ClickHouse installation complete"
     args.push(format!("startup-script={}", startup_script));
 
     // Run gcloud
-    let status = Command::new("gcloud")
-        .args(&args)
-        .status()?;
+    let status = Command::new("gcloud").args(&args).status()?;
 
     if !status.success() {
         return Err(genohype_core::HailError::Io(std::io::Error::new(
@@ -240,7 +241,16 @@ pub fn show_instance(config: &Config, name: &str) -> Result<()> {
         std::io::Write::flush(&mut std::io::stdout()).ok();
 
         let check = Command::new("curl")
-            .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", "--connect-timeout", "2", &format!("http://{}:8123", ip)])
+            .args([
+                "-s",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "--connect-timeout",
+                "2",
+                &format!("http://{}:8123", ip),
+            ])
             .output();
 
         match check {
@@ -468,4 +478,3 @@ fn get_internal_ip(project: &str, name: &str, zone: &str) -> Result<String> {
         )))
     }
 }
-

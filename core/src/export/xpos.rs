@@ -172,7 +172,10 @@ mod tests {
 
     fn locus(contig: &str, pos: i32) -> EncodedValue {
         EncodedValue::Struct(vec![
-            ("contig".to_string(), EncodedValue::Binary(contig.as_bytes().to_vec())),
+            (
+                "contig".to_string(),
+                EncodedValue::Binary(contig.as_bytes().to_vec()),
+            ),
             ("position".to_string(), EncodedValue::Int32(pos)),
         ])
     }
@@ -181,7 +184,10 @@ mod tests {
     fn test_compute_xpos_for_row_from_locus() {
         let row = EncodedValue::Struct(vec![
             ("locus".to_string(), locus("chr22", 16050075)),
-            ("variant_id".to_string(), EncodedValue::Binary(b"22-16050075-A-G".to_vec())),
+            (
+                "variant_id".to_string(),
+                EncodedValue::Binary(b"22-16050075-A-G".to_vec()),
+            ),
         ]);
         assert_eq!(compute_xpos_for_row(&row), Some(22_000_000_000 + 16050075));
     }
@@ -198,10 +204,7 @@ mod tests {
 
     #[test]
     fn test_compute_xpos_for_row_none_when_no_coords() {
-        let row = EncodedValue::Struct(vec![(
-            "rsids".to_string(),
-            EncodedValue::Array(vec![]),
-        )]);
+        let row = EncodedValue::Struct(vec![("rsids".to_string(), EncodedValue::Array(vec![]))]);
         assert_eq!(compute_xpos_for_row(&row), None);
     }
 }

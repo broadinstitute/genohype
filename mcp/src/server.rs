@@ -1,17 +1,12 @@
 use std::sync::Arc;
 
 use rmcp::{
-    ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{ServerCapabilities, ServerInfo},
-    tool, tool_handler, tool_router,
+    tool, tool_handler, tool_router, ServerHandler,
 };
 
-use crate::tools::{
-    gene::*,
-    region::*,
-    variant::*,
-};
+use crate::tools::{gene::*, region::*, variant::*};
 use crate::traits::GenomicDataProvider;
 
 /// MCP server exposing generic genomic data tools.
@@ -62,52 +57,76 @@ impl std::fmt::Debug for GenomicToolServer {
 impl GenomicToolServer {
     // -- Variant tools --
 
-    #[tool(description = "Get detailed information about a specific genetic variant including allele frequencies across populations, transcript consequences, in silico predictor scores, and quality flags. Use variant IDs in the format 'chrom-pos-ref-alt' (e.g., '1-55039447-G-A').")]
+    #[tool(
+        description = "Get detailed information about a specific genetic variant including allele frequencies across populations, transcript consequences, in silico predictor scores, and quality flags. Use variant IDs in the format 'chrom-pos-ref-alt' (e.g., '1-55039447-G-A')."
+    )]
     async fn get_variant_details(
         &self,
         Parameters(params): Parameters<GetVariantDetailsParams>,
     ) -> String {
         let dataset = params.dataset.as_deref().unwrap_or("gnomad_r4");
-        match self.provider.get_variant_details(&params.variant_id, dataset).await {
+        match self
+            .provider
+            .get_variant_details(&params.variant_id, dataset)
+            .await
+        {
             Ok(Some(details)) => serde_json::to_string_pretty(&details).unwrap_or_default(),
             Ok(None) => format!("Variant {} not found", params.variant_id),
             Err(e) => format!("Error: {e}"),
         }
     }
 
-    #[tool(description = "Get a concise summary of a variant including its consequence, gene, and allele frequency. Lighter than get_variant_details.")]
+    #[tool(
+        description = "Get a concise summary of a variant including its consequence, gene, and allele frequency. Lighter than get_variant_details."
+    )]
     async fn get_variant_summary(
         &self,
         Parameters(params): Parameters<GetVariantSummaryParams>,
     ) -> String {
         let dataset = params.dataset.as_deref().unwrap_or("gnomad_r4");
-        match self.provider.get_variant_summary(&params.variant_id, dataset).await {
+        match self
+            .provider
+            .get_variant_summary(&params.variant_id, dataset)
+            .await
+        {
             Ok(Some(summary)) => serde_json::to_string_pretty(&summary).unwrap_or_default(),
             Ok(None) => format!("Variant {} not found", params.variant_id),
             Err(e) => format!("Error: {e}"),
         }
     }
 
-    #[tool(description = "Get allele frequencies for a variant across all ancestry populations. Returns per-population allele count, allele number, frequency, and homozygote/hemizygote counts.")]
+    #[tool(
+        description = "Get allele frequencies for a variant across all ancestry populations. Returns per-population allele count, allele number, frequency, and homozygote/hemizygote counts."
+    )]
     async fn get_variant_frequencies(
         &self,
         Parameters(params): Parameters<GetVariantFrequenciesParams>,
     ) -> String {
         let dataset = params.dataset.as_deref().unwrap_or("gnomad_r4");
-        match self.provider.get_variant_frequencies(&params.variant_id, dataset).await {
+        match self
+            .provider
+            .get_variant_frequencies(&params.variant_id, dataset)
+            .await
+        {
             Ok(Some(freqs)) => serde_json::to_string_pretty(&freqs).unwrap_or_default(),
             Ok(None) => format!("Variant {} not found", params.variant_id),
             Err(e) => format!("Error: {e}"),
         }
     }
 
-    #[tool(description = "Get detailed information for multiple variants in a single request. More efficient than calling get_variant_details repeatedly.")]
+    #[tool(
+        description = "Get detailed information for multiple variants in a single request. More efficient than calling get_variant_details repeatedly."
+    )]
     async fn get_multiple_variant_details(
         &self,
         Parameters(params): Parameters<GetMultipleVariantDetailsParams>,
     ) -> String {
         let dataset = params.dataset.as_deref().unwrap_or("gnomad_r4");
-        match self.provider.get_multiple_variant_details(&params.variant_ids, dataset).await {
+        match self
+            .provider
+            .get_multiple_variant_details(&params.variant_ids, dataset)
+            .await
+        {
             Ok(details) => serde_json::to_string_pretty(&details).unwrap_or_default(),
             Err(e) => format!("Error: {e}"),
         }
@@ -115,7 +134,9 @@ impl GenomicToolServer {
 
     // -- Gene tools --
 
-    #[tool(description = "Get summary information for a gene including its genomic coordinates, canonical transcript, and constraint metrics (pLI, LOEUF, missense Z). Accepts Ensembl gene IDs (ENSG...) or gene symbols (e.g., BRCA1).")]
+    #[tool(
+        description = "Get summary information for a gene including its genomic coordinates, canonical transcript, and constraint metrics (pLI, LOEUF, missense Z). Accepts Ensembl gene IDs (ENSG...) or gene symbols (e.g., BRCA1)."
+    )]
     async fn get_gene_summary(
         &self,
         Parameters(params): Parameters<GetGeneSummaryParams>,
@@ -127,19 +148,27 @@ impl GenomicToolServer {
         }
     }
 
-    #[tool(description = "Get variants found within a gene. Optionally filter by consequence type (e.g., 'missense_variant', 'stop_gained', 'pLoF'). Returns variant summaries with consequence, frequency, and gene annotation.")]
+    #[tool(
+        description = "Get variants found within a gene. Optionally filter by consequence type (e.g., 'missense_variant', 'stop_gained', 'pLoF'). Returns variant summaries with consequence, frequency, and gene annotation."
+    )]
     async fn get_gene_variants(
         &self,
         Parameters(params): Parameters<GetGeneVariantsParams>,
     ) -> String {
         let dataset = params.dataset.as_deref().unwrap_or("gnomad_r4");
-        match self.provider.get_gene_variants(&params.gene_id, dataset, params.consequence.as_deref()).await {
+        match self
+            .provider
+            .get_gene_variants(&params.gene_id, dataset, params.consequence.as_deref())
+            .await
+        {
             Ok(variants) => serde_json::to_string_pretty(&variants).unwrap_or_default(),
             Err(e) => format!("Error: {e}"),
         }
     }
 
-    #[tool(description = "Get tissue-level gene expression data (TPM values from GTEx). Useful for understanding where a gene is expressed and interpreting the clinical relevance of variants.")]
+    #[tool(
+        description = "Get tissue-level gene expression data (TPM values from GTEx). Useful for understanding where a gene is expressed and interpreting the clinical relevance of variants."
+    )]
     async fn get_gene_expression_summary(
         &self,
         Parameters(params): Parameters<GetGeneExpressionParams>,
@@ -151,7 +180,9 @@ impl GenomicToolServer {
         }
     }
 
-    #[tool(description = "List all transcripts for a gene with their biotype, canonical status, MANE Select status, and RefSeq ID.")]
+    #[tool(
+        description = "List all transcripts for a gene with their biotype, canonical status, MANE Select status, and RefSeq ID."
+    )]
     async fn list_gene_transcripts(
         &self,
         Parameters(params): Parameters<ListGeneTranscriptsParams>,
@@ -162,12 +193,18 @@ impl GenomicToolServer {
         }
     }
 
-    #[tool(description = "Get full details for a specific transcript including exon coordinates, biotype, and identifiers.")]
+    #[tool(
+        description = "Get full details for a specific transcript including exon coordinates, biotype, and identifiers."
+    )]
     async fn get_transcript_details(
         &self,
         Parameters(params): Parameters<GetTranscriptDetailsParams>,
     ) -> String {
-        match self.provider.get_transcript_details(&params.transcript_id).await {
+        match self
+            .provider
+            .get_transcript_details(&params.transcript_id)
+            .await
+        {
             Ok(Some(details)) => serde_json::to_string_pretty(&details).unwrap_or_default(),
             Ok(None) => format!("Transcript {} not found", params.transcript_id),
             Err(e) => format!("Error: {e}"),
@@ -176,13 +213,19 @@ impl GenomicToolServer {
 
     // -- Region tools --
 
-    #[tool(description = "Get variants in a genomic region defined by chromosome and start/end coordinates. Returns variant summaries with consequence, frequency, and gene annotation. Coordinates are 1-based, inclusive.")]
+    #[tool(
+        description = "Get variants in a genomic region defined by chromosome and start/end coordinates. Returns variant summaries with consequence, frequency, and gene annotation. Coordinates are 1-based, inclusive."
+    )]
     async fn get_region_variants(
         &self,
         Parameters(params): Parameters<GetRegionVariantsParams>,
     ) -> String {
         let dataset = params.dataset.as_deref().unwrap_or("gnomad_r4");
-        match self.provider.get_region_variants(&params.chrom, params.start, params.end, dataset).await {
+        match self
+            .provider
+            .get_region_variants(&params.chrom, params.start, params.end, dataset)
+            .await
+        {
             Ok(variants) => serde_json::to_string_pretty(&variants).unwrap_or_default(),
             Err(e) => format!("Error: {e}"),
         }
@@ -196,10 +239,9 @@ impl GenomicToolServer {
 #[tool_handler]
 impl ServerHandler for GenomicToolServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions(
-                "Genomic data MCP server providing tools for querying variants, \
-                 genes, and genomic regions across population databases."
-            )
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+            "Genomic data MCP server providing tools for querying variants, \
+                 genes, and genomic regions across population databases.",
+        )
     }
 }

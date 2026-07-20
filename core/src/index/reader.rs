@@ -1,7 +1,7 @@
 //! Index reader for B-tree index files
 
 use crate::buffer::{InputBuffer, LEB128Buffer};
-use crate::codec::{EncodedType, ETypeParser};
+use crate::codec::{ETypeParser, EncodedType};
 use crate::index::{IndexMetadata, IndexNode, InternalNode, LeafNode};
 use crate::io::join_path;
 use crate::metadata::{CacheOptions, IndexSpec, MetadataCache};
@@ -59,12 +59,8 @@ impl IndexReader {
         let internal_type = ETypeParser::parse(&spec.internal_node_codec.e_type)?;
 
         // Load all nodes from the index file into cache
-        let node_cache = Self::load_all_nodes_from_path(
-            index_dir,
-            &metadata,
-            &leaf_type,
-            &internal_type,
-        )?;
+        let node_cache =
+            Self::load_all_nodes_from_path(index_dir, &metadata, &leaf_type, &internal_type)?;
 
         Ok(IndexReader {
             _index_dir: index_dir.to_string(),
@@ -93,17 +89,13 @@ impl IndexReader {
             Some(c) if opts.enabled => {
                 // Cache the metadata.json.gz file locally
                 let metadata_url = join_path(index_dir, "metadata.json.gz");
-                let metadata_local = c.get_or_fetch_file(
-                    index_dir,
-                    "metadata.json.gz",
-                    opts,
-                    || {
+                let metadata_local =
+                    c.get_or_fetch_file(index_dir, "metadata.json.gz", opts, || {
                         let mut reader = crate::io::get_reader(&metadata_url)?;
                         let mut data = Vec::new();
                         reader.read_to_end(&mut data)?;
                         Ok(data)
-                    },
-                )?;
+                    })?;
 
                 let metadata_local_str = metadata_local.to_string_lossy().to_string();
                 let metadata = crate::index::IndexMetadata::from_path(&metadata_local_str)?;
@@ -113,17 +105,13 @@ impl IndexReader {
 
                 // Cache the index data file locally
                 let index_url = join_path(index_dir, &metadata.index_path);
-                let index_local = c.get_or_fetch_file(
-                    index_dir,
-                    &metadata.index_path,
-                    opts,
-                    || {
+                let index_local =
+                    c.get_or_fetch_file(index_dir, &metadata.index_path, opts, || {
                         let mut reader = crate::io::get_reader(&index_url)?;
                         let mut data = Vec::new();
                         reader.read_to_end(&mut data)?;
                         Ok(data)
-                    },
-                )?;
+                    })?;
 
                 // Load nodes from the cached local file (will use MmapReader)
                 let index_local_str = index_local.to_string_lossy().to_string();
@@ -199,7 +187,6 @@ impl IndexReader {
         leaf_type: &EncodedType,
         internal_type: &EncodedType,
     ) -> Result<HashMap<u64, IndexNode>> {
-
         // Map physical file offset -> offset in decompressed_data
         let mut block_map: HashMap<u64, usize> = HashMap::new();
         let mut decompressed_data: Vec<u8> = Vec::new();
@@ -226,16 +213,12 @@ impl IndexReader {
                 return Err(HailError::InvalidFormat("Block too small".to_string()));
             }
 
-            let expected_len = i32::from_le_bytes([
-                compressed[0],
-                compressed[1],
-                compressed[2],
-                compressed[3],
-            ]) as usize;
+            let expected_len =
+                i32::from_le_bytes([compressed[0], compressed[1], compressed[2], compressed[3]])
+                    as usize;
 
             let zstd_data = &compressed[4..];
-            let decompressed_block =
-                zstd::decode_all(zstd_data).map_err(|_| HailError::Zstd)?;
+            let decompressed_block = zstd::decode_all(zstd_data).map_err(|_| HailError::Zstd)?;
 
             if decompressed_block.len() != expected_len {
                 return Err(HailError::InvalidFormat(format!(
@@ -373,8 +356,13 @@ impl IndexReader {
     /// Returns `None` if all entries in the leaf are strictly less than `search_key`,
     /// meaning the interval starts after all indexed data in this partition path.
     pub fn seek_lower_bound(&self, key: &crate::codec::EncodedValue) -> Result<Option<i64>> {
-        let result = self.lower_bound_seek(key, self.metadata.height - 1, self.metadata.root_offset);
-        tracing::debug!("seek_lower_bound: height={}, result={:?}", self.metadata.height, result);
+        let result =
+            self.lower_bound_seek(key, self.metadata.height - 1, self.metadata.root_offset);
+        tracing::debug!(
+            "seek_lower_bound: height={}, result={:?}",
+            self.metadata.height,
+            result
+        );
         result
     }
 
@@ -383,7 +371,12 @@ impl IndexReader {
     /// Internal nodes use the same traversal as `lower_bound` (find last child
     /// where `first_key <= search_key`). Leaf nodes find the first entry where
     /// `search_key <= entry.key` instead of requiring exact match.
-    fn lower_bound_seek(&self, key: &crate::codec::EncodedValue, level: u32, offset: u64) -> Result<Option<i64>> {
+    fn lower_bound_seek(
+        &self,
+        key: &crate::codec::EncodedValue,
+        level: u32,
+        offset: u64,
+    ) -> Result<Option<i64>> {
         let node = self.read_node(offset)?;
 
         if level == 0 {
@@ -437,7 +430,12 @@ impl IndexReader {
     /// Binary search for a key in the B-tree (recursive)
     ///
     /// This implements the lower_bound algorithm from Hail's IndexReader.scala
-    fn lower_bound(&self, key: &crate::codec::EncodedValue, level: u32, offset: u64) -> Result<Option<i64>> {
+    fn lower_bound(
+        &self,
+        key: &crate::codec::EncodedValue,
+        level: u32,
+        offset: u64,
+    ) -> Result<Option<i64>> {
         let node = self.read_node(offset)?;
 
         if level == 0 {
@@ -484,12 +482,18 @@ impl IndexReader {
 
     /// Compare two keys for equality
     fn keys_equal(a: &crate::codec::EncodedValue, b: &crate::codec::EncodedValue) -> bool {
-        matches!(Self::compare_encoded_values(a, b), Some(std::cmp::Ordering::Equal))
+        matches!(
+            Self::compare_encoded_values(a, b),
+            Some(std::cmp::Ordering::Equal)
+        )
     }
 
     /// Check if key a <= key b
     fn key_less_or_equal(a: &crate::codec::EncodedValue, b: &crate::codec::EncodedValue) -> bool {
-        matches!(Self::compare_encoded_values(a, b), Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal))
+        matches!(
+            Self::compare_encoded_values(a, b),
+            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+        )
     }
 
     /// Recursively compare two EncodedValues with genomic-aware ordering.
@@ -547,17 +551,18 @@ impl IndexReader {
 fn contig_sort_index(name: &str) -> Option<usize> {
     // GRCh38 ordering (chr-prefixed)
     const GRCH38: &[&str] = &[
-        "chr1", "chr2", "chr3", "chr4", "chr5", "chr6", "chr7", "chr8", "chr9", "chr10",
-        "chr11", "chr12", "chr13", "chr14", "chr15", "chr16", "chr17", "chr18", "chr19", "chr20",
-        "chr21", "chr22", "chrX", "chrY", "chrM",
+        "chr1", "chr2", "chr3", "chr4", "chr5", "chr6", "chr7", "chr8", "chr9", "chr10", "chr11",
+        "chr12", "chr13", "chr14", "chr15", "chr16", "chr17", "chr18", "chr19", "chr20", "chr21",
+        "chr22", "chrX", "chrY", "chrM",
     ];
     // GRCh37 ordering (no prefix)
     const GRCH37: &[&str] = &[
-        "1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
-        "11", "12", "13", "14", "15", "16", "17", "18", "19", "20",
-        "21", "22", "X", "Y", "MT",
+        "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16",
+        "17", "18", "19", "20", "21", "22", "X", "Y", "MT",
     ];
-    GRCH38.iter().position(|&c| c == name)
+    GRCH38
+        .iter()
+        .position(|&c| c == name)
         .or_else(|| GRCH37.iter().position(|&c| c == name))
 }
 
@@ -601,21 +606,34 @@ mod tests {
     #[test]
     fn test_compare_encoded_values_struct_prefix() {
         // A shorter struct (prefix key) should be Less than a longer one when overlapping fields match
-        let seek_key = EncodedValue::Struct(vec![
-            ("locus".to_string(), EncodedValue::Struct(vec![
-                ("contig".to_string(), EncodedValue::Binary(b"chr17".to_vec())),
+        let seek_key = EncodedValue::Struct(vec![(
+            "locus".to_string(),
+            EncodedValue::Struct(vec![
+                (
+                    "contig".to_string(),
+                    EncodedValue::Binary(b"chr17".to_vec()),
+                ),
                 ("position".to_string(), EncodedValue::Int32(43044295)),
-            ])),
-        ]);
+            ]),
+        )]);
         let index_key = EncodedValue::Struct(vec![
-            ("locus".to_string(), EncodedValue::Struct(vec![
-                ("contig".to_string(), EncodedValue::Binary(b"chr17".to_vec())),
-                ("position".to_string(), EncodedValue::Int32(43044295)),
-            ])),
-            ("alleles".to_string(), EncodedValue::Array(vec![
-                EncodedValue::Binary(b"A".to_vec()),
-                EncodedValue::Binary(b"G".to_vec()),
-            ])),
+            (
+                "locus".to_string(),
+                EncodedValue::Struct(vec![
+                    (
+                        "contig".to_string(),
+                        EncodedValue::Binary(b"chr17".to_vec()),
+                    ),
+                    ("position".to_string(), EncodedValue::Int32(43044295)),
+                ]),
+            ),
+            (
+                "alleles".to_string(),
+                EncodedValue::Array(vec![
+                    EncodedValue::Binary(b"A".to_vec()),
+                    EncodedValue::Binary(b"G".to_vec()),
+                ]),
+            ),
         ]);
         // Seek key (1 field) < index key (2 fields) when locus matches
         assert_eq!(
@@ -628,18 +646,23 @@ mod tests {
     #[test]
     fn test_compare_encoded_values_nested_struct() {
         // Struct comparison recurses into nested structs
-        let a = EncodedValue::Struct(vec![
-            ("locus".to_string(), EncodedValue::Struct(vec![
+        let a = EncodedValue::Struct(vec![(
+            "locus".to_string(),
+            EncodedValue::Struct(vec![
                 ("contig".to_string(), EncodedValue::Binary(b"chr2".to_vec())),
                 ("position".to_string(), EncodedValue::Int32(100)),
-            ])),
-        ]);
-        let b = EncodedValue::Struct(vec![
-            ("locus".to_string(), EncodedValue::Struct(vec![
-                ("contig".to_string(), EncodedValue::Binary(b"chr17".to_vec())),
+            ]),
+        )]);
+        let b = EncodedValue::Struct(vec![(
+            "locus".to_string(),
+            EncodedValue::Struct(vec![
+                (
+                    "contig".to_string(),
+                    EncodedValue::Binary(b"chr17".to_vec()),
+                ),
                 ("position".to_string(), EncodedValue::Int32(100)),
-            ])),
-        ]);
+            ]),
+        )]);
         // chr2 < chr17 in genomic ordering
         assert!(IndexReader::key_less_or_equal(&a, &b));
         assert!(!IndexReader::key_less_or_equal(&b, &a));
@@ -650,7 +673,10 @@ mod tests {
         use crate::metadata::IndexSpec;
         let idx_dir = "/tmp/gnomad-idx-4765";
         if !std::path::Path::new(idx_dir).exists() {
-            eprintln!("Skipping test: {} not found (download with gsutil)", idx_dir);
+            eprintln!(
+                "Skipping test: {} not found (download with gsutil)",
+                idx_dir
+            );
             return;
         }
 
@@ -678,10 +704,15 @@ mod tests {
 
         let reader = IndexReader::new(idx_dir, &spec).expect("Failed to load index");
         let meta = reader.metadata();
-        eprintln!("Index: height={}, n_keys={}, branching_factor={}", meta.height, meta.n_keys, meta.branching_factor);
+        eprintln!(
+            "Index: height={}, n_keys={}, branching_factor={}",
+            meta.height, meta.n_keys, meta.branching_factor
+        );
 
         // Inspect root node
-        let root = reader.read_node(meta.root_offset).expect("Failed to read root");
+        let root = reader
+            .read_node(meta.root_offset)
+            .expect("Failed to read root");
         match root {
             IndexNode::Internal(internal) => {
                 eprintln!("Root is internal with {} children", internal.children.len());
@@ -691,17 +722,32 @@ mod tests {
                         if let Some((_, EncodedValue::Struct(locus_fields))) = fields.first() {
                             if let Some((_, EncodedValue::Binary(b))) = locus_fields.first() {
                                 String::from_utf8_lossy(b).to_string()
-                            } else { "?".to_string() }
-                        } else { "?".to_string() }
-                    } else { "?".to_string() };
+                            } else {
+                                "?".to_string()
+                            }
+                        } else {
+                            "?".to_string()
+                        }
+                    } else {
+                        "?".to_string()
+                    };
                     let pos = if let EncodedValue::Struct(fields) = &child.first_key {
                         if let Some((_, EncodedValue::Struct(locus_fields))) = fields.first() {
                             if let Some((_, EncodedValue::Int32(p))) = locus_fields.get(1) {
                                 *p
-                            } else { 0 }
-                        } else { 0 }
-                    } else { 0 };
-                    eprintln!("  child[{}]: {}:{}, first_record_offset={}", i, contig, pos, child.first_record_offset);
+                            } else {
+                                0
+                            }
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    };
+                    eprintln!(
+                        "  child[{}]: {}:{}, first_record_offset={}",
+                        i, contig, pos, child.first_record_offset
+                    );
                 }
             }
             IndexNode::Leaf(leaf) => {
@@ -713,38 +759,61 @@ mod tests {
         }
 
         // Test seek for chr17:43044295
-        let seek_key = EncodedValue::Struct(vec![
-            ("locus".to_string(), EncodedValue::Struct(vec![
-                ("contig".to_string(), EncodedValue::Binary(b"chr17".to_vec())),
+        let seek_key = EncodedValue::Struct(vec![(
+            "locus".to_string(),
+            EncodedValue::Struct(vec![
+                (
+                    "contig".to_string(),
+                    EncodedValue::Binary(b"chr17".to_vec()),
+                ),
                 ("position".to_string(), EncodedValue::Int32(43044295)),
-            ])),
-        ]);
+            ]),
+        )]);
 
-        let result = reader.seek_lower_bound(&seek_key).expect("seek_lower_bound failed");
+        let result = reader
+            .seek_lower_bound(&seek_key)
+            .expect("seek_lower_bound failed");
         eprintln!("seek_lower_bound(chr17:43044295) = {:?}", result);
 
         // Test with chr10 key (which IS in this partition)
-        let seek_chr10 = EncodedValue::Struct(vec![
-            ("locus".to_string(), EncodedValue::Struct(vec![
-                ("contig".to_string(), EncodedValue::Binary(b"chr10".to_vec())),
+        let seek_chr10 = EncodedValue::Struct(vec![(
+            "locus".to_string(),
+            EncodedValue::Struct(vec![
+                (
+                    "contig".to_string(),
+                    EncodedValue::Binary(b"chr10".to_vec()),
+                ),
                 ("position".to_string(), EncodedValue::Int32(80000)),
-            ])),
-        ]);
+            ]),
+        )]);
         let result_chr10 = reader.seek_lower_bound(&seek_chr10).expect("seek failed");
         eprintln!("seek_lower_bound(chr10:80000) = {:?}", result_chr10);
-        assert!(result_chr10.is_some(), "chr10:80000 should be found in this partition (has chr10 data)");
+        assert!(
+            result_chr10.is_some(),
+            "chr10:80000 should be found in this partition (has chr10 data)"
+        );
         let offset = result_chr10.unwrap();
-        eprintln!("chr10:80000 offset = {} (non-zero: {})", offset, offset != 0);
+        eprintln!(
+            "chr10:80000 offset = {} (non-zero: {})",
+            offset,
+            offset != 0
+        );
 
         // Test with chr9 at the very start
-        let seek_chr9_start = EncodedValue::Struct(vec![
-            ("locus".to_string(), EncodedValue::Struct(vec![
+        let seek_chr9_start = EncodedValue::Struct(vec![(
+            "locus".to_string(),
+            EncodedValue::Struct(vec![
                 ("contig".to_string(), EncodedValue::Binary(b"chr9".to_vec())),
                 ("position".to_string(), EncodedValue::Int32(138175445)),
-            ])),
-        ]);
-        let result_chr9 = reader.seek_lower_bound(&seek_chr9_start).expect("seek failed");
+            ]),
+        )]);
+        let result_chr9 = reader
+            .seek_lower_bound(&seek_chr9_start)
+            .expect("seek failed");
         eprintln!("seek_lower_bound(chr9:138175445) = {:?}", result_chr9);
-        assert!(result_chr9.is_some(), "chr9:138175445 should be found (first key)");
+        assert!(
+            result_chr9.is_some(),
+            "chr9:138175445 should be found (first key)"
+        );
     }
 }

@@ -317,7 +317,11 @@ impl QueryEngine {
     ///
     /// # Returns
     /// A vector of decoded rows
-    pub fn scan_partition(&self, partition_idx: usize, ranges: &[KeyRange]) -> Result<Vec<EncodedValue>> {
+    pub fn scan_partition(
+        &self,
+        partition_idx: usize,
+        ranges: &[KeyRange],
+    ) -> Result<Vec<EncodedValue>> {
         self.source.scan_partition(partition_idx, ranges)
     }
 
@@ -403,7 +407,8 @@ impl QueryEngine {
         intervals: Option<Arc<IntervalList>>,
         decode_projection: Option<Arc<ProjectionTree>>,
     ) -> Result<impl Iterator<Item = Result<EncodedValue>>> {
-        self.source.query_stream_with_projection(ranges, intervals, decode_projection)
+        self.source
+            .query_stream_with_projection(ranges, intervals, decode_projection)
     }
 
     /// Sample random rows from the data source
@@ -438,11 +443,12 @@ impl QueryEngine {
     ///
     /// The AnnotationContext (GFF3, FASTA) is lazily loaded on first row access.
     #[cfg(feature = "vep")]
-    pub fn with_vep(mut self, options: crate::datasource::annotating::VepInitOptions) -> Result<Self> {
-        let annotating = crate::datasource::annotating::AnnotatingDataSource::new(
-            self.source,
-            options,
-        )?;
+    pub fn with_vep(
+        mut self,
+        options: crate::datasource::annotating::VepInitOptions,
+    ) -> Result<Self> {
+        let annotating =
+            crate::datasource::annotating::AnnotatingDataSource::new(self.source, options)?;
         self.source = Box::new(annotating);
         Ok(self)
     }
@@ -469,7 +475,10 @@ mod tests {
 
         // Create a key to lookup
         let key = EncodedValue::Struct(vec![
-            ("gene_id".to_string(), EncodedValue::Binary(b"ENSG00000066468".to_vec())),
+            (
+                "gene_id".to_string(),
+                EncodedValue::Binary(b"ENSG00000066468".to_vec()),
+            ),
             ("chrom".to_string(), EncodedValue::Binary(b"10".to_vec())),
             ("start".to_string(), EncodedValue::Int32(121478332)),
         ]);

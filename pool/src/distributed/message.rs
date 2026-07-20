@@ -271,7 +271,6 @@ pub struct TelemetrySnapshot {
     pub partitions_completed: usize,
 
     // Extended metrics for dashboard
-
     /// Per-core CPU usage percentages
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_per_core: Option<Vec<f32>>,
@@ -308,7 +307,6 @@ pub struct TelemetrySnapshot {
     pub max_batch_capacity: Option<usize>,
 
     // Phenotype visibility fields for better dashboard display
-
     /// Currently processing phenotype ID (if in a Manhattan/batch job)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_phenotype_id: Option<String>,

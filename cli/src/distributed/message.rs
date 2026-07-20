@@ -159,9 +159,7 @@ pub enum ExecutionMode {
 #[serde(tag = "type")]
 pub enum JobSpec {
     /// Export to Parquet files
-    ExportParquet {
-        output_path: String,
-    },
+    ExportParquet { output_path: String },
     /// Export to JSON files (NDJSON)
     ExportJson {
         output_path: String,
@@ -178,7 +176,10 @@ pub enum JobSpec {
         fail_fast: bool,
     },
     /// Generate Manhattan plot (high-level submission - coordinator splits into phases)
-    Manhattan { spec: ManhattanSpec, mode: ExecutionMode },
+    Manhattan {
+        spec: ManhattanSpec,
+        mode: ExecutionMode,
+    },
     /// Submit a batch of Manhattan plots (coordinator queues them)
     ManhattanBatch {
         specs: Vec<ManhattanSpec>,
@@ -698,12 +699,16 @@ impl JobSpec {
             JobSpec::ManhattanBatch { specs, .. } => specs.first().map(|s| s.output_path.as_str()),
             JobSpec::ManhattanScan(spec) => Some(&spec.output_path),
             JobSpec::ManhattanAggregate(spec) => Some(&spec.output_path),
-            JobSpec::ManhattanAggregateBatch { specs } => specs.first().map(|s| s.output_path.as_str()),
+            JobSpec::ManhattanAggregateBatch { specs } => {
+                specs.first().map(|s| s.output_path.as_str())
+            }
             JobSpec::Loci(spec) => Some(&spec.output_dir),
             JobSpec::ExportClickhouse { table_name, .. } => Some(table_name),
             JobSpec::IngestManhattan { input_dir, .. } => Some(input_dir),
             JobSpec::IngestManhattanTask { base_path, .. } => Some(base_path),
-            JobSpec::IngestManhattanBatch { tasks, .. } => tasks.first().map(|t| t.base_path.as_str()),
+            JobSpec::IngestManhattanBatch { tasks, .. } => {
+                tasks.first().map(|t| t.base_path.as_str())
+            }
             JobSpec::Stress(spec) => spec.write_dir.as_deref(),
             JobSpec::Custom { .. } => None,
         }
@@ -834,7 +839,9 @@ impl JobSpec {
                 })
                 .collect(),
 
-            JobSpec::Custom { tasks, manifest, .. } => {
+            JobSpec::Custom {
+                tasks, manifest, ..
+            } => {
                 if let Some(entries) = manifest {
                     // Manifest-backed: one task per manifest entry with entry as task payload
                     let total = entries.len();
@@ -844,7 +851,8 @@ impl JobSpec {
                         .map(|(i, entry)| {
                             // Derive a dashboard label: explicit "label" field, or first
                             // string value in the object (often a URI/name), or fallback to index
-                            let label = entry.get("label")
+                            let label = entry
+                                .get("label")
                                 .and_then(|v| v.as_str())
                                 .map(String::from)
                                 .or_else(|| {
@@ -904,9 +912,6 @@ impl JobSpec {
         }
     }
 }
-
-
-
 
 /// Dashboard summary for the overall job.
 #[derive(Debug, Serialize, Deserialize)]

@@ -1,7 +1,9 @@
 use crate::distributed::coordinator::state::{CoordinatorData, JobExecutionState, SharedState};
-use crate::distributed::message::{CatalogEntry, JobEvent, JobSpec, LoadCatalogRequest, ProcessCatalogRequest};
-use axum::{extract::State, Json};
+use crate::distributed::message::{
+    CatalogEntry, JobEvent, JobSpec, LoadCatalogRequest, ProcessCatalogRequest,
+};
 use crate::manhattan::batch::BatchConfig;
+use axum::{extract::State, Json};
 
 pub(crate) async fn load_catalog_api(
     State(state): State<SharedState>,
@@ -14,7 +16,9 @@ pub(crate) async fn load_catalog_api(
     } else if let Some(ref assets_json) = req.assets_json {
         catalog::load_catalog_from_assets(assets_json)
     } else {
-        return Json(serde_json::json!({ "success": false, "error": "Provide config_path or assets_json" }));
+        return Json(
+            serde_json::json!({ "success": false, "error": "Provide config_path or assets_json" }),
+        );
     };
 
     match result {
@@ -26,20 +30,20 @@ pub(crate) async fn load_catalog_api(
             data.catalog = Some(cat);
             Json(serde_json::json!({ "success": true, "count": count }))
         }
-        Err(e) => {
-            Json(serde_json::json!({ "success": false, "error": e.to_string() }))
-        }
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() })),
     }
 }
 
-pub(crate) async fn get_catalog_api(
-    State(state): State<SharedState>,
-) -> Json<Vec<CatalogEntry>> {
+pub(crate) async fn get_catalog_api(State(state): State<SharedState>) -> Json<Vec<CatalogEntry>> {
     // Phase 1: check if we need to load, and grab the config (lock released after this block)
     let pending_config = {
         let data = state.lock().expect("state lock poisoned");
         if data.catalog.is_none() {
-            if let Some(JobSpec::ManhattanBatch { config: Some(ref cfg), .. }) = data.config.job_spec {
+            if let Some(JobSpec::ManhattanBatch {
+                config: Some(ref cfg),
+                ..
+            }) = data.config.job_spec
+            {
                 Some(cfg.clone())
             } else {
                 None
@@ -53,7 +57,10 @@ pub(crate) async fn get_catalog_api(
     let loaded_catalog = if let Some(cfg) = pending_config {
         match crate::distributed::coordinator::services::catalog::load_catalog_from_config(cfg) {
             Ok(res) => {
-                println!("Lazy-loaded catalog with {} phenotypes", res.0.entries.len());
+                println!(
+                    "Lazy-loaded catalog with {} phenotypes",
+                    res.0.entries.len()
+                );
                 Some(res)
             }
             Err(e) => {
@@ -80,7 +87,13 @@ pub(crate) async fn get_catalog_api(
         for entry in entries.iter_mut() {
             // First check if it's currently processing in a batch
             let mut is_processing = false;
-            let base_dir = catalog.config.job.output_dir.as_deref().unwrap_or("").trim_end_matches('/');
+            let base_dir = catalog
+                .config
+                .job
+                .output_dir
+                .as_deref()
+                .unwrap_or("")
+                .trim_end_matches('/');
             let output_path = format!("{}/{}/{}", base_dir, entry.ancestry, entry.id);
 
             if let JobExecutionState::Batch(batch) = &data.job_state {
@@ -90,9 +103,10 @@ pub(crate) async fn get_catalog_api(
                 }
             } else if let JobExecutionState::Ingestion(ref ing) = data.job_state {
                 // Check if this phenotype is currently being ingested
-                let is_active = ing.active_tasks.values().any(|(pid, anc, _, _, _)| {
-                    pid == &entry.id && anc == &entry.ancestry
-                });
+                let is_active = ing
+                    .active_tasks
+                    .values()
+                    .any(|(pid, anc, _, _, _)| pid == &entry.id && anc == &entry.ancestry);
                 if is_active {
                     entry.status = "ingesting".to_string();
                     is_processing = true;
@@ -106,9 +120,15 @@ pub(crate) async fn get_catalog_api(
 
             // If not actively processing (or recently completed/failed in the last batch), use our pre-loaded states
             if !is_processing {
-                if data.ingested_phenotypes.contains(&(entry.id.clone(), entry.ancestry.clone())) {
+                if data
+                    .ingested_phenotypes
+                    .contains(&(entry.id.clone(), entry.ancestry.clone()))
+                {
                     entry.status = "ingested".to_string();
-                } else if data.completed_phenotypes.contains(&(entry.id.clone(), entry.ancestry.clone())) {
+                } else if data
+                    .completed_phenotypes
+                    .contains(&(entry.id.clone(), entry.ancestry.clone()))
+                {
                     entry.status = "completed".to_string();
                 }
             }
@@ -146,9 +166,15 @@ fn synthesize_catalog_from_batch(
             }
 
             let final_status = if status == "idle" {
-                if data.ingested_phenotypes.contains(&(id.clone(), ancestry.clone())) {
+                if data
+                    .ingested_phenotypes
+                    .contains(&(id.clone(), ancestry.clone()))
+                {
                     "ingested".to_string()
-                } else if data.completed_phenotypes.contains(&(id.clone(), ancestry.clone())) {
+                } else if data
+                    .completed_phenotypes
+                    .contains(&(id.clone(), ancestry.clone()))
+                {
                     "completed".to_string()
                 } else {
                     status
@@ -178,16 +204,18 @@ fn synthesize_catalog_from_batch(
 }
 
 /// Serve the embedded job config as JSON (for the config panel).
-pub(crate) async fn get_config_api(
-    State(state): State<SharedState>,
-) -> Json<serde_json::Value> {
+pub(crate) async fn get_config_api(State(state): State<SharedState>) -> Json<serde_json::Value> {
     let data = state.lock().expect("state lock poisoned");
 
     // Try catalog config first, then fall back to job spec's embedded config
     if let Some(ref catalog) = data.catalog {
         return Json(serde_json::to_value(&catalog.config).unwrap_or(serde_json::json!(null)));
     }
-    if let Some(JobSpec::ManhattanBatch { config: Some(ref cfg), .. }) = data.config.job_spec {
+    if let Some(JobSpec::ManhattanBatch {
+        config: Some(ref cfg),
+        ..
+    }) = data.config.job_spec
+    {
         return Json(serde_json::to_value(cfg).unwrap_or(serde_json::json!(null)));
     }
     Json(serde_json::json!(null))
@@ -214,7 +242,9 @@ pub(crate) async fn process_catalog_api(
     }
 
     if selected_inputs.is_empty() {
-        return Json(serde_json::json!({ "success": false, "error": "No valid phenotypes selected" }));
+        return Json(
+            serde_json::json!({ "success": false, "error": "No valid phenotypes selected" }),
+        );
     }
 
     // Build the BatchConfig
@@ -245,8 +275,16 @@ pub(crate) async fn process_catalog_api(
     };
 
     if data.idle || !matches!(data.job_state, JobExecutionState::Batch(_)) {
-        let primary_input = specs.first().and_then(|s| s.primary_input_path()).unwrap_or("batch").to_string();
-        let job_spec = JobSpec::ManhattanBatch { specs, mode, config: None };
+        let primary_input = specs
+            .first()
+            .and_then(|s| s.primary_input_path())
+            .unwrap_or("batch")
+            .to_string();
+        let job_spec = JobSpec::ManhattanBatch {
+            specs,
+            mode,
+            config: None,
+        };
 
         if let Err(e) = crate::distributed::coordinator::services::start_new_job(
             &mut data,
@@ -263,7 +301,12 @@ pub(crate) async fn process_catalog_api(
 
         let pheno_count = req.phenotypes.len();
         let max_display = 5;
-        let mut display_names: Vec<String> = req.phenotypes.iter().take(max_display).map(|(id, anc)| format!("{}/{}", anc, id)).collect();
+        let mut display_names: Vec<String> = req
+            .phenotypes
+            .iter()
+            .take(max_display)
+            .map(|(id, anc)| format!("{}/{}", anc, id))
+            .collect();
         if pheno_count > max_display {
             display_names.push(format!("+ {} more", pheno_count - max_display));
         }
@@ -272,13 +315,18 @@ pub(crate) async fn process_catalog_api(
             event_type: "submitted".to_string(),
             worker_id: None,
             phenotype_id: None,
-            details: format!("Started batch from catalog: {} phenotypes ({})", pheno_count, display_names.join(", ")),
+            details: format!(
+                "Started batch from catalog: {} phenotypes ({})",
+                pheno_count,
+                display_names.join(", ")
+            ),
         });
 
         Json(serde_json::json!({ "success": true, "message": "Started new batch job" }))
     } else {
         // Append to existing batch job
-        if let Err(e) = crate::distributed::coordinator::services::append_to_batch(&mut data, specs) {
+        if let Err(e) = crate::distributed::coordinator::services::append_to_batch(&mut data, specs)
+        {
             return Json(serde_json::json!({ "success": false, "error": e }));
         }
         Json(serde_json::json!({ "success": true, "message": "Appended to running batch job" }))
@@ -302,7 +350,9 @@ pub(crate) async fn ingest_catalog_api(
         let data = state.lock().expect("state lock poisoned");
 
         if !data.idle {
-            return Json(serde_json::json!({ "success": false, "error": "Coordinator is busy. Wait for job to finish." }));
+            return Json(
+                serde_json::json!({ "success": false, "error": "Coordinator is busy. Wait for job to finish." }),
+            );
         }
 
         let catalog = if let Some(cat) = &data.catalog {
@@ -312,10 +362,17 @@ pub(crate) async fn ingest_catalog_api(
         };
 
         let input_dir = catalog.config.ingest_input_dir().unwrap_or_default();
-        let clickhouse_url = catalog.config.ingest.clickhouse_url.clone().unwrap_or_default();
+        let clickhouse_url = catalog
+            .config
+            .ingest
+            .clickhouse_url
+            .clone()
+            .unwrap_or_default();
 
         if input_dir.is_empty() || clickhouse_url.is_empty() {
-            return Json(serde_json::json!({ "success": false, "error": "ingest.input_dir and clickhouse_url must be set in config" }));
+            return Json(
+                serde_json::json!({ "success": false, "error": "ingest.input_dir and clickhouse_url must be set in config" }),
+            );
         }
 
         let init_strategy = match catalog.config.ingest.init_strategy.to_lowercase().as_str() {
@@ -326,7 +383,9 @@ pub(crate) async fn ingest_catalog_api(
 
         // Zero-I/O verification: only keep phenotypes that are marked completed
         // in the coordinator's in-memory state, avoiding any GCS round-trips.
-        let valid_phenotypes: Vec<(String, String)> = req.phenotypes.into_iter()
+        let valid_phenotypes: Vec<(String, String)> = req
+            .phenotypes
+            .into_iter()
             .filter(|p| data.completed_phenotypes.contains(p))
             .collect();
 
@@ -352,19 +411,34 @@ pub(crate) async fn ingest_catalog_api(
     // Phase 2: Execute DDL and discover phenotypes (no lock held)
     #[cfg(feature = "clickhouse")]
     {
-        if let Err(e) = crate::distributed::coordinator::services::init_clickhouse_tables(&clickhouse_url, &init_strategy) {
-            return Json(serde_json::json!({ "success": false, "error": format!("DDL failed: {}", e) }));
+        if let Err(e) = crate::distributed::coordinator::services::init_clickhouse_tables(
+            &clickhouse_url,
+            &init_strategy,
+        ) {
+            return Json(
+                serde_json::json!({ "success": false, "error": format!("DDL failed: {}", e) }),
+            );
         }
     }
 
     let phenotype_filter = job_spec.phenotypes().unwrap_or_default();
-    let phenotypes = match crate::distributed::coordinator::services::discover_phenotypes_for_ingestion(&input_dir, Some(&phenotype_filter)) {
-        Ok(p) => p,
-        Err(e) => return Json(serde_json::json!({ "success": false, "error": format!("Discovery failed: {}", e) })),
-    };
+    let phenotypes =
+        match crate::distributed::coordinator::services::discover_phenotypes_for_ingestion(
+            &input_dir,
+            Some(&phenotype_filter),
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                return Json(
+                    serde_json::json!({ "success": false, "error": format!("Discovery failed: {}", e) }),
+                )
+            }
+        };
 
     if phenotypes.is_empty() {
-        return Json(serde_json::json!({ "success": false, "error": "No matching phenotypes found in output directory" }));
+        return Json(
+            serde_json::json!({ "success": false, "error": "No matching phenotypes found in output directory" }),
+        );
     }
 
     // Phase 3: Re-acquire lock and update state
@@ -372,7 +446,9 @@ pub(crate) async fn ingest_catalog_api(
 
     // Re-check idle in case another request snuck in while we were doing I/O
     if !data.idle {
-        return Json(serde_json::json!({ "success": false, "error": "Coordinator became busy during ingestion setup" }));
+        return Json(
+            serde_json::json!({ "success": false, "error": "Coordinator became busy during ingestion setup" }),
+        );
     }
 
     data.config.input_path = input_dir;
@@ -390,7 +466,11 @@ pub(crate) async fn ingest_catalog_api(
 
     // Truncate the display list to prevent massive strings with thousands of phenotypes
     let max_display = 5;
-    let mut display_names: Vec<String> = phenotypes.iter().take(max_display).map(|(id, anc, _)| format!("{}/{}", anc, id)).collect();
+    let mut display_names: Vec<String> = phenotypes
+        .iter()
+        .take(max_display)
+        .map(|(id, anc, _)| format!("{}/{}", anc, id))
+        .collect();
     if pheno_count > max_display {
         display_names.push(format!("+ {} more", pheno_count - max_display));
     }
@@ -402,29 +482,35 @@ pub(crate) async fn ingest_catalog_api(
                 phenotypes,
                 &clickhouse_url,
                 &catalog.config.ingest.database,
-            )
+            ),
         );
     }
 
     let job_id = uuid::Uuid::new_v4().to_string();
     data.current_job_id = Some(job_id.clone());
-    let _ = data.metrics_db.insert_job(&crate::distributed::message::JobRecord {
-        job_id,
-        status: "running".to_string(),
-        start_time_ms: crate::distributed::coordinator::state::CoordinatorData::now_ms(),
-        end_time_ms: None,
-        job_spec_json: serde_json::to_value(&job_spec).ok(),
-        input_path: data.config.input_path.clone(),
-        total_tasks: 0,
-        job_type: Some("ingest manhattan (catalog)".to_string()),
-    });
+    let _ = data
+        .metrics_db
+        .insert_job(&crate::distributed::message::JobRecord {
+            job_id,
+            status: "running".to_string(),
+            start_time_ms: crate::distributed::coordinator::state::CoordinatorData::now_ms(),
+            end_time_ms: None,
+            job_spec_json: serde_json::to_value(&job_spec).ok(),
+            input_path: data.config.input_path.clone(),
+            total_tasks: 0,
+            job_type: Some("ingest manhattan (catalog)".to_string()),
+        });
 
     data.log_event(crate::distributed::message::JobEvent {
         timestamp_ms: crate::distributed::coordinator::state::CoordinatorData::now_ms(),
         event_type: "submitted".to_string(),
         worker_id: None,
         phenotype_id: None,
-        details: format!("Started ingestion for {} phenotypes ({})", pheno_count, display_names.join(", ")),
+        details: format!(
+            "Started ingestion for {} phenotypes ({})",
+            pheno_count,
+            display_names.join(", ")
+        ),
     });
 
     Json(serde_json::json!({ "success": true, "message": "Started ingestion job" }))

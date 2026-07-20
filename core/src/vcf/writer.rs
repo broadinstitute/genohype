@@ -6,7 +6,7 @@
 use crate::codec::{EncodedType, EncodedValue};
 use crate::{HailError, Result};
 use noodles::bgzf;
-use noodles::vcf::header::record::value::map::{info, format};
+use noodles::vcf::header::record::value::map::{format, info};
 use noodles::vcf::header::record::value::Map;
 use noodles::vcf::header::FileFormat;
 use noodles::vcf::variant::io::Write as VcfWrite;
@@ -35,7 +35,11 @@ pub type BgzfVcfWriter = VcfWriter<bgzf::Writer<File>>;
 
 impl VcfWriter<BufWriter<File>> {
     /// Create a new VCF writer for plain text output
-    pub fn new<P: AsRef<Path>>(path: P, schema: &EncodedType, sample_names: Vec<String>) -> Result<Self> {
+    pub fn new<P: AsRef<Path>>(
+        path: P,
+        schema: &EncodedType,
+        sample_names: Vec<String>,
+    ) -> Result<Self> {
         let file = File::create(path)?;
         let buf_writer = BufWriter::new(file);
         let header = schema_to_header(schema, &sample_names)?;
@@ -52,7 +56,11 @@ impl VcfWriter<BufWriter<File>> {
 
 impl VcfWriter<bgzf::Writer<File>> {
     /// Create a new VCF writer for BGZF compressed output
-    pub fn new_bgzf<P: AsRef<Path>>(path: P, schema: &EncodedType, sample_names: Vec<String>) -> Result<Self> {
+    pub fn new_bgzf<P: AsRef<Path>>(
+        path: P,
+        schema: &EncodedType,
+        sample_names: Vec<String>,
+    ) -> Result<Self> {
         let file = File::create(path)?;
         let bgzf_writer = bgzf::Writer::new(file);
         let header = schema_to_header(schema, &sample_names)?;
@@ -98,7 +106,11 @@ fn schema_to_header(schema: &EncodedType, sample_names: &[String]) -> Result<Hea
     if let EncodedType::EBaseStruct { fields, .. } = schema {
         // Find the info field
         if let Some(info_field) = fields.iter().find(|f| f.name == "info") {
-            if let EncodedType::EBaseStruct { fields: info_fields, .. } = &info_field.encoded_type {
+            if let EncodedType::EBaseStruct {
+                fields: info_fields,
+                ..
+            } = &info_field.encoded_type
+            {
                 for field in info_fields {
                     let (number, ty) = encoded_type_to_vcf_type(&field.encoded_type);
                     let mut info_map = Map::<info::Info>::new(number, ty, String::new());
@@ -112,7 +124,10 @@ fn schema_to_header(schema: &EncodedType, sample_names: &[String]) -> Result<Hea
         // Find the genotypes field and extract format fields
         if let Some(gt_field) = fields.iter().find(|f| f.name == "genotypes") {
             if let EncodedType::EArray { element, .. } = &gt_field.encoded_type {
-                if let EncodedType::EBaseStruct { fields: gt_fields, .. } = element.as_ref() {
+                if let EncodedType::EBaseStruct {
+                    fields: gt_fields, ..
+                } = element.as_ref()
+                {
                     for field in gt_fields {
                         // Skip sample_id, it's not a FORMAT field
                         if field.name == "sample_id" {
@@ -293,7 +308,9 @@ fn extract_locus(fields: &[(String, EncodedValue)]) -> Result<(String, i32)> {
 
         Ok((contig, position))
     } else {
-        Err(HailError::InvalidFormat("Locus must be a struct".to_string()))
+        Err(HailError::InvalidFormat(
+            "Locus must be a struct".to_string(),
+        ))
     }
 }
 
@@ -312,7 +329,9 @@ fn extract_alleles(fields: &[(String, EncodedValue)]) -> Result<(String, Vec<Str
         let reference = if let EncodedValue::Binary(b) = &allele_arr[0] {
             String::from_utf8_lossy(b).to_string()
         } else {
-            return Err(HailError::InvalidFormat("Reference allele must be binary".to_string()));
+            return Err(HailError::InvalidFormat(
+                "Reference allele must be binary".to_string(),
+            ));
         };
 
         let alternates: Vec<String> = allele_arr[1..]
@@ -328,7 +347,9 @@ fn extract_alleles(fields: &[(String, EncodedValue)]) -> Result<(String, Vec<Str
 
         Ok((reference, alternates))
     } else {
-        Err(HailError::InvalidFormat("Alleles must be an array".to_string()))
+        Err(HailError::InvalidFormat(
+            "Alleles must be an array".to_string(),
+        ))
     }
 }
 
@@ -352,11 +373,15 @@ fn convert_info_to_vcf(
                     continue;
                 }
             }
-            EncodedValue::Binary(b) => Some(InfoValue::String(String::from_utf8_lossy(b).to_string())),
+            EncodedValue::Binary(b) => {
+                Some(InfoValue::String(String::from_utf8_lossy(b).to_string()))
+            }
             EncodedValue::Array(arr) => convert_info_array_to_vcf(arr),
             EncodedValue::Struct(_) => {
                 // Serialize struct as JSON string
-                Some(InfoValue::String(serde_json::to_string(value).unwrap_or_default()))
+                Some(InfoValue::String(
+                    serde_json::to_string(value).unwrap_or_default(),
+                ))
             }
         };
 
@@ -447,10 +472,7 @@ fn convert_genotypes_to_vcf(
     }
 
     // Build keys
-    let keys: Keys = format_keys
-        .iter()
-        .map(|k| k.parse().unwrap())
-        .collect();
+    let keys: Keys = format_keys.iter().map(|k| k.parse().unwrap()).collect();
 
     // Build sample values
     let mut sample_values = Vec::new();
@@ -553,12 +575,13 @@ mod tests {
 
     #[test]
     fn test_extract_locus() {
-        let fields = vec![
-            ("locus".to_string(), EncodedValue::Struct(vec![
+        let fields = vec![(
+            "locus".to_string(),
+            EncodedValue::Struct(vec![
                 ("contig".to_string(), EncodedValue::Binary(b"chr1".to_vec())),
                 ("position".to_string(), EncodedValue::Int32(12345)),
-            ])),
-        ];
+            ]),
+        )];
 
         let (chrom, pos) = extract_locus(&fields).unwrap();
         assert_eq!(chrom, "chr1");
@@ -567,13 +590,14 @@ mod tests {
 
     #[test]
     fn test_extract_alleles() {
-        let fields = vec![
-            ("alleles".to_string(), EncodedValue::Array(vec![
+        let fields = vec![(
+            "alleles".to_string(),
+            EncodedValue::Array(vec![
                 EncodedValue::Binary(b"A".to_vec()),
                 EncodedValue::Binary(b"G".to_vec()),
                 EncodedValue::Binary(b"T".to_vec()),
-            ])),
-        ];
+            ]),
+        )];
 
         let (ref_allele, alts) = extract_alleles(&fields).unwrap();
         assert_eq!(ref_allele, "A");

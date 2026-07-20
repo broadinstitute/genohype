@@ -58,11 +58,7 @@ pub fn run_export_vcf(args: ExportVcfArgs) -> Result<()> {
         );
     }
     if let Some(l) = args.common.limit {
-        println!(
-            "{} {}",
-            "Row limit:".cyan(),
-            l.to_string().bright_white()
-        );
+        println!("{} {}", "Row limit:".cyan(), l.to_string().bright_white());
     }
     if args.bgzip {
         println!("{} {}", "Compression:".cyan(), "BGZF".bright_white());
@@ -139,16 +135,8 @@ pub fn run_export_vcf(args: ExportVcfArgs) -> Result<()> {
         "Rows written:".cyan(),
         total_rows.to_string().bright_white()
     );
-    println!(
-        "  {} {}",
-        "Output file:".cyan(),
-        args.output.bright_white()
-    );
-    println!(
-        "  {} {}",
-        "Output size:".cyan(),
-        output_size.bright_white()
-    );
+    println!("  {} {}", "Output file:".cyan(), args.output.bright_white());
+    println!("  {} {}", "Output size:".cyan(), output_size.bright_white());
 
     Ok(())
 }

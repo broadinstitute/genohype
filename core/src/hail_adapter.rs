@@ -3,13 +3,16 @@
 //! Implements the `DataSource` trait for native Hail Tables (.ht directories).
 
 use crate::buffer::{BlockMap, BufferBuilder, InputBuffer};
-use crate::codec::{EncodedType, EncodedValue, ETypeParser};
+use crate::codec::{ETypeParser, EncodedType, EncodedValue};
 use crate::datasource::DataSource;
 use crate::index::IndexReader;
 use crate::io::join_path;
 use crate::metadata::{CacheOptions, MetadataCache, RVDComponentSpec, TableMetadata};
 use crate::projection::ProjectionTree;
-use crate::query::{filter_partitions, filter_partitions_with_intervals, IntervalList, KeyRange, KeyValue, PartitionStream};
+use crate::query::{
+    filter_partitions, filter_partitions_with_intervals, IntervalList, KeyRange, KeyValue,
+    PartitionStream,
+};
 use crate::HailError;
 use crate::Result;
 use crossbeam_channel;
@@ -163,7 +166,11 @@ impl HailTableSource {
             cache.as_ref(),
             cache_opts.as_ref(),
         )?;
-        debug!("RVD metadata loaded: {} partitions, {} range bounds", rvd_spec.part_files.len(), rvd_spec.range_bounds.len());
+        debug!(
+            "RVD metadata loaded: {} partitions, {} range bounds",
+            rvd_spec.part_files.len(),
+            rvd_spec.range_bounds.len()
+        );
 
         // Parse the row type from the codec spec
         let row_type = ETypeParser::parse(&rvd_spec.codec_spec.e_type)?;
@@ -176,9 +183,17 @@ impl HailTableSource {
             &table_path,
             cache.as_ref(),
             cache_opts.as_ref(),
-        ).ok();
+        )
+        .ok();
         let partition_counts = table_metadata.as_ref().and_then(|m| m.partition_counts());
-        debug!("Partition counts from metadata: {}", if partition_counts.is_some() { "available" } else { "unavailable" });
+        debug!(
+            "Partition counts from metadata: {}",
+            if partition_counts.is_some() {
+                "available"
+            } else {
+                "unavailable"
+            }
+        );
 
         Ok(HailTableSource {
             rows_path,
@@ -255,9 +270,11 @@ impl HailTableSource {
             return Ok(reader.clone());
         }
 
-        let index_spec = self.rvd_spec.index_spec.as_ref().ok_or_else(|| {
-            HailError::Index("Table does not have an index".to_string())
-        })?;
+        let index_spec = self
+            .rvd_spec
+            .index_spec
+            .as_ref()
+            .ok_or_else(|| HailError::Index("Table does not have an index".to_string()))?;
 
         // Get the partition file name and derive the index directory name
         let part_file = &self.rvd_spec.part_files[partition_idx];
@@ -296,7 +313,11 @@ impl HailTableSource {
     ///
     /// The offset is a Hail virtual offset: high 48 bits = compressed file offset,
     /// low 16 bits = byte offset within the decompressed block.
-    fn read_row_at_offset(&self, partition_idx: usize, virtual_offset: i64) -> Result<EncodedValue> {
+    fn read_row_at_offset(
+        &self,
+        partition_idx: usize,
+        virtual_offset: i64,
+    ) -> Result<EncodedValue> {
         let part_path = self.get_partition_path(partition_idx);
 
         // Decode virtual offset: high 48 bits = file offset, low 16 bits = local offset
@@ -344,9 +365,7 @@ impl HailTableSource {
         let parts_path = join_path(&self.rows_path, "parts");
         let part_path = join_path(&parts_path, part_file);
 
-        let buffer = BufferBuilder::from_path(&part_path)?
-            .with_leb128()
-            .build();
+        let buffer = BufferBuilder::from_path(&part_path)?.with_leb128().build();
 
         Ok(PartitionStream::with_intervals(
             buffer,
@@ -402,12 +421,16 @@ fn build_seek_key_from_intervals(
     let contig = min_contig?;
     let pos = min_pos?;
 
-    Some(EncodedValue::Struct(vec![
-        ("locus".to_string(), EncodedValue::Struct(vec![
-            ("contig".to_string(), EncodedValue::Binary(contig.as_bytes().to_vec())),
+    Some(EncodedValue::Struct(vec![(
+        "locus".to_string(),
+        EncodedValue::Struct(vec![
+            (
+                "contig".to_string(),
+                EncodedValue::Binary(contig.as_bytes().to_vec()),
+            ),
             ("position".to_string(), EncodedValue::Int32(pos)),
-        ])),
-    ]))
+        ]),
+    )]))
 }
 
 impl DataSource for HailTableSource {
@@ -530,9 +553,9 @@ impl DataSource for HailTableSource {
         let cache_opts = self.cache_opts.clone();
 
         // Pre-compute seek key from intervals (if available)
-        let seek_key = intervals.as_ref().and_then(|ivl| {
-            build_seek_key_from_intervals(ivl, &key_fields)
-        });
+        let seek_key = intervals
+            .as_ref()
+            .and_then(|ivl| build_seek_key_from_intervals(ivl, &key_fields));
 
         let num_partitions = matching_partitions.len();
 
@@ -551,9 +574,9 @@ impl DataSource for HailTableSource {
                         return Ok(reader.clone());
                     }
                 }
-                let spec = index_spec.as_ref().ok_or_else(|| {
-                    HailError::Index("Table does not have an index".to_string())
-                })?;
+                let spec = index_spec
+                    .as_ref()
+                    .ok_or_else(|| HailError::Index("Table does not have an index".to_string()))?;
                 let part_file = &part_files[partition_idx];
                 let index_dir_name = format!("{}.idx", part_file);
                 let index_rel_path = spec.rel_path.trim_start_matches("../");
@@ -571,18 +594,19 @@ impl DataSource for HailTableSource {
             };
 
             // Helper to get or create block map for a partition
-            let get_block_map = |partition_idx: usize, part_path: &str| -> crate::Result<Arc<BlockMap>> {
-                {
-                    let cache = block_maps.lock().unwrap();
-                    if let Some(map) = cache.get(&partition_idx) {
-                        return Ok(map.clone());
+            let get_block_map =
+                |partition_idx: usize, part_path: &str| -> crate::Result<Arc<BlockMap>> {
+                    {
+                        let cache = block_maps.lock().unwrap();
+                        if let Some(map) = cache.get(&partition_idx) {
+                            return Ok(map.clone());
+                        }
                     }
-                }
-                let map = Arc::new(BlockMap::build_from_path(part_path)?);
-                let mut cache = block_maps.lock().unwrap();
-                cache.insert(partition_idx, map.clone());
-                Ok(map)
-            };
+                    let map = Arc::new(BlockMap::build_from_path(part_path)?);
+                    let mut cache = block_maps.lock().unwrap();
+                    cache.insert(partition_idx, map.clone());
+                    Ok(map)
+                };
 
             // Process partitions in parallel using rayon
             matching_partitions
@@ -721,9 +745,9 @@ impl DataSource for HailTableSource {
         let metadata_cache = self.metadata_cache.clone();
         let cache_opts = self.cache_opts.clone();
 
-        let seek_key = intervals.as_ref().and_then(|ivl| {
-            build_seek_key_from_intervals(ivl, &key_fields)
-        });
+        let seek_key = intervals
+            .as_ref()
+            .and_then(|ivl| build_seek_key_from_intervals(ivl, &key_fields));
 
         let num_partitions = matching_partitions.len();
 
@@ -740,9 +764,9 @@ impl DataSource for HailTableSource {
                         return Ok(reader.clone());
                     }
                 }
-                let spec = index_spec.as_ref().ok_or_else(|| {
-                    HailError::Index("Table does not have an index".to_string())
-                })?;
+                let spec = index_spec
+                    .as_ref()
+                    .ok_or_else(|| HailError::Index("Table does not have an index".to_string()))?;
                 let part_file = &part_files[partition_idx];
                 let index_dir_name = format!("{}.idx", part_file);
                 let index_rel_path = spec.rel_path.trim_start_matches("../");
@@ -772,12 +796,20 @@ impl DataSource for HailTableSource {
                         seek_key.as_ref().and_then(|key| {
                             let reader = match get_index_reader(idx) {
                                 Ok(r) => r,
-                                Err(e) => { debug!("Partition {}: index reader error: {}", idx, e); return None; }
+                                Err(e) => {
+                                    debug!("Partition {}: index reader error: {}", idx, e);
+                                    return None;
+                                }
                             };
                             let virtual_offset = match reader.seek_lower_bound(key) {
                                 Ok(Some(o)) => o,
-                                Ok(None) => { return None; }
-                                Err(e) => { debug!("Partition {}: seek error: {}", idx, e); return None; }
+                                Ok(None) => {
+                                    return None;
+                                }
+                                Err(e) => {
+                                    debug!("Partition {}: seek error: {}", idx, e);
+                                    return None;
+                                }
                             };
                             let file_offset = (virtual_offset as u64) >> 16;
                             let local_offset = (virtual_offset & 0xFFFF) as usize;
@@ -790,34 +822,31 @@ impl DataSource for HailTableSource {
                     let buffer_and_offset = {
                         let _open_span = info_span!("partition_open", partition = idx).entered();
                         match seek_result {
-                            Some((file_offset, local_offset)) => {
-                                (|| -> crate::Result<_> {
-                                    let mut reader = crate::io::get_reader(&part_path)?;
-                                    use std::io::Seek;
-                                    reader.seek(std::io::SeekFrom::Start(file_offset))?;
-                                    let buffer = BufferBuilder::from_reader(reader)
-                                        .with_leb128()
-                                        .build();
-                                    Ok((buffer, local_offset))
-                                })()
-                            }
-                            None => {
-                                BufferBuilder::from_path(&part_path)
-                                    .map(|b| (b.with_leb128().build(), 0usize))
-                            }
+                            Some((file_offset, local_offset)) => (|| -> crate::Result<_> {
+                                let mut reader = crate::io::get_reader(&part_path)?;
+                                use std::io::Seek;
+                                reader.seek(std::io::SeekFrom::Start(file_offset))?;
+                                let buffer =
+                                    BufferBuilder::from_reader(reader).with_leb128().build();
+                                Ok((buffer, local_offset))
+                            })(),
+                            None => BufferBuilder::from_path(&part_path)
+                                .map(|b| (b.with_leb128().build(), 0usize)),
                         }
                     };
 
                     match buffer_and_offset {
                         Ok((buffer, local_offset)) => {
-                            let _decode_span = info_span!("partition_decode", partition = idx).entered();
+                            let _decode_span =
+                                info_span!("partition_decode", partition = idx).entered();
                             let stream = PartitionStream::with_intervals(
                                 buffer,
                                 row_type.clone(),
                                 ranges.clone(),
                                 intervals.clone(),
                                 local_offset,
-                            ).with_decode_projection(decode_projection.clone());
+                            )
+                            .with_decode_projection(decode_projection.clone());
 
                             for row in stream {
                                 if sender.send(row).is_err() {

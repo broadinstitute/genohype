@@ -115,7 +115,10 @@ impl EncodedType {
                 // - Number of bytes = ⌈n_nullable_fields / 8⌉
 
                 // STEP 1: Count nullable fields and read bitmap
-                let n_nullable = fields.iter().filter(|f| !f.encoded_type.is_required()).count();
+                let n_nullable = fields
+                    .iter()
+                    .filter(|f| !f.encoded_type.is_required())
+                    .count();
                 let n_missing_bytes = (n_nullable + 7) / 8;
 
                 let mut missing_bitmap = vec![0u8; n_missing_bytes];
@@ -126,7 +129,11 @@ impl EncodedType {
                 let mut nullable_idx = 0; // Index in the bitmap (only increments for nullable fields)
 
                 for (_field_idx, field) in fields.iter().enumerate() {
-                    debug!("Decoding struct field: {} (required: {})", field.name, field.encoded_type.is_required());
+                    debug!(
+                        "Decoding struct field: {} (required: {})",
+                        field.name,
+                        field.encoded_type.is_required()
+                    );
                     if field.encoded_type.is_required() {
                         // Required field - always present, read it
                         let value = field.encoded_type.read_present_value(buffer)?;
@@ -244,7 +251,10 @@ impl EncodedType {
                 buffer.skip(length as usize)
             }
             EncodedType::EBaseStruct { fields, .. } => {
-                let n_nullable = fields.iter().filter(|f| !f.encoded_type.is_required()).count();
+                let n_nullable = fields
+                    .iter()
+                    .filter(|f| !f.encoded_type.is_required())
+                    .count();
                 let n_missing_bytes = (n_nullable + 7) / 8;
 
                 let mut missing_bitmap = vec![0u8; n_missing_bytes];
@@ -267,8 +277,14 @@ impl EncodedType {
                 }
                 Ok(())
             }
-            EncodedType::EInt32 { .. } => { buffer.read_i32()?; Ok(()) }
-            EncodedType::EInt64 { .. } => { buffer.read_i64()?; Ok(()) }
+            EncodedType::EInt32 { .. } => {
+                buffer.read_i32()?;
+                Ok(())
+            }
+            EncodedType::EInt64 { .. } => {
+                buffer.read_i64()?;
+                Ok(())
+            }
             EncodedType::EFloat32 { .. } => buffer.skip(4),
             EncodedType::EFloat64 { .. } => buffer.skip(8),
             EncodedType::EBoolean { .. } => buffer.skip(1),
@@ -331,7 +347,10 @@ impl EncodedType {
 
         match self {
             EncodedType::EBaseStruct { fields, .. } => {
-                let n_nullable = fields.iter().filter(|f| !f.encoded_type.is_required()).count();
+                let n_nullable = fields
+                    .iter()
+                    .filter(|f| !f.encoded_type.is_required())
+                    .count();
                 let n_missing_bytes = (n_nullable + 7) / 8;
 
                 let mut missing_bitmap = vec![0u8; n_missing_bytes];
@@ -346,10 +365,9 @@ impl EncodedType {
 
                     if field.encoded_type.is_required() {
                         if is_wanted {
-                            let value = field.encoded_type.read_projected_value(
-                                buffer,
-                                child_proj,
-                            )?;
+                            let value = field
+                                .encoded_type
+                                .read_projected_value(buffer, child_proj)?;
                             field_values.push((field.name.clone(), value));
                         } else {
                             field.encoded_type.skip_present_value(buffer)?;
@@ -364,10 +382,9 @@ impl EncodedType {
                                 field_values.push((field.name.clone(), EncodedValue::Null));
                             }
                         } else if is_wanted {
-                            let value = field.encoded_type.read_projected_value(
-                                buffer,
-                                child_proj,
-                            )?;
+                            let value = field
+                                .encoded_type
+                                .read_projected_value(buffer, child_proj)?;
                             field_values.push((field.name.clone(), value));
                         } else {
                             field.encoded_type.skip_present_value(buffer)?;
@@ -404,7 +421,8 @@ impl EncodedType {
                 let length = buffer.read_i32()?;
                 if length < 0 || length > 100000 {
                     return Err(HailError::InvalidFormat(format!(
-                        "Invalid array length: {}", length
+                        "Invalid array length: {}",
+                        length
                     )));
                 }
                 let length = length as usize;
@@ -585,10 +603,13 @@ impl EncodedValue {
             }
             EncodedValue::Struct(fields) => {
                 let header = std::mem::size_of::<Vec<(String, EncodedValue)>>();
-                let content: usize = fields.iter().map(|(name, value)| {
-                    // String has header + chars, plus the value
-                    std::mem::size_of::<String>() + name.len() + value.estimated_size_bytes()
-                }).sum();
+                let content: usize = fields
+                    .iter()
+                    .map(|(name, value)| {
+                        // String has header + chars, plus the value
+                        std::mem::size_of::<String>() + name.len() + value.estimated_size_bytes()
+                    })
+                    .sum();
                 header + content
             }
         }
@@ -636,13 +657,14 @@ impl EncodedValue {
     /// For nested structs, shows the total size of that field including all children.
     pub fn field_sizes(&self) -> Vec<(String, usize, String)> {
         match self {
-            EncodedValue::Struct(fields) => {
-                fields.iter().map(|(name, value)| {
+            EncodedValue::Struct(fields) => fields
+                .iter()
+                .map(|(name, value)| {
                     let size = value.estimated_size_bytes();
                     let type_desc = value.type_description();
                     (name.clone(), size, type_desc)
-                }).collect()
-            }
+                })
+                .collect(),
             _ => vec![],
         }
     }
@@ -658,7 +680,8 @@ impl EncodedValue {
             EncodedValue::Float64(_) => "float64".to_string(),
             EncodedValue::Binary(b) => format!("string[{}]", b.len()),
             EncodedValue::Array(elements) => {
-                let inner = elements.first()
+                let inner = elements
+                    .first()
                     .map(|e| e.type_description())
                     .unwrap_or_else(|| "?".to_string());
                 format!("array<{}>[{}]", inner, elements.len())

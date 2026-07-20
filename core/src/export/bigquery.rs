@@ -123,10 +123,7 @@ impl BigQueryClient {
             return Ok(());
         }
 
-        let parts: Vec<&str> = gcs_uri
-            .trim_start_matches("gs://")
-            .splitn(2, '/')
-            .collect();
+        let parts: Vec<&str> = gcs_uri.trim_start_matches("gs://").splitn(2, '/').collect();
         if parts.len() != 2 {
             return Ok(());
         }

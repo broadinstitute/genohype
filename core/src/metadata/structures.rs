@@ -1,12 +1,12 @@
 //! Metadata structures for Hail tables
 
+use crate::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 use tracing::debug;
-use crate::Result;
 
 /// Top-level table metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,9 +106,7 @@ pub enum BufferSpec {
     },
 
     #[serde(rename = "LEB128BufferSpec")]
-    LEB128 {
-        child: Box<BufferSpec>,
-    },
+    LEB128 { child: Box<BufferSpec> },
 }
 
 /// Partition boundary interval
@@ -145,8 +143,7 @@ impl TableMetadata {
         file.read_to_end(&mut data)?;
 
         // Try gzipped first, fall back to plain JSON
-        Self::from_gzipped_json(&data)
-            .or_else(|_| Self::from_json(&data))
+        Self::from_gzipped_json(&data).or_else(|_| Self::from_json(&data))
     }
 
     /// Load metadata from a path string (local or cloud URL)
@@ -161,11 +158,14 @@ impl TableMetadata {
         let mut reader = crate::io::get_reader(path)?;
         let mut data = Vec::new();
         reader.read_to_end(&mut data)?;
-        debug!("TableMetadata::from_path read {} bytes in {:?}", data.len(), start.elapsed());
+        debug!(
+            "TableMetadata::from_path read {} bytes in {:?}",
+            data.len(),
+            start.elapsed()
+        );
 
         // Try gzipped first, fall back to plain JSON
-        Self::from_gzipped_json(&data)
-            .or_else(|_| Self::from_json(&data))
+        Self::from_gzipped_json(&data).or_else(|_| Self::from_json(&data))
     }
 
     /// Load metadata with optional caching support.
@@ -185,7 +185,11 @@ impl TableMetadata {
                     let mut reader = crate::io::get_reader(path)?;
                     let mut buf = Vec::new();
                     reader.read_to_end(&mut buf)?;
-                    debug!("TableMetadata fetched {} bytes in {:?}", buf.len(), start.elapsed());
+                    debug!(
+                        "TableMetadata fetched {} bytes in {:?}",
+                        buf.len(),
+                        start.elapsed()
+                    );
                     Ok(buf)
                 })?;
                 Self::from_gzipped_json(&data).or_else(|_| Self::from_json(&data))
@@ -230,8 +234,7 @@ impl RVDComponentSpec {
         file.read_to_end(&mut data)?;
 
         // Try gzipped first, fall back to plain JSON
-        Self::from_gzipped_json(&data)
-            .or_else(|_| Self::from_json(&data))
+        Self::from_gzipped_json(&data).or_else(|_| Self::from_json(&data))
     }
 
     /// Load RVD component specification from a path string (local or cloud URL)
@@ -246,12 +249,18 @@ impl RVDComponentSpec {
         let mut reader = crate::io::get_reader(path)?;
         let mut data = Vec::new();
         reader.read_to_end(&mut data)?;
-        debug!("RVDComponentSpec::from_path read {} bytes in {:?}", data.len(), start.elapsed());
+        debug!(
+            "RVDComponentSpec::from_path read {} bytes in {:?}",
+            data.len(),
+            start.elapsed()
+        );
 
         let parse_start = std::time::Instant::now();
-        let result = Self::from_gzipped_json(&data)
-            .or_else(|_| Self::from_json(&data));
-        debug!("RVDComponentSpec::from_path parsed JSON in {:?}", parse_start.elapsed());
+        let result = Self::from_gzipped_json(&data).or_else(|_| Self::from_json(&data));
+        debug!(
+            "RVDComponentSpec::from_path parsed JSON in {:?}",
+            parse_start.elapsed()
+        );
         result
     }
 
@@ -269,7 +278,11 @@ impl RVDComponentSpec {
                     let mut reader = crate::io::get_reader(path)?;
                     let mut buf = Vec::new();
                     reader.read_to_end(&mut buf)?;
-                    debug!("RVDComponentSpec fetched {} bytes in {:?}", buf.len(), start.elapsed());
+                    debug!(
+                        "RVDComponentSpec fetched {} bytes in {:?}",
+                        buf.len(),
+                        start.elapsed()
+                    );
                     Ok(buf)
                 })?;
                 Self::from_gzipped_json(&data).or_else(|_| Self::from_json(&data))
@@ -286,8 +299,9 @@ mod tests {
     #[test]
     fn test_parse_gene_models_rows_metadata() {
         let metadata = RVDComponentSpec::from_file(
-            "data/gene_models_hds/ht/prep_table.ht/rows/metadata.json.gz"
-        ).expect("Failed to parse metadata");
+            "data/gene_models_hds/ht/prep_table.ht/rows/metadata.json.gz",
+        )
+        .expect("Failed to parse metadata");
 
         // Check key fields
         assert_eq!(metadata.key, vec!["gene_id", "chrom", "start"]);

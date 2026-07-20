@@ -114,14 +114,19 @@ pub fn run_integrated_pipeline(config: &PipelineConfig) -> Result<()> {
     let run_aggregate = !config.scan_only;
 
     if config.scan_only || config.aggregate_only {
-        println!("Note: --scan-only and --aggregate-only modes skip certain local processing steps.");
+        println!(
+            "Note: --scan-only and --aggregate-only modes skip certain local processing steps."
+        );
     }
 
     // 2. Process Gene Burden (if provided)
     let mut interest_regions = IntervalList::new();
     let mut sig_genes: Vec<SignificantGene> = Vec::new();
     let mut gene_plot_points: Vec<crate::manhattan::data::GenePlotPoint> = Vec::new();
-    let mut gene_plot_points_by_group: HashMap<(String, String), Vec<crate::manhattan::data::GenePlotPoint>> = HashMap::new();
+    let mut gene_plot_points_by_group: HashMap<
+        (String, String),
+        Vec<crate::manhattan::data::GenePlotPoint>,
+    > = HashMap::new();
 
     if run_scan && config.gene_burden.is_some() {
         let burden_path = config.gene_burden.as_ref().unwrap();
@@ -160,11 +165,7 @@ pub fn run_integrated_pipeline(config: &PipelineConfig) -> Result<()> {
 
         // Add significant gene regions to interest regions
         for gene in &sig_genes {
-            interest_regions.add(
-                gene.interval.0.clone(),
-                gene.interval.1,
-                gene.interval.2,
-            );
+            interest_regions.add(gene.interval.0.clone(), gene.interval.1, gene.interval.2);
         }
     }
 
@@ -181,10 +182,7 @@ pub fn run_integrated_pipeline(config: &PipelineConfig) -> Result<()> {
     let mut manifest_loci = Vec::new();
 
     // We need at least one table to establish layout
-    let layout_path = config
-        .exome
-        .as_ref()
-        .or(config.genome.as_ref());
+    let layout_path = config.exome.as_ref().or(config.genome.as_ref());
 
     let (chrom_layout, y_scale) = if let Some(path) = layout_path {
         let layout_engine = QueryEngine::open_path(path)?;
@@ -207,7 +205,10 @@ pub fn run_integrated_pipeline(config: &PipelineConfig) -> Result<()> {
 
     // 2b. Render Gene Manhattan plot (now that we have the layout)
     if run_aggregate && !gene_plot_points.is_empty() {
-        println!("Rendering gene Manhattan plot ({} genes)...", gene_plot_points.len());
+        println!(
+            "Rendering gene Manhattan plot ({} genes)...",
+            gene_plot_points.len()
+        );
         // Render combined/legacy gene Manhattan
         let gene_png = render_gene_manhattan(
             &gene_plot_points,
@@ -276,20 +277,29 @@ pub fn run_integrated_pipeline(config: &PipelineConfig) -> Result<()> {
     // 4b. Enrich buffered variants with annotations (targeted lookups)
     if !exome_buffer.is_empty() {
         if let Some(annot_path) = &config.exome_annotations {
-            println!("Enriching {} exome variants with annotations...", exome_buffer.len());
+            println!(
+                "Enriching {} exome variants with annotations...",
+                exome_buffer.len()
+            );
             enrich_variants_with_annotations(&mut exome_buffer, annot_path)?;
         }
     }
     if !genome_buffer.is_empty() {
         if let Some(annot_path) = &config.genome_annotations {
-            println!("Enriching {} genome variants with annotations...", genome_buffer.len());
+            println!(
+                "Enriching {} genome variants with annotations...",
+                genome_buffer.len()
+            );
             enrich_variants_with_annotations(&mut genome_buffer, annot_path)?;
         }
     }
 
     // Finish significant hits writer
     let sig_count = sig_writer.finish()?;
-    println!("Wrote {} significant hits to significant.parquet", sig_count);
+    println!(
+        "Wrote {} significant hits to significant.parquet",
+        sig_count
+    );
 
     if run_aggregate {
         // 5. Compute Locus Regions
@@ -317,15 +327,15 @@ pub fn run_integrated_pipeline(config: &PipelineConfig) -> Result<()> {
         println!("Total locus regions: {}", interest_regions.len());
 
         // 6. Generate Locus Outputs
-    let loci_dir = output_base.join("loci");
-    if config.locus_plots {
-        fs::create_dir_all(&loci_dir)?;
-    }
+        let loci_dir = output_base.join("loci");
+        if config.locus_plots {
+            fs::create_dir_all(&loci_dir)?;
+        }
 
-    // Collect contigs to iterate
-    let contigs: Vec<String> = interest_regions.contigs().cloned().collect();
+        // Collect contigs to iterate
+        let contigs: Vec<String> = interest_regions.contigs().cloned().collect();
 
-    for contig in &contigs {
+        for contig in &contigs {
             if let Some(ranges) = interest_regions.intervals_for_contig(contig) {
                 for range in ranges {
                     let start = *range.start();
@@ -358,7 +368,8 @@ pub fn run_integrated_pipeline(config: &PipelineConfig) -> Result<()> {
                     let phenotype_name = "local_run";
                     let ancestry_name = "meta";
 
-                    let region_variants: Vec<LocusVariantRow> = exome_subset.iter()
+                    let region_variants: Vec<LocusVariantRow> = exome_subset
+                        .iter()
                         .map(|v| LocusVariantRow {
                             locus_id: region_name.clone(),
                             phenotype: phenotype_name.to_string(),
@@ -370,7 +381,11 @@ pub fn run_integrated_pipeline(config: &PipelineConfig) -> Result<()> {
                             ref_allele: v.alleles.first().cloned().unwrap_or_default(),
                             alt_allele: v.alleles.get(1).cloned().unwrap_or_default(),
                             pvalue: v.pvalue,
-                            neg_log10_p: if v.pvalue > 0.0 { -v.pvalue.log10() as f32 } else { 0.0 },
+                            neg_log10_p: if v.pvalue > 0.0 {
+                                -v.pvalue.log10() as f32
+                            } else {
+                                0.0
+                            },
                             is_significant: v.pvalue < config.threshold,
                             beta: v.beta,
                             se: v.se,
@@ -392,7 +407,11 @@ pub fn run_integrated_pipeline(config: &PipelineConfig) -> Result<()> {
                             ref_allele: v.alleles.first().cloned().unwrap_or_default(),
                             alt_allele: v.alleles.get(1).cloned().unwrap_or_default(),
                             pvalue: v.pvalue,
-                            neg_log10_p: if v.pvalue > 0.0 { -v.pvalue.log10() as f32 } else { 0.0 },
+                            neg_log10_p: if v.pvalue > 0.0 {
+                                -v.pvalue.log10() as f32
+                            } else {
+                                0.0
+                            },
                             is_significant: v.pvalue < config.threshold,
                             beta: v.beta,
                             se: v.se,
@@ -409,12 +428,22 @@ pub fn run_integrated_pipeline(config: &PipelineConfig) -> Result<()> {
 
                     // Add Locus Definition
                     // Find lead variant
-                    let lead = exome_subset.iter().chain(genome_subset.iter())
-                        .min_by(|a, b| a.pvalue.partial_cmp(&b.pvalue).unwrap_or(std::cmp::Ordering::Equal));
+                    let lead = exome_subset
+                        .iter()
+                        .chain(genome_subset.iter())
+                        .min_by(|a, b| {
+                            a.pvalue
+                                .partial_cmp(&b.pvalue)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        });
 
-                    let source_str = if !exome_subset.is_empty() && !genome_subset.is_empty() { "both" }
-                        else if !exome_subset.is_empty() { "exome" }
-                        else { "genome" };
+                    let source_str = if !exome_subset.is_empty() && !genome_subset.is_empty() {
+                        "both"
+                    } else if !exome_subset.is_empty() {
+                        "exome"
+                    } else {
+                        "genome"
+                    };
 
                     locus_definitions.push(LocusDefinitionRow {
                         locus_id: region_name.clone(),
@@ -426,7 +455,9 @@ pub fn run_integrated_pipeline(config: &PipelineConfig) -> Result<()> {
                         xstart: calculate_xpos(contig, start),
                         xstop: calculate_xpos(contig, end),
                         source: source_str.to_string(),
-                        lead_variant: lead.map(|v| format!("{}:{}", v.contig, v.position)).unwrap_or_default(),
+                        lead_variant: lead
+                            .map(|v| format!("{}:{}", v.contig, v.position))
+                            .unwrap_or_default(),
                         lead_pvalue: lead.map(|v| v.pvalue).unwrap_or(1.0),
                         exome_count: exome_subset.len() as u32,
                         genome_count: genome_subset.len() as u32,
@@ -441,14 +472,34 @@ pub fn run_integrated_pipeline(config: &PipelineConfig) -> Result<()> {
                     // Add to Manifest
                     manifest_loci.push(ManifestLocus {
                         id: region_name.clone(),
-                        region: ManifestRegion { contig: normalize_contig_name(contig), start: start as i64, end: end as i64 },
+                        region: ManifestRegion {
+                            contig: normalize_contig_name(contig),
+                            start: start as i64,
+                            end: end as i64,
+                        },
                         source: source_str.to_string(),
-                        lead_variant: lead.map(|v| format!("{}:{}", v.contig, v.position)).unwrap_or_default(),
+                        lead_variant: lead
+                            .map(|v| format!("{}:{}", v.contig, v.position))
+                            .unwrap_or_default(),
                         lead_pvalue: lead.map(|v| v.pvalue).unwrap_or(1.0),
                         lead_gene: lead.and_then(|v| v.gene_symbol.clone()),
                         plot: plot_path,
-                        exome_variants: if !exome_subset.is_empty() { Some(ManifestLocusVariants { path: format!("loci_variants.parquet (locus_id={})", region_name), count: exome_subset.len() as u64 }) } else { None },
-                        genome_variants: if !genome_subset.is_empty() { Some(ManifestLocusVariants { path: format!("loci_variants.parquet (locus_id={})", region_name), count: genome_subset.len() as u64 }) } else { None },
+                        exome_variants: if !exome_subset.is_empty() {
+                            Some(ManifestLocusVariants {
+                                path: format!("loci_variants.parquet (locus_id={})", region_name),
+                                count: exome_subset.len() as u64,
+                            })
+                        } else {
+                            None
+                        },
+                        genome_variants: if !genome_subset.is_empty() {
+                            Some(ManifestLocusVariants {
+                                path: format!("loci_variants.parquet (locus_id={})", region_name),
+                                count: genome_subset.len() as u64,
+                            })
+                        } else {
+                            None
+                        },
                         genes: vec![],
                     });
 
@@ -473,12 +524,15 @@ pub fn run_integrated_pipeline(config: &PipelineConfig) -> Result<()> {
         // Write loci parquet files
         if !locus_definitions.is_empty() {
             println!("Writing loci.parquet...");
-            let mut writer = LocusDefinitionWriter::new(output_base.join("loci.parquet").to_str().unwrap())?;
+            let mut writer =
+                LocusDefinitionWriter::new(output_base.join("loci.parquet").to_str().unwrap())?;
             writer.write_batch(&locus_definitions)?;
             writer.finish()?;
 
             println!("Writing loci_variants.parquet...");
-            let mut writer = LocusVariantWriter::new(output_base.join("loci_variants.parquet").to_str().unwrap())?;
+            let mut writer = LocusVariantWriter::new(
+                output_base.join("loci_variants.parquet").to_str().unwrap(),
+            )?;
             writer.write_batch(&locus_variants)?;
             writer.finish()?;
         }
@@ -593,7 +647,10 @@ fn scan_variant_table(
                 pb.set_position(i as u64);
             }
         }
-        println!("  Merge complete: {} matched, {} unmatched", matched, unmatched);
+        println!(
+            "  Merge complete: {} matched, {} unmatched",
+            matched, unmatched
+        );
     } else {
         // No annotations - just scan results
         let results_iter = results_engine.query_iter(&[])?;
@@ -634,11 +691,7 @@ fn scan_variant_table(
 
     // Save Per-Chromosome PNGs
     let output_dir = Path::new(output_png).parent().unwrap();
-    let file_name = Path::new(output_png)
-        .file_name()
-        .unwrap()
-        .to_str()
-        .unwrap();
+    let file_name = Path::new(output_png).file_name().unwrap().to_str().unwrap();
 
     for (chrom, mut chrom_renderer) in chrom_renderers {
         // Draw threshold line on per-chrom plot
@@ -690,13 +743,26 @@ fn process_joined_row(
 
     // Render point to WG
     render_variant(
-        &v.contig, v.position, v.neg_log10_p, layout, y_scale, renderer,
+        &v.contig,
+        v.position,
+        v.neg_log10_p,
+        layout,
+        y_scale,
+        renderer,
     );
 
     // Render point to per-chromosome plot
     render_variant_per_chrom(
-        &v.contig, v.position, v.neg_log10_p, layout, y_scale,
-        contig_lengths, chrom_renderers, chrom_layouts, width, height,
+        &v.contig,
+        v.position,
+        v.neg_log10_p,
+        layout,
+        y_scale,
+        contig_lengths,
+        chrom_renderers,
+        chrom_layouts,
+        width,
+        height,
     );
 
     // Check significance
@@ -779,13 +845,26 @@ fn process_single_row(
 
     // Render point to WG
     render_variant(
-        &v.contig, v.position, v.neg_log10_p, layout, y_scale, renderer,
+        &v.contig,
+        v.position,
+        v.neg_log10_p,
+        layout,
+        y_scale,
+        renderer,
     );
 
     // Render point to per-chromosome plot
     render_variant_per_chrom(
-        &v.contig, v.position, v.neg_log10_p, layout, y_scale,
-        contig_lengths, chrom_renderers, chrom_layouts, width, height,
+        &v.contig,
+        v.position,
+        v.neg_log10_p,
+        layout,
+        y_scale,
+        contig_lengths,
+        chrom_renderers,
+        chrom_layouts,
+        width,
+        height,
     );
 
     // Check significance
@@ -935,10 +1014,7 @@ struct ExtractedVariant {
 }
 
 /// Extract variant fields from a row.
-fn extract_variant_fields(
-    row: &EncodedValue,
-    y_field: &str,
-) -> Option<ExtractedVariant> {
+fn extract_variant_fields(row: &EncodedValue, y_field: &str) -> Option<ExtractedVariant> {
     if let EncodedValue::Struct(fields) = row {
         // Helper to extract optional float
         let get_float = |name: &str| -> Option<f64> {
@@ -1167,16 +1243,24 @@ fn enrich_variants_with_annotations(
             (
                 "locus".to_string(),
                 EncodedValue::Struct(vec![
-                    ("contig".to_string(), EncodedValue::Binary(variant.contig.as_bytes().to_vec())),
-                    ("position".to_string(), EncodedValue::Int32(variant.position)),
+                    (
+                        "contig".to_string(),
+                        EncodedValue::Binary(variant.contig.as_bytes().to_vec()),
+                    ),
+                    (
+                        "position".to_string(),
+                        EncodedValue::Int32(variant.position),
+                    ),
                 ]),
             ),
             (
                 "alleles".to_string(),
                 EncodedValue::Array(
-                    variant.alleles.iter()
+                    variant
+                        .alleles
+                        .iter()
                         .map(|a| EncodedValue::Binary(a.as_bytes().to_vec()))
-                        .collect()
+                        .collect(),
                 ),
             ),
         ]);

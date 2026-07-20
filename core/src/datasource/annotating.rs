@@ -61,25 +61,21 @@ impl AnnotatingDataSource {
     /// Get or initialize the annotation context.
     fn get_context(&self) -> Result<&AnnotationContext> {
         let loftee = self.options.loftee;
-        self.context
-            .get_or_try_init(|| {
-                let mut ctx = AnnotationContext::new(
-                    Some(self.options.gff3.as_str()),
-                    self.options.fasta.as_deref(),
-                    self.options.sa_dir.as_deref(),
-                    self.options.distance,
-                )
-                .map_err(|e| {
-                    crate::HailError::InvalidFormat(format!(
-                        "Failed to initialize VEP context: {}",
-                        e
-                    ))
-                })?;
-                if loftee {
-                    ctx.loftee_config = Some(fastvep_loftee::LofteeConfig::default());
-                }
-                Ok(ctx)
-            })
+        self.context.get_or_try_init(|| {
+            let mut ctx = AnnotationContext::new(
+                Some(self.options.gff3.as_str()),
+                self.options.fasta.as_deref(),
+                self.options.sa_dir.as_deref(),
+                self.options.distance,
+            )
+            .map_err(|e| {
+                crate::HailError::InvalidFormat(format!("Failed to initialize VEP context: {}", e))
+            })?;
+            if loftee {
+                ctx.loftee_config = Some(fastvep_loftee::LofteeConfig::default());
+            }
+            Ok(ctx)
+        })
     }
 
     /// Wrap an iterator to annotate each row.
@@ -147,9 +143,9 @@ impl DataSource for AnnotatingDataSource {
     ) -> Result<Box<dyn Iterator<Item = Result<EncodedValue>> + Send>> {
         // Ignore the decode projection for the inner source since we need all fields
         // for annotation. The vep field is always appended.
-        let inner_iter = self
-            .inner
-            .query_stream_with_projection(ranges, intervals, decode_projection)?;
+        let inner_iter =
+            self.inner
+                .query_stream_with_projection(ranges, intervals, decode_projection)?;
         self.annotate_iter(inner_iter)
     }
 

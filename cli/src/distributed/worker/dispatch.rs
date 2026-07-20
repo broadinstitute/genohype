@@ -20,7 +20,11 @@ pub fn dispatch_job(
     filters: &[String],
     intervals: &[String],
     telemetry: Option<Arc<TelemetryState>>,
-) -> Result<(usize, Option<serde_json::Value>, Option<(String, QueryEngine)>)> {
+) -> Result<(
+    usize,
+    Option<serde_json::Value>,
+    Option<(String, QueryEngine)>,
+)> {
     // Parse filters from strings
     let key_ranges = parse_filter_strings(filters);
     let interval_list = parse_interval_strings(intervals);
@@ -69,7 +73,8 @@ pub fn dispatch_job(
         JobSpec::Manhattan { .. } => {
             // Manhattan is a coordinator-level job spec for submission
             Err(crate::HailError::InvalidFormat(
-                "Manhattan should not be dispatched to worker - it's for coordinator submission".to_string()
+                "Manhattan should not be dispatched to worker - it's for coordinator submission"
+                    .to_string(),
             ))
         }
         JobSpec::ManhattanBatch { .. } => {
@@ -128,7 +133,8 @@ pub fn dispatch_job(
             // Set phenotype context to indicate aggregate batch mode
             if let Some(ref ts) = telemetry {
                 let count = specs.len();
-                let first_id = specs.first()
+                let first_id = specs
+                    .first()
                     .and_then(|s| s.phenotype_id.as_deref())
                     .unwrap_or("batch");
                 let display_id = if count > 1 {
@@ -144,14 +150,18 @@ pub fn dispatch_job(
             // This allows nested parallelism:
             // - Top level: parallel phenotypes
             // - Inner level: parallel locus plots (within process_manhattan_aggregate)
-            let results: Vec<Result<(usize, serde_json::Value)>> = specs.par_iter()
+            let results: Vec<Result<(usize, serde_json::Value)>> = specs
+                .par_iter()
                 .map(|spec| {
                     // Track the phenotype being processed on this Rayon thread
                     // Use phenotype_id as the display label (not ancestry)
-                    let phenotype_id = spec.phenotype_id.clone()
+                    let phenotype_id = spec
+                        .phenotype_id
+                        .clone()
                         .unwrap_or_else(|| "unknown".to_string());
                     let label = Some(phenotype_id.clone());
-                    let _core_guard = telemetry.as_ref()
+                    let _core_guard = telemetry
+                        .as_ref()
                         .map(|ts| CoreTaskGuard::phenotype(ts, &phenotype_id, label));
 
                     handlers::manhattan::process_manhattan_aggregate(spec)
@@ -184,7 +194,10 @@ pub fn dispatch_job(
             let rows = handlers::loci::process_loci(spec)?;
             Ok((rows, None, None))
         }
-        JobSpec::ExportClickhouse { clickhouse_url, table_name } => {
+        JobSpec::ExportClickhouse {
+            clickhouse_url,
+            table_name,
+        } => {
             #[cfg(feature = "clickhouse")]
             {
                 let (rows, engine) = handlers::clickhouse::process_clickhouse_export(
@@ -210,10 +223,16 @@ pub fn dispatch_job(
             // This is a coordinator-level job spec, should never be sent to workers
             Err(crate::HailError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "IngestManhattan is a coordinator job spec, not a worker task"
+                "IngestManhattan is a coordinator job spec, not a worker task",
             )))
         }
-        JobSpec::IngestManhattanTask { phenotype_id, ancestry, base_path, clickhouse_url, database } => {
+        JobSpec::IngestManhattanTask {
+            phenotype_id,
+            ancestry,
+            base_path,
+            clickhouse_url,
+            database,
+        } => {
             #[cfg(feature = "clickhouse")]
             {
                 let rows = handlers::ingest::process_ingest_manhattan(
@@ -234,14 +253,22 @@ pub fn dispatch_job(
                 )))
             }
         }
-        JobSpec::IngestManhattanBatch { tasks, clickhouse_url, database } => {
+        JobSpec::IngestManhattanBatch {
+            tasks,
+            clickhouse_url,
+            database,
+        } => {
             #[cfg(feature = "clickhouse")]
             {
                 use rayon::prelude::*;
 
-                println!("Processing batch of {} ingestion tasks concurrently...", tasks.len());
+                println!(
+                    "Processing batch of {} ingestion tasks concurrently...",
+                    tasks.len()
+                );
 
-                let results: Vec<crate::Result<usize>> = tasks.par_iter()
+                let results: Vec<crate::Result<usize>> = tasks
+                    .par_iter()
                     .map(|task| {
                         let _core_guard = telemetry.as_ref().map(|ts| {
                             crate::distributed::worker::telemetry::CoreTaskGuard::phenotype(
@@ -266,7 +293,11 @@ pub fn dispatch_job(
                     total_rows += result?;
                 }
 
-                println!("Batch ingestion complete: {} tasks, {} total rows", tasks.len(), total_rows);
+                println!(
+                    "Batch ingestion complete: {} tasks, {} total rows",
+                    tasks.len(),
+                    total_rows
+                );
                 Ok((total_rows, None, None))
             }
             #[cfg(not(feature = "clickhouse"))]

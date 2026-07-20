@@ -1,7 +1,9 @@
 //! BigQuery export command.
 
 use crate::cli::ExportBigqueryArgs;
-use crate::commands::utils::{parse_export_filters, parse_export_intervals, progress_style_spinner};
+use crate::commands::utils::{
+    parse_export_filters, parse_export_intervals, progress_style_spinner,
+};
 use genohype_core::export::BigQueryClient;
 use genohype_core::parquet::{build_record_batch, ParquetWriter};
 use genohype_core::query::QueryEngine;
@@ -59,11 +61,7 @@ pub fn run_export_bigquery(args: ExportBigqueryArgs) -> Result<()> {
         );
     }
     if let Some(l) = args.common.limit {
-        println!(
-            "  {} {}",
-            "Row limit:".cyan(),
-            l.to_string().bright_white()
-        );
+        println!("  {} {}", "Row limit:".cyan(), l.to_string().bright_white());
     }
     println!();
 
@@ -143,12 +141,14 @@ pub fn run_export_bigquery(args: ExportBigqueryArgs) -> Result<()> {
     println!("{}", "Starting BigQuery export...".dimmed());
     let rt = tokio::runtime::Runtime::new()?;
     let result = rt.block_on(async {
-        let client = BigQueryClient::new(project, &args.bucket).await.map_err(|e| {
-            genohype_core::HailError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                e.to_string(),
-            ))
-        })?;
+        let client = BigQueryClient::new(project, &args.bucket)
+            .await
+            .map_err(|e| {
+                genohype_core::HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                ))
+            })?;
 
         println!("{}", "Uploading to GCS...".dimmed());
         let gcs_uri = client.upload_parquet(&temp_file_path).await.map_err(|e| {
@@ -179,10 +179,7 @@ pub fn run_export_bigquery(args: ExportBigqueryArgs) -> Result<()> {
 
     // 4. Cleanup Local temp file
     if std::fs::remove_file(&temp_file_path).is_err() {
-        eprintln!(
-            "{} Failed to remove local temp file",
-            "Warning:".yellow()
-        );
+        eprintln!("{} Failed to remove local temp file", "Warning:".yellow());
     }
 
     // Propagate any errors from the async block

@@ -5,8 +5,8 @@ pub use async_client::*;
 pub use extract::*;
 
 use crate::codec::EncodedValue;
-use crate::query::{IntervalList, KeyRange, KeyValue, QueryBound, QueryEngine};
 use crate::error::Result;
+use crate::query::{IntervalList, KeyRange, KeyValue, QueryBound, QueryEngine};
 use std::sync::Arc;
 
 /// A client for querying locus-keyed Hail Tables
@@ -26,12 +26,7 @@ impl LocusTable {
         })
     }
 
-    pub fn query_interval(
-        &self,
-        contig: &str,
-        start: i32,
-        end: i32,
-    ) -> Result<Vec<EncodedValue>> {
+    pub fn query_interval(&self, contig: &str, start: i32, end: i32) -> Result<Vec<EncodedValue>> {
         let ranges = vec![
             KeyRange::point_nested(
                 self.contig_path.clone(),
@@ -44,9 +39,7 @@ impl LocusTable {
             },
         ];
 
-        self.engine
-            .query_iter(&ranges)?
-            .collect::<Result<Vec<_>>>()
+        self.engine.query_iter(&ranges)?.collect::<Result<Vec<_>>>()
     }
 
     pub fn query_variant(
@@ -64,8 +57,10 @@ impl LocusTable {
             KeyRange::point_nested(self.position_path.clone(), KeyValue::Int32(position)),
         ];
 
-        let results: Vec<EncodedValue> =
-            self.engine.query_iter(&ranges)?.collect::<Result<Vec<_>>>()?;
+        let results: Vec<EncodedValue> = self
+            .engine
+            .query_iter(&ranges)?
+            .collect::<Result<Vec<_>>>()?;
 
         if ref_allele.is_some() || alt_allele.is_some() {
             Ok(results
@@ -77,7 +72,11 @@ impl LocusTable {
         }
     }
 
-    pub fn query_intervals(&self, contig: &str, intervals: &[(i32, i32)]) -> Result<Vec<EncodedValue>> {
+    pub fn query_intervals(
+        &self,
+        contig: &str,
+        intervals: &[(i32, i32)],
+    ) -> Result<Vec<EncodedValue>> {
         let mut interval_list = IntervalList::new();
         for (start, end) in intervals {
             interval_list.add(contig.to_string(), *start, *end);
@@ -112,14 +111,16 @@ impl LocusTable {
     ) -> bool {
         if let Some(EncodedValue::Array(alleles)) = get_field(row, "alleles") {
             let ref_match = ref_allele.map_or(true, |r| {
-                alleles
-                    .first()
-                    .map_or(false, |a| matches!(a, EncodedValue::Binary(b) if b == r.as_bytes()))
+                alleles.first().map_or(
+                    false,
+                    |a| matches!(a, EncodedValue::Binary(b) if b == r.as_bytes()),
+                )
             });
             let alt_match = alt_allele.map_or(true, |a| {
-                alleles
-                    .get(1)
-                    .map_or(false, |al| matches!(al, EncodedValue::Binary(b) if b == a.as_bytes()))
+                alleles.get(1).map_or(
+                    false,
+                    |al| matches!(al, EncodedValue::Binary(b) if b == a.as_bytes()),
+                )
             });
             return ref_match && alt_match;
         }

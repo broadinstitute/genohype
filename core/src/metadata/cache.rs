@@ -78,10 +78,7 @@ impl MetadataCache {
     /// `gs://bucket/path/to/table.ht` → `<cache_dir>/gs/bucket/path/to/table.ht/`
     fn url_to_cache_dir(&self, url: &str) -> PathBuf {
         // Replace :// with / and strip trailing slashes
-        let sanitized = url
-            .replace("://", "/")
-            .trim_end_matches('/')
-            .to_string();
+        let sanitized = url.replace("://", "/").trim_end_matches('/').to_string();
 
         // Prevent directory traversal
         let sanitized = sanitized.replace("..", "_");
@@ -363,11 +360,7 @@ mod tests {
 
         // Set mtime to 25 hours ago
         let old_time = SystemTime::now() - Duration::from_secs(25 * 3600);
-        filetime::set_file_mtime(
-            &path,
-            filetime::FileTime::from_system_time(old_time),
-        )
-        .unwrap();
+        filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(old_time)).unwrap();
 
         let opts = CacheOptions::default(); // 24h TTL
         let data = cache
@@ -386,10 +379,15 @@ mod tests {
 
         // First call: cache miss, fetches and writes file
         let path = cache
-            .get_or_fetch_file("gs://bucket/table.ht/index/part-0.idx", "index", &opts, || {
-                call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(b"index-data".to_vec())
-            })
+            .get_or_fetch_file(
+                "gs://bucket/table.ht/index/part-0.idx",
+                "index",
+                &opts,
+                || {
+                    call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(b"index-data".to_vec())
+                },
+            )
             .unwrap();
         assert!(path.exists());
         assert_eq!(std::fs::read(&path).unwrap(), b"index-data");
@@ -397,10 +395,15 @@ mod tests {
 
         // Second call: cache hit, returns same path without fetching
         let path2 = cache
-            .get_or_fetch_file("gs://bucket/table.ht/index/part-0.idx", "index", &opts, || {
-                call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(b"should-not-be-called".to_vec())
-            })
+            .get_or_fetch_file(
+                "gs://bucket/table.ht/index/part-0.idx",
+                "index",
+                &opts,
+                || {
+                    call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(b"should-not-be-called".to_vec())
+                },
+            )
             .unwrap();
         assert_eq!(path, path2);
         assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);

@@ -1,9 +1,9 @@
 //! Annotation logic for significant hits using a secondary Hail table.
 
-use genohype_core::codec::EncodedValue;
 use crate::manhattan::data::SignificantHit;
-use genohype_core::query::QueryEngine;
 use crate::Result;
+use genohype_core::codec::EncodedValue;
+use genohype_core::query::QueryEngine;
 
 /// Annotates significant hits by looking up their keys in an annotation table.
 #[allow(dead_code)]
@@ -35,8 +35,8 @@ impl Annotator {
         if let Some(row) = engine.lookup(key)? {
             if self.fields.is_empty() {
                 // If no specific fields requested, serialize the whole row
-                hit.annotations = serde_json::to_value(&format!("{:?}", row))
-                    .unwrap_or(serde_json::Value::Null);
+                hit.annotations =
+                    serde_json::to_value(&format!("{:?}", row)).unwrap_or(serde_json::Value::Null);
             } else {
                 // Extract only requested fields
                 let mut map = serde_json::Map::new();

@@ -10,13 +10,13 @@
 //! - Computes `xpos` from contig and position
 //! - Adds "chr" prefix to contig for annotation joining
 
-use genohype_core::export::ClickHouseClient;
-use genohype_core::io::{get_file_size, is_cloud_path, range_read};
 use crate::Result;
 use arrow::array::{
     ArrayRef, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray, StringBuilder,
 };
 use arrow::datatypes::{DataType, Field, Schema};
+use genohype_core::export::ClickHouseClient;
+use genohype_core::io::{get_file_size, is_cloud_path, range_read};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
@@ -156,7 +156,7 @@ pub fn run_ingest_task(
     ancestry: &str,
     base_path: &str,
     clickhouse_url: &str,
-    _database: &str,  // Currently unused - tables use default database
+    _database: &str, // Currently unused - tables use default database
 ) -> Result<usize> {
     println!(
         "Ingesting phenotype {} ({}) from {}",
@@ -218,13 +218,7 @@ pub fn run_ingest_task(
     );
 
     // 2. Ingest loci
-    let loci_rows = ingest_loci(
-        phenotype_id,
-        ancestry,
-        base,
-        &manifest.loci,
-        &client,
-    )?;
+    let loci_rows = ingest_loci(phenotype_id, ancestry, base, &manifest.loci, &client)?;
     total_rows += loci_rows;
 
     // 3. Ingest plot metadata
@@ -236,19 +230,10 @@ pub fn run_ingest_task(
     for seq_type in &["exome", "genome"] {
         let parquet_path = format!("{}/{}_significant.parquet", base, seq_type);
         if file_exists(&parquet_path)? {
-            let rows = ingest_variants(
-                phenotype_id,
-                ancestry,
-                seq_type,
-                &parquet_path,
-                &client,
-            )?;
+            let rows = ingest_variants(phenotype_id, ancestry, seq_type, &parquet_path, &client)?;
             total_rows += rows;
             significant_variant_count += rows as u32;
-            println!(
-                "  Ingested {} {} significant variants",
-                rows, seq_type
-            );
+            println!("  Ingested {} {} significant variants", rows, seq_type);
         }
     }
 
@@ -579,8 +564,16 @@ fn ingest_loci(
         xstops.push(compute_xpos(&contig, locus.region.end));
 
         // Determine source from locus field or counts
-        let exome_count = locus.exome_variants.as_ref().and_then(|v| v.count).unwrap_or(0);
-        let genome_count = locus.genome_variants.as_ref().and_then(|v| v.count).unwrap_or(0);
+        let exome_count = locus
+            .exome_variants
+            .as_ref()
+            .and_then(|v| v.count)
+            .unwrap_or(0);
+        let genome_count = locus
+            .genome_variants
+            .as_ref()
+            .and_then(|v| v.count)
+            .unwrap_or(0);
 
         let source = locus.source.clone().unwrap_or_else(|| {
             if exome_count > 0 && genome_count > 0 {
@@ -652,7 +645,12 @@ fn ingest_loci(
     // Insert into ClickHouse (use just table name, database is set via URL or default)
     client
         .insert_parquet_bytes("loci", parquet_bytes)
-        .map_err(|e| crate::HailError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+        .map_err(|e| {
+            crate::HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string(),
+            ))
+        })?;
 
     println!("  Ingested {} loci", num_rows);
     Ok(num_rows)
@@ -760,7 +758,12 @@ fn ingest_plots(
 
     client
         .insert_parquet_bytes("phenotype_plots", parquet_bytes)
-        .map_err(|e| crate::HailError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+        .map_err(|e| {
+            crate::HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string(),
+            ))
+        })?;
 
     println!("  Ingested {} plot metadata records", count);
     Ok(count)
@@ -797,9 +800,9 @@ fn ingest_variants(
         let contig_col = batch
             .column_by_name("contig")
             .ok_or_else(|| crate::HailError::InvalidFormat("Missing contig column".to_string()))?;
-        let position_col = batch
-            .column_by_name("position")
-            .ok_or_else(|| crate::HailError::InvalidFormat("Missing position column".to_string()))?;
+        let position_col = batch.column_by_name("position").ok_or_else(|| {
+            crate::HailError::InvalidFormat("Missing position column".to_string())
+        })?;
 
         let contig_arr = contig_col
             .as_any()
@@ -864,7 +867,12 @@ fn ingest_variants(
 
         client
             .insert_parquet_bytes("significant_variants", parquet_bytes)
-            .map_err(|e| crate::HailError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+            .map_err(|e| {
+                crate::HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                ))
+            })?;
 
         total_rows += num_rows;
     }
@@ -877,10 +885,7 @@ fn ingest_variants(
 /// The loci_variants.parquet file is already fully prepared with all columns
 /// (locus_id, phenotype, ancestry, sequencing_type, contig, xpos, position,
 /// ref, alt, pvalue, neg_log10_p, is_significant), so we can upload it directly.
-fn ingest_loci_variants(
-    parquet_path: &str,
-    client: &ClickHouseClient,
-) -> Result<usize> {
+fn ingest_loci_variants(parquet_path: &str, client: &ClickHouseClient) -> Result<usize> {
     ingest_parquet_direct(parquet_path, "loci_variants", client)
 }
 
@@ -890,10 +895,7 @@ fn ingest_loci_variants(
 /// (gene_id, gene_symbol, annotation, max_maf, phenotype, ancestry, pvalue,
 /// pvalue_burden, pvalue_skat, beta_burden, mac, contig, gene_start_position, xpos),
 /// so we can upload it directly.
-fn ingest_gene_associations(
-    parquet_path: &str,
-    client: &ClickHouseClient,
-) -> Result<usize> {
+fn ingest_gene_associations(parquet_path: &str, client: &ClickHouseClient) -> Result<usize> {
     ingest_parquet_direct(parquet_path, "gene_associations", client)
 }
 
@@ -902,10 +904,7 @@ fn ingest_gene_associations(
 /// The qq_*.parquet files are already fully prepared with all columns
 /// (phenotype, ancestry, sequencing_type, contig, position, ref_allele,
 /// alt_allele, pvalue_log10, pvalue_expected_log10), so we can upload directly.
-fn ingest_qq_points(
-    parquet_path: &str,
-    client: &ClickHouseClient,
-) -> Result<usize> {
+fn ingest_qq_points(parquet_path: &str, client: &ClickHouseClient) -> Result<usize> {
     ingest_parquet_direct(parquet_path, "qq_points", client)
 }
 
@@ -934,9 +933,12 @@ fn ingest_parquet_direct(
     }
 
     // Upload to ClickHouse
-    client
-        .insert_parquet_bytes(table_name, data)
-        .map_err(|e| crate::HailError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+    client.insert_parquet_bytes(table_name, data).map_err(|e| {
+        crate::HailError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            e.to_string(),
+        ))
+    })?;
 
     Ok(row_count)
 }

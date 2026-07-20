@@ -41,11 +41,17 @@ fn variant_row(contig: &str, pos: i32, r: &str, a: &str, marker: i32) -> Encoded
         (
             "locus".to_string(),
             EncodedValue::Struct(vec![
-                ("contig".to_string(), EncodedValue::Binary(contig.as_bytes().to_vec())),
+                (
+                    "contig".to_string(),
+                    EncodedValue::Binary(contig.as_bytes().to_vec()),
+                ),
                 ("position".to_string(), EncodedValue::Int32(pos)),
             ]),
         ),
-        ("variant_id".to_string(), EncodedValue::Binary(variant_id.into_bytes())),
+        (
+            "variant_id".to_string(),
+            EncodedValue::Binary(variant_id.into_bytes()),
+        ),
         (
             "alleles".to_string(),
             EncodedValue::Array(vec![
@@ -85,7 +91,12 @@ fn source_rows(table_env: Option<&str>) -> Vec<EncodedValue> {
 }
 
 /// Load `rows` into `pg_table`, returning rows upserted.
-fn load(client: &mut PostgresClient, rows: &[EncodedValue], pg_table: &str, recreate: bool) -> usize {
+fn load(
+    client: &mut PostgresClient,
+    rows: &[EncodedValue],
+    pg_table: &str,
+    recreate: bool,
+) -> usize {
     if recreate {
         client.drop_table(pg_table).expect("drop");
     }
@@ -145,5 +156,7 @@ fn roundtrip_reconciles_counts_and_is_idempotent() {
     let expected = genohype_core::export::postgres::row_to_json(probe);
     assert_eq!(stored, expected, "data JSONB payload round-trips");
 
-    println!("round-trip OK: counts reconcile, re-load idempotent, columns + data JSONB round-trip");
+    println!(
+        "round-trip OK: counts reconcile, re-load idempotent, columns + data JSONB round-trip"
+    );
 }

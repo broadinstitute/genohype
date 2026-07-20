@@ -75,7 +75,11 @@ impl ParquetWriter<File> {
     /// * `path` - Output path for the Parquet file
     /// * `hail_schema` - The EncodedType describing the row structure
     /// * `batch_size` - Number of rows to accumulate before flushing
-    pub fn with_batch_size(path: &str, hail_schema: &EncodedType, batch_size: usize) -> Result<Self> {
+    pub fn with_batch_size(
+        path: &str,
+        hail_schema: &EncodedType,
+        batch_size: usize,
+    ) -> Result<Self> {
         let file = File::create(path)?;
         Self::from_writer_with_batch_size(file, hail_schema, batch_size)
     }
@@ -109,7 +113,11 @@ impl<W: Write + Send> ParquetWriter<W> {
     }
 
     /// Create a ParquetWriter from a writer with a custom batch size
-    pub fn from_writer_with_batch_size(writer: W, hail_schema: &EncodedType, batch_size: usize) -> Result<Self> {
+    pub fn from_writer_with_batch_size(
+        writer: W,
+        hail_schema: &EncodedType,
+        batch_size: usize,
+    ) -> Result<Self> {
         let arrow_schema = Arc::new(create_schema(hail_schema)?);
 
         let props = WriterProperties::builder()
@@ -311,7 +319,10 @@ fn arrow_type_to_encoded(dtype: &arrow::datatypes::DataType, required: bool) -> 
         DataType::Utf8 | DataType::LargeUtf8 => EncodedType::EBinary { required },
         DataType::List(field) => EncodedType::EArray {
             required,
-            element: Box::new(arrow_type_to_encoded(field.data_type(), !field.is_nullable())),
+            element: Box::new(arrow_type_to_encoded(
+                field.data_type(),
+                !field.is_nullable(),
+            )),
         },
         DataType::Struct(fields) => {
             let encoded_fields: Vec<_> = fields

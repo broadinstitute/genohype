@@ -24,20 +24,23 @@ mod ingest;
 pub use genohype_core::{HailError, Result};
 
 use clap::Parser;
-use cli::{Cli, CacheCommands, ClickHouseCommands, ClusterCommands, Commands, EnvCommands, ExportCommands, VcfCommands};
 #[cfg(feature = "clickhouse")]
 use cli::IngestCommands;
+use cli::{
+    CacheCommands, Cli, ClickHouseCommands, ClusterCommands, Commands, EnvCommands, ExportCommands,
+    VcfCommands,
+};
 #[cfg(feature = "vep")]
 use commands::annotate::run_annotate;
 use genohype_core::metadata::CacheOptions;
 use owo_colors::OwoColorize;
 
 // Import command handlers from the commands module
+#[cfg(feature = "bigquery")]
+use commands::export::run_export_bigquery;
 use commands::export::{
     run_export_cache_build, run_export_hail, run_export_json, run_export_parquet, run_export_vcf,
 };
-#[cfg(feature = "bigquery")]
-use commands::export::run_export_bigquery;
 #[cfg(feature = "clickhouse")]
 use commands::export::{run_export_clickhouse, run_export_genes_clickhouse};
 #[cfg(feature = "elasticsearch")]
@@ -82,7 +85,12 @@ fn main() -> Result<()> {
     });
 
     match cli.command {
-        Commands::Info { path, json, count, globals } => show_info(&path, json, count, globals, cache_opts)?,
+        Commands::Info {
+            path,
+            json,
+            count,
+            globals,
+        } => show_info(&path, json, count, globals, cache_opts)?,
         Commands::Summary { path } => run_summary(&path, cache_opts)?,
         Commands::Query(args) => run_query(args, cache_opts)?,
         Commands::Export { command } => match command {
@@ -169,9 +177,7 @@ fn main() -> Result<()> {
             CacheCommands::Clear => {
                 if let Some(cache) = genohype_core::metadata::MetadataCache::new() {
                     let cache_dir = cache.cache_dir().to_path_buf();
-                    cache.clear().map_err(|e| {
-                        genohype_core::HailError::Io(e)
-                    })?;
+                    cache.clear().map_err(|e| genohype_core::HailError::Io(e))?;
                     println!("Cache cleared: {}", cache_dir.display());
                 } else {
                     eprintln!("Could not determine cache directory");
@@ -217,9 +223,7 @@ fn init_tracing(cli: &Cli) -> Option<tracing_chrome::FlushGuard> {
             .include_args(true)
             .build();
 
-        tracing_subscriber::registry()
-            .with(chrome_layer)
-            .init();
+        tracing_subscriber::registry().with(chrome_layer).init();
 
         eprintln!("Profiling enabled → {}", path);
         Some(guard)

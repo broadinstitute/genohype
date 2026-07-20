@@ -478,10 +478,16 @@ impl CoordinatorData {
                 *retries
             };
             if retry_count > 3 {
-                println!("Partition {} exceeded max retries (worker {} dead). Marking as failed.", part_id, dead_worker_id);
+                println!(
+                    "Partition {} exceeded max retries (worker {} dead). Marking as failed.",
+                    part_id, dead_worker_id
+                );
                 self.failed_partitions.insert(part_id);
             } else {
-                println!("Worker {} died. Requeuing partition {} (retry {}/3)", dead_worker_id, part_id, retry_count);
+                println!(
+                    "Worker {} died. Requeuing partition {} (retry {}/3)",
+                    dead_worker_id, part_id, retry_count
+                );
                 self.pending_partitions.push_front(part_id);
 
                 // Add REQUEUED event to dashboard
@@ -490,7 +496,10 @@ impl CoordinatorData {
                     event_type: "requeued".to_string(),
                     worker_id: Some(dead_worker_id.to_string()),
                     phenotype_id: None,
-                    details: format!("Task {} requeued after worker death (retry {}/3)", part_id, retry_count),
+                    details: format!(
+                        "Task {} requeued after worker death (retry {}/3)",
+                        part_id, retry_count
+                    ),
                 });
             }
         }
@@ -507,7 +516,10 @@ impl CoordinatorData {
                 lost_exome.sort_by(|a, b| b.cmp(a));
                 for part_id in lost_exome {
                     manhattan.exome_processing.remove(&part_id);
-                    println!("Worker {} died. Requeuing exome partition {}", dead_worker_id, part_id);
+                    println!(
+                        "Worker {} died. Requeuing exome partition {}",
+                        dead_worker_id, part_id
+                    );
                     manhattan.exome_pending.push_front(part_id);
                 }
 
@@ -520,7 +532,10 @@ impl CoordinatorData {
                 lost_genome.sort_by(|a, b| b.cmp(a));
                 for part_id in lost_genome {
                     manhattan.genome_processing.remove(&part_id);
-                    println!("Worker {} died. Requeuing genome partition {}", dead_worker_id, part_id);
+                    println!(
+                        "Worker {} died. Requeuing genome partition {}",
+                        dead_worker_id, part_id
+                    );
                     manhattan.genome_pending.push_front(part_id);
                 }
             }
@@ -528,13 +543,23 @@ impl CoordinatorData {
                 let mut lost_tasks = Vec::new();
                 for (task_id, (pheno, ancestry, base_path, worker, _)) in &ingestion.active_tasks {
                     if worker == dead_worker_id {
-                        lost_tasks.push((task_id.clone(), pheno.clone(), ancestry.clone(), base_path.clone()));
+                        lost_tasks.push((
+                            task_id.clone(),
+                            pheno.clone(),
+                            ancestry.clone(),
+                            base_path.clone(),
+                        ));
                     }
                 }
                 for (task_id, pheno, ancestry, base_path) in lost_tasks {
                     ingestion.active_tasks.remove(&task_id);
-                    println!("Worker {} died. Requeuing ingestion task {}/{}", dead_worker_id, ancestry, pheno);
-                    ingestion.pending_tasks.push_front((pheno, ancestry, base_path));
+                    println!(
+                        "Worker {} died. Requeuing ingestion task {}/{}",
+                        dead_worker_id, ancestry, pheno
+                    );
+                    ingestion
+                        .pending_tasks
+                        .push_front((pheno, ancestry, base_path));
                 }
             }
             JobExecutionState::Batch(ref mut batch) => {
@@ -548,7 +573,10 @@ impl CoordinatorData {
                     lost_exome.sort_by(|a, b| b.cmp(a));
                     for part_id in lost_exome {
                         state.exome_processing.remove(&part_id);
-                        println!("Worker {} died. Requeuing exome partition {} for {}", dead_worker_id, part_id, pheno_id);
+                        println!(
+                            "Worker {} died. Requeuing exome partition {} for {}",
+                            dead_worker_id, part_id, pheno_id
+                        );
                         state.exome_pending.push_front(part_id);
                     }
 
@@ -561,7 +589,10 @@ impl CoordinatorData {
                     lost_genome.sort_by(|a, b| b.cmp(a));
                     for part_id in lost_genome {
                         state.genome_processing.remove(&part_id);
-                        println!("Worker {} died. Requeuing genome partition {} for {}", dead_worker_id, part_id, pheno_id);
+                        println!(
+                            "Worker {} died. Requeuing genome partition {} for {}",
+                            dead_worker_id, part_id, pheno_id
+                        );
                         state.genome_pending.push_front(part_id);
                     }
                 }
@@ -585,14 +616,21 @@ impl CoordinatorData {
                 if let ActiveTask::AggregateBatch { phenotype_ids, .. } = task {
                     if let JobExecutionState::Batch(ref mut batch) = self.job_state {
                         for pheno_id in phenotype_ids {
-                            let retries = batch.aggregate_retry_counts.entry(pheno_id.clone()).or_insert(0);
+                            let retries = batch
+                                .aggregate_retry_counts
+                                .entry(pheno_id.clone())
+                                .or_insert(0);
                             *retries += 1;
                             if *retries > MAX_AGGREGATE_RETRIES {
                                 println!("Phenotype {} exceeded max aggregate retries (worker {} dead). Marking as failed.", pheno_id, dead_worker_id);
                                 batch.failed_count += 1;
                                 batch.aggregate_specs.remove(&pheno_id);
-                            } else if let Some(spec) = batch.aggregate_specs.get(&pheno_id).cloned() {
-                                println!("Worker {} died. Requeuing aggregate task for {} (retry {})", dead_worker_id, pheno_id, retries);
+                            } else if let Some(spec) = batch.aggregate_specs.get(&pheno_id).cloned()
+                            {
+                                println!(
+                                    "Worker {} died. Requeuing aggregate task for {} (retry {})",
+                                    dead_worker_id, pheno_id, retries
+                                );
                                 batch.ready_to_aggregate.push((pheno_id, spec));
                             }
                         }

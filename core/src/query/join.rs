@@ -146,10 +146,8 @@ mod tests {
             Ok(make_row("chr1", 300)),
         ];
 
-        let right: Vec<Result<EncodedValue>> = vec![
-            Ok(make_row("chr1", 100)),
-            Ok(make_row("chr1", 300)),
-        ];
+        let right: Vec<Result<EncodedValue>> =
+            vec![Ok(make_row("chr1", 100)), Ok(make_row("chr1", 300))];
 
         let keys = vec!["chrom".to_string(), "pos".to_string()];
         let iter = SortedMergeIterator::new(left.into_iter(), right.into_iter(), keys);
@@ -167,10 +165,8 @@ mod tests {
 
     #[test]
     fn test_merge_join_empty_right() {
-        let left: Vec<Result<EncodedValue>> = vec![
-            Ok(make_row("chr1", 100)),
-            Ok(make_row("chr1", 200)),
-        ];
+        let left: Vec<Result<EncodedValue>> =
+            vec![Ok(make_row("chr1", 100)), Ok(make_row("chr1", 200))];
 
         let right: Vec<Result<EncodedValue>> = vec![];
 

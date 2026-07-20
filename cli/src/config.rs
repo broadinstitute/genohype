@@ -414,8 +414,8 @@ impl Config {
     pub fn get_pool(&self, name: &str) -> Option<ResolvedPoolConfig> {
         self.pools.get(name).map(|profile| {
             // Auto-enable coordinator if WireGuard is configured
-            let with_coordinator = profile.with_coordinator.unwrap_or(false)
-                || profile.wireguard.is_some();
+            let with_coordinator =
+                profile.with_coordinator.unwrap_or(false) || profile.wireguard.is_some();
 
             ResolvedPoolConfig {
                 name: name.to_string(),
@@ -431,8 +431,14 @@ impl Config {
                     .clone()
                     .or_else(|| self.defaults.zone.clone())
                     .unwrap_or_else(|| "us-central1-a".to_string()),
-                network: profile.network.clone().or_else(|| self.defaults.network.clone()),
-                subnet: profile.subnet.clone().or_else(|| self.defaults.subnet.clone()),
+                network: profile
+                    .network
+                    .clone()
+                    .or_else(|| self.defaults.network.clone()),
+                subnet: profile
+                    .subnet
+                    .clone()
+                    .or_else(|| self.defaults.subnet.clone()),
                 project: self.defaults.project.clone(),
                 with_coordinator,
                 wireguard: profile.wireguard.clone(),
@@ -641,8 +647,8 @@ impl HailEnv {
 
     /// Load .genohype-env from a specific path.
     pub fn load_file(path: &PathBuf) -> Result<Self, String> {
-        let content =
-            std::fs::read_to_string(path).map_err(|e| format!("Failed to read .genohype-env: {}", e))?;
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read .genohype-env: {}", e))?;
         toml::from_str(&content).map_err(|e| format!("Failed to parse .genohype-env: {}", e))
     }
 

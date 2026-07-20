@@ -66,12 +66,10 @@ impl AppState {
 
         // Create new engine in a blocking task (since QueryEngine::open_path does sync I/O)
         let path_owned = path.to_string();
-        let engine = tokio::task::spawn_blocking(move || {
-            QueryEngine::open_path(&path_owned)
-        })
-        .await
-        .map_err(|e| format!("Task join error: {}", e))?
-        .map_err(|e| e.to_string())?;
+        let engine = tokio::task::spawn_blocking(move || QueryEngine::open_path(&path_owned))
+            .await
+            .map_err(|e| format!("Task join error: {}", e))?
+            .map_err(|e| e.to_string())?;
 
         let engine = Arc::new(engine);
 
@@ -232,12 +230,10 @@ async fn table_info(
     Query(params): Query<TableParams>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<TableInfo>, (StatusCode, Json<ErrorResponse>)> {
-    let engine = state.get_engine(&params.table).await.map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse { error: e }),
-        )
-    })?;
+    let engine = state
+        .get_engine(&params.table)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })))?;
 
     Ok(Json(TableInfo {
         path: params.table,
@@ -252,12 +248,10 @@ async fn table_schema(
     Query(params): Query<TableParams>,
     State(state): State<Arc<AppState>>,
 ) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
-    let engine = state.get_engine(&params.table).await.map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse { error: e }),
-        )
-    })?;
+    let engine = state
+        .get_engine(&params.table)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })))?;
 
     let schema = if let Some(rvd_spec) = engine.rvd_spec() {
         format_schema_clean(&rvd_spec.codec_spec.v_type)
@@ -288,11 +282,7 @@ async fn query_table(
     let engine = match state.get_engine(&table_path).await {
         Ok(e) => e,
         Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse { error: e }),
-            )
-                .into_response();
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })).into_response();
         }
     };
 

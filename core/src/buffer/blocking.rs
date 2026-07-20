@@ -3,8 +3,8 @@
 //! Provides byte-level access on top of block-based buffers.
 //! Converts `InputBlockBuffer` to `InputBuffer`.
 
-use crate::error::{HailError, Result};
 use crate::buffer::{InputBlockBuffer, InputBuffer};
+use crate::error::{HailError, Result};
 
 /// Fixed-size blocking buffer (typically 64KB)
 ///

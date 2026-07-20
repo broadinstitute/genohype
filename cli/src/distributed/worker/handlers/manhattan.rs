@@ -2,7 +2,9 @@
 //!
 //! Processes Manhattan scan (Phase 1) and aggregate (Phase 2) jobs.
 
-use crate::distributed::message::{CoreTaskInfo, ManhattanAggregateSpec, ManhattanScanSpec, ManhattanSource};
+use crate::distributed::message::{
+    CoreTaskInfo, ManhattanAggregateSpec, ManhattanScanSpec, ManhattanSource,
+};
 use crate::distributed::worker::telemetry::{CoreTaskGuard, TelemetryState};
 use crate::Result;
 use genohype_core::query::QueryEngine;
@@ -86,12 +88,15 @@ pub fn process_manhattan_scan_v2(
             // Track the active partition for this Rayon thread (RAII guard)
             // Include phenotype as label so dashboard shows which phenotype each core is scanning
             let _core_guard = telemetry.as_ref().map(|ts| {
-                CoreTaskGuard::new(ts, CoreTaskInfo {
-                    task_type: "partition".to_string(),
-                    task_id: partition_id.to_string(),
-                    label: Some(phenotype.clone()),
-                    parent: None,
-                })
+                CoreTaskGuard::new(
+                    ts,
+                    CoreTaskInfo {
+                        task_type: "partition".to_string(),
+                        task_id: partition_id.to_string(),
+                        label: Some(phenotype.clone()),
+                        parent: None,
+                    },
+                )
             });
 
             let iter = engine_ref.scan_partition_iter(partition_id, &[])?;
@@ -125,7 +130,13 @@ pub fn process_manhattan_scan_v2(
                     if let Some(x) = layout.get_x(contig_for_layout, point.position) {
                         let y = y_scale.get_y(point.neg_log10_p);
                         let color = layout.get_color(contig_for_layout);
-                        renderer.render_point_with_radius(x, y, color, style.point_alpha, style.point_radius);
+                        renderer.render_point_with_radius(
+                            x,
+                            y,
+                            color,
+                            style.point_alpha,
+                            style.point_radius,
+                        );
                     }
 
                     // 2. Per-Chromosome Plot
@@ -133,30 +144,44 @@ pub fn process_manhattan_scan_v2(
                     let normalized_contig = normalize_contig_name(&point.contig);
 
                     // Look up length using short name (e.g., "1") because that's what we have in map
-                    if let Some(&len) = contig_lengths.get(contig_for_layout).or_else(|| contig_lengths.get(&normalized_contig)) {
+                    if let Some(&len) = contig_lengths
+                        .get(contig_for_layout)
+                        .or_else(|| contig_lengths.get(&normalized_contig))
+                    {
                         // Initialize renderer and layout for this chromosome if needed
-                        let chrom_layout = chrom_layouts.entry(normalized_contig.clone()).or_insert_with(|| {
-                            // Create a layout where this single chromosome fills the width
-                            ChromosomeLayout::new(&[(contig_for_layout.to_string(), len)], width, 0)
-                        });
+                        let chrom_layout = chrom_layouts
+                            .entry(normalized_contig.clone())
+                            .or_insert_with(|| {
+                                // Create a layout where this single chromosome fills the width
+                                ChromosomeLayout::new(
+                                    &[(contig_for_layout.to_string(), len)],
+                                    width,
+                                    0,
+                                )
+                            });
 
-                        let chrom_renderer = chrom_renderers.entry(normalized_contig.clone()).or_insert_with(|| {
-                            ManhattanRenderer::new_transparent(width, height)
-                        });
+                        let chrom_renderer = chrom_renderers
+                            .entry(normalized_contig.clone())
+                            .or_insert_with(|| ManhattanRenderer::new_transparent(width, height));
 
                         if let Some(x) = chrom_layout.get_x(contig_for_layout, point.position) {
                             let y = y_scale.get_y(point.neg_log10_p);
                             // Use same color scheme as WG plot
                             let color = layout.get_color(contig_for_layout);
-                            chrom_renderer.render_point_with_radius(x, y, color, style.point_alpha, style.point_radius);
+                            chrom_renderer.render_point_with_radius(
+                                x,
+                                y,
+                                color,
+                                style.point_alpha,
+                                style.point_radius,
+                            );
                         }
                     }
 
                     // Check significance threshold
                     if point.pvalue < threshold {
                         // Extract additional fields for significant hit
-                        let (ref_allele, alt_allele, beta, se, af) =
-                            extract_sig_hit_fields(&row);
+                        let (ref_allele, alt_allele, beta, se, af) = extract_sig_hit_fields(&row);
 
                         // Normalize contig to chr-prefixed format for output
                         let contig_normalized = normalize_contig_name(&point.contig);
@@ -206,7 +231,10 @@ pub fn process_manhattan_scan_v2(
             let root = spec.output_path.trim_end_matches('/');
             for (chrom, chrom_renderer) in chrom_renderers {
                 let chrom_png_data = chrom_renderer.encode_png()?;
-                let chrom_path = format!("{}/chroms/{}/{}/part-{:05}.png", root, chrom, source_name, partition_id);
+                let chrom_path = format!(
+                    "{}/chroms/{}/{}/part-{:05}.png",
+                    root, chrom, source_name, partition_id
+                );
 
                 if is_cloud_path(&chrom_path) {
                     let mut writer = StreamingCloudWriter::new(&chrom_path)?;
@@ -262,9 +290,10 @@ pub fn process_manhattan_scan_v2(
     Ok((total_rows, Some((spec.table_path.clone(), engine))))
 }
 
-
 /// Extract fields for a significant hit from an encoded row.
-pub fn extract_sig_hit_fields(row: &genohype_core::codec::EncodedValue) -> (String, String, Option<f64>, Option<f64>, Option<f64>) {
+pub fn extract_sig_hit_fields(
+    row: &genohype_core::codec::EncodedValue,
+) -> (String, String, Option<f64>, Option<f64>, Option<f64>) {
     use genohype_core::codec::EncodedValue;
 
     // Helper to get nested field
@@ -272,7 +301,10 @@ pub fn extract_sig_hit_fields(row: &genohype_core::codec::EncodedValue) -> (Stri
         let mut current = value;
         for &field_name in path {
             if let EncodedValue::Struct(fields) = current {
-                current = fields.iter().find(|(n, _)| n == field_name).map(|(_, v)| v)?;
+                current = fields
+                    .iter()
+                    .find(|(n, _)| n == field_name)
+                    .map(|(_, v)| v)?;
             } else {
                 return None;
             }
@@ -281,41 +313,41 @@ pub fn extract_sig_hit_fields(row: &genohype_core::codec::EncodedValue) -> (Stri
     }
 
     // Extract alleles
-    let (ref_allele, alt_allele) = if let Some(EncodedValue::Array(alleles)) = get_field(row, &["alleles"]) {
-        let ref_a = alleles.first()
-            .and_then(|v| v.as_string())
-            .unwrap_or_default();
-        let alt_a = alleles.get(1)
-            .and_then(|v| v.as_string())
-            .unwrap_or_default();
-        (ref_a, alt_a)
-    } else {
-        (String::new(), String::new())
-    };
+    let (ref_allele, alt_allele) =
+        if let Some(EncodedValue::Array(alleles)) = get_field(row, &["alleles"]) {
+            let ref_a = alleles
+                .first()
+                .and_then(|v| v.as_string())
+                .unwrap_or_default();
+            let alt_a = alleles
+                .get(1)
+                .and_then(|v| v.as_string())
+                .unwrap_or_default();
+            (ref_a, alt_a)
+        } else {
+            (String::new(), String::new())
+        };
 
     // Extract BETA
-    let beta = get_field(row, &["BETA"])
-        .and_then(|v| match v {
-            EncodedValue::Float64(f) => Some(*f),
-            EncodedValue::Float32(f) => Some(*f as f64),
-            _ => None,
-        });
+    let beta = get_field(row, &["BETA"]).and_then(|v| match v {
+        EncodedValue::Float64(f) => Some(*f),
+        EncodedValue::Float32(f) => Some(*f as f64),
+        _ => None,
+    });
 
     // Extract SE
-    let se = get_field(row, &["SE"])
-        .and_then(|v| match v {
-            EncodedValue::Float64(f) => Some(*f),
-            EncodedValue::Float32(f) => Some(*f as f64),
-            _ => None,
-        });
+    let se = get_field(row, &["SE"]).and_then(|v| match v {
+        EncodedValue::Float64(f) => Some(*f),
+        EncodedValue::Float32(f) => Some(*f as f64),
+        _ => None,
+    });
 
     // Extract AF (AF_Allele2)
-    let af = get_field(row, &["AF_Allele2"])
-        .and_then(|v| match v {
-            EncodedValue::Float64(f) => Some(*f),
-            EncodedValue::Float32(f) => Some(*f as f64),
-            _ => None,
-        });
+    let af = get_field(row, &["AF_Allele2"]).and_then(|v| match v {
+        EncodedValue::Float64(f) => Some(*f),
+        EncodedValue::Float32(f) => Some(*f as f64),
+        _ => None,
+    });
 
     (ref_allele, alt_allele, beta, se, af)
 }
@@ -364,7 +396,10 @@ fn verify_and_checkpoint(spec: &ManhattanAggregateSpec) -> Result<()> {
         let file_url = format!("{}/{}", output_base, file);
         if genohype_core::io::is_cloud_path(&file_url) {
             if let Err(e) = genohype_core::io::get_file_size(&file_url) {
-                eprintln!("  Warning: Expected output file missing or inaccessible: {} ({})", file_url, e);
+                eprintln!(
+                    "  Warning: Expected output file missing or inaccessible: {} ({})",
+                    file_url, e
+                );
             }
         } else if !std::path::Path::new(&file_url).exists() {
             eprintln!("  Warning: Expected output file missing: {}", file_url);
@@ -400,14 +435,20 @@ fn verify_and_checkpoint(spec: &ManhattanAggregateSpec) -> Result<()> {
         writer.write_all(b"")?;
         writer.finish()?;
 
-        println!("  Checkpoint: added {}_{} to .completed_phenos", ancestry, id);
+        println!(
+            "  Checkpoint: added {}_{} to .completed_phenos",
+            ancestry, id
+        );
     } else {
         // Local file system fallback
         let marker_dir = format!("{}/.completed_phenos", base_dir);
         std::fs::create_dir_all(&marker_dir)?;
         let marker_path = format!("{}/{}_{}", marker_dir, ancestry, id);
         std::fs::write(&marker_path, b"")?;
-        println!("  Checkpoint: added {}_{} to .completed_phenos", ancestry, id);
+        println!(
+            "  Checkpoint: added {}_{} to .completed_phenos",
+            ancestry, id
+        );
     }
 
     Ok(())

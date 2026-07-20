@@ -48,7 +48,10 @@ pub fn get_prefetch_depth() -> usize {
 
 /// Set the adaptive prefetch depth (clamped to [MIN, MAX])
 pub fn set_prefetch_depth(depth: usize) {
-    PREFETCH_DEPTH.store(depth.clamp(MIN_PREFETCH_DEPTH, MAX_PREFETCH_DEPTH), Ordering::Relaxed);
+    PREFETCH_DEPTH.store(
+        depth.clamp(MIN_PREFETCH_DEPTH, MAX_PREFETCH_DEPTH),
+        Ordering::Relaxed,
+    );
 }
 
 /// Global byte-weighted chunk cache for cloud IO.
@@ -67,9 +70,8 @@ static CHUNK_CACHE: Lazy<moka::future::Cache<String, bytes::Bytes>> = Lazy::new(
 ///
 /// This runtime is used for all async cloud storage operations,
 /// including prefetching reads and uploading writes.
-pub(crate) static IO_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
-    Runtime::new().expect("Failed to create IO runtime")
-});
+pub(crate) static IO_RUNTIME: Lazy<Runtime> =
+    Lazy::new(|| Runtime::new().expect("Failed to create IO runtime"));
 
 /// Global cache of GCS clients by bucket name.
 ///
@@ -132,12 +134,14 @@ pub fn get_gcs_client(bucket: &str) -> Result<Arc<dyn ObjectStore>> {
         return Ok(client.clone());
     }
 
-    debug!("GCS client cache miss for bucket {}, creating new client", bucket);
+    debug!(
+        "GCS client cache miss for bucket {}, creating new client",
+        bucket
+    );
     let start = std::time::Instant::now();
 
     // Build the GCS client, optionally using service account key file
-    let mut builder = object_store::gcp::GoogleCloudStorageBuilder::new()
-        .with_bucket_name(bucket);
+    let mut builder = object_store::gcp::GoogleCloudStorageBuilder::new().with_bucket_name(bucket);
 
     // Use key file if available, otherwise fall back to metadata service
     if let Ok(key_path) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS") {
@@ -163,13 +167,16 @@ pub fn get_gcs_client(bucket: &str) -> Result<Arc<dyn ObjectStore>> {
         .with_http2_keep_alive_while_idle();
     builder = builder.with_client_options(client_options);
 
-    let client: Arc<dyn ObjectStore> = Arc::new(
-        builder
-            .build()
-            .map_err(|e| HailError::InvalidFormat(format!("Failed to create GCS client: {}", e)))?
-    );
+    let client: Arc<dyn ObjectStore> =
+        Arc::new(builder.build().map_err(|e| {
+            HailError::InvalidFormat(format!("Failed to create GCS client: {}", e))
+        })?);
 
-    debug!("GCS client created for bucket {} in {:?}", bucket, start.elapsed());
+    debug!(
+        "GCS client created for bucket {} in {:?}",
+        bucket,
+        start.elapsed()
+    );
     cache.insert(bucket.to_string(), client.clone());
     Ok(client)
 }
@@ -229,9 +236,9 @@ impl CloudReader {
         let path = self.path.clone();
 
         let start_time = std::time::Instant::now();
-        let bytes = IO_RUNTIME.block_on(async {
-            get_range_retrying(&store, &path, range).await
-        }).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        let bytes = IO_RUNTIME
+            .block_on(async { get_range_retrying(&store, &path, range).await })
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
         trace!("CloudReader: fetch completed in {:?}", start_time.elapsed());
 
@@ -369,14 +376,18 @@ impl PrefetchingCloudReader {
         path: ObjPath,
         start_offset: u64,
         file_size: u64,
-    ) -> (tokio::sync::mpsc::Receiver<std::io::Result<bytes::Bytes>>, tokio::sync::mpsc::Sender<()>) {
+    ) -> (
+        tokio::sync::mpsc::Receiver<std::io::Result<bytes::Bytes>>,
+        tokio::sync::mpsc::Sender<()>,
+    ) {
         let depth = get_prefetch_depth();
         let (tx, rx) = tokio::sync::mpsc::channel(depth);
         let (cancel_tx, mut cancel_rx) = tokio::sync::mpsc::channel::<()>(1);
 
         IO_RUNTIME.spawn(async move {
             // Build a stream of chunk offsets, then fetch them concurrently
-            let chunk_count = ((file_size - start_offset) as usize + PREFETCH_CHUNK_SIZE - 1) / PREFETCH_CHUNK_SIZE;
+            let chunk_count = ((file_size - start_offset) as usize + PREFETCH_CHUNK_SIZE - 1)
+                / PREFETCH_CHUNK_SIZE;
 
             let store_ref = &store;
             let path_ref = &path;
@@ -384,7 +395,8 @@ impl PrefetchingCloudReader {
             let mut fetch_stream = futures::stream::iter(0..chunk_count)
                 .map(|i| {
                     let offset = start_offset + (i as u64 * PREFETCH_CHUNK_SIZE as u64);
-                    let len = std::cmp::min(PREFETCH_CHUNK_SIZE as u64, file_size - offset) as usize;
+                    let len =
+                        std::cmp::min(PREFETCH_CHUNK_SIZE as u64, file_size - offset) as usize;
                     let range = offset as usize..(offset as usize + len);
                     let store = store_ref.clone();
                     let path = path_ref.clone();
@@ -392,19 +404,33 @@ impl PrefetchingCloudReader {
                         let cache_key = format!("{}|{}|{}", path.as_ref(), offset, len);
                         // Check chunk cache first
                         if let Some(cached) = CHUNK_CACHE.get(&cache_key).await {
-                            trace!("PrefetchingCloudReader: cache hit for range {}..{}", offset, offset + len as u64);
+                            trace!(
+                                "PrefetchingCloudReader: cache hit for range {}..{}",
+                                offset,
+                                offset + len as u64
+                            );
                             return Ok(cached);
                         }
-                        trace!("PrefetchingCloudReader: fetching range {}..{}", offset, offset + len as u64);
+                        trace!(
+                            "PrefetchingCloudReader: fetching range {}..{}",
+                            offset,
+                            offset + len as u64
+                        );
                         let start_time = std::time::Instant::now();
                         let result = get_range_retrying(&store, &path, range).await;
-                        trace!("PrefetchingCloudReader: fetch completed in {:?}", start_time.elapsed());
+                        trace!(
+                            "PrefetchingCloudReader: fetch completed in {:?}",
+                            start_time.elapsed()
+                        );
                         match result {
                             Ok(bytes) => {
                                 CHUNK_CACHE.insert(cache_key, bytes.clone()).await;
                                 Ok(bytes)
                             }
-                            Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())),
+                            Err(e) => Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                e.to_string(),
+                            )),
                         }
                     }
                 })
@@ -465,7 +491,8 @@ impl Read for PrefetchingCloudReader {
         let available = self.current_chunk.len() - self.chunk_pos;
         let to_copy = std::cmp::min(available, buf.len());
 
-        buf[..to_copy].copy_from_slice(&self.current_chunk[self.chunk_pos..self.chunk_pos + to_copy]);
+        buf[..to_copy]
+            .copy_from_slice(&self.current_chunk[self.chunk_pos..self.chunk_pos + to_copy]);
         self.chunk_pos += to_copy;
         self.position += to_copy as u64;
 
@@ -603,12 +630,15 @@ pub type BoxedReader = Box<dyn ReadSeek + Send + Sync>;
 /// falling back to standard file I/O if mmap fails.
 #[tracing::instrument(skip_all, fields(path))]
 pub fn get_reader(path: &str) -> Result<BoxedReader> {
-    if path.starts_with("gs://") || path.starts_with("s3://") || path.starts_with("http://") || path.starts_with("https://") {
+    if path.starts_with("gs://")
+        || path.starts_with("s3://")
+        || path.starts_with("http://")
+        || path.starts_with("https://")
+    {
         create_cloud_reader(path)
     } else {
         // Local file - try mmap first for optimal NVMe performance
-        let file = File::open(path)
-            .map_err(|e| HailError::Io(e))?;
+        let file = File::open(path).map_err(|e| HailError::Io(e))?;
 
         // Try memory mapping for zero-copy access
         match MmapReader::new(&file) {
@@ -618,7 +648,11 @@ pub fn get_reader(path: &str) -> Result<BoxedReader> {
             }
             Err(e) => {
                 // Fall back to standard file reading if mmap fails
-                trace!("Mmap failed ({}), falling back to standard file reader for {}", e, path);
+                trace!(
+                    "Mmap failed ({}), falling back to standard file reader for {}",
+                    e,
+                    path
+                );
                 // Re-open the file since we may have consumed it
                 let file = File::open(path).map_err(|e| HailError::Io(e))?;
                 Ok(Box::new(file))
@@ -636,13 +670,20 @@ fn create_cloud_reader(url_str: &str) -> Result<BoxedReader> {
     let (store, path) = crate::io::resolve_url(url_str)?;
 
     // Get the file size via HEAD request
-    let file_size = IO_RUNTIME.block_on(async {
-        store.head(&path).await
-    }).map_err(|e| HailError::InvalidFormat(format!("Failed to get file metadata: {}", e)))?.size as u64;
+    let file_size = IO_RUNTIME
+        .block_on(async { store.head(&path).await })
+        .map_err(|e| HailError::InvalidFormat(format!("Failed to get file metadata: {}", e)))?
+        .size as u64;
 
     // Use PrefetchingCloudReader for latency-hiding streaming
-    trace!("Creating PrefetchingCloudReader for {} ({} bytes)", url_str, file_size);
-    Ok(Box::new(PrefetchingCloudReader::new(store, path, file_size)))
+    trace!(
+        "Creating PrefetchingCloudReader for {} ({} bytes)",
+        url_str,
+        file_size
+    );
+    Ok(Box::new(PrefetchingCloudReader::new(
+        store, path, file_size,
+    )))
 }
 
 /// Join a base path with a child path, handling both local and cloud paths correctly
@@ -653,7 +694,11 @@ pub fn join_path(base: &str, child: &str) -> String {
     // Normalize child path (remove leading separators)
     let child = child.trim_start_matches('/').trim_start_matches('\\');
 
-    if base.starts_with("gs://") || base.starts_with("s3://") || base.starts_with("http://") || base.starts_with("https://") {
+    if base.starts_with("gs://")
+        || base.starts_with("s3://")
+        || base.starts_with("http://")
+        || base.starts_with("https://")
+    {
         // Cloud URL - always use forward slashes
         let base = base.trim_end_matches('/');
         format!("{}/{}", base, child)
@@ -666,7 +711,10 @@ pub fn join_path(base: &str, child: &str) -> String {
 
 /// Check if a path is a cloud URL
 pub fn is_cloud_path(path: &str) -> bool {
-    path.starts_with("gs://") || path.starts_with("s3://") || path.starts_with("http://") || path.starts_with("https://")
+    path.starts_with("gs://")
+        || path.starts_with("s3://")
+        || path.starts_with("http://")
+        || path.starts_with("https://")
 }
 
 /// Read a specific byte range from a file (local or cloud)
@@ -708,9 +756,14 @@ fn range_read_cloud(url_str: &str, offset: u64, length: usize) -> Result<Vec<u8>
     let (store, path) = crate::io::resolve_url(url_str)?;
 
     let range = offset as usize..(offset as usize + length);
-    let bytes = IO_RUNTIME.block_on(async {
-        get_range_retrying(&store, &path, range).await
-    }).map_err(|e| HailError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+    let bytes = IO_RUNTIME
+        .block_on(async { get_range_retrying(&store, &path, range).await })
+        .map_err(|e| {
+            HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string(),
+            ))
+        })?;
 
     Ok(bytes.to_vec())
 }
@@ -752,9 +805,14 @@ pub fn get_file_size(path: &str) -> Result<u64> {
     if is_cloud_path(path) {
         let (store, obj_path) = crate::io::resolve_url(path)?;
 
-        let meta = IO_RUNTIME.block_on(async {
-            store.head(&obj_path).await
-        }).map_err(|e| HailError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+        let meta = IO_RUNTIME
+            .block_on(async { store.head(&obj_path).await })
+            .map_err(|e| {
+                HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                ))
+            })?;
 
         Ok(meta.size as u64)
     } else {

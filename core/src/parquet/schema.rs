@@ -36,7 +36,11 @@ pub fn hail_type_to_arrow(etype: &EncodedType) -> Result<DataType> {
 /// Convert a Hail EncodedField to an Arrow Field
 fn hail_field_to_arrow(field: &EncodedField) -> Result<Field> {
     let dtype = hail_type_to_arrow(&field.encoded_type)?;
-    Ok(Field::new(&field.name, dtype, !field.encoded_type.is_required()))
+    Ok(Field::new(
+        &field.name,
+        dtype,
+        !field.encoded_type.is_required(),
+    ))
 }
 
 /// Create an Arrow Schema from a root EncodedType (must be a Struct)

@@ -6,7 +6,9 @@
 use crate::distributed::coordinator::{
     ActiveTask, BatchState, CoordinatorData, IngestionState, ManhattanPhase, ManhattanPipelineState,
 };
-use crate::distributed::message::{CompleteRequest, JobEvent, ManhattanAggregateSpec, ManhattanSource};
+use crate::distributed::message::{
+    CompleteRequest, JobEvent, ManhattanAggregateSpec, ManhattanSource,
+};
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -57,8 +59,10 @@ pub(crate) fn complete_manhattan_work(
             // Check if scan phase is complete
             let exome_done = manhattan.exome_completed.len() == manhattan.exome_total_tasks;
             let genome_done = manhattan.genome_completed.len() == manhattan.genome_total_tasks;
-            let exome_idle = manhattan.exome_pending.is_empty() && manhattan.exome_processing.is_empty();
-            let genome_idle = manhattan.genome_pending.is_empty() && manhattan.genome_processing.is_empty();
+            let exome_idle =
+                manhattan.exome_pending.is_empty() && manhattan.exome_processing.is_empty();
+            let genome_idle =
+                manhattan.genome_pending.is_empty() && manhattan.genome_processing.is_empty();
 
             if (exome_done || manhattan.exome_total_tasks == 0)
                 && (genome_done || manhattan.genome_total_tasks == 0)
@@ -96,7 +100,11 @@ pub(crate) fn complete_manhattan_work(
 ///
 /// Handles both single-task and batch completions by iterating over
 /// all task IDs reported in the request.
-pub(crate) fn complete_ingestion_work(data: &mut CoordinatorData, ingestion: &mut IngestionState, req: &CompleteRequest) {
+pub(crate) fn complete_ingestion_work(
+    data: &mut CoordinatorData,
+    ingestion: &mut IngestionState,
+    req: &CompleteRequest,
+) {
     let task_count = req.tasks.len();
 
     for task_id in &req.tasks {
@@ -104,7 +112,8 @@ pub(crate) fn complete_ingestion_work(data: &mut CoordinatorData, ingestion: &mu
             ingestion.active_tasks.remove(task_id)
         {
             if req.error.is_none() {
-                data.ingested_phenotypes.insert((phenotype_id.clone(), ancestry.clone()));
+                data.ingested_phenotypes
+                    .insert((phenotype_id.clone(), ancestry.clone()));
                 data.log_event(crate::distributed::message::JobEvent {
                     timestamp_ms: crate::distributed::coordinator::state::CoordinatorData::now_ms(),
                     event_type: "success".to_string(),
@@ -172,7 +181,12 @@ pub(crate) fn complete_batch_work(
     let now_ms = CoordinatorData::now_ms();
 
     match task {
-        ActiveTask::Scan { phenotype_id, partition_ids, source, started_at_ms } => {
+        ActiveTask::Scan {
+            phenotype_id,
+            partition_ids,
+            source,
+            started_at_ms,
+        } => {
             // Track CPU time for this scan task
             let duration_secs = (now_ms.saturating_sub(started_at_ms)) as f64 / 1000.0;
             data.scan_cpu_secs += duration_secs;
@@ -222,7 +236,10 @@ pub(crate) fn complete_batch_work(
                 && genome_idle
             {
                 if batch.mode == crate::distributed::message::ExecutionMode::ScanOnly {
-                    println!("Phenotype {} scan complete (ScanOnly mode), marking as fully complete", phenotype_id);
+                    println!(
+                        "Phenotype {} scan complete (ScanOnly mode), marking as fully complete",
+                        phenotype_id
+                    );
                     batch.completed_count += 1;
                     if let Some(status) = batch.phenotype_statuses.get_mut(&phenotype_id) {
                         status.stage = "completed".to_string();
@@ -232,7 +249,10 @@ pub(crate) fn complete_batch_work(
                         event_type: "completed".to_string(),
                         worker_id: Some(req.worker_id.clone()),
                         phenotype_id: Some(phenotype_id.clone()),
-                        details: format!("Scan complete (ScanOnly mode) [{}/{}]", batch.completed_count, batch.total_phenotypes),
+                        details: format!(
+                            "Scan complete (ScanOnly mode) [{}/{}]",
+                            batch.completed_count, batch.total_phenotypes
+                        ),
                     });
                     batch.active_phenotypes.remove(&phenotype_id);
                 } else {
@@ -277,8 +297,12 @@ pub(crate) fn complete_batch_work(
                     };
 
                     // Store spec for potential retries
-                    batch.aggregate_specs.insert(phenotype_id.clone(), aggregate_spec.clone());
-                    batch.ready_to_aggregate.push((phenotype_id.clone(), aggregate_spec));
+                    batch
+                        .aggregate_specs
+                        .insert(phenotype_id.clone(), aggregate_spec.clone());
+                    batch
+                        .ready_to_aggregate
+                        .push((phenotype_id.clone(), aggregate_spec));
 
                     // Remove from active phenotypes
                     batch.active_phenotypes.remove(&phenotype_id);
@@ -290,8 +314,12 @@ pub(crate) fn complete_batch_work(
                     ManhattanSource::Genome => "genome",
                 };
                 let (done, total) = match source {
-                    ManhattanSource::Exome => (state.exome_completed.len(), state.exome_total_tasks),
-                    ManhattanSource::Genome => (state.genome_completed.len(), state.genome_total_tasks),
+                    ManhattanSource::Exome => {
+                        (state.exome_completed.len(), state.exome_total_tasks)
+                    }
+                    ManhattanSource::Genome => {
+                        (state.genome_completed.len(), state.genome_total_tasks)
+                    }
                 };
                 println!(
                     "Phenotype {} {} progress: {}/{} partitions",
@@ -300,7 +328,10 @@ pub(crate) fn complete_batch_work(
             }
         }
 
-        ActiveTask::AggregateBatch { phenotype_ids, started_at_ms } => {
+        ActiveTask::AggregateBatch {
+            phenotype_ids,
+            started_at_ms,
+        } => {
             // Track CPU time for this aggregate task
             let duration_secs = (now_ms.saturating_sub(started_at_ms)) as f64 / 1000.0;
             data.aggregate_cpu_secs += duration_secs;
@@ -310,31 +341,31 @@ pub(crate) fn complete_batch_work(
 
             // Extract individual summaries if available
             // Each summary may have its own "error" field for per-phenotype failures
-            let results_map: HashMap<String, (serde_json::Value, bool)> =
-                if let Some(ref json) = req.result_json {
-                    if let Some(results_array) = json.get("batch_results").and_then(|v| v.as_array())
-                    {
-                        // Results array corresponds to phenotype_ids order
-                        if results_array.len() == phenotype_ids.len() {
-                            phenotype_ids
-                                .iter()
-                                .zip(results_array.iter())
-                                .map(|(id, res)| {
-                                    // Check if this specific phenotype had an error
-                                    let has_error = res.get("error").and_then(|e| e.as_str()).is_some()
-                                        || res.get("status").and_then(|s| s.as_str()) == Some("error");
-                                    (id.clone(), (res.clone(), has_error))
-                                })
-                                .collect()
-                        } else {
-                            HashMap::new()
-                        }
+            let results_map: HashMap<String, (serde_json::Value, bool)> = if let Some(ref json) =
+                req.result_json
+            {
+                if let Some(results_array) = json.get("batch_results").and_then(|v| v.as_array()) {
+                    // Results array corresponds to phenotype_ids order
+                    if results_array.len() == phenotype_ids.len() {
+                        phenotype_ids
+                            .iter()
+                            .zip(results_array.iter())
+                            .map(|(id, res)| {
+                                // Check if this specific phenotype had an error
+                                let has_error = res.get("error").and_then(|e| e.as_str()).is_some()
+                                    || res.get("status").and_then(|s| s.as_str()) == Some("error");
+                                (id.clone(), (res.clone(), has_error))
+                            })
+                            .collect()
                     } else {
                         HashMap::new()
                     }
                 } else {
                     HashMap::new()
-                };
+                }
+            } else {
+                HashMap::new()
+            };
 
             const MAX_AGGREGATE_RETRIES: usize = 2;
 
@@ -351,11 +382,17 @@ pub(crate) fn complete_batch_work(
 
                 // Determine if this phenotype failed
                 let phenotype_failed = is_global_error
-                    || results_map.get(&phenotype_id).map(|(_, err)| *err).unwrap_or(false);
+                    || results_map
+                        .get(&phenotype_id)
+                        .map(|(_, err)| *err)
+                        .unwrap_or(false);
 
                 if phenotype_failed {
                     // Check if we should retry or mark as permanently failed
-                    let retries = batch.aggregate_retry_counts.entry(phenotype_id.clone()).or_insert(0);
+                    let retries = batch
+                        .aggregate_retry_counts
+                        .entry(phenotype_id.clone())
+                        .or_insert(0);
                     *retries += 1;
 
                     if *retries > MAX_AGGREGATE_RETRIES {
@@ -393,7 +430,10 @@ pub(crate) fn complete_batch_work(
                             event_type: "failed".to_string(),
                             worker_id: Some(req.worker_id.clone()),
                             phenotype_id: Some(phenotype_id.clone()),
-                            details: format!("Permanently failed after {} retries: {}", MAX_AGGREGATE_RETRIES, error_detail),
+                            details: format!(
+                                "Permanently failed after {} retries: {}",
+                                MAX_AGGREGATE_RETRIES, error_detail
+                            ),
                         });
                     } else {
                         // Requeue for retry if we have the spec
@@ -407,7 +447,10 @@ pub(crate) fn complete_batch_work(
                                 event_type: "requeued".to_string(),
                                 worker_id: Some(req.worker_id.clone()),
                                 phenotype_id: Some(phenotype_id.clone()),
-                                details: format!("Aggregate failed, retry {}/{}", retries, MAX_AGGREGATE_RETRIES),
+                                details: format!(
+                                    "Aggregate failed, retry {}/{}",
+                                    retries, MAX_AGGREGATE_RETRIES
+                                ),
                             });
                             batch.ready_to_aggregate.push((phenotype_id.clone(), spec));
 
@@ -420,7 +463,8 @@ pub(crate) fn complete_batch_work(
                             batch.failed_count += 1;
                             if let Some(status) = batch.phenotype_statuses.get_mut(&phenotype_id) {
                                 status.stage = "failed".to_string();
-                                status.error = Some("No aggregate spec available for retry".to_string());
+                                status.error =
+                                    Some("No aggregate spec available for retry".to_string());
                             }
 
                             println!(
@@ -432,7 +476,8 @@ pub(crate) fn complete_batch_work(
                                 event_type: "failed".to_string(),
                                 worker_id: Some(req.worker_id.clone()),
                                 phenotype_id: Some(phenotype_id.clone()),
-                                details: "Failed: no aggregate spec available for retry".to_string(),
+                                details: "Failed: no aggregate spec available for retry"
+                                    .to_string(),
                             });
                         }
                     }
@@ -468,7 +513,10 @@ pub(crate) fn complete_batch_work(
                         event_type: "completed".to_string(),
                         worker_id: Some(req.worker_id.clone()),
                         phenotype_id: Some(phenotype_id.clone()),
-                        details: format!("Completed [{}/{}] in {}", batch.completed_count, batch.total_phenotypes, duration_str),
+                        details: format!(
+                            "Completed [{}/{}] in {}",
+                            batch.completed_count, batch.total_phenotypes, duration_str
+                        ),
                     });
                 }
             }
@@ -480,9 +528,11 @@ pub(crate) fn complete_batch_work(
 mod tests {
     use super::*;
     use crate::distributed::coordinator::{
-        CoordinatorConfig, ManhattanPipelineState, JobExecutionState,
+        CoordinatorConfig, JobExecutionState, ManhattanPipelineState,
     };
-    use crate::distributed::message::{ExecutionMode, ManhattanSpec, PhenotypeStatus, ManhattanAggregateSpec};
+    use crate::distributed::message::{
+        ExecutionMode, ManhattanAggregateSpec, ManhattanSpec, PhenotypeStatus,
+    };
     use crate::distributed::metrics_db::MetricsDb;
     use std::collections::{HashSet, VecDeque};
     use std::time::Instant;
@@ -508,15 +558,22 @@ mod tests {
     }
 
     /// Create a minimal ManhattanPipelineState for testing scan completions.
-    fn create_test_pipeline_state(partition_ids: &[usize], source: ManhattanSource) -> ManhattanPipelineState {
+    fn create_test_pipeline_state(
+        partition_ids: &[usize],
+        source: ManhattanSource,
+    ) -> ManhattanPipelineState {
         let mut exome_processing = HashMap::new();
         let mut genome_processing = HashMap::new();
 
         for &p in partition_ids {
             let entry = ("test-worker".to_string(), Instant::now());
             match source {
-                ManhattanSource::Exome => { exome_processing.insert(p, entry); }
-                ManhattanSource::Genome => { genome_processing.insert(p, entry); }
+                ManhattanSource::Exome => {
+                    exome_processing.insert(p, entry);
+                }
+                ManhattanSource::Genome => {
+                    genome_processing.insert(p, entry);
+                }
             }
         }
 
@@ -671,8 +728,7 @@ mod tests {
             "Phenotype should be in ready_to_aggregate queue"
         );
         assert_eq!(
-            batch.ready_to_aggregate[0].0,
-            phenotype_id,
+            batch.ready_to_aggregate[0].0, phenotype_id,
             "Correct phenotype should be in ready_to_aggregate"
         );
 
@@ -818,38 +874,45 @@ mod tests {
                     cpu_core_secs: None,
                 },
             );
-            batch.aggregate_specs.insert(pid.clone(), ManhattanAggregateSpec {
-                output_path: format!("gs://test/{}", pid),
-                phenotype_id: Some(pid.clone()),
-                ancestry: None,
-                exome_results: None,
-                genome_results: None,
-                gene_burden: None,
-                exome_exp_p: None,
-                genome_exp_p: None,
-                exome_annotations: None,
-                genome_annotations: None,
-                genes: None,
-                threshold: 5e-8,
-                gene_threshold: 2.5e-6,
-                locus_threshold: 0.01,
-                locus_window: 1_000_000,
-                locus_plots: false,
-                min_variants_per_locus: 1,
-                width: 1200,
-                height: 400,
-                layout: Default::default(),
-                y_scale: Default::default(),
-                cleanup: false,
-                styling: Default::default(),
-            });
+            batch.aggregate_specs.insert(
+                pid.clone(),
+                ManhattanAggregateSpec {
+                    output_path: format!("gs://test/{}", pid),
+                    phenotype_id: Some(pid.clone()),
+                    ancestry: None,
+                    exome_results: None,
+                    genome_results: None,
+                    gene_burden: None,
+                    exome_exp_p: None,
+                    genome_exp_p: None,
+                    exome_annotations: None,
+                    genome_annotations: None,
+                    genes: None,
+                    threshold: 5e-8,
+                    gene_threshold: 2.5e-6,
+                    locus_threshold: 0.01,
+                    locus_window: 1_000_000,
+                    locus_plots: false,
+                    min_variants_per_locus: 1,
+                    width: 1200,
+                    height: 400,
+                    layout: Default::default(),
+                    y_scale: Default::default(),
+                    cleanup: false,
+                    styling: Default::default(),
+                },
+            );
         }
 
         // Simulate completion: first task ID is the UUID (as fixed in assignment.rs),
         // remaining are phenotype IDs
         let req = CompleteRequest {
             worker_id: "test-worker".to_string(),
-            tasks: vec![task_id.clone(), "pheno_B".to_string(), "pheno_C".to_string()],
+            tasks: vec![
+                task_id.clone(),
+                "pheno_B".to_string(),
+                "pheno_C".to_string(),
+            ],
             items_processed: 0, // Aggregate tasks report 0 rows
             result_json: None,
             error: None,
@@ -871,7 +934,10 @@ mod tests {
         );
 
         for pid in &phenotype_ids {
-            let status = batch.phenotype_statuses.get(pid).expect("status should exist");
+            let status = batch
+                .phenotype_statuses
+                .get(pid)
+                .expect("status should exist");
             assert_eq!(
                 status.stage, "completed",
                 "Phenotype {} should be in 'completed' stage, got '{}'",

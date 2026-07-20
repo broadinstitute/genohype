@@ -21,7 +21,13 @@ fn format_number(n: usize) -> String {
     result
 }
 
-pub fn show_info(table_path: &str, json: bool, count: bool, globals: bool, cache_opts: Option<CacheOptions>) -> Result<()> {
+pub fn show_info(
+    table_path: &str,
+    json: bool,
+    count: bool,
+    globals: bool,
+    cache_opts: Option<CacheOptions>,
+) -> Result<()> {
     if globals {
         return show_globals(table_path, cache_opts);
     }
@@ -37,7 +43,10 @@ pub fn show_info(table_path: &str, json: bool, count: bool, globals: bool, cache
 
     if is_vcf || is_bed {
         let label = if is_vcf { "VCF" } else { "BED" };
-        println!("{}", format!("{} File Information", label).bold().underline());
+        println!(
+            "{}",
+            format!("{} File Information", label).bold().underline()
+        );
         println!();
         println!("{} {}", "Path:".green(), table_path.bright_white());
         println!();
@@ -95,11 +104,7 @@ pub fn show_info(table_path: &str, json: bool, count: bool, globals: bool, cache
         println!("  {}", "(none)".dimmed());
     } else {
         for (i, key) in keys.iter().enumerate() {
-            println!(
-                "  {}. {}",
-                (i + 1).to_string().cyan(),
-                key.bright_white()
-            );
+            println!("  {}. {}", (i + 1).to_string().cyan(), key.bright_white());
         }
     }
     println!();
@@ -135,11 +140,7 @@ pub fn show_info(table_path: &str, json: bool, count: bool, globals: bool, cache
             );
         } else {
             spinner.finish_and_clear();
-            println!(
-                "{} {}",
-                "Total Rows:".green(),
-                "(unavailable)".dimmed()
-            );
+            println!("{} {}", "Total Rows:".green(), "(unavailable)".dimmed());
         }
     } else {
         println!(

@@ -18,12 +18,10 @@ use crate::manhattan::data::{
     Manifest, ManifestInputs, ManifestLocus, ManifestManhattan, ManifestManhattans,
     ManifestSigHits, ManifestSignificantHits, ManifestStats,
 };
-use crate::manhattan::genes::{
-    render_gene_manhattan_styled, scan_gene_burden_to_parquet,
-};
-use crate::manhattan::qq::scan_qq_to_parquet;
+use crate::manhattan::genes::{render_gene_manhattan_styled, scan_gene_burden_to_parquet};
 use crate::manhattan::layout::ChromosomeLayout;
 use crate::manhattan::pipeline::composite_partial_pngs_with_style;
+use crate::manhattan::qq::scan_qq_to_parquet;
 use genohype_core::error::Result;
 use genohype_core::io::is_cloud_path;
 use genohype_core::query::QueryEngine;
@@ -31,10 +29,10 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use io::{
-    cleanup_chrom_intermediates, cleanup_intermediates, discover_chromosomes,
-    has_partial_pngs, write_locus_file,
+    cleanup_chrom_intermediates, cleanup_intermediates, discover_chromosomes, has_partial_pngs,
+    write_locus_file,
 };
-use locus::{generate_locus_plots, generate_loci_from_parquet};
+use locus::{generate_loci_from_parquet, generate_locus_plots};
 use merge::{merge_and_combine_hits, merge_significant_hits};
 use utils::{chrono_now_iso, extract_phenotype_name};
 
@@ -148,13 +146,25 @@ pub fn run_aggregation(spec: &ManhattanAggregateSpec) -> Result<(usize, serde_js
     // Step 1: Composite PNGs
     println!("  Compositing partial PNGs...");
     let exome_count = if spec.exome_results.is_some() {
-        composite_source_pngs(output_base, "exome", spec.width, spec.height, &exome_style.background)?
+        composite_source_pngs(
+            output_base,
+            "exome",
+            spec.width,
+            spec.height,
+            &exome_style.background,
+        )?
     } else {
         0
     };
 
     let genome_count = if spec.genome_results.is_some() {
-        composite_source_pngs(output_base, "genome", spec.width, spec.height, &genome_style.background)?
+        composite_source_pngs(
+            output_base,
+            "genome",
+            spec.width,
+            spec.height,
+            &genome_style.background,
+        )?
     } else {
         0
     };
@@ -167,7 +177,10 @@ pub fn run_aggregation(spec: &ManhattanAggregateSpec) -> Result<(usize, serde_js
     // Discover chromosomes that have outputs
     let discovered_chroms = discover_chromosomes(&chroms_dir)?;
     if !discovered_chroms.is_empty() {
-        println!("    Found {} chromosomes with data", discovered_chroms.len());
+        println!(
+            "    Found {} chromosomes with data",
+            discovered_chroms.len()
+        );
     }
 
     for chrom in discovered_chroms {
@@ -184,7 +197,14 @@ pub fn run_aggregation(spec: &ManhattanAggregateSpec) -> Result<(usize, serde_js
             let exome_parts = format!("{}/exome", chrom_path_base);
             if has_partial_pngs(&exome_parts)? {
                 let out = format!("{}/exome_manhattan.png", chrom_path_base);
-                composite_partial_pngs_with_style(&exome_parts, &out, spec.width, spec.height, 0.0, &exome_style.background)?;
+                composite_partial_pngs_with_style(
+                    &exome_parts,
+                    &out,
+                    spec.width,
+                    spec.height,
+                    0.0,
+                    &exome_style.background,
+                )?;
                 chrom_entry.exome = Some(ManifestManhattan {
                     png: format!("{}/chroms/{}/exome_manhattan.png", output_base, chrom),
                     count: 0,
@@ -198,7 +218,14 @@ pub fn run_aggregation(spec: &ManhattanAggregateSpec) -> Result<(usize, serde_js
             let genome_parts = format!("{}/genome", chrom_path_base);
             if has_partial_pngs(&genome_parts)? {
                 let out = format!("{}/genome_manhattan.png", chrom_path_base);
-                composite_partial_pngs_with_style(&genome_parts, &out, spec.width, spec.height, 0.0, &genome_style.background)?;
+                composite_partial_pngs_with_style(
+                    &genome_parts,
+                    &out,
+                    spec.width,
+                    spec.height,
+                    0.0,
+                    &genome_style.background,
+                )?;
                 chrom_entry.genome = Some(ManifestManhattan {
                     png: format!("{}/chroms/{}/genome_manhattan.png", output_base, chrom),
                     count: 0,
@@ -285,7 +312,10 @@ pub fn run_aggregation(spec: &ManhattanAggregateSpec) -> Result<(usize, serde_js
                     &layout,
                     Some(&gene_style),
                 )?;
-                let group_path = format!("{}/plots/gene_manhattan_{}_maf{}.png", output_base, annotation, maf_str);
+                let group_path = format!(
+                    "{}/plots/gene_manhattan_{}_maf{}.png",
+                    output_base, annotation, maf_str
+                );
                 write_locus_file(&group_path, &group_png)?;
             }
         }
@@ -293,11 +323,7 @@ pub fn run_aggregation(spec: &ManhattanAggregateSpec) -> Result<(usize, serde_js
         // Collect significant gene regions for locus plots
         let mut gene_regions = genohype_core::query::IntervalList::new();
         for gene in &scan_result.significant_genes {
-            gene_regions.add(
-                gene.interval.0.clone(),
-                gene.interval.1,
-                gene.interval.2,
-            );
+            gene_regions.add(gene.interval.0.clone(), gene.interval.1, gene.interval.2);
         }
 
         (scan_result.total_rows as u64, gene_regions)
@@ -323,7 +349,10 @@ pub fn run_aggregation(spec: &ManhattanAggregateSpec) -> Result<(usize, serde_js
         ) {
             Ok(result) => {
                 println!("    Exported {} QQ points for exome", result.total_rows);
-                qq_stats_map.insert("exome".to_string(), serde_json::to_value(&result.stats).unwrap_or_default());
+                qq_stats_map.insert(
+                    "exome".to_string(),
+                    serde_json::to_value(&result.stats).unwrap_or_default(),
+                );
             }
             Err(e) => {
                 eprintln!("    Warning: Failed to process exome QQ table: {}", e);
@@ -343,7 +372,10 @@ pub fn run_aggregation(spec: &ManhattanAggregateSpec) -> Result<(usize, serde_js
         ) {
             Ok(result) => {
                 println!("    Exported {} QQ points for genome", result.total_rows);
-                qq_stats_map.insert("genome".to_string(), serde_json::to_value(&result.stats).unwrap_or_default());
+                qq_stats_map.insert(
+                    "genome".to_string(),
+                    serde_json::to_value(&result.stats).unwrap_or_default(),
+                );
             }
             Err(e) => {
                 eprintln!("    Warning: Failed to process genome QQ table: {}", e);
@@ -420,7 +452,11 @@ pub fn run_aggregation(spec: &ManhattanAggregateSpec) -> Result<(usize, serde_js
                 total += size;
             }
         }
-        if total > 0 { Some(total) } else { None }
+        if total > 0 {
+            Some(total)
+        } else {
+            None
+        }
     };
 
     let output_dir_size_bytes = get_gcs_dir_size(output_base);

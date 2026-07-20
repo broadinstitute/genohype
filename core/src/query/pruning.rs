@@ -102,9 +102,9 @@ pub fn filter_partitions_with_intervals(
         .enumerate()
         .filter(|(_, interval)| {
             // A partition matches if ALL query ranges overlap with it
-            let ranges_match = ranges.iter().all(|range| {
-                range_overlaps(interval, &range.field_path, &range.start, &range.end)
-            });
+            let ranges_match = ranges
+                .iter()
+                .all(|range| range_overlaps(interval, &range.field_path, &range.start, &range.end));
 
             if !ranges_match {
                 return false;
@@ -143,11 +143,17 @@ fn partition_overlaps_intervals(partition: &Interval, intervals: &IntervalList) 
         (Some(start), Some(end)) => {
             // Extract contig and position from start
             let start_contig = start.get("contig").and_then(|v| v.as_str());
-            let start_pos = start.get("position").and_then(|v| v.as_i64()).map(|p| p as i32);
+            let start_pos = start
+                .get("position")
+                .and_then(|v| v.as_i64())
+                .map(|p| p as i32);
 
             // Extract contig and position from end
             let end_contig = end.get("contig").and_then(|v| v.as_str());
-            let end_pos = end.get("position").and_then(|v| v.as_i64()).map(|p| p as i32);
+            let end_pos = end
+                .get("position")
+                .and_then(|v| v.as_i64())
+                .map(|p| p as i32);
 
             match (start_contig, start_pos, end_contig, end_pos) {
                 (Some(sc), Some(sp), Some(ec), Some(ep)) => {
@@ -221,16 +227,17 @@ fn partition_overlaps_intervals(partition: &Interval, intervals: &IntervalList) 
 /// Map a contig name to its sort index in standard reference genomes.
 fn contig_sort_index(name: &str) -> Option<usize> {
     const GRCH38: &[&str] = &[
-        "chr1", "chr2", "chr3", "chr4", "chr5", "chr6", "chr7", "chr8", "chr9", "chr10",
-        "chr11", "chr12", "chr13", "chr14", "chr15", "chr16", "chr17", "chr18", "chr19", "chr20",
-        "chr21", "chr22", "chrX", "chrY", "chrM",
+        "chr1", "chr2", "chr3", "chr4", "chr5", "chr6", "chr7", "chr8", "chr9", "chr10", "chr11",
+        "chr12", "chr13", "chr14", "chr15", "chr16", "chr17", "chr18", "chr19", "chr20", "chr21",
+        "chr22", "chrX", "chrY", "chrM",
     ];
     const GRCH37: &[&str] = &[
-        "1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
-        "11", "12", "13", "14", "15", "16", "17", "18", "19", "20",
-        "21", "22", "X", "Y", "MT",
+        "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16",
+        "17", "18", "19", "20", "21", "22", "X", "Y", "MT",
     ];
-    GRCH38.iter().position(|&c| c == name)
+    GRCH38
+        .iter()
+        .position(|&c| c == name)
         .or_else(|| GRCH37.iter().position(|&c| c == name))
 }
 
@@ -265,9 +272,14 @@ mod tests {
 
     #[test]
     fn test_filter_partitions_single_match() {
-        let intervals = vec![
-            create_test_interval("ENSG00000066468", "10", 121478332, "ENSG00000185960", "X", 624344),
-        ];
+        let intervals = vec![create_test_interval(
+            "ENSG00000066468",
+            "10",
+            121478332,
+            "ENSG00000185960",
+            "X",
+            624344,
+        )];
 
         // Query for chromosome 10
         let ranges = vec![KeyRange::point(
@@ -281,9 +293,14 @@ mod tests {
 
     #[test]
     fn test_filter_partitions_no_match() {
-        let intervals = vec![
-            create_test_interval("ENSG00000066468", "10", 121478332, "ENSG00000185960", "X", 624344),
-        ];
+        let intervals = vec![create_test_interval(
+            "ENSG00000066468",
+            "10",
+            121478332,
+            "ENSG00000185960",
+            "X",
+            624344,
+        )];
 
         // Query for chromosome 1 (not in the data)
         let ranges = vec![KeyRange::point(
@@ -297,18 +314,21 @@ mod tests {
 
     #[test]
     fn test_filter_partitions_range_query() {
-        let intervals = vec![
-            create_test_interval("ENSG00000066468", "10", 121478332, "ENSG00000185960", "X", 624344),
-        ];
+        let intervals = vec![create_test_interval(
+            "ENSG00000066468",
+            "10",
+            121478332,
+            "ENSG00000185960",
+            "X",
+            624344,
+        )];
 
         // Query for chromosome range (includes both 10 and X)
-        let ranges = vec![
-            KeyRange::inclusive(
-                "chrom".to_string(),
-                KeyValue::String("1".to_string()),
-                KeyValue::String("Z".to_string()),
-            ),
-        ];
+        let ranges = vec![KeyRange::inclusive(
+            "chrom".to_string(),
+            KeyValue::String("1".to_string()),
+            KeyValue::String("Z".to_string()),
+        )];
 
         let result = filter_partitions(&intervals, &ranges);
         assert_eq!(result, vec![0]);
@@ -317,9 +337,30 @@ mod tests {
     #[test]
     fn test_filter_partitions_multiple_intervals() {
         let intervals = vec![
-            create_test_interval("ENSG00000000001", "1", 1000000, "ENSG00000000100", "1", 2000000),
-            create_test_interval("ENSG00000000101", "2", 3000000, "ENSG00000000200", "2", 4000000),
-            create_test_interval("ENSG00000000201", "3", 5000000, "ENSG00000000300", "3", 6000000),
+            create_test_interval(
+                "ENSG00000000001",
+                "1",
+                1000000,
+                "ENSG00000000100",
+                "1",
+                2000000,
+            ),
+            create_test_interval(
+                "ENSG00000000101",
+                "2",
+                3000000,
+                "ENSG00000000200",
+                "2",
+                4000000,
+            ),
+            create_test_interval(
+                "ENSG00000000201",
+                "3",
+                5000000,
+                "ENSG00000000300",
+                "3",
+                6000000,
+            ),
         ];
 
         // Query for chromosome 2

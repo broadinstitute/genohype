@@ -87,8 +87,11 @@ pub(crate) async fn get_clickhouse_info(
             {
                 let mut data = state.lock().expect("state lock poisoned");
                 for p in &info.ingested_phenotypes {
-                    if p.status.to_uppercase() == "INGESTED" || p.status.to_uppercase() == "COMPLETED" {
-                        data.ingested_phenotypes.insert((p.phenotype.clone(), p.ancestry.clone()));
+                    if p.status.to_uppercase() == "INGESTED"
+                        || p.status.to_uppercase() == "COMPLETED"
+                    {
+                        data.ingested_phenotypes
+                            .insert((p.phenotype.clone(), p.ancestry.clone()));
                     }
                 }
             }
@@ -101,9 +104,7 @@ pub(crate) async fn get_clickhouse_info(
 
             Json(serde_json::to_value(&info).unwrap_or_default())
         }
-        Err(e) => {
-            Json(serde_json::json!({ "error": format!("ClickHouse query failed: {}", e) }))
-        }
+        Err(e) => Json(serde_json::json!({ "error": format!("ClickHouse query failed: {}", e) })),
     }
 }
 
@@ -195,7 +196,10 @@ async fn query_clickhouse(
 
 fn parse_table_info(json: &serde_json::Value) -> Result<Vec<TableInfo>, String> {
     let empty = vec![];
-    let data = json.get("data").and_then(|d| d.as_array()).unwrap_or(&empty);
+    let data = json
+        .get("data")
+        .and_then(|d| d.as_array())
+        .unwrap_or(&empty);
     Ok(data
         .iter()
         .map(|row| TableInfo {
@@ -211,7 +215,10 @@ fn parse_table_info(json: &serde_json::Value) -> Result<Vec<TableInfo>, String> 
 
 fn parse_partition_info(json: &serde_json::Value) -> Result<Vec<PartitionInfo>, String> {
     let empty = vec![];
-    let data = json.get("data").and_then(|d| d.as_array()).unwrap_or(&empty);
+    let data = json
+        .get("data")
+        .and_then(|d| d.as_array())
+        .unwrap_or(&empty);
     Ok(data
         .iter()
         .map(|row| PartitionInfo {
@@ -225,7 +232,10 @@ fn parse_partition_info(json: &serde_json::Value) -> Result<Vec<PartitionInfo>, 
 
 fn parse_pipeline_status(json: &serde_json::Value) -> Result<Vec<IngestedPhenotype>, String> {
     let empty = vec![];
-    let data = json.get("data").and_then(|d| d.as_array()).unwrap_or(&empty);
+    let data = json
+        .get("data")
+        .and_then(|d| d.as_array())
+        .unwrap_or(&empty);
     Ok(data
         .iter()
         .map(|row| IngestedPhenotype {

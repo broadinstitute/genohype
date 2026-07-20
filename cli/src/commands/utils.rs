@@ -100,7 +100,9 @@ pub fn parse_interval_list(
 }
 
 /// Parse interval list from export args
-pub fn parse_export_intervals(args: &impl HasCommonExportArgs) -> Result<Option<Arc<IntervalList>>> {
+pub fn parse_export_intervals(
+    args: &impl HasCommonExportArgs,
+) -> Result<Option<Arc<IntervalList>>> {
     parse_interval_list(
         args.common().intervals_file.as_deref(),
         &args.common().interval,

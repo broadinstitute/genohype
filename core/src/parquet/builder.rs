@@ -152,12 +152,7 @@ impl ColumnBuilder {
                 offsets.push(values.len() as i32);
                 nulls.push(true); // List is present
             }
-            (
-                ColumnBuilder::List {
-                    offsets, nulls, ..
-                },
-                EncodedValue::Null,
-            ) => {
+            (ColumnBuilder::List { offsets, nulls, .. }, EncodedValue::Null) => {
                 // Null list - offset stays the same, mark as null
                 let last_offset = *offsets.last().unwrap();
                 offsets.push(last_offset);
@@ -167,9 +162,7 @@ impl ColumnBuilder {
             // Struct
             (
                 ColumnBuilder::Struct {
-                    builders,
-                    nulls,
-                    ..
+                    builders, nulls, ..
                 },
                 EncodedValue::Struct(field_values),
             ) => {
@@ -187,9 +180,7 @@ impl ColumnBuilder {
             }
             (
                 ColumnBuilder::Struct {
-                    builders,
-                    nulls,
-                    ..
+                    builders, nulls, ..
                 },
                 EncodedValue::Null,
             ) => {
@@ -225,7 +216,9 @@ impl ColumnBuilder {
                 offsets.push(last_offset);
                 nulls.push(false);
             }
-            ColumnBuilder::Struct { builders, nulls, .. } => {
+            ColumnBuilder::Struct {
+                builders, nulls, ..
+            } => {
                 for builder in builders.iter_mut() {
                     builder.append_null()?;
                 }
@@ -251,10 +244,12 @@ impl ColumnBuilder {
                 nulls,
             } => {
                 // Build the inner array from accumulated values
-                let mut inner_builder = ColumnBuilder::new(inner_type)
-                    .expect("Inner builder creation should not fail");
+                let mut inner_builder =
+                    ColumnBuilder::new(inner_type).expect("Inner builder creation should not fail");
                 for v in values.drain(..) {
-                    inner_builder.append(&v).expect("Inner append should not fail");
+                    inner_builder
+                        .append(&v)
+                        .expect("Inner append should not fail");
                 }
                 let inner_array = inner_builder.finish();
 
@@ -287,7 +282,12 @@ impl ColumnBuilder {
                     .expect("ListArray creation should not fail"),
                 )
             }
-            ColumnBuilder::Struct { builders, fields, nulls, .. } => {
+            ColumnBuilder::Struct {
+                builders,
+                fields,
+                nulls,
+                ..
+            } => {
                 let arrays: Vec<ArrayRef> = builders.iter_mut().map(|b| b.finish()).collect();
 
                 // Create nulls buffer if there are any nulls
@@ -340,7 +340,7 @@ impl EncodedValue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Array, Int32Array, StringArray, ListArray};
+    use arrow::array::{Array, Int32Array, ListArray, StringArray};
 
     #[test]
     fn test_int32_builder() {

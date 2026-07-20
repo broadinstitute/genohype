@@ -31,31 +31,32 @@ pub use state::CoordinatorConfig;
 
 // Re-export internal state types for use within the crate
 pub(crate) use state::{
-    ActiveTask, BatchState, CoordinatorData, IngestionState, JobExecutionState,
-    ManhattanPhase, ManhattanPipelineState, SharedState, WorkerStatus,
-    AGGREGATE_BATCH_SIZE, BATCH_ACTIVE_LIMIT, MAX_AGGREGATE_RETRIES, MAX_METRICS_HISTORY,
+    ActiveTask, BatchState, CoordinatorData, IngestionState, JobExecutionState, ManhattanPhase,
+    ManhattanPipelineState, SharedState, WorkerStatus, AGGREGATE_BATCH_SIZE, BATCH_ACTIVE_LIMIT,
+    MAX_AGGREGATE_RETRIES, MAX_METRICS_HISTORY,
 };
 
 use crate::distributed::message::{
-    ActiveTaskInfo, CompleteRequest, CompleteResponse, FailureRecord,
-    HeartbeatRequest, HeartbeatResponse, JobEvent, JobResultResponse, JobSpec,
-    ManhattanSource, StatusResponse, TaskDescriptor, WorkRequest, WorkResponse,
+    ActiveTaskInfo, CompleteRequest, CompleteResponse, FailureRecord, HeartbeatRequest,
+    HeartbeatResponse, JobEvent, JobResultResponse, JobSpec, ManhattanSource, StatusResponse,
+    TaskDescriptor, WorkRequest, WorkResponse,
 };
 use crate::distributed::metrics_db::MetricsDb;
 use crate::Result;
 use std::collections::{HashMap, HashSet, VecDeque};
-use uuid::Uuid;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 // Import functions from extracted modules
 use api::dashboard::build_dashboard_summary;
-use monitor::{backup_db, check_cpu_status_consistency, check_stuck_job, check_timeouts, check_worker_liveness};
+use monitor::{
+    backup_db, check_cpu_status_consistency, check_stuck_job, check_timeouts, check_worker_liveness,
+};
 use scheduler::{
-    complete_batch_work, complete_ingestion_work, complete_manhattan_work,
-    determine_batch_size, extract_capacity_from_error, get_batch_work, get_ingestion_work,
-    get_manhattan_work,
+    complete_batch_work, complete_ingestion_work, complete_manhattan_work, determine_batch_size,
+    extract_capacity_from_error, get_batch_work, get_ingestion_work, get_manhattan_work,
 };
 
 /// Start the coordinator server using a config struct.
@@ -113,7 +114,10 @@ pub async fn run_coordinator(
     network: Option<String>,
     subnet: Option<String>,
 ) -> Result<()> {
-    use axum::{routing::{delete, get, post}, Router};
+    use axum::{
+        routing::{delete, get, post},
+        Router,
+    };
     use tokio::net::TcpListener;
 
     // Determine if starting in idle mode (no job configured yet)
@@ -178,10 +182,7 @@ pub async fn run_coordinator(
                         // Verify file exists and has size
                         if let Ok(metadata) = std::fs::metadata(&db_path_clone) {
                             if metadata.len() > 0 {
-                                eprintln!(
-                                    "  Successfully restored DB ({} bytes)",
-                                    metadata.len()
-                                );
+                                eprintln!("  Successfully restored DB ({} bytes)", metadata.len());
                                 return true;
                             } else {
                                 eprintln!("  Warning: Restored DB file is empty");
@@ -257,7 +258,11 @@ pub async fn run_coordinator(
                     .ok()
                     .and_then(|o| {
                         let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                        if s.is_empty() { None } else { Some(s) }
+                        if s.is_empty() {
+                            None
+                        } else {
+                            Some(s)
+                        }
                     })
             }),
             gcp_zone: gcp_zone.or_else(|| {
@@ -268,7 +273,11 @@ pub async fn run_coordinator(
                     .ok()
                     .and_then(|o| {
                         let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                        if s.is_empty() { None } else { Some(s) }
+                        if s.is_empty() {
+                            None
+                        } else {
+                            Some(s)
+                        }
                     })
             }),
             machine_type,
@@ -353,11 +362,13 @@ pub async fn run_coordinator(
                         let total = batch.total_phenotypes;
                         let completed = batch.completed_count;
                         let pending = batch.pending_queue.len();
-                        let processing = batch.active_phenotypes.len() + batch.ready_to_aggregate.len();
+                        let processing =
+                            batch.active_phenotypes.len() + batch.ready_to_aggregate.len();
                         let is_complete = batch.pending_queue.is_empty()
                             && batch.active_phenotypes.is_empty()
                             && batch.ready_to_aggregate.is_empty()
-                            && (batch.completed_count + batch.failed_count) == batch.total_phenotypes;
+                            && (batch.completed_count + batch.failed_count)
+                                == batch.total_phenotypes;
                         (
                             pending,
                             processing,
@@ -372,8 +383,16 @@ pub async fn run_coordinator(
                     JobExecutionState::Manhattan(m) => {
                         // Single Manhattan pipeline uses separate tracking
                         let total_parts = m.exome_total_tasks + m.genome_total_tasks + 1; // +1 for aggregate
-                        let completed_parts = m.exome_completed.len() + m.genome_completed.len() + if m.aggregate_complete { 1 } else { 0 };
-                        let processing_parts = m.exome_processing.len() + m.genome_processing.len() + if m.aggregate_dispatched && !m.aggregate_complete { 1 } else { 0 };
+                        let completed_parts = m.exome_completed.len()
+                            + m.genome_completed.len()
+                            + if m.aggregate_complete { 1 } else { 0 };
+                        let processing_parts = m.exome_processing.len()
+                            + m.genome_processing.len()
+                            + if m.aggregate_dispatched && !m.aggregate_complete {
+                                1
+                            } else {
+                                0
+                            };
                         let pending_parts = m.exome_pending.len() + m.genome_pending.len();
                         let is_complete = m.phase == ManhattanPhase::Complete;
                         (
@@ -448,7 +467,8 @@ pub async fn run_coordinator(
             };
 
             if let Some(ref bp) = backup_path {
-                let should_backup = events_since > 1000 || last_backup_time.elapsed().as_secs() > 60;
+                let should_backup =
+                    events_since > 1000 || last_backup_time.elapsed().as_secs() > 60;
                 if should_backup {
                     if backup_db(&metrics_db, &db_path, bp).await {
                         last_backup_time = Instant::now();
@@ -462,8 +482,8 @@ pub async fn run_coordinator(
 
             // Check if job is complete
             // For batch/Manhattan: use the phase flag; for standard jobs: check partition counts
-            let job_complete = is_batch_complete ||
-                (total > 0 && (completed + failed) == total && processing == 0 && pending == 0);
+            let job_complete = is_batch_complete
+                || (total > 0 && (completed + failed) == total && processing == 0 && pending == 0);
 
             if job_complete {
                 if failed > 0 {
@@ -490,34 +510,34 @@ pub async fn run_coordinator(
                         println!("Skipping composite step (--no-composite). Run manually with:");
                         println!("  genohype manhattan --from-shards {}", spec.output_path);
                     } else {
-                    println!("Running post-job composite for Manhattan plot...");
+                        println!("Running post-job composite for Manhattan plot...");
 
-                    let output_dir = spec.output_path.trim_end_matches('/');
-                    let final_png = format!("{}/manhattan.png", output_dir);
+                        let output_dir = spec.output_path.trim_end_matches('/');
+                        let final_png = format!("{}/manhattan.png", output_dir);
 
-                    // Run composite in a blocking thread to avoid nested runtime issues
-                    let output_path = spec.output_path.clone();
-                    let final_png_clone = final_png.clone();
-                    let width = spec.width;
-                    let height = spec.height;
-                    let threshold = spec.threshold;
+                        // Run composite in a blocking thread to avoid nested runtime issues
+                        let output_path = spec.output_path.clone();
+                        let final_png_clone = final_png.clone();
+                        let width = spec.width;
+                        let height = spec.height;
+                        let threshold = spec.threshold;
 
-                    let result = tokio::task::spawn_blocking(move || {
-                        crate::manhattan::pipeline::composite_partial_pngs(
-                            &output_path,
-                            &final_png_clone,
-                            width,
-                            height,
-                            threshold,
-                        )
-                    })
-                    .await;
+                        let result = tokio::task::spawn_blocking(move || {
+                            crate::manhattan::pipeline::composite_partial_pngs(
+                                &output_path,
+                                &final_png_clone,
+                                width,
+                                height,
+                                threshold,
+                            )
+                        })
+                        .await;
 
-                    match result {
-                        Ok(Ok(())) => println!("Composite complete: {}", final_png),
-                        Ok(Err(e)) => eprintln!("Warning: Composite failed: {}", e),
-                        Err(e) => eprintln!("Warning: Composite task panicked: {}", e),
-                    }
+                        match result {
+                            Ok(Ok(())) => println!("Composite complete: {}", final_png),
+                            Ok(Err(e)) => eprintln!("Warning: Composite failed: {}", e),
+                            Err(e) => eprintln!("Warning: Composite task panicked: {}", e),
+                        }
                     }
                 }
 
@@ -582,11 +602,19 @@ pub async fn run_coordinator(
                     let completed: Vec<(String, String)> = match &data.job_state {
                         JobExecutionState::Batch(batch) => {
                             let mut result = Vec::new();
-                            if let Some(crate::distributed::message::JobSpec::ManhattanBatch { ref specs, .. }) = data.config.job_spec {
+                            if let Some(crate::distributed::message::JobSpec::ManhattanBatch {
+                                ref specs,
+                                ..
+                            }) = data.config.job_spec
+                            {
                                 for spec in specs {
-                                    if let Some(status) = batch.phenotype_statuses.get(&spec.output_path) {
+                                    if let Some(status) =
+                                        batch.phenotype_statuses.get(&spec.output_path)
+                                    {
                                         if status.stage == "completed" {
-                                            if let (Some(id), Some(ancestry)) = (&spec.phenotype, &spec.ancestry) {
+                                            if let (Some(id), Some(ancestry)) =
+                                                (&spec.phenotype, &spec.ancestry)
+                                            {
                                                 result.push((id.clone(), ancestry.clone()));
                                             }
                                         }
@@ -597,8 +625,14 @@ pub async fn run_coordinator(
                         }
                         JobExecutionState::Manhattan(m) if m.phase == ManhattanPhase::Complete => {
                             let mut result = Vec::new();
-                            if let Some(crate::distributed::message::JobSpec::Manhattan { ref spec, .. }) = data.config.job_spec {
-                                if let (Some(id), Some(ancestry)) = (&spec.phenotype, &spec.ancestry) {
+                            if let Some(crate::distributed::message::JobSpec::Manhattan {
+                                ref spec,
+                                ..
+                            }) = data.config.job_spec
+                            {
+                                if let (Some(id), Some(ancestry)) =
+                                    (&spec.phenotype, &spec.ancestry)
+                                {
                                     result.push((id.clone(), ancestry.clone()));
                                 }
                             }
@@ -644,23 +678,47 @@ pub async fn run_coordinator(
         .route("/status", get(get_status))
         .route("/heartbeat", post(handle_heartbeat))
         // Dashboard API
-        .route("/api/dashboard/summary", get(api::dashboard::get_dashboard_summary))
-        .route("/api/dashboard/bottlenecks", get(api::dashboard::get_dashboard_bottlenecks))
-        .route("/api/dashboard/workers", get(api::dashboard::get_dashboard_workers))
-        .route("/api/dashboard/metrics", get(api::dashboard::get_dashboard_metrics))
-        .route("/api/dashboard/batch", get(api::dashboard::get_batch_status))
+        .route(
+            "/api/dashboard/summary",
+            get(api::dashboard::get_dashboard_summary),
+        )
+        .route(
+            "/api/dashboard/bottlenecks",
+            get(api::dashboard::get_dashboard_bottlenecks),
+        )
+        .route(
+            "/api/dashboard/workers",
+            get(api::dashboard::get_dashboard_workers),
+        )
+        .route(
+            "/api/dashboard/metrics",
+            get(api::dashboard::get_dashboard_metrics),
+        )
+        .route(
+            "/api/dashboard/batch",
+            get(api::dashboard::get_batch_status),
+        )
         // Cluster management API
         .route("/api/cluster/config", get(api::cluster::get_config))
         .route("/api/cluster/vms", get(api::cluster::get_vms))
         .route("/api/cluster/scale", post(api::cluster::scale_cluster))
         // ClickHouse API
-        .route("/api/clickhouse/info", get(api::clickhouse::get_clickhouse_info))
+        .route(
+            "/api/clickhouse/info",
+            get(api::clickhouse::get_clickhouse_info),
+        )
         // Catalog API
         .route("/api/catalog/load", post(api::catalog::load_catalog_api))
         .route("/api/catalog", get(api::catalog::get_catalog_api))
         .route("/api/catalog/config", get(api::catalog::get_config_api))
-        .route("/api/catalog/process", post(api::catalog::process_catalog_api))
-        .route("/api/catalog/ingest", post(api::catalog::ingest_catalog_api))
+        .route(
+            "/api/catalog/process",
+            post(api::catalog::process_catalog_api),
+        )
+        .route(
+            "/api/catalog/ingest",
+            post(api::catalog::ingest_catalog_api),
+        )
         // Job management API
         .route("/api/job", post(api::jobs::submit_job))
         .route("/api/cancel", post(api::jobs::cancel_job))
@@ -669,18 +727,45 @@ pub async fn run_coordinator(
         .route("/api/export-metrics", post(api::jobs::export_metrics))
         .route("/api/events", get(api::jobs::get_events))
         .route("/api/failures", get(api::jobs::get_failures))
-        .route("/api/workers/:worker_id/logs", get(api::jobs::get_worker_logs))
-        .route("/api/workers/:worker_id/reset-capacity", post(api::jobs::reset_worker_capacity))
+        .route(
+            "/api/workers/:worker_id/logs",
+            get(api::jobs::get_worker_logs),
+        )
+        .route(
+            "/api/workers/:worker_id/reset-capacity",
+            post(api::jobs::reset_worker_capacity),
+        )
         .route("/api/update-fleet", post(api::jobs::update_fleet))
-        .route("/api/update-coordinator", post(api::jobs::update_coordinator))
+        .route(
+            "/api/update-coordinator",
+            post(api::jobs::update_coordinator),
+        )
         // History API
         .route("/api/history/jobs", get(api::history::get_history_jobs))
-        .route("/api/history/jobs/:job_id/summary", get(api::history::get_history_job_summary))
-        .route("/api/history/jobs/:job_id/metrics", get(api::history::get_history_job_metrics))
-        .route("/api/history/jobs/:job_id/events", get(api::history::get_history_job_events))
-        .route("/api/history/jobs/:job_id/failures", get(api::history::get_history_job_failures))
-        .route("/api/history/jobs/:job_id/batch", get(api::history::get_history_job_batch))
-        .route("/api/history/jobs/:job_id", delete(api::history::delete_history_job))
+        .route(
+            "/api/history/jobs/:job_id/summary",
+            get(api::history::get_history_job_summary),
+        )
+        .route(
+            "/api/history/jobs/:job_id/metrics",
+            get(api::history::get_history_job_metrics),
+        )
+        .route(
+            "/api/history/jobs/:job_id/events",
+            get(api::history::get_history_job_events),
+        )
+        .route(
+            "/api/history/jobs/:job_id/failures",
+            get(api::history::get_history_job_failures),
+        )
+        .route(
+            "/api/history/jobs/:job_id/batch",
+            get(api::history::get_history_job_batch),
+        )
+        .route(
+            "/api/history/jobs/:job_id",
+            delete(api::history::delete_history_job),
+        )
         .with_state(state)
         // Embedded dashboard SPA
         .route("/dashboard", get(ui::serve_dashboard_index))
@@ -707,7 +792,11 @@ async fn get_work(
     axum::Json(req): axum::Json<WorkRequest>,
 ) -> axum::Json<WorkResponse> {
     let mut data = state.lock().unwrap();
-    data.touch_worker(&req.worker_id, req.hardware.clone(), req.build_version.clone());
+    data.touch_worker(
+        &req.worker_id,
+        req.hardware.clone(),
+        req.build_version.clone(),
+    );
 
     // Check for pending binary update
     if let Some(gcs_url) = data.update_fleet_url.clone() {
@@ -759,11 +848,21 @@ async fn get_work(
             .get(&req.worker_id)
             .and_then(|w| w.hardware.as_ref());
 
-        let max_batch_size = determine_batch_size(data.config.batch_size, worker_hw, &data.config.job_spec, data.config.memory_weight_mb);
+        let max_batch_size = determine_batch_size(
+            data.config.batch_size,
+            worker_hw,
+            &data.config.job_spec,
+            data.config.memory_weight_mb,
+        );
         // Respect learned capacity ceiling if it exists
-        let worker_cap = data.worker_registry.get(&req.worker_id).and_then(|w| w.max_batch_capacity);
+        let worker_cap = data
+            .worker_registry
+            .get(&req.worker_id)
+            .and_then(|w| w.max_batch_capacity);
         let effective_max = worker_cap.unwrap_or(max_batch_size).min(max_batch_size);
-        let batch_size = data.worker_registry.get(&req.worker_id)
+        let batch_size = data
+            .worker_registry
+            .get(&req.worker_id)
             .and_then(|w| w.current_batch_size)
             .unwrap_or_else(|| (effective_max / 10).max(2).min(effective_max));
 
@@ -816,7 +915,10 @@ async fn get_work(
             .iter()
             .map(|t| t.label.clone().unwrap_or_else(|| t.id.clone()))
             .collect();
-        let task_type = tasks.first().map(|t| t.task_type.as_str()).unwrap_or("unknown");
+        let task_type = tasks
+            .first()
+            .map(|t| t.task_type.as_str())
+            .unwrap_or("unknown");
 
         // Update worker status and assign task info for AIMD duration tracking
         if let Some(w) = data.worker_registry.get_mut(&req.worker_id) {
@@ -902,11 +1004,12 @@ async fn complete_work(
 
     // Clear the current_task from the worker and capture it for duration tracking
     // Also extract hardware info for AIMD calculation
-    let (completed_task, worker_hardware) = if let Some(w) = data.worker_registry.get_mut(&req.worker_id) {
-        (w.current_task.take(), w.hardware.clone())
-    } else {
-        (None, None)
-    };
+    let (completed_task, worker_hardware) =
+        if let Some(w) = data.worker_registry.get_mut(&req.worker_id) {
+            (w.current_task.take(), w.hardware.clone())
+        } else {
+            (None, None)
+        };
 
     // Extract task IDs and partition indices from request
     let task_ids = &req.tasks;
@@ -927,9 +1030,16 @@ async fn complete_work(
 
     // AIMD Batch Size Adjustment
     if let Some(w) = data.worker_registry.get_mut(&req.worker_id) {
-        let max_batch = determine_batch_size(config_batch_size, worker_hardware.as_ref(), &job_spec_ref, memory_weight_mb);
+        let max_batch = determine_batch_size(
+            config_batch_size,
+            worker_hardware.as_ref(),
+            &job_spec_ref,
+            memory_weight_mb,
+        );
         // Start conservative if we don't have a baseline yet
-        let current_batch = w.current_batch_size.unwrap_or((max_batch / 10).max(2).min(max_batch));
+        let current_batch = w
+            .current_batch_size
+            .unwrap_or((max_batch / 10).max(2).min(max_batch));
 
         if let Some(ref err_msg) = req.error {
             // Check if this is a "batch too large" error with capacity info
@@ -979,7 +1089,9 @@ async fn complete_work(
         // Calculate wasted time based on when the task started
         let wasted_duration_ms = match &failed_task {
             Some(ActiveTask::Scan { started_at_ms, .. }) => now_ms.saturating_sub(*started_at_ms),
-            Some(ActiveTask::AggregateBatch { started_at_ms, .. }) => now_ms.saturating_sub(*started_at_ms),
+            Some(ActiveTask::AggregateBatch { started_at_ms, .. }) => {
+                now_ms.saturating_sub(*started_at_ms)
+            }
             None => 0,
         };
 
@@ -989,7 +1101,10 @@ async fn complete_work(
         // Log the error prominently
         println!(
             "ERROR from worker {}: tasks {:?} failed: {} (wasted {:.1}s)",
-            req.worker_id, task_ids, error, wasted_duration_ms as f64 / 1000.0
+            req.worker_id,
+            task_ids,
+            error,
+            wasted_duration_ms as f64 / 1000.0
         );
 
         // Store the error for dashboard display
@@ -1015,7 +1130,11 @@ async fn complete_work(
             event_type: "warning".to_string(),
             worker_id: Some(req.worker_id.clone()),
             phenotype_id: None,
-            details: format!("Batch failed: {} (wasted {:.1}s)", error, wasted_duration_ms as f64 / 1000.0),
+            details: format!(
+                "Batch failed: {} (wasted {:.1}s)",
+                error,
+                wasted_duration_ms as f64 / 1000.0
+            ),
         });
 
         // Only process standard job partitions if they are actually in processing_partitions
@@ -1062,7 +1181,10 @@ async fn complete_work(
                     event_type: "failed".to_string(),
                     worker_id: None,
                     phenotype_id: None,
-                    details: format!("Task {} permanently failed after {} retries", part_id, retry_count),
+                    details: format!(
+                        "Task {} permanently failed after {} retries",
+                        part_id, retry_count
+                    ),
                 });
             } else {
                 println!(
@@ -1077,7 +1199,10 @@ async fn complete_work(
                     event_type: "requeued".to_string(),
                     worker_id: None,
                     phenotype_id: None,
-                    details: format!("Task {} requeued after failure (retry {}/3)", part_id, retry_count),
+                    details: format!(
+                        "Task {} requeued after failure (retry {}/3)",
+                        part_id, retry_count
+                    ),
                 });
             }
         }
@@ -1088,7 +1213,10 @@ async fn complete_work(
                 Some(ActiveTask::AggregateBatch { phenotype_ids, .. }) => {
                     // Re-queue aggregate tasks for retry
                     for phenotype_id in phenotype_ids {
-                        let retries = batch.aggregate_retry_counts.entry(phenotype_id.clone()).or_insert(0);
+                        let retries = batch
+                            .aggregate_retry_counts
+                            .entry(phenotype_id.clone())
+                            .or_insert(0);
                         *retries += 1;
 
                         if *retries > MAX_AGGREGATE_RETRIES {
@@ -1100,7 +1228,10 @@ async fn complete_work(
 
                             // Write error.json to the output path before removing the spec
                             if let Some(spec) = batch.aggregate_specs.remove(&phenotype_id) {
-                                let err_path = format!("{}/error.json", spec.output_path.trim_end_matches('/'));
+                                let err_path = format!(
+                                    "{}/error.json",
+                                    spec.output_path.trim_end_matches('/')
+                                );
                                 let timestamp_ms = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .map(|d| d.as_millis() as u64)
@@ -1118,7 +1249,8 @@ async fn complete_work(
                                         use genohype_core::io::CloudWriter;
                                         use std::io::Write;
                                         if let Ok(mut writer) = CloudWriter::new(&err_path) {
-                                            let _ = writer.write_all(err_json.to_string().as_bytes());
+                                            let _ =
+                                                writer.write_all(err_json.to_string().as_bytes());
                                             let _ = writer.finish();
                                         }
                                     } else {
@@ -1126,7 +1258,8 @@ async fn complete_work(
                                     }
                                 });
                             }
-                        } else if let Some(spec) = batch.aggregate_specs.get(&phenotype_id).cloned() {
+                        } else if let Some(spec) = batch.aggregate_specs.get(&phenotype_id).cloned()
+                        {
                             println!(
                                 "Re-queuing phenotype {} for aggregate retry ({}/{})",
                                 phenotype_id, retries, MAX_AGGREGATE_RETRIES
@@ -1142,7 +1275,11 @@ async fn complete_work(
                         }
                     }
                 }
-                Some(ActiveTask::Scan { phenotype_id, source, .. }) => {
+                Some(ActiveTask::Scan {
+                    phenotype_id,
+                    source,
+                    ..
+                }) => {
                     // Re-queue scan partitions back to the phenotype
                     if let Some(state) = batch.active_phenotypes.get_mut(&phenotype_id) {
                         let mut valid_parts = Vec::new();
@@ -1150,14 +1287,24 @@ async fn complete_work(
                         // Check ownership
                         for &part_id in &partitions {
                             let is_owned = match source {
-                                ManhattanSource::Exome => state.exome_processing.get(&part_id).map_or(false, |(w, _)| w == &req.worker_id),
-                                ManhattanSource::Genome => state.genome_processing.get(&part_id).map_or(false, |(w, _)| w == &req.worker_id),
+                                ManhattanSource::Exome => state
+                                    .exome_processing
+                                    .get(&part_id)
+                                    .map_or(false, |(w, _)| w == &req.worker_id),
+                                ManhattanSource::Genome => state
+                                    .genome_processing
+                                    .get(&part_id)
+                                    .map_or(false, |(w, _)| w == &req.worker_id),
                             };
 
                             if is_owned {
                                 match source {
-                                    ManhattanSource::Exome => { state.exome_processing.remove(&part_id); }
-                                    ManhattanSource::Genome => { state.genome_processing.remove(&part_id); }
+                                    ManhattanSource::Exome => {
+                                        state.exome_processing.remove(&part_id);
+                                    }
+                                    ManhattanSource::Genome => {
+                                        state.genome_processing.remove(&part_id);
+                                    }
                                 }
                                 valid_parts.push(part_id);
                             } else {
@@ -1174,7 +1321,9 @@ async fn complete_work(
                         }
                         println!(
                             "Re-queued {} scan tasks for phenotype {} (source: {:?})",
-                            valid_parts.len(), phenotype_id, source
+                            valid_parts.len(),
+                            phenotype_id,
+                            source
                         );
                     } else {
                         println!(
@@ -1196,19 +1345,29 @@ async fn complete_work(
             let mut valid_genome = Vec::new();
 
             for &part_id in &partitions {
-                if manhattan.exome_processing.get(&part_id).map_or(false, |(w, _)| w == &req.worker_id) {
+                if manhattan
+                    .exome_processing
+                    .get(&part_id)
+                    .map_or(false, |(w, _)| w == &req.worker_id)
+                {
                     manhattan.exome_processing.remove(&part_id);
                     valid_exome.push(part_id);
                 }
 
-                if manhattan.genome_processing.get(&part_id).map_or(false, |(w, _)| w == &req.worker_id) {
+                if manhattan
+                    .genome_processing
+                    .get(&part_id)
+                    .map_or(false, |(w, _)| w == &req.worker_id)
+                {
                     manhattan.genome_processing.remove(&part_id);
                     valid_genome.push(part_id);
                 }
 
                 // If this was the aggregate task, mark it failed
                 if manhattan.aggregate_dispatched && !manhattan.aggregate_complete {
-                    println!("Aggregate task failed - job cannot complete without fixing the error");
+                    println!(
+                        "Aggregate task failed - job cannot complete without fixing the error"
+                    );
                 }
             }
 
@@ -1238,7 +1397,9 @@ async fn complete_work(
                     {
                         println!(
                             "Ingestion failed: {}/{} - {}",
-                            phenotype_id, ancestry, req.error.as_deref().unwrap_or("unknown")
+                            phenotype_id,
+                            ancestry,
+                            req.error.as_deref().unwrap_or("unknown")
                         );
                         ingestion.failed_count += 1;
                     }
@@ -1268,35 +1429,35 @@ async fn complete_work(
             data.job_state = JobExecutionState::Standard;
             // Standard job completion
             for &part_id in &partitions {
-            let mut valid_completion = false;
+                let mut valid_completion = false;
 
-            if let Some((worker_id, _)) = data.processing_partitions.get(&part_id) {
-                if worker_id == &req.worker_id {
-                    valid_completion = true;
+                if let Some((worker_id, _)) = data.processing_partitions.get(&part_id) {
+                    if worker_id == &req.worker_id {
+                        valid_completion = true;
+                    } else {
+                        println!(
+                            "Warning: task {} completed by {} but is currently assigned to {}",
+                            part_id, req.worker_id, worker_id
+                        );
+                        // It was reassigned, but the slow worker finished it. We still count it as done.
+                    }
                 } else {
                     println!(
-                        "Warning: task {} completed by {} but is currently assigned to {}",
-                        part_id, req.worker_id, worker_id
+                        "Warning: task {} completed by {} but wasn't in processing map",
+                        part_id, req.worker_id
                     );
-                    // It was reassigned, but the slow worker finished it. We still count it as done.
                 }
-            } else {
-                println!(
-                    "Warning: task {} completed by {} but wasn't in processing map",
-                    part_id, req.worker_id
-                );
-            }
 
-            if valid_completion {
-                data.processing_partitions.remove(&part_id);
-            }
+                if valid_completion {
+                    data.processing_partitions.remove(&part_id);
+                }
 
-            // Mark as complete regardless of ownership (work is done!)
-            if !data.completed_tasks.contains(&part_id) {
-                data.completed_tasks.insert(part_id);
-                // Update progress timestamp (R3)
-                data.last_progress_time = Instant::now();
-            }
+                // Mark as complete regardless of ownership (work is done!)
+                if !data.completed_tasks.contains(&part_id) {
+                    data.completed_tasks.insert(part_id);
+                    // Update progress timestamp (R3)
+                    data.last_progress_time = Instant::now();
+                }
             }
         }
     }
@@ -1322,7 +1483,10 @@ async fn complete_work(
             event_type: "completed".to_string(),
             worker_id: Some(req.worker_id.clone()),
             phenotype_id: None,
-            details: format!("Completed tasks {:?} ({} rows)", task_ids, req.items_processed),
+            details: format!(
+                "Completed tasks {:?} ({} rows)",
+                task_ids, req.items_processed
+            ),
         });
     }
 
@@ -1371,8 +1535,18 @@ async fn get_status(
             // Add aggregate phase (+1 task)
             let total = total_parts + 1;
             let completed = completed_parts + if m.aggregate_complete { 1 } else { 0 };
-            let processing = processing_parts + if m.aggregate_dispatched && !m.aggregate_complete { 1 } else { 0 };
-            let pending = pending_parts + if !m.aggregate_dispatched && m.phase == ManhattanPhase::Aggregate { 1 } else { 0 };
+            let processing = processing_parts
+                + if m.aggregate_dispatched && !m.aggregate_complete {
+                    1
+                } else {
+                    0
+                };
+            let pending = pending_parts
+                + if !m.aggregate_dispatched && m.phase == ManhattanPhase::Aggregate {
+                    1
+                } else {
+                    0
+                };
             let is_complete = m.phase == ManhattanPhase::Complete;
 
             (pending, processing, completed, total, is_complete)
@@ -1438,7 +1612,10 @@ async fn handle_heartbeat(
 
         // Phase 3: Memory-based batch reduction heuristic
         // If memory usage exceeds 80%, aggressively slash batch size to prevent OOM
-        if let (Some(used), Some(total)) = (req.telemetry.memory_used_bytes, req.telemetry.memory_total_bytes) {
+        if let (Some(used), Some(total)) = (
+            req.telemetry.memory_used_bytes,
+            req.telemetry.memory_total_bytes,
+        ) {
             if total > 0 {
                 let mem_usage_pct = (used as f64 / total as f64) * 100.0;
                 if mem_usage_pct > 80.0 {
@@ -1452,7 +1629,8 @@ async fn handle_heartbeat(
                         );
 
                         // Collect event info to log after releasing worker borrow
-                        batch_reduction_event = Some((req.worker_id.clone(), new_batch, mem_usage_pct));
+                        batch_reduction_event =
+                            Some((req.worker_id.clone(), new_batch, mem_usage_pct));
 
                         w.current_batch_size = Some(new_batch);
                     }
@@ -1478,13 +1656,20 @@ async fn handle_heartbeat(
             event_type: "warning".to_string(),
             worker_id: Some(worker_id),
             phenotype_id: None,
-            details: format!("Reduced batch size to {} (Memory at {:.1}%)", new_batch, mem_pct),
+            details: format!(
+                "Reduced batch size to {} (Memory at {:.1}%)",
+                new_batch, mem_pct
+            ),
         });
     }
 
     // Persist to SQLite (fire-and-forget, don't block on DB errors)
     let job_id = data.current_job_id.clone();
-    if let Err(e) = data.metrics_db.insert_snapshot_with_job_id(&req.worker_id, &req.telemetry, job_id.as_deref()) {
+    if let Err(e) = data.metrics_db.insert_snapshot_with_job_id(
+        &req.worker_id,
+        &req.telemetry,
+        job_id.as_deref(),
+    ) {
         eprintln!("Warning: failed to persist metrics to DB: {}", e);
     }
 

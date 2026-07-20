@@ -18,4 +18,4 @@ pub mod schema;
 pub mod writer;
 
 pub use reader::VcfDataSource;
-pub use writer::{VcfWriter, VcfFileWriter, BgzfVcfWriter};
+pub use writer::{BgzfVcfWriter, VcfFileWriter, VcfWriter};

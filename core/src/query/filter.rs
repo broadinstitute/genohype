@@ -131,7 +131,10 @@ mod tests {
     #[test]
     fn test_parse_field_path() {
         assert_eq!(parse_field_path("Pvalue"), vec!["Pvalue"]);
-        assert_eq!(parse_field_path("locus.position"), vec!["locus", "position"]);
+        assert_eq!(
+            parse_field_path("locus.position"),
+            vec!["locus", "position"]
+        );
         assert_eq!(parse_field_path(" gene . name "), vec!["gene", "name"]);
     }
 

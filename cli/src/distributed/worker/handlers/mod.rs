@@ -2,10 +2,10 @@
 //!
 //! Each module handles processing a specific type of job dispatched to workers.
 
-pub mod stress;
 pub mod export;
-pub mod manhattan;
 pub mod loci;
+pub mod manhattan;
+pub mod stress;
 
 #[cfg(feature = "clickhouse")]
 pub mod clickhouse;

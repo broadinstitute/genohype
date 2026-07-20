@@ -6,8 +6,8 @@
 //! to provide complete blocks where each block contains a 4-byte decompressed
 //! length followed by raw Zstd compressed data (without magic number).
 
-use crate::error::{HailError, Result};
 use crate::buffer::InputBlockBuffer;
+use crate::error::{HailError, Result};
 
 /// Zstd decompression buffer
 ///
@@ -52,9 +52,7 @@ impl<B: InputBlockBuffer> InputBlockBuffer for ZstdBuffer<B> {
         let compressed_data = &compressed_block[4..];
 
         // Decompress the data
-        let decompressed = zstd::decode_all(compressed_data).map_err(|_| {
-            HailError::Zstd
-        })?;
+        let decompressed = zstd::decode_all(compressed_data).map_err(|_| HailError::Zstd)?;
 
         // Verify the decompressed size matches the expected size
         if decompressed.len() != expected_decompressed_len {

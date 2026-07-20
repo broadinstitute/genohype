@@ -111,14 +111,19 @@ impl CloudWriter {
         tracing::trace!("CloudWriter: uploading {} bytes to {:?}", size, path);
         let start_time = std::time::Instant::now();
 
-        IO_RUNTIME.block_on(async move {
-            store.put(&path, data.into()).await
-        }).map_err(|e| HailError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Failed to upload to cloud storage: {}", e),
-        )))?;
+        IO_RUNTIME
+            .block_on(async move { store.put(&path, data.into()).await })
+            .map_err(|e| {
+                HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to upload to cloud storage: {}", e),
+                ))
+            })?;
 
-        tracing::trace!("CloudWriter: upload completed in {:?}", start_time.elapsed());
+        tracing::trace!(
+            "CloudWriter: upload completed in {:?}",
+            start_time.elapsed()
+        );
         Ok(size)
     }
 
@@ -207,7 +212,11 @@ impl StreamingCloudWriter {
     }
 
     /// Create a streaming writer from an existing ObjectStore
-    pub fn from_store(store: Arc<dyn ObjectStore>, path: ObjPath, part_size: usize) -> Result<Self> {
+    pub fn from_store(
+        store: Arc<dyn ObjectStore>,
+        path: ObjPath,
+        part_size: usize,
+    ) -> Result<Self> {
         let (part_tx, part_rx) = bounded::<Bytes>(UPLOAD_CHANNEL_CAPACITY);
 
         // Start the multipart upload and spawn the background task
@@ -215,7 +224,9 @@ impl StreamingCloudWriter {
         let upload_handle = std::thread::spawn(move || {
             IO_RUNTIME.block_on(async move {
                 // Initialize multipart upload
-                let upload = store.put_multipart(&path_clone).await
+                let upload = store
+                    .put_multipart(&path_clone)
+                    .await
                     .map_err(|e| format!("Failed to initiate multipart upload: {}", e))?;
 
                 let mut writer = WriteMultipart::new(upload);
@@ -226,7 +237,9 @@ impl StreamingCloudWriter {
                 }
 
                 // Complete the multipart upload
-                writer.finish().await
+                writer
+                    .finish()
+                    .await
                     .map_err(|e| format!("Failed to complete multipart upload: {}", e))?;
 
                 Ok(())
@@ -290,7 +303,10 @@ impl StreamingCloudWriter {
         if let Some(handle) = self.upload_handle.take() {
             match handle.join() {
                 Ok(Ok(())) => {
-                    tracing::trace!("StreamingCloudWriter: upload complete, {} bytes total", self.total_bytes);
+                    tracing::trace!(
+                        "StreamingCloudWriter: upload complete, {} bytes total",
+                        self.total_bytes
+                    );
                 }
                 Ok(Err(e)) => {
                     return Err(HailError::Io(std::io::Error::new(

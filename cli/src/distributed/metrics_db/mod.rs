@@ -22,7 +22,7 @@ impl MetricsDb {
         // This allows workers to write telemetry while dashboard reads metrics
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=NORMAL;"
+             PRAGMA synchronous=NORMAL;",
         )?;
 
         // Create tables if they don't exist
@@ -120,7 +120,8 @@ impl MetricsDb {
                 [],
                 |row| row.get(0),
             )
-            .unwrap_or(0) > 0;
+            .unwrap_or(0)
+            > 0;
 
         if !has_job_id {
             let _ = conn.execute_batch(
@@ -163,7 +164,8 @@ impl MetricsDb {
             .unwrap_or(0) > 0;
 
         if !has_batch_size {
-            let _ = conn.execute_batch("ALTER TABLE telemetry ADD COLUMN current_batch_size INTEGER;");
+            let _ =
+                conn.execute_batch("ALTER TABLE telemetry ADD COLUMN current_batch_size INTEGER;");
         }
 
         // Add max_batch_capacity column if it doesn't exist (for existing databases)
@@ -176,7 +178,8 @@ impl MetricsDb {
             .unwrap_or(0) > 0;
 
         if !has_max_cap {
-            let _ = conn.execute_batch("ALTER TABLE telemetry ADD COLUMN max_batch_capacity INTEGER;");
+            let _ =
+                conn.execute_batch("ALTER TABLE telemetry ADD COLUMN max_batch_capacity INTEGER;");
         }
 
         Ok(Self {
@@ -191,7 +194,11 @@ impl MetricsDb {
     }
 
     /// Insert a telemetry snapshot for a worker.
-    pub fn insert_snapshot(&self, worker_id: &str, snapshot: &TelemetrySnapshot) -> SqliteResult<()> {
+    pub fn insert_snapshot(
+        &self,
+        worker_id: &str,
+        snapshot: &TelemetrySnapshot,
+    ) -> SqliteResult<()> {
         self.insert_snapshot_with_job_id(worker_id, snapshot, None)
     }
 
@@ -354,7 +361,8 @@ impl MetricsDb {
     /// Get list of all worker IDs that have telemetry data.
     pub fn get_worker_ids(&self) -> SqliteResult<Vec<String>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT DISTINCT worker_id FROM telemetry ORDER BY worker_id")?;
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT worker_id FROM telemetry ORDER BY worker_id")?;
         let ids = stmt
             .query_map([], |row| row.get(0))?
             .collect::<SqliteResult<Vec<_>>>()?;
@@ -480,8 +488,7 @@ impl MetricsDb {
         let jobs = stmt
             .query_map([], |row| {
                 let job_spec_str: Option<String> = row.get(4)?;
-                let job_spec_json = job_spec_str
-                    .and_then(|s| serde_json::from_str(&s).ok());
+                let job_spec_json = job_spec_str.and_then(|s| serde_json::from_str(&s).ok());
                 Ok(JobRecord {
                     job_id: row.get(0)?,
                     status: row.get(1)?,
@@ -631,8 +638,7 @@ impl MetricsDb {
         let failures = stmt
             .query_map([job_id], |row| {
                 let tasks_json: String = row.get(2)?;
-                let tasks: Vec<String> =
-                    serde_json::from_str(&tasks_json).unwrap_or_default();
+                let tasks: Vec<String> = serde_json::from_str(&tasks_json).unwrap_or_default();
                 Ok(FailureRecord {
                     timestamp_ms: row.get::<_, i64>(0)? as u64,
                     phenotype_id: row.get(1)?,
@@ -712,7 +718,10 @@ impl MetricsDb {
             "DELETE FROM batch_phenotypes WHERE job_id = ?1",
             params![job_id],
         )?;
-        tx.execute("DELETE FROM stress_job_params WHERE job_id = ?1", params![job_id])?;
+        tx.execute(
+            "DELETE FROM stress_job_params WHERE job_id = ?1",
+            params![job_id],
+        )?;
         tx.execute("DELETE FROM telemetry WHERE job_id = ?1", params![job_id])?;
 
         tx.commit()?;
@@ -720,7 +729,11 @@ impl MetricsDb {
     }
 
     /// Get metrics for a specific job.
-    pub fn get_job_metrics(&self, job_id: &str, since_ms: u64) -> SqliteResult<Vec<(String, Vec<TelemetrySnapshot>)>> {
+    pub fn get_job_metrics(
+        &self,
+        job_id: &str,
+        since_ms: u64,
+    ) -> SqliteResult<Vec<(String, Vec<TelemetrySnapshot>)>> {
         let conn = self.conn.lock().unwrap();
 
         // First get distinct worker IDs for this job
