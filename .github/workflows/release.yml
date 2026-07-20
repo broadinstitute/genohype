@@ -169,12 +169,16 @@ jobs:
 
             highest_glibc="$(
               strings "$binary" \
-                | grep -Eo 'GLIBC_[0-9]+(\\.[0-9]+)+' \
+                | grep -Eo 'GLIBC_[0-9]+([.][0-9]+)+' \
                 | cut -d_ -f2 \
                 | sort -Vu \
                 | tail -1
             )"
-            if [[ "$(printf '2.17\\n%s\\n' "$highest_glibc" | sort -Vu | tail -1)" != "2.17" ]]; then
+            if [[ -z "$highest_glibc" ]]; then
+              echo "error: could not determine the Linux binary's glibc requirement" >&2
+              exit 1
+            fi
+            if [[ "$(printf '%s\n' "2.17" "$highest_glibc" | sort -Vu | tail -1)" != "2.17" ]]; then
               echo "error: Linux binary requires glibc $highest_glibc; expected at most 2.17" >&2
               exit 1
             fi
