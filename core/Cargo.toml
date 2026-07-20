@@ -17,7 +17,7 @@ vep = ["dep:fastvep-core", "dep:fastvep-io", "dep:fastvep-annotate", "dep:fastve
 clickhouse = ["export", "dep:reqwest"]
 elasticsearch = ["export", "dep:reqwest"]
 postgres = ["export", "dep:sqlx"]
-bigquery = ["export", "dep:google-cloud-bigquery", "dep:google-cloud-storage", "dep:google-cloud-auth"]
+bigquery = ["export", "dep:google-cloud-bigquery", "dep:google-cloud-storage"]
 
 [dependencies]
 # Compression
@@ -97,10 +97,10 @@ reqwest = { version = "0.11", default-features = false, features = ["blocking", 
 # DATABASE_URL is needed at build time. TLS via rustls to match reqwest.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres"], optional = true }
 
-# Google Cloud for BigQuery export (bigquery feature)
-google-cloud-bigquery = { version = "0.13", optional = true }
-google-cloud-storage = { version = "0.22", optional = true }
-google-cloud-auth = { version = "0.19", optional = true }
+# Google Cloud for BigQuery export (bigquery feature). Use rustls so release
+# binaries do not require a platform OpenSSL installation.
+google-cloud-bigquery = { version = "0.13", default-features = false, features = ["auth", "rustls-tls"], optional = true }
+google-cloud-storage = { version = "0.22", default-features = false, features = ["auth", "rustls-tls"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
