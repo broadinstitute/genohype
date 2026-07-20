@@ -155,7 +155,8 @@ mod tests {
         assert_eq!(alloc2.count_owned(10), 3);
 
         // Verify all items are covered exactly once
-        let mut all: Vec<usize> = indices0.into_iter()
+        let mut all: Vec<usize> = indices0
+            .into_iter()
             .chain(indices1)
             .chain(indices2)
             .collect();
@@ -167,10 +168,10 @@ mod tests {
     fn test_owns() {
         let alloc = PartitionAllocator::new(1, 3);
         assert!(!alloc.owns(0)); // 0 % 3 == 0
-        assert!(alloc.owns(1));  // 1 % 3 == 1
+        assert!(alloc.owns(1)); // 1 % 3 == 1
         assert!(!alloc.owns(2)); // 2 % 3 == 2
         assert!(!alloc.owns(3)); // 3 % 3 == 0
-        assert!(alloc.owns(4));  // 4 % 3 == 1
+        assert!(alloc.owns(4)); // 4 % 3 == 1
     }
 
     #[test]

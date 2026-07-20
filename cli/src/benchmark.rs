@@ -3,12 +3,14 @@
 //! Collects CPU, memory, and I/O metrics during export to help
 //! identify bottlenecks and guide scaling decisions.
 
-#[cfg(feature = "benchmark")]
-use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, RefreshKind, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+#[cfg(feature = "benchmark")]
+use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+#[cfg(feature = "benchmark")]
+use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, RefreshKind, System};
 
 /// Input table metadata for the benchmark report
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -94,7 +96,10 @@ impl BenchmarkReport {
 
     /// Calculate max CPU utilization
     pub fn max_cpu_percent(&self) -> f32 {
-        self.samples.iter().map(|s| s.cpu_percent).fold(0.0, f32::max)
+        self.samples
+            .iter()
+            .map(|s| s.cpu_percent)
+            .fold(0.0, f32::max)
     }
 
     /// Calculate average memory usage in GB
@@ -102,13 +107,19 @@ impl BenchmarkReport {
         if self.samples.is_empty() {
             return 0.0;
         }
-        let avg_bytes = self.samples.iter().map(|s| s.memory_used).sum::<u64>() / self.samples.len() as u64;
+        let avg_bytes =
+            self.samples.iter().map(|s| s.memory_used).sum::<u64>() / self.samples.len() as u64;
         avg_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
     }
 
     /// Calculate max memory usage in GB
     pub fn max_memory_gb(&self) -> f64 {
-        let max_bytes = self.samples.iter().map(|s| s.memory_used).max().unwrap_or(0);
+        let max_bytes = self
+            .samples
+            .iter()
+            .map(|s| s.memory_used)
+            .max()
+            .unwrap_or(0);
         max_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
     }
 
@@ -143,7 +154,12 @@ impl BenchmarkReport {
         if self.samples.is_empty() {
             return 0.0;
         }
-        let avg = self.samples.iter().map(|s| s.disk_read_bytes_sec).sum::<u64>() / self.samples.len() as u64;
+        let avg = self
+            .samples
+            .iter()
+            .map(|s| s.disk_read_bytes_sec)
+            .sum::<u64>()
+            / self.samples.len() as u64;
         avg as f64 / (1024.0 * 1024.0)
     }
 
@@ -152,19 +168,34 @@ impl BenchmarkReport {
         if self.samples.is_empty() {
             return 0.0;
         }
-        let avg = self.samples.iter().map(|s| s.disk_write_bytes_sec).sum::<u64>() / self.samples.len() as u64;
+        let avg = self
+            .samples
+            .iter()
+            .map(|s| s.disk_write_bytes_sec)
+            .sum::<u64>()
+            / self.samples.len() as u64;
         avg as f64 / (1024.0 * 1024.0)
     }
 
     /// Calculate max disk write MB/s
     pub fn max_disk_write_mb_sec(&self) -> f64 {
-        let max = self.samples.iter().map(|s| s.disk_write_bytes_sec).max().unwrap_or(0);
+        let max = self
+            .samples
+            .iter()
+            .map(|s| s.disk_write_bytes_sec)
+            .max()
+            .unwrap_or(0);
         max as f64 / (1024.0 * 1024.0)
     }
 
     /// Calculate max disk read MB/s
     pub fn max_disk_read_mb_sec(&self) -> f64 {
-        let max = self.samples.iter().map(|s| s.disk_read_bytes_sec).max().unwrap_or(0);
+        let max = self
+            .samples
+            .iter()
+            .map(|s| s.disk_read_bytes_sec)
+            .max()
+            .unwrap_or(0);
         max as f64 / (1024.0 * 1024.0)
     }
 
@@ -173,29 +204,41 @@ impl BenchmarkReport {
         let avg_cpu = self.avg_cpu_percent();
         let max_mem = self.max_memory_gb();
         let total_mem = self.total_memory_gb();
-        let mem_usage_pct = if total_mem > 0.0 { max_mem / total_mem * 100.0 } else { 0.0 };
+        let mem_usage_pct = if total_mem > 0.0 {
+            max_mem / total_mem * 100.0
+        } else {
+            0.0
+        };
 
         // Check if we're CPU-bound (high CPU utilization)
         if avg_cpu > 80.0 {
-            return Bottleneck::Cpu { utilization: avg_cpu };
+            return Bottleneck::Cpu {
+                utilization: avg_cpu,
+            };
         }
 
         // Check if we're memory-bound
         if mem_usage_pct > 85.0 {
-            return Bottleneck::Memory { usage_percent: mem_usage_pct as f32 };
+            return Bottleneck::Memory {
+                usage_percent: mem_usage_pct as f32,
+            };
         }
 
         // Check disk I/O
         let avg_disk_write = if self.samples.is_empty() {
             0
         } else {
-            self.samples.iter().map(|s| s.disk_write_bytes_sec).sum::<u64>() / self.samples.len() as u64
+            self.samples
+                .iter()
+                .map(|s| s.disk_write_bytes_sec)
+                .sum::<u64>()
+                / self.samples.len() as u64
         };
 
         // If CPU is low but we're writing data, might be I/O bound
         if avg_cpu < 50.0 && avg_disk_write > 0 {
             return Bottleneck::Io {
-                write_mb_sec: avg_disk_write as f64 / (1024.0 * 1024.0)
+                write_mb_sec: avg_disk_write as f64 / (1024.0 * 1024.0),
             };
         }
 
@@ -268,7 +311,11 @@ impl BenchmarkReport {
             println!("  {} {}", "Path:".cyan(), meta.path);
             println!("  {} {}", "Partitions:".cyan(), meta.num_partitions);
             if let Some(size) = meta.total_size_bytes {
-                println!("  {} {:.2} GB", "Size:".cyan(), size as f64 / (1024.0 * 1024.0 * 1024.0));
+                println!(
+                    "  {} {:.2} GB",
+                    "Size:".cyan(),
+                    size as f64 / (1024.0 * 1024.0 * 1024.0)
+                );
             }
             println!("  {} {:?}", "Key fields:".cyan(), meta.key_fields);
             println!("  {} {}", "Schema fields:".cyan(), meta.num_fields);
@@ -279,17 +326,37 @@ impl BenchmarkReport {
         if let Some(ref stats) = self.row_size_stats {
             println!("{}", "Decoded Row Size (in-memory, sampled):".green());
             println!("  {} {} rows", "Samples:".cyan(), stats.sample_count);
-            println!("  {} {:.1} KB", "Average:".cyan(), stats.avg_bytes() / 1024.0);
-            println!("  {} {:.1} KB", "Min:".cyan(), stats.min_bytes as f64 / 1024.0);
-            println!("  {} {:.1} KB", "Max:".cyan(), stats.max_bytes as f64 / 1024.0);
+            println!(
+                "  {} {:.1} KB",
+                "Average:".cyan(),
+                stats.avg_bytes() / 1024.0
+            );
+            println!(
+                "  {} {:.1} KB",
+                "Min:".cyan(),
+                stats.min_bytes as f64 / 1024.0
+            );
+            println!(
+                "  {} {:.1} KB",
+                "Max:".cyan(),
+                stats.max_bytes as f64 / 1024.0
+            );
             if let Some((total_fields, max_depth, array_count)) = stats.schema_stats {
-                println!("  {} {} fields, depth {}, {} arrays", "Schema:".cyan(),
-                    total_fields, max_depth, array_count);
+                println!(
+                    "  {} {} fields, depth {}, {} arrays",
+                    "Schema:".cyan(),
+                    total_fields,
+                    max_depth,
+                    array_count
+                );
             }
             // Estimate total decoded data size
             let estimated_total = stats.avg_bytes() * self.total_rows as f64;
-            println!("  {} {:.2} GB (uncompressed)", "Est. memory footprint:".cyan(),
-                estimated_total / (1024.0 * 1024.0 * 1024.0));
+            println!(
+                "  {} {:.2} GB (uncompressed)",
+                "Est. memory footprint:".cyan(),
+                estimated_total / (1024.0 * 1024.0 * 1024.0)
+            );
 
             // Show per-field breakdown (top 10 by size)
             let sorted_fields = stats.sorted_field_stats();
@@ -298,13 +365,19 @@ impl BenchmarkReport {
                 println!("{}", "  Field Contribution (% of decoded row):".green());
                 let total_avg = stats.avg_bytes();
                 for (i, field) in sorted_fields.iter().take(10).enumerate() {
-                    let pct = if total_avg > 0.0 { field.avg_bytes() / total_avg * 100.0 } else { 0.0 };
-                    println!("  {:2}. {:30} {:>8.1} B ({:>5.1}%)  {}",
+                    let pct = if total_avg > 0.0 {
+                        field.avg_bytes() / total_avg * 100.0
+                    } else {
+                        0.0
+                    };
+                    println!(
+                        "  {:2}. {:30} {:>8.1} B ({:>5.1}%)  {}",
                         i + 1,
                         field.name.cyan(),
                         field.avg_bytes(),
                         pct,
-                        field.type_desc.dimmed());
+                        field.type_desc.dimmed()
+                    );
                 }
                 if sorted_fields.len() > 10 {
                     println!("      ... and {} more fields", sorted_fields.len() - 10);
@@ -318,18 +391,33 @@ impl BenchmarkReport {
             println!("{}", "Output:".green());
             println!("  {} {}", "Path:".cyan(), path);
             if let Some(size) = self.output_size_bytes {
-                println!("  {} {:.2} GB", "Size:".cyan(), size as f64 / (1024.0 * 1024.0 * 1024.0));
+                println!(
+                    "  {} {:.2} GB",
+                    "Size:".cyan(),
+                    size as f64 / (1024.0 * 1024.0 * 1024.0)
+                );
             }
             println!();
         }
 
         // Duration and throughput
         println!("{}", "Performance:".green());
-        println!("  {} {:.1}s ({:.1}m)", "Duration:".cyan(),
+        println!(
+            "  {} {:.1}s ({:.1}m)",
+            "Duration:".cyan(),
             self.duration.as_secs_f64(),
-            self.duration.as_secs_f64() / 60.0);
-        println!("  {} {:.0} rows/sec", "Throughput:".cyan(), self.rows_per_sec());
-        println!("  {} {:.2} partitions/sec", "Partition rate:".cyan(), self.partitions_per_sec());
+            self.duration.as_secs_f64() / 60.0
+        );
+        println!(
+            "  {} {:.0} rows/sec",
+            "Throughput:".cyan(),
+            self.rows_per_sec()
+        );
+        println!(
+            "  {} {:.2} partitions/sec",
+            "Partition rate:".cyan(),
+            self.partitions_per_sec()
+        );
         if let (Some(in_meta), Some(out_size)) = (&self.input_metadata, self.output_size_bytes) {
             if let Some(in_size) = in_meta.total_size_bytes {
                 let compression_ratio = in_size as f64 / out_size as f64;
@@ -341,8 +429,16 @@ impl BenchmarkReport {
         // CPU metrics
         println!("{}", "CPU:".green());
         println!("  {} {}", "Cores:".cyan(), self.num_cpus);
-        println!("  {} {:.1}%", "Avg utilization:".cyan(), self.avg_cpu_percent());
-        println!("  {} {:.1}%", "Max utilization:".cyan(), self.max_cpu_percent());
+        println!(
+            "  {} {:.1}%",
+            "Avg utilization:".cyan(),
+            self.avg_cpu_percent()
+        );
+        println!(
+            "  {} {:.1}%",
+            "Max utilization:".cyan(),
+            self.max_cpu_percent()
+        );
         println!();
 
         // Memory metrics
@@ -354,20 +450,36 @@ impl BenchmarkReport {
         } else {
             0.0
         };
-        println!("  {} {:.1} GB ({:.0}%)", "Max used:".cyan(), self.max_memory_gb(), mem_pct);
+        println!(
+            "  {} {:.1} GB ({:.0}%)",
+            "Max used:".cyan(),
+            self.max_memory_gb(),
+            mem_pct
+        );
         println!();
 
         // Disk I/O metrics
         println!("{}", "Disk I/O:".green());
-        println!("  {} {:.1} MB/s (avg), {:.1} MB/s (max)", "Read:".cyan(),
-            self.avg_disk_read_mb_sec(), self.max_disk_read_mb_sec());
-        println!("  {} {:.1} MB/s (avg), {:.1} MB/s (max)", "Write:".cyan(),
-            self.avg_disk_write_mb_sec(), self.max_disk_write_mb_sec());
+        println!(
+            "  {} {:.1} MB/s (avg), {:.1} MB/s (max)",
+            "Read:".cyan(),
+            self.avg_disk_read_mb_sec(),
+            self.max_disk_read_mb_sec()
+        );
+        println!(
+            "  {} {:.1} MB/s (avg), {:.1} MB/s (max)",
+            "Write:".cyan(),
+            self.avg_disk_write_mb_sec(),
+            self.max_disk_write_mb_sec()
+        );
         if let (Some(avail), Some(total)) = (self.disk_space_available, self.disk_space_total) {
-            println!("  {} {:.1} GB / {:.1} GB ({:.0}% free)", "Space:".cyan(),
+            println!(
+                "  {} {:.1} GB / {:.1} GB ({:.0}% free)",
+                "Space:".cyan(),
                 avail as f64 / (1024.0 * 1024.0 * 1024.0),
                 total as f64 / (1024.0 * 1024.0 * 1024.0),
-                avail as f64 / total as f64 * 100.0);
+                avail as f64 / total as f64 * 100.0
+            );
         }
         println!();
 
@@ -476,9 +588,8 @@ impl MetricsCollector {
         let start_time_clone = start_time;
 
         // Get CPU count before spawning thread
-        let sys = System::new_with_specifics(
-            RefreshKind::new().with_cpu(CpuRefreshKind::everything())
-        );
+        let sys =
+            System::new_with_specifics(RefreshKind::new().with_cpu(CpuRefreshKind::everything()));
         let num_cpus = sys.cpus().len();
 
         let handle = thread::spawn(move || {
@@ -486,12 +597,14 @@ impl MetricsCollector {
             let mut sys = System::new_with_specifics(
                 RefreshKind::new()
                     .with_cpu(CpuRefreshKind::everything())
-                    .with_memory(MemoryRefreshKind::everything())
+                    .with_memory(MemoryRefreshKind::everything()),
             );
             let disks = Disks::new_with_refreshed_list();
 
             // Track disk space (from first disk with significant space)
-            let (disk_space_available, disk_space_total) = disks.list().iter()
+            let (disk_space_available, disk_space_total) = disks
+                .list()
+                .iter()
                 .filter(|d| d.total_space() > 1024 * 1024 * 1024) // > 1GB
                 .map(|d| (Some(d.available_space()), Some(d.total_space())))
                 .next()
@@ -611,11 +724,12 @@ impl MetricsCollector {
     pub fn finish(mut self, total_rows: usize) -> BenchmarkReport {
         self.stop_flag.store(true, Ordering::Relaxed);
 
-        let (samples, disk_space_available, disk_space_total) = if let Some(handle) = self.handle.take() {
-            handle.join().unwrap_or_default()
-        } else {
-            (Vec::new(), None, None)
-        };
+        let (samples, disk_space_available, disk_space_total) =
+            if let Some(handle) = self.handle.take() {
+                handle.join().unwrap_or_default()
+            } else {
+                (Vec::new(), None, None)
+            };
 
         // Calculate output size if path is set
         let output_size_bytes = self.output_path.as_ref().and_then(|path| {
@@ -654,3 +768,47 @@ impl MetricsCollector {
     }
 }
 
+/// Get total disk I/O bytes (read, write) from /proc/diskstats on Linux.
+#[cfg(all(feature = "benchmark", target_os = "linux"))]
+fn get_disk_io_bytes() -> (u64, u64) {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    let mut total_read = 0u64;
+    let mut total_write = 0u64;
+
+    if let Ok(file) = File::open("/proc/diskstats") {
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 10 {
+                continue;
+            }
+
+            // Count whole disks, not partitions or virtual loop/RAM devices.
+            let name = parts[2];
+            if (name.chars().last().is_some_and(|c| c.is_ascii_digit())
+                && !name.starts_with("nvme"))
+                || name.contains("loop")
+                || name.contains("ram")
+            {
+                continue;
+            }
+
+            if let (Ok(read_sectors), Ok(write_sectors)) =
+                (parts[5].parse::<u64>(), parts[9].parse::<u64>())
+            {
+                // Linux reports sectors in 512-byte units.
+                total_read += read_sectors * 512;
+                total_write += write_sectors * 512;
+            }
+        }
+    }
+
+    (total_read, total_write)
+}
+
+/// Disk I/O counters are unavailable on systems without /proc/diskstats.
+#[cfg(all(feature = "benchmark", not(target_os = "linux")))]
+fn get_disk_io_bytes() -> (u64, u64) {
+    (0, 0)
+}

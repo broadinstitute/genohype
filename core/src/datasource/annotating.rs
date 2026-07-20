@@ -61,25 +61,21 @@ impl AnnotatingDataSource {
     /// Get or initialize the annotation context.
     fn get_context(&self) -> Result<&AnnotationContext> {
         let loftee = self.options.loftee;
-        self.context
-            .get_or_try_init(|| {
-                let mut ctx = AnnotationContext::new(
-                    Some(self.options.gff3.as_str()),
-                    self.options.fasta.as_deref(),
-                    self.options.sa_dir.as_deref(),
-                    self.options.distance,
-                )
-                .map_err(|e| {
-                    crate::HailError::InvalidFormat(format!(
-                        "Failed to initialize VEP context: {}",
-                        e
-                    ))
-                })?;
-                if loftee {
-                    ctx.loftee_config = Some(fastvep_loftee::LofteeConfig::default());
-                }
-                Ok(ctx)
-            })
+        self.context.get_or_try_init(|| {
+            let mut ctx = AnnotationContext::new(
+                Some(self.options.gff3.as_str()),
+                self.options.fasta.as_deref(),
+                self.options.sa_dir.as_deref(),
+                self.options.distance,
+            )
+            .map_err(|e| {
+                crate::HailError::InvalidFormat(format!("Failed to initialize VEP context: {}", e))
+            })?;
+            if loftee {
+                ctx.loftee_config = Some(fastvep_loftee::LofteeConfig::default());
+            }
+            Ok(ctx)
+        })
     }
 
     /// Wrap an iterator to annotate each row.
@@ -147,9 +143,9 @@ impl DataSource for AnnotatingDataSource {
     ) -> Result<Box<dyn Iterator<Item = Result<EncodedValue>> + Send>> {
         // Ignore the decode projection for the inner source since we need all fields
         // for annotation. The vep field is always appended.
-        let inner_iter = self
-            .inner
-            .query_stream_with_projection(ranges, intervals, decode_projection)?;
+        let inner_iter =
+            self.inner
+                .query_stream_with_projection(ranges, intervals, decode_projection)?;
         self.annotate_iter(inner_iter)
     }
 
@@ -212,12 +208,19 @@ mod tests {
 
     #[test]
     fn test_annotating_datasource_with_vcf() {
-        let vcf_path = "../data/test/pcsk9_test.vcf";
-        let gff3_path = "../data/test/pcsk9_transcripts.gff3";
+        let fixtures = std::path::PathBuf::from("tests/fixtures/vep");
+        let vcf_path = fixtures.join("pcsk9_test.vcf");
 
-        let vcf_source = crate::vcf::VcfDataSource::new(vcf_path).unwrap();
+        // fastVEP creates a cache beside the GFF3. Use a temporary copy so the
+        // checked-in fixture remains immutable when tests run.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let gff3_path = temp_dir.path().join("pcsk9_transcripts.gff3");
+        std::fs::copy(fixtures.join("pcsk9_transcripts.gff3"), &gff3_path).unwrap();
+
+        let vcf_source =
+            crate::vcf::VcfDataSource::new(vcf_path.to_string_lossy().as_ref()).unwrap();
         let options = VepInitOptions {
-            gff3: gff3_path.to_string(),
+            gff3: gff3_path.to_string_lossy().into_owned(),
             fasta: None,
             sa_dir: None,
             distance: 5000,

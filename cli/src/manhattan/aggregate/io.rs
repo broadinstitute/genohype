@@ -39,32 +39,48 @@ pub(crate) fn list_cloud_parquet_files(dir: &str, suffix: &str) -> Result<Vec<St
     use object_store::ObjectStore;
     use url::Url;
 
-    let url = Url::parse(dir)
-        .map_err(|e| HailError::InvalidFormat(format!("Invalid URL: {}", e)))?;
+    let url =
+        Url::parse(dir).map_err(|e| HailError::InvalidFormat(format!("Invalid URL: {}", e)))?;
 
-    let (store, prefix, base_url): (Arc<dyn object_store::ObjectStore>, ObjPath, String) = match url.scheme() {
-        #[cfg(feature = "gcp")]
-        "gs" => {
-            let bucket = url.host_str()
-                .ok_or_else(|| HailError::InvalidFormat("Missing bucket in GCS URL".to_string()))?;
-            let path = url.path().trim_start_matches('/');
-            (genohype_core::io::get_gcs_client(bucket)?, ObjPath::from(path), format!("gs://{}/", bucket))
-        }
-        #[cfg(feature = "aws")]
-        "s3" => {
-            let bucket = url.host_str()
-                .ok_or_else(|| HailError::InvalidFormat("Missing bucket in S3 URL".to_string()))?;
-            let path = url.path().trim_start_matches('/');
-            let s3 = object_store::aws::AmazonS3Builder::new()
-                .with_bucket_name(bucket)
-                .build()
-                .map_err(|e| HailError::InvalidFormat(format!("Failed to create S3 client: {}", e)))?;
-            (Arc::new(s3), ObjPath::from(path), format!("s3://{}/", bucket))
-        }
-        scheme => {
-            return Err(HailError::InvalidFormat(format!("Unsupported URL scheme: {}", scheme)));
-        }
-    };
+    let (store, prefix, base_url): (Arc<dyn object_store::ObjectStore>, ObjPath, String) =
+        match url.scheme() {
+            #[cfg(feature = "gcp")]
+            "gs" => {
+                let bucket = url.host_str().ok_or_else(|| {
+                    HailError::InvalidFormat("Missing bucket in GCS URL".to_string())
+                })?;
+                let path = url.path().trim_start_matches('/');
+                (
+                    genohype_core::io::get_gcs_client(bucket)?,
+                    ObjPath::from(path),
+                    format!("gs://{}/", bucket),
+                )
+            }
+            #[cfg(feature = "aws")]
+            "s3" => {
+                let bucket = url.host_str().ok_or_else(|| {
+                    HailError::InvalidFormat("Missing bucket in S3 URL".to_string())
+                })?;
+                let path = url.path().trim_start_matches('/');
+                let s3 = object_store::aws::AmazonS3Builder::new()
+                    .with_bucket_name(bucket)
+                    .build()
+                    .map_err(|e| {
+                        HailError::InvalidFormat(format!("Failed to create S3 client: {}", e))
+                    })?;
+                (
+                    Arc::new(s3),
+                    ObjPath::from(path),
+                    format!("s3://{}/", bucket),
+                )
+            }
+            scheme => {
+                return Err(HailError::InvalidFormat(format!(
+                    "Unsupported URL scheme: {}",
+                    scheme
+                )));
+            }
+        };
 
     // Use blocking runtime for object_store async operations
     let rt = tokio::runtime::Runtime::new()?;
@@ -342,7 +358,13 @@ pub fn get_gcs_dir_size(path: &str) -> Option<u64> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     // Output format: "12345  gs://bucket/path"
-    stdout.lines().next()?.split_whitespace().next()?.parse().ok()
+    stdout
+        .lines()
+        .next()?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// Get the total size of a local directory in bytes.

@@ -44,10 +44,7 @@ impl IntervalList {
     /// * `start` - Start position (1-based, inclusive)
     /// * `end` - End position (1-based, inclusive)
     pub fn add(&mut self, contig: String, start: i32, end: i32) {
-        self.intervals
-            .entry(contig)
-            .or_default()
-            .push(start..=end);
+        self.intervals.entry(contig).or_default().push(start..=end);
         self.optimized = false;
     }
 
@@ -104,17 +101,11 @@ impl IntervalList {
         })?;
 
         let start: i32 = range_part[..dash_pos].parse().map_err(|_| {
-            HailError::InvalidFormat(format!(
-                "Invalid start position in interval '{}'",
-                s
-            ))
+            HailError::InvalidFormat(format!("Invalid start position in interval '{}'", s))
         })?;
 
         let end: i32 = range_part[dash_pos + 1..].parse().map_err(|_| {
-            HailError::InvalidFormat(format!(
-                "Invalid end position in interval '{}'",
-                s
-            ))
+            HailError::InvalidFormat(format!("Invalid end position in interval '{}'", s))
         })?;
 
         if start > end {
@@ -164,7 +155,11 @@ impl IntervalList {
         for (line_num, line) in content.lines().enumerate() {
             let line = line.trim();
             // Skip empty lines and comments
-            if line.is_empty() || line.starts_with('#') || line.starts_with("track") || line.starts_with("browser") {
+            if line.is_empty()
+                || line.starts_with('#')
+                || line.starts_with("track")
+                || line.starts_with("browser")
+            {
                 continue;
             }
 
@@ -224,10 +219,7 @@ impl IntervalList {
 
         for (idx, item) in array.iter().enumerate() {
             let obj = item.as_object().ok_or_else(|| {
-                HailError::InvalidFormat(format!(
-                    "JSON interval {} must be an object",
-                    idx
-                ))
+                HailError::InvalidFormat(format!("JSON interval {} must be an object", idx))
             })?;
 
             let contig = obj
@@ -243,25 +235,19 @@ impl IntervalList {
                 })?
                 .to_string();
 
-            let start = obj
-                .get("start")
-                .and_then(|v| v.as_i64())
-                .ok_or_else(|| {
-                    HailError::InvalidFormat(format!(
-                        "JSON interval {} missing or invalid 'start' field",
-                        idx
-                    ))
-                })? as i32;
+            let start = obj.get("start").and_then(|v| v.as_i64()).ok_or_else(|| {
+                HailError::InvalidFormat(format!(
+                    "JSON interval {} missing or invalid 'start' field",
+                    idx
+                ))
+            })? as i32;
 
-            let end = obj
-                .get("end")
-                .and_then(|v| v.as_i64())
-                .ok_or_else(|| {
-                    HailError::InvalidFormat(format!(
-                        "JSON interval {} missing or invalid 'end' field",
-                        idx
-                    ))
-                })? as i32;
+            let end = obj.get("end").and_then(|v| v.as_i64()).ok_or_else(|| {
+                HailError::InvalidFormat(format!(
+                    "JSON interval {} missing or invalid 'end' field",
+                    idx
+                ))
+            })? as i32;
 
             if start > end {
                 return Err(HailError::InvalidFormat(format!(
@@ -429,7 +415,9 @@ impl IntervalList {
             false
         } else {
             // Linear search if not optimized
-            ranges.iter().any(|r| *r.start() <= end && *r.end() >= start)
+            ranges
+                .iter()
+                .any(|r| *r.start() <= end && *r.end() >= start)
         }
     }
 
@@ -456,10 +444,7 @@ impl IntervalList {
     /// Merge another interval list into this one
     pub fn merge(&mut self, other: Self) {
         for (contig, ranges) in other.intervals {
-            self.intervals
-                .entry(contig)
-                .or_default()
-                .extend(ranges);
+            self.intervals.entry(contig).or_default().extend(ranges);
         }
         self.optimized = false;
     }
@@ -525,18 +510,19 @@ mod tests {
         list.optimize();
 
         // Test overlaps
-        assert!(list.overlaps("chr1", 50, 150));  // Overlaps start
+        assert!(list.overlaps("chr1", 50, 150)); // Overlaps start
         assert!(list.overlaps("chr1", 150, 250)); // Overlaps end
         assert!(list.overlaps("chr1", 100, 200)); // Exact match
         assert!(list.overlaps("chr1", 120, 180)); // Contained
-        assert!(list.overlaps("chr1", 50, 500));  // Contains
+        assert!(list.overlaps("chr1", 50, 500)); // Contains
         assert!(!list.overlaps("chr1", 201, 299)); // Gap
         assert!(!list.overlaps("chr2", 100, 200)); // Wrong contig
     }
 
     #[test]
     fn test_parse_bed() {
-        let bed_content = "chr1\t99\t200\ntrack name=test\nchr1\t299\t400\n#comment\nchr2\t499\t600\n";
+        let bed_content =
+            "chr1\t99\t200\ntrack name=test\nchr1\t299\t400\n#comment\nchr2\t499\t600\n";
         let list = IntervalList::parse_bed(bed_content).unwrap();
 
         // BED is 0-based half-open, converted to 1-based inclusive
@@ -588,6 +574,7 @@ mod tests {
     fn test_invalid_interval_string() {
         assert!(IntervalList::from_strings(&["invalid".to_string()]).is_err());
         assert!(IntervalList::from_strings(&["chr1:abc-def".to_string()]).is_err());
-        assert!(IntervalList::from_strings(&["chr1:200-100".to_string()]).is_err()); // start > end
+        assert!(IntervalList::from_strings(&["chr1:200-100".to_string()]).is_err());
+        // start > end
     }
 }

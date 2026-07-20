@@ -59,12 +59,7 @@ mod tests {
             fn upload_file(&self, _: &Path, _: &str, _: &str, _: &str) -> Result<()> {
                 Ok(())
             }
-            fn get_ssh_command(
-                &self,
-                _: &str,
-                _: &str,
-                _: &str,
-            ) -> std::process::Command {
+            fn get_ssh_command(&self, _: &str, _: &str, _: &str) -> std::process::Command {
                 std::process::Command::new("echo")
             }
         }

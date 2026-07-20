@@ -106,9 +106,13 @@ pub(crate) fn generate_loci_from_parquet(
     println!("    Extracting significant positions...");
     let sig_path = format!("{}/significant.parquet", output_base);
 
-    let mut sig_positions = if std::path::Path::new(&sig_path).exists() || is_cloud_path(&sig_path) {
+    let mut sig_positions = if std::path::Path::new(&sig_path).exists() || is_cloud_path(&sig_path)
+    {
         let positions = extract_sig_positions(&sig_path)?;
-        println!("      Found {} significant hits from significant.parquet", positions.len());
+        println!(
+            "      Found {} significant hits from significant.parquet",
+            positions.len()
+        );
         positions
     } else {
         println!("      No significant.parquet found, skipping variant hits");
@@ -148,8 +152,16 @@ pub(crate) fn generate_loci_from_parquet(
     }
 
     // Step 2: Compute locus regions (Greedy P-value clumping + merge with genes)
-    println!("    Computing locus regions (clumping window: {}bp, min_variants: {})...", locus_window, min_variants_per_locus);
-    let regions = compute_locus_regions_with_genes(&sig_positions, &gene_regions, locus_window, min_variants_per_locus);
+    println!(
+        "    Computing locus regions (clumping window: {}bp, min_variants: {})...",
+        locus_window, min_variants_per_locus
+    );
+    let regions = compute_locus_regions_with_genes(
+        &sig_positions,
+        &gene_regions,
+        locus_window,
+        min_variants_per_locus,
+    );
     println!("      Found {} clumped/merged locus regions", regions.len());
 
     if regions.is_empty() {
@@ -177,37 +189,36 @@ pub(crate) fn generate_loci_from_parquet(
     );
 
     // Generate loci in parallel, collecting rows for parquet output
-    let results: Vec<
-        Result<Option<(ManifestLocus, LocusDefinitionRow, Vec<LocusVariantRow>)>>,
-    > = pool.install(|| {
-        regions
-            .par_iter()
-            .map(|(contig, start, end)| {
-                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                if done == 1 || done % 20 == 0 || done == total_regions {
-                    println!(
-                        "      Progress: {}/{} - {}:{}-{}",
-                        done, total_regions, contig, start, end
-                    );
-                }
+    let results: Vec<Result<Option<(ManifestLocus, LocusDefinitionRow, Vec<LocusVariantRow>)>>> =
+        pool.install(|| {
+            regions
+                .par_iter()
+                .map(|(contig, start, end)| {
+                    let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                    if done == 1 || done % 20 == 0 || done == total_regions {
+                        println!(
+                            "      Progress: {}/{} - {}:{}-{}",
+                            done, total_regions, contig, start, end
+                        );
+                    }
 
-                generate_single_locus_core(
-                    &loci_dir,
-                    &sig_positions,
-                    exome_table,
-                    genome_table,
-                    contig,
-                    *start,
-                    *end,
-                    threshold,
-                    phenotype,
-                    ancestry,
-                    styling,
-                    render_images,
-                )
-            })
-            .collect()
-    });
+                    generate_single_locus_core(
+                        &loci_dir,
+                        &sig_positions,
+                        exome_table,
+                        genome_table,
+                        contig,
+                        *start,
+                        *end,
+                        threshold,
+                        phenotype,
+                        ancestry,
+                        styling,
+                        render_images,
+                    )
+                })
+                .collect()
+        });
 
     // Collect successful results
     let mut manifest_loci = Vec::new();
@@ -271,11 +282,7 @@ fn generate_single_locus_core(
     styling: Option<&crate::manhattan::config::ManhattanConfig>,
     render_images: bool,
 ) -> Result<Option<(ManifestLocus, LocusDefinitionRow, Vec<LocusVariantRow>)>> {
-    let region_id = format!("{}_{}_{}",
-        contig.replace("chr", ""),
-        start,
-        end
-    );
+    let region_id = format!("{}_{}_{}", contig.replace("chr", ""), start, end);
 
     // Find lead variant in this region
     let lead = find_lead_variant(sig_positions, contig, start, end);
@@ -449,7 +456,10 @@ pub fn extract_sig_positions(parquet_path: &str) -> Result<Vec<SigPosition>> {
             Ok(b) => b,
             Err(e) => {
                 let err_str = e.to_string();
-                if err_str.contains("404") || err_str.contains("not found") || err_str.contains("NotFound") {
+                if err_str.contains("404")
+                    || err_str.contains("not found")
+                    || err_str.contains("NotFound")
+                {
                     return Ok(vec![]);
                 }
                 return Err(e);
@@ -473,22 +483,45 @@ pub fn extract_sig_positions(parquet_path: &str) -> Result<Vec<SigPosition>> {
         let contig_idx = schema.fields().iter().position(|f| f.name() == "contig");
         let position_idx = schema.fields().iter().position(|f| f.name() == "position");
         let pvalue_idx = schema.fields().iter().position(|f| f.name() == "pvalue");
-        let seq_type_idx = schema.fields().iter().position(|f| f.name() == "sequencing_type");
+        let seq_type_idx = schema
+            .fields()
+            .iter()
+            .position(|f| f.name() == "sequencing_type");
 
-        if contig_idx.is_none() || position_idx.is_none() || pvalue_idx.is_none() || seq_type_idx.is_none() {
+        if contig_idx.is_none()
+            || position_idx.is_none()
+            || pvalue_idx.is_none()
+            || seq_type_idx.is_none()
+        {
             continue;
         }
 
-        let contig_col = batch.column(contig_idx.unwrap()).as_any().downcast_ref::<StringArray>();
-        let position_col = batch.column(position_idx.unwrap()).as_any().downcast_ref::<Int32Array>();
-        let pvalue_col = batch.column(pvalue_idx.unwrap()).as_any().downcast_ref::<Float64Array>();
-        let seq_type_col = batch.column(seq_type_idx.unwrap()).as_any().downcast_ref::<StringArray>();
+        let contig_col = batch
+            .column(contig_idx.unwrap())
+            .as_any()
+            .downcast_ref::<StringArray>();
+        let position_col = batch
+            .column(position_idx.unwrap())
+            .as_any()
+            .downcast_ref::<Int32Array>();
+        let pvalue_col = batch
+            .column(pvalue_idx.unwrap())
+            .as_any()
+            .downcast_ref::<Float64Array>();
+        let seq_type_col = batch
+            .column(seq_type_idx.unwrap())
+            .as_any()
+            .downcast_ref::<StringArray>();
 
         if let (Some(contig_arr), Some(pos_arr), Some(pval_arr), Some(seq_arr)) =
             (contig_col, position_col, pvalue_col, seq_type_col)
         {
             for i in 0..batch.num_rows() {
-                if contig_arr.is_null(i) || pos_arr.is_null(i) || pval_arr.is_null(i) || seq_arr.is_null(i) {
+                if contig_arr.is_null(i)
+                    || pos_arr.is_null(i)
+                    || pval_arr.is_null(i)
+                    || seq_arr.is_null(i)
+                {
                     continue;
                 }
 
@@ -525,7 +558,8 @@ pub(crate) fn compute_locus_regions_with_genes(
     let mut all_regions: Vec<(String, i32, i32)> = Vec::new();
 
     // 1. Separate variant positions (filter out "gene" source variants which are added directly)
-    let mut variant_positions: Vec<SigPosition> = positions.iter()
+    let mut variant_positions: Vec<SigPosition> = positions
+        .iter()
         .filter(|p| p.source != "gene")
         .cloned()
         .collect();
@@ -533,12 +567,18 @@ pub(crate) fn compute_locus_regions_with_genes(
     // 2. Greedy clumping
     if !variant_positions.is_empty() {
         // Sort by p-value ascending (best first)
-        variant_positions.sort_by(|a, b| a.pvalue.partial_cmp(&b.pvalue).unwrap_or(std::cmp::Ordering::Equal));
+        variant_positions.sort_by(|a, b| {
+            a.pvalue
+                .partial_cmp(&b.pvalue)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         let mut absorbed = vec![false; variant_positions.len()];
 
         for i in 0..variant_positions.len() {
-            if absorbed[i] { continue; }
+            if absorbed[i] {
+                continue;
+            }
             let lead = &variant_positions[i];
 
             let clump_start = (lead.position - window).max(1);
@@ -550,7 +590,10 @@ pub(crate) fn compute_locus_regions_with_genes(
             for j in i..variant_positions.len() {
                 if !absorbed[j] {
                     let candidate = &variant_positions[j];
-                    if candidate.contig == lead.contig && candidate.position >= clump_start && candidate.position <= clump_end {
+                    if candidate.contig == lead.contig
+                        && candidate.position >= clump_start
+                        && candidate.position <= clump_end
+                    {
                         absorbed[j] = true;
                         clump_count += 1;
                     }
@@ -642,7 +685,11 @@ fn find_lead_variant(
     positions
         .iter()
         .filter(|p| p.contig == contig && p.position >= start && p.position <= end)
-        .min_by(|a, b| a.pvalue.partial_cmp(&b.pvalue).unwrap_or(std::cmp::Ordering::Equal))
+        .min_by(|a, b| {
+            a.pvalue
+                .partial_cmp(&b.pvalue)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
         .cloned()
 }
 
@@ -664,8 +711,11 @@ fn read_locus_variants(
     let engine = QueryEngine::open_path(table_path)?;
     let open_time = t0.elapsed();
     if open_time.as_secs() > 1 {
-        eprintln!("      [slow] QueryEngine::open_path took {:.1}s for {}",
-            open_time.as_secs_f64(), table_path);
+        eprintln!(
+            "      [slow] QueryEngine::open_path took {:.1}s for {}",
+            open_time.as_secs_f64(),
+            table_path
+        );
     }
 
     // Create interval list for this region
@@ -719,8 +769,14 @@ fn read_locus_variants(
 
     let query_time = t1.elapsed();
     if query_time.as_secs() > 2 {
-        eprintln!("      [slow] Interval query took {:.1}s, {} rows for {}:{}-{}",
-            query_time.as_secs_f64(), row_count, contig, start, end);
+        eprintln!(
+            "      [slow] Interval query took {:.1}s, {} rows for {}:{}-{}",
+            query_time.as_secs_f64(),
+            row_count,
+            contig,
+            start,
+            end
+        );
     }
 
     Ok(variants)
@@ -732,7 +788,10 @@ fn extract_locus_info(row: &EncodedValue) -> Option<ExtractedLocusInfo> {
         let mut current = value;
         for &field_name in path {
             if let EncodedValue::Struct(fields) = current {
-                current = fields.iter().find(|(n, _)| n == field_name).map(|(_, v)| v)?;
+                current = fields
+                    .iter()
+                    .find(|(n, _)| n == field_name)
+                    .map(|(_, v)| v)?;
             } else {
                 return None;
             }
@@ -759,13 +818,20 @@ fn extract_locus_info(row: &EncodedValue) -> Option<ExtractedLocusInfo> {
     let pvalue = get_float(row, &["Pvalue", "pvalue", "p_value", "P"])?;
 
     // Extract alleles from the "alleles" array field
-    let (ref_allele, alt_allele) = if let Some(EncodedValue::Array(alleles)) = get_field(row, &["alleles"]) {
-        let r = alleles.first().and_then(|v| v.as_string()).unwrap_or_default();
-        let a = alleles.get(1).and_then(|v| v.as_string()).unwrap_or_default();
-        (r, a)
-    } else {
-        (String::new(), String::new())
-    };
+    let (ref_allele, alt_allele) =
+        if let Some(EncodedValue::Array(alleles)) = get_field(row, &["alleles"]) {
+            let r = alleles
+                .first()
+                .and_then(|v| v.as_string())
+                .unwrap_or_default();
+            let a = alleles
+                .get(1)
+                .and_then(|v| v.as_string())
+                .unwrap_or_default();
+            (r, a)
+        } else {
+            (String::new(), String::new())
+        };
 
     // Extract beta (effect size)
     let beta = get_float(row, &["BETA", "beta", "Beta"]);
@@ -895,7 +961,10 @@ fn write_loci_parquet(
             let mut writer = LocusVariantWriter::new(&variants_path)?;
             writer.write_batch(variants)?;
             let count = writer.finish()?;
-            println!("      Wrote {} locus variants to loci_variants.parquet", count);
+            println!(
+                "      Wrote {} locus variants to loci_variants.parquet",
+                count
+            );
         }
     }
 

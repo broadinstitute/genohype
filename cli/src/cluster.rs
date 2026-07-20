@@ -58,9 +58,9 @@ pub fn list_clusters(config: &Config, status_filter: Option<&String>) -> Result<
 
 /// Show detailed information about a specific cluster.
 pub fn show_cluster(config: &Config, name: &str) -> Result<()> {
-    let cluster = config
-        .get_cluster(Some(name))
-        .ok_or_else(|| genohype_core::HailError::InvalidFormat(format!("Unknown cluster: {}", name)))?;
+    let cluster = config.get_cluster(Some(name)).ok_or_else(|| {
+        genohype_core::HailError::InvalidFormat(format!("Unknown cluster: {}", name))
+    })?;
 
     println!("{} {}", "Cluster:".green(), name.bright_white());
 
@@ -94,7 +94,9 @@ pub fn show_cluster(config: &Config, name: &str) -> Result<()> {
 pub fn verify_cluster(config: &Config, name: &str) -> Result<()> {
     let cluster = config
         .get_cluster(Some(name))
-        .ok_or_else(|| genohype_core::HailError::InvalidFormat(format!("Unknown cluster: {}", name)))?
+        .ok_or_else(|| {
+            genohype_core::HailError::InvalidFormat(format!("Unknown cluster: {}", name))
+        })?
         .resolve_env_vars()
         .map_err(genohype_core::HailError::Config)?;
 
@@ -219,15 +221,15 @@ pub fn verify_cluster(config: &Config, name: &str) -> Result<()> {
 pub fn deploy_cluster(config: &Config, name: &str, tag: &str, backend_only: bool) -> Result<()> {
     let cluster = config
         .get_cluster(Some(name))
-        .ok_or_else(|| genohype_core::HailError::InvalidFormat(format!("Unknown cluster: {}", name)))?
+        .ok_or_else(|| {
+            genohype_core::HailError::InvalidFormat(format!("Unknown cluster: {}", name))
+        })?
         .resolve_env_vars()
         .map_err(genohype_core::HailError::Config)?;
 
-    let project = config
-        .defaults
-        .project
-        .as_deref()
-        .ok_or_else(|| genohype_core::HailError::Config("No project configured in defaults".into()))?;
+    let project = config.defaults.project.as_deref().ok_or_else(|| {
+        genohype_core::HailError::Config("No project configured in defaults".into())
+    })?;
 
     let region = config.defaults.region.as_deref().unwrap_or("us-central1");
     let registry = config

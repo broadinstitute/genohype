@@ -22,7 +22,10 @@ pub fn generate_worker_startup_script(binary_gcs_url: Option<&str>, pool_name: &
             format!("gsutil cp {} /tmp/genohype", binary_url)
         } else {
             // HTTP URL (e.g., from coordinator /api/binary) - retry since coordinator may still be booting
-            format!("curl -sL --retry 10 --retry-delay 5 --retry-all-errors -o /tmp/genohype {}", binary_url)
+            format!(
+                "curl -sL --retry 10 --retry-delay 5 --retry-all-errors -o /tmp/genohype {}",
+                binary_url
+            )
         };
         format!(
             r#"
@@ -280,8 +283,7 @@ touch /tmp/genohype-ready
 
 echo "=== Coordinator VM initialized ==="
 "#,
-        wg_install,
-        binary_download
+        wg_install, binary_download
     )
 }
 
@@ -292,7 +294,9 @@ echo "=== Coordinator VM initialized ==="
 pub fn generate_startup_script_with_extras(extra_commands: &str) -> String {
     let mut script = generate_worker_startup_script(None, "default");
     // Remove the final echo and add custom commands before it
-    script = script.trim_end_matches("echo \"=== Worker VM initialized ===\"\n").to_string();
+    script = script
+        .trim_end_matches("echo \"=== Worker VM initialized ===\"\n")
+        .to_string();
     script.push_str("\n# Custom setup\n");
     script.push_str(extra_commands);
     script.push_str("\necho \"=== Worker VM initialized ===\"\n");

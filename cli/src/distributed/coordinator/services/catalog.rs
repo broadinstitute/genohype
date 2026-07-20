@@ -12,7 +12,11 @@ pub struct CatalogState {
     pub inputs: HashMap<(String, String), PhenotypeInput>,
 }
 
-pub type CatalogLoadResult = (CatalogState, HashSet<(String, String)>, HashSet<(String, String)>);
+pub type CatalogLoadResult = (
+    CatalogState,
+    HashSet<(String, String)>,
+    HashSet<(String, String)>,
+);
 
 /// Load catalog from a TOML config file path.
 pub fn load_catalog(config_path: &str) -> crate::Result<CatalogLoadResult> {
@@ -45,7 +49,11 @@ fn fetch_clickhouse_status(url: &str) -> HashSet<(String, String)> {
         let query = "SELECT phenotype, ancestry FROM pipeline_status WHERE status IN ('INGESTED', 'COMPLETED') FORMAT JSON";
         let formatted_url = format!("{}/?default_format=JSON", url.trim_end_matches('/'));
 
-        if let Ok(resp) = reqwest::blocking::Client::new().post(&formatted_url).body(query).send() {
+        if let Ok(resp) = reqwest::blocking::Client::new()
+            .post(&formatted_url)
+            .body(query)
+            .send()
+        {
             if let Ok(json) = resp.json::<serde_json::Value>() {
                 if let Some(arr) = json.get("data").and_then(|d| d.as_array()) {
                     for row in arr {
@@ -100,7 +108,10 @@ fn build_catalog(config: ManhattanJobConfig) -> crate::Result<CatalogLoadResult>
         }
 
         if !completed_phenos.is_empty() {
-            println!("  Storage scan: found {} completed phenotypes", completed_phenos.len());
+            println!(
+                "  Storage scan: found {} completed phenotypes",
+                completed_phenos.len()
+            );
         }
     }
 
@@ -108,14 +119,16 @@ fn build_catalog(config: ManhattanJobConfig) -> crate::Result<CatalogLoadResult>
     if let Some(ref ch_url) = config.ingest.clickhouse_url {
         ingested_phenos = fetch_clickhouse_status(ch_url);
         if !ingested_phenos.is_empty() {
-            println!("  ClickHouse scan: found {} ingested phenotypes", ingested_phenos.len());
+            println!(
+                "  ClickHouse scan: found {} ingested phenotypes",
+                ingested_phenos.len()
+            );
         }
     }
 
     // Load ALL assets (no filters) to populate the catalog
-    let raw_inputs = crate::manhattan::batch::load_and_group_assets(
-        assets_json, None, None, None, None,
-    )?;
+    let raw_inputs =
+        crate::manhattan::batch::load_and_group_assets(assets_json, None, None, None, None)?;
 
     let mut inputs_map = HashMap::new();
     let mut entries_map = HashMap::new();
@@ -157,19 +170,28 @@ fn build_catalog(config: ManhattanJobConfig) -> crate::Result<CatalogLoadResult>
                 for row_res in iter {
                     if let Ok(EncodedValue::Struct(fields)) = row_res {
                         let get_str = |k: &str| -> Option<String> {
-                            fields.iter().find(|(n, _)| n == k).and_then(|(_, v)| v.as_string())
+                            fields
+                                .iter()
+                                .find(|(n, _)| n == k)
+                                .and_then(|(_, v)| v.as_string())
                         };
                         let get_int = |k: &str| -> Option<i32> {
-                            fields.iter().find(|(n, _)| n == k).and_then(|(_, v)| v.as_i32())
+                            fields
+                                .iter()
+                                .find(|(n, _)| n == k)
+                                .and_then(|(_, v)| v.as_i32())
                         };
 
-                        if let (Some(id), Some(ancestry)) = (get_str("phenoname"), get_str("ancestry")) {
+                        if let (Some(id), Some(ancestry)) =
+                            (get_str("phenoname"), get_str("ancestry"))
+                        {
                             // Metadata table uses uppercase ancestry (e.g. "META"),
                             // assets JSON uses lowercase (e.g. "meta"). Normalize.
                             let key = (id, ancestry.to_lowercase());
                             if let Some(entry) = entries_map.get_mut(&key) {
                                 entry.description = get_str("description");
-                                entry.category = get_str("category").or_else(|| get_str("phecode_category"));
+                                entry.category =
+                                    get_str("category").or_else(|| get_str("phecode_category"));
                                 entry.trait_type = get_str("trait_type");
                                 entry.n_cases = get_int("n_cases");
                                 entry.n_controls = get_int("n_controls");
@@ -179,7 +201,10 @@ fn build_catalog(config: ManhattanJobConfig) -> crate::Result<CatalogLoadResult>
                 }
             }
         } else {
-            println!("Warning: Could not open metadata table at {}, skipping enrichment.", meta_path);
+            println!(
+                "Warning: Could not open metadata table at {}, skipping enrichment.",
+                meta_path
+            );
         }
     } else {
         println!("No metadata_path provided in config, skipping enrichment.");
@@ -190,9 +215,13 @@ fn build_catalog(config: ManhattanJobConfig) -> crate::Result<CatalogLoadResult>
 
     println!("Catalog loaded with {} phenotypes.", entries.len());
 
-    Ok((CatalogState {
-        config,
-        entries,
-        inputs: inputs_map,
-    }, completed_phenos, ingested_phenos))
+    Ok((
+        CatalogState {
+            config,
+            entries,
+            inputs: inputs_map,
+        },
+        completed_phenos,
+        ingested_phenos,
+    ))
 }

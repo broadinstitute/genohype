@@ -22,7 +22,8 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 // Check if it looks like a valid JSON response (new field names)
-                return stdout.contains("\"pending_tasks\"") || stdout.contains("\"completed_tasks\"");
+                return stdout.contains("\"pending_tasks\"")
+                    || stdout.contains("\"completed_tasks\"");
             }
         }
         false
@@ -54,7 +55,9 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
 
         // Slow path: SSH through IAP (can take 5-30+ seconds)
         let remote_curl = format!("curl -s http://localhost:3000{}", endpoint);
-        let mut cmd = self.provider.get_ssh_command(&coordinator.name, zone, &remote_curl);
+        let mut cmd = self
+            .provider
+            .get_ssh_command(&coordinator.name, zone, &remote_curl);
         cmd.stdout(std::process::Stdio::piped());
 
         let output = cmd.output().map_err(HailError::Io)?;
@@ -116,11 +119,12 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             memory_weight_mb,
         };
 
-        let json_payload = serde_json::to_string(&request)
-            .map_err(|e| HailError::Io(std::io::Error::new(
+        let json_payload = serde_json::to_string(&request).map_err(|e| {
+            HailError::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 format!("Failed to serialize job config: {}", e),
-            )))?;
+            ))
+        })?;
 
         // Submit via curl through SSH
         // Determine submission method based on payload size
@@ -134,7 +138,10 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             use std::io::Write;
             use std::time::{SystemTime, UNIX_EPOCH};
 
-            println!("{}", "  Payload large, uploading job config file...".dimmed());
+            println!(
+                "{}",
+                "  Payload large, uploading job config file...".dimmed()
+            );
 
             // Create local temp file
             let timestamp = SystemTime::now()
@@ -168,7 +175,9 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             )
         };
 
-        let mut cmd = self.provider.get_ssh_command(&coordinator.name, zone, &curl_cmd);
+        let mut cmd = self
+            .provider
+            .get_ssh_command(&coordinator.name, zone, &curl_cmd);
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
@@ -195,7 +204,10 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                 }
             }
             Err(e) => {
-                eprintln!("Failed to parse coordinator response: {} (raw: {})", e, stdout);
+                eprintln!(
+                    "Failed to parse coordinator response: {} (raw: {})",
+                    e, stdout
+                );
                 Ok(false)
             }
         }
@@ -223,10 +235,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         let bucket_path = bucket_path.trim_end_matches('/');
         let destination = format!("{}/{}-{}-metrics.db", bucket_path, pool_name, timestamp);
 
-        println!(
-            "{} Exporting metrics to GCS...",
-            "Saving:".cyan()
-        );
+        println!("{} Exporting metrics to GCS...", "Saving:".cyan());
 
         let request = ExportMetricsRequest {
             destination: destination.clone(),
@@ -250,7 +259,9 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             json_payload.replace('\'', "'\\''")
         );
 
-        let mut cmd = self.provider.get_ssh_command(&coordinator.name, zone, &curl_cmd);
+        let mut cmd = self
+            .provider
+            .get_ssh_command(&coordinator.name, zone, &curl_cmd);
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
@@ -289,7 +300,9 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                     println!(
                         "   {} {}",
                         "Warning:".yellow(),
-                        response.error.unwrap_or_else(|| "Unknown error".to_string())
+                        response
+                            .error
+                            .unwrap_or_else(|| "Unknown error".to_string())
                     );
                 }
             }
@@ -323,9 +336,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                 json_payload
             );
 
-            let mut cmd = self
-                .provider
-                .get_ssh_command(&coord.name, zone, &cmd_str);
+            let mut cmd = self.provider.get_ssh_command(&coord.name, zone, &cmd_str);
             cmd.stdout(std::process::Stdio::piped());
 
             if let Ok(output) = cmd.output() {
@@ -512,11 +523,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                 "[{}] {} {} {}",
                 timestamp.dimmed(),
                 type_color,
-                event
-                    .worker_id
-                    .as_deref()
-                    .unwrap_or("-")
-                    .cyan(),
+                event.worker_id.as_deref().unwrap_or("-").cyan(),
                 event.details
             );
         };

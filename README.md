@@ -4,7 +4,7 @@ A fast, memory-efficient toolkit for genomic data processing. Read Hail tables a
 
 ## Features
 
-- **Zero Java dependencies**: Single static binary, no JVM or Hail installation required
+- **No Java runtime**: Prebuilt CLI binaries require no JVM or Hail installation
 - **Multiple input formats**: Hail tables (.ht), VCF files (.vcf.bgz with tabix)
 - **Cloud-native**: Read from local disk, GCS, S3, or HTTP URLs
 - **Multiple outputs**: Export to Parquet, VCF, ClickHouse, BigQuery, or Hail format
@@ -14,15 +14,40 @@ A fast, memory-efficient toolkit for genomic data processing. Read Hail tables a
 
 ## Installation
 
+Install the latest prebuilt release on Apple Silicon macOS, Intel macOS, or x86-64 Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/broadinstitute/genohype/main/scripts/install.sh | sh
+genohype --version
+```
+
+The installer verifies SHA-256 checksums and installs to `${GENOHYPE_INSTALL_DIR:-$HOME/.local/bin}`. On macOS it also installs the Linux worker binary used by `genohype pool`. To select a specific release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/broadinstitute/genohype/main/scripts/install.sh \
+  | GENOHYPE_VERSION=v0.1.0 sh
+```
+
+To inspect the installer before running it:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/broadinstitute/genohype/main/scripts/install.sh
+less install.sh
+sh install.sh
+```
+
+To build from source instead:
+
 ```bash
 # Default build (GCS support)
-cargo build --release
+./scripts/build-dashboard.sh
+cargo build --release --locked
 
 # Local files only (fastest compile)
-cargo build --release --no-default-features
+cargo build --release --locked --no-default-features
 
 # Build with all features
-cargo build --release --features full
+cargo build --release --locked --features full
 ```
 
 ## Quick Start
@@ -181,24 +206,21 @@ genohype schema validate data/variants.vcf.bgz schema.json --sample 10000
 
 ## Distributed Processing (GCP)
 
-Run parallel exports across multiple GCP VMs:
+Run parallel exports across multiple GCP VMs. Prebuilt macOS installations include the Linux worker used by the pool commands; when building from source, run `make worker` first.
 
 ```bash
-# 1. Build Linux worker binary
-make worker
-
-# 2. Create a pool of spot VMs
+# 1. Create a pool of spot VMs
 genohype pool create my-pool --workers 4 --spot
 
-# 3. Submit a distributed job
+# 2. Submit a distributed job
 genohype pool submit my-pool -- \
     export parquet gs://bucket/input.ht gs://bucket/output/ --shard-count 100
 
-# 4. Clean up
+# 3. Clean up
 genohype pool destroy my-pool
 ```
 
-Requires `gcloud` CLI configured with appropriate project/credentials.
+Requires `gcloud` CLI configured with appropriate project and credentials.
 
 ## Interval File Formats
 
@@ -251,9 +273,14 @@ cargo build --release --features full
 ## Testing
 
 ```bash
-cargo test
-cargo test --features full  # test all features
+cargo test --workspace
+cargo test --workspace --all-features
+
+# Build the existing pool dashboard and run the complete local CI suite
+./scripts/verify.sh
 ```
+
+Release maintainers should follow [RELEASING.md](RELEASING.md).
 
 ## Architecture
 
@@ -293,3 +320,7 @@ cargo test --features full  # test all features
 - **Streaming by Default** - Memory-efficient processing of arbitrarily large datasets
 - **Parquet as Intermediate** - Bridge between row-oriented sources and columnar targets
 - **Consistent CLI** - Same `--where`/`--limit`/`--interval` options work across all commands
+
+## License
+
+Genohype is available under the [MIT License](LICENSE).

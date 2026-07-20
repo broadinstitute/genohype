@@ -28,10 +28,7 @@ pub(crate) fn start_new_job(
     intervals: Vec<String>,
 ) -> Result<(), String> {
     // Enrich specs if it's a batch job
-    if let JobSpec::ManhattanBatch {
-        ref mut specs, ..
-    } = job_spec
-    {
+    if let JobSpec::ManhattanBatch { ref mut specs, .. } = job_spec {
         super::batch_init::enrich_specs(specs);
     }
 

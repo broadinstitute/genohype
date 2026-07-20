@@ -965,8 +965,14 @@ mod tests {
 
     fn gene_es_row() -> EncodedValue {
         EncodedValue::Struct(vec![
-            ("gene_id".to_string(), EncodedValue::Binary(b"ENSG1".to_vec())),
-            ("symbol".to_string(), EncodedValue::Binary(b"PCSK9".to_vec())),
+            (
+                "gene_id".to_string(),
+                EncodedValue::Binary(b"ENSG1".to_vec()),
+            ),
+            (
+                "symbol".to_string(),
+                EncodedValue::Binary(b"PCSK9".to_vec()),
+            ),
             ("chrom".to_string(), EncodedValue::Binary(b"chr1".to_vec())),
             ("start".to_string(), EncodedValue::Int32(100)),
             ("stop".to_string(), EncodedValue::Int32(200)),
@@ -990,8 +996,7 @@ mod tests {
         // Backend term-queries gene_id + symbol_upper_case, prefix-queries search_terms.
         assert_eq!(doc["gene_id"], "ENSG1");
         assert_eq!(doc["symbol_upper_case"], "PCSK9");
-        let terms: Vec<String> =
-            serde_json::from_value(doc["search_terms"].clone()).unwrap();
+        let terms: Vec<String> = serde_json::from_value(doc["search_terms"].clone()).unwrap();
         assert!(terms.contains(&"PCSK9".to_string()));
         assert!(terms.contains(&"ENSG1".to_string()));
         // Backend rebuilds the gene from `_source.value`; gencode_symbol must be present.

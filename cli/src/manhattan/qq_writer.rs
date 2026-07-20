@@ -4,11 +4,11 @@
 //! for QQ plot rendering on the frontend. Includes variant key fields for
 //! annotation joins.
 
-use genohype_core::error::Result;
 use crate::manhattan::data::QQPointRow;
 use arrow::array::{ArrayRef, Float64Builder, Int32Builder, StringBuilder};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use genohype_core::error::Result;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use std::fs::File;

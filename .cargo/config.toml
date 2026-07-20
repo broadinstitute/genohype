@@ -1,13 +1,10 @@
-# Cargo configuration for improved build times across worktrees
+# Cargo configuration shared by all contributors.
 #
-# sccache: Caches compilation artifacts globally, enabling sharing between worktrees
-# without the file locking issues of a shared target directory.
-#
-# Note: mold linker is Linux-only (macOS Mach-O support was removed).
-# On macOS ARM64, Apple's default linker is quite fast.
+# To use sccache locally, set RUSTC_WRAPPER=sccache in your environment. Keeping
+# it out of this file allows Cargo commands to work on machines without sccache.
 
-[build]
-rustc-wrapper = "sccache"
+[net]
+git-fetch-with-cli = true
 
 # Linux x86_64: mold linker settings (only used when building ON Linux)
 # When cross-compiling from macOS, zigbuild handles linking automatically

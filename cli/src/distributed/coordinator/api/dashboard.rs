@@ -131,7 +131,10 @@ pub(crate) fn build_dashboard_summary(data: &CoordinatorData) -> DashboardSummar
             failed: ing.failed_count,
         })
     } else if let Some(ref last_batch) = data.last_completed_batch {
-        let completed = last_batch.values().filter(|s| s.stage == "completed").count();
+        let completed = last_batch
+            .values()
+            .filter(|s| s.stage == "completed")
+            .count();
         let failed = last_batch.values().filter(|s| s.stage == "failed").count();
         Some(DashboardBatchProgress {
             total: last_batch.len(),
@@ -345,7 +348,9 @@ pub(crate) async fn get_dashboard_workers(
 /// only the data for the active/most recent job rather than all historical data.
 pub(crate) async fn get_dashboard_metrics(
     axum::extract::State(state): axum::extract::State<SharedState>,
-    axum::extract::Query(query): axum::extract::Query<crate::distributed::coordinator::api::jobs::SinceQuery>,
+    axum::extract::Query(query): axum::extract::Query<
+        crate::distributed::coordinator::api::jobs::SinceQuery,
+    >,
 ) -> axum::Json<DashboardMetrics> {
     let data = state.lock().unwrap();
 

@@ -65,7 +65,9 @@ pub fn run_export_genes_clickhouse(args: ExportGenesClickhouseArgs) -> Result<()
             .map_err(ch_err)?;
         println!("  {}", "Dropped existing table (--recreate)".yellow());
     }
-    client.execute(&create_genes_ddl(&args.table)).map_err(ch_err)?;
+    client
+        .execute(&create_genes_ddl(&args.table))
+        .map_err(ch_err)?;
     println!("  {}", "Genes table ready".green());
 
     let iterator = engine.query_iter_with_intervals(&where_filters, intervals)?;

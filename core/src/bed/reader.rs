@@ -81,10 +81,7 @@ impl BedDataSource {
         // Read header + first data line to detect schema
         let (col_names, col_types, chrom_col, start_col) = Self::detect_schema(path)?;
 
-        let columns: Vec<(String, ColumnType)> = col_names
-            .into_iter()
-            .zip(col_types)
-            .collect();
+        let columns: Vec<(String, ColumnType)> = col_names.into_iter().zip(col_types).collect();
 
         let schema = Self::build_schema(&columns);
 
@@ -166,9 +163,8 @@ impl BedDataSource {
             break;
         }
 
-        let first_line = first_data_line.ok_or_else(|| {
-            HailError::InvalidFormat("BED file has no data lines".to_string())
-        })?;
+        let first_line = first_data_line
+            .ok_or_else(|| HailError::InvalidFormat("BED file has no data lines".to_string()))?;
 
         let parts: Vec<&str> = first_line.split('\t').collect();
         let num_cols = parts.len();
@@ -358,10 +354,7 @@ impl BedDataSource {
         // Look up the reference sequence index for this contig
         let ref_seq_id = index
             .header()
-            .and_then(|h| {
-                h.reference_sequence_names()
-                    .get_index_of(region.name())
-            })
+            .and_then(|h| h.reference_sequence_names().get_index_of(region.name()))
             .ok_or_else(|| {
                 HailError::InvalidFormat(format!(
                     "Contig {} not found in tabix index",
@@ -369,14 +362,12 @@ impl BedDataSource {
                 ))
             })?;
 
-        let chunks = index
-            .query(ref_seq_id, region.interval())
-            .map_err(|e| {
-                HailError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
+        let chunks = index.query(ref_seq_id, region.interval()).map_err(|e| {
+            HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string(),
+            ))
+        })?;
 
         let columns = self.columns.clone();
         let ranges = ranges.to_vec();
@@ -387,7 +378,10 @@ impl BedDataSource {
 
         // Seek to the first chunk's start position
         if let Some(first_chunk) = chunks.first() {
-            buf_reader.get_mut().seek(first_chunk.start()).map_err(HailError::Io)?;
+            buf_reader
+                .get_mut()
+                .seek(first_chunk.start())
+                .map_err(HailError::Io)?;
             // Reconstruct BufReader to clear stale buffer after seek
             buf_reader = BufReader::new(buf_reader.into_inner());
         }
@@ -459,9 +453,7 @@ fn parse_bed_line(line: &str, columns: &[(String, ColumnType)]) -> Result<Encode
                 match ct {
                     ColumnType::String => EncodedValue::Binary(raw.as_bytes().to_vec()),
                     ColumnType::Int32 => EncodedValue::Int32(raw.parse::<i32>().unwrap_or(0)),
-                    ColumnType::Float64 => {
-                        EncodedValue::Float64(raw.parse::<f64>().unwrap_or(0.0))
-                    }
+                    ColumnType::Float64 => EncodedValue::Float64(raw.parse::<f64>().unwrap_or(0.0)),
                 }
             } else {
                 EncodedValue::Null
@@ -648,18 +640,25 @@ impl DataSource for BedDataSource {
                         for range in ranges_for_contig {
                             let start = *range.start() as usize;
                             let end = *range.end() as usize;
-                            let start_pos = Position::try_from(start.max(1)).unwrap_or(Position::MIN);
+                            let start_pos =
+                                Position::try_from(start.max(1)).unwrap_or(Position::MIN);
                             let end_pos = Position::try_from(end).unwrap_or(Position::MAX);
                             let region = Region::new(contig.as_str(), start_pos..=end_pos);
 
-                            debug!("BED: indexed query for interval {}:{}-{}", contig, start, end);
+                            debug!(
+                                "BED: indexed query for interval {}:{}-{}",
+                                contig, start, end
+                            );
                             let iter = self.indexed_query(&region, index, ranges)?;
                             all_results.extend(iter);
                         }
                     }
                 }
 
-                info!("BED: indexed interval query returned {} records", all_results.len());
+                info!(
+                    "BED: indexed interval query returned {} records",
+                    all_results.len()
+                );
                 return Ok(Box::new(all_results.into_iter()));
             }
         }

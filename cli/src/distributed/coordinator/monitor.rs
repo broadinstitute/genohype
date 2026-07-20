@@ -93,9 +93,10 @@ pub(crate) fn check_stuck_job(state: &SharedState, timeout_secs: u64) {
         JobExecutionState::Batch(batch) => {
             // For batch jobs, check if any phenotypes completed
             batch.completed_count > 0
-                || !batch.active_phenotypes.values().all(|s| {
-                    s.exome_completed.is_empty() && s.genome_completed.is_empty()
-                })
+                || !batch
+                    .active_phenotypes
+                    .values()
+                    .all(|s| s.exome_completed.is_empty() && s.genome_completed.is_empty())
         }
         JobExecutionState::Manhattan(m) => {
             // For single Manhattan jobs, check if any exome/genome partitions completed
@@ -246,7 +247,8 @@ pub(crate) fn check_cpu_status_consistency(state: &SharedState) {
                     } else {
                         format!(" ({})", source)
                     };
-                    worker.effective_status = Some(format!("{} {}{}", phase, phenotype, source_suffix));
+                    worker.effective_status =
+                        Some(format!("{} {}{}", phase, phenotype, source_suffix));
                 } else {
                     worker.effective_status = Some(phase.to_string());
                 }

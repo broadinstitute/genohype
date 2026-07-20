@@ -22,11 +22,7 @@ pub fn run_validate(args: ValidateArgs) -> Result<()> {
         "Validating table:".green(),
         args.table.bright_white()
     );
-    println!(
-        "{} {}",
-        "Using schema:".green(),
-        args.schema.bright_white()
-    );
+    println!("{} {}", "Using schema:".green(), args.schema.bright_white());
     if let Some(l) = args.limit {
         println!(
             "{} {} {}",
@@ -108,11 +104,7 @@ pub fn run_generate_schema(table_path: &str, output_path: Option<&str>) -> Resul
     if let Some(path) = output_path {
         // Write to file
         SchemaGenerator::write_to_file(&schema, path)?;
-        eprintln!(
-            "{} {}",
-            "Schema written to:".green(),
-            path.bright_white()
-        );
+        eprintln!("{} {}", "Schema written to:".green(), path.bright_white());
     } else {
         // Print to stdout
         println!("{}", serde_json::to_string_pretty(&schema)?);

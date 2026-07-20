@@ -2,8 +2,8 @@
 //!
 //! Used by Hail for efficient encoding of small integers
 
-use crate::error::{HailError, Result};
 use crate::buffer::InputBuffer;
+use crate::error::{HailError, Result};
 
 /// LEB128 decoding buffer
 pub struct LEB128Buffer<B: InputBuffer> {
@@ -106,7 +106,7 @@ mod tests {
     #[test]
     fn test_read_uleb128_single_byte() {
         let data = vec![
-            1, 0, 0, 0, // block length
+            1, 0, 0, 0,    // block length
             0x7F, // 127 in LEB128
         ];
 
@@ -148,7 +148,7 @@ mod tests {
     #[test]
     fn test_read_sleb128_negative() {
         let data = vec![
-            1, 0, 0, 0, // block length
+            1, 0, 0, 0,    // block length
             0x7F, // -1 in SLEB128 (bit 6 set, sign extends to -1)
         ];
 

@@ -38,7 +38,10 @@ pub use block_map::BlockMap;
 pub use blocking::BlockingBuffer;
 pub use builder::BufferBuilder;
 pub use leb128::LEB128Buffer;
-pub use output::{OutputBuffer, LEB128OutputBuffer, BlockingOutputBuffer, StreamBlockOutputBuffer, ZstdOutputBuffer, OutputBufferBuilder};
+pub use output::{
+    BlockingOutputBuffer, LEB128OutputBuffer, OutputBuffer, OutputBufferBuilder,
+    StreamBlockOutputBuffer, ZstdOutputBuffer,
+};
 pub use slice::SliceBuffer;
 pub use stream_block::StreamBlockBuffer;
 pub use zstd::ZstdBuffer;

@@ -83,19 +83,15 @@ impl Encoder {
             }
 
             // Handle type mismatches
-            (ty, EncodedValue::Null) => {
-                Err(HailError::InvalidFormat(format!(
-                    "Cannot write null value for required type {:?}",
-                    ty
-                )))
-            }
+            (ty, EncodedValue::Null) => Err(HailError::InvalidFormat(format!(
+                "Cannot write null value for required type {:?}",
+                ty
+            ))),
 
-            (ty, value) => {
-                Err(HailError::InvalidFormat(format!(
-                    "Type mismatch: expected {:?}, got {:?}",
-                    ty, value
-                )))
-            }
+            (ty, value) => Err(HailError::InvalidFormat(format!(
+                "Type mismatch: expected {:?}, got {:?}",
+                ty, value
+            ))),
         }
     }
 
@@ -115,7 +111,10 @@ impl Encoder {
             .collect();
 
         // Count nullable fields
-        let n_nullable = fields.iter().filter(|f| !f.encoded_type.is_required()).count();
+        let n_nullable = fields
+            .iter()
+            .filter(|f| !f.encoded_type.is_required())
+            .count();
         let n_missing_bytes = (n_nullable + 7) / 8;
 
         // Build the missing bitmap
@@ -146,7 +145,10 @@ impl Encoder {
         // Write present field values
         nullable_idx = 0;
         for field in fields {
-            let value = value_map.get(field.name.as_str()).cloned().unwrap_or(&EncodedValue::Null);
+            let value = value_map
+                .get(field.name.as_str())
+                .cloned()
+                .unwrap_or(&EncodedValue::Null);
 
             if field.encoded_type.is_required() {
                 // Required field - always write

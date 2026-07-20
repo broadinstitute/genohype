@@ -108,14 +108,20 @@ impl StatsAccumulator {
             }
             EncodedValue::Null => {
                 if !path.is_empty() {
-                    let stat = self.stats.entry(path.to_string()).or_insert_with(FieldStat::new);
+                    let stat = self
+                        .stats
+                        .entry(path.to_string())
+                        .or_insert_with(FieldStat::new);
                     stat.update_null();
                 }
             }
             _ => {
                 // Leaf value
                 if !path.is_empty() {
-                    let stat = self.stats.entry(path.to_string()).or_insert_with(FieldStat::new);
+                    let stat = self
+                        .stats
+                        .entry(path.to_string())
+                        .or_insert_with(FieldStat::new);
                     let val_str = value_to_string(value);
                     stat.update(&val_str);
                 }

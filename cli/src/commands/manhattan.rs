@@ -10,7 +10,9 @@ use crate::manhattan::data::{
 };
 use crate::manhattan::genes::{process_gene_burden, GeneMap};
 use crate::manhattan::layout::{ChromosomeLayout, YScale};
-use crate::manhattan::pipeline::{aggregate_shards_and_render, run_integrated_pipeline, PipelineConfig};
+use crate::manhattan::pipeline::{
+    aggregate_shards_and_render, run_integrated_pipeline, PipelineConfig,
+};
 use crate::manhattan::reference::get_contig_lengths;
 use crate::manhattan::render::ManhattanRenderer;
 use crossbeam_channel::bounded;
@@ -31,10 +33,7 @@ pub fn run_manhattan(args: ManhattanArgs) -> Result<()> {
     if let Some(shards_path) = &args.from_shards {
         use crate::manhattan::pipeline::composite_partial_pngs;
 
-        println!(
-            "{} Aggregating distributed shards",
-            "Mode:".cyan().bold()
-        );
+        println!("{} Aggregating distributed shards", "Mode:".cyan().bold());
 
         let output_prefix = args.output.as_deref().unwrap_or("manhattan");
 
@@ -104,18 +103,11 @@ pub fn run_manhattan(args: ManhattanArgs) -> Result<()> {
     }
 
     // Legacy single-table mode below
-    println!(
-        "{} Running legacy single-table mode",
-        "Mode:".cyan().bold()
-    );
+    println!("{} Running legacy single-table mode", "Mode:".cyan().bold());
 
     // Load Gene Map if provided
     let gene_map = if let Some(path) = &args.genes {
-        println!(
-            "{} {}",
-            "Loading genes from:".green(),
-            path.bright_white()
-        );
+        println!("{} {}", "Loading genes from:".green(), path.bright_white());
         Some(GeneMap::load(path)?)
     } else {
         None
@@ -259,9 +251,9 @@ pub fn run_manhattan(args: ManhattanArgs) -> Result<()> {
             let _ = QueryEngine::open_path(&table_path_owned)?; // Verify path is valid
             let partitions_to_process: Vec<usize> = (0..num_partitions).collect();
 
-            partitions_to_process
-                .into_par_iter()
-                .try_for_each_with(tx.clone(), |sender, partition_idx| -> Result<()> {
+            partitions_to_process.into_par_iter().try_for_each_with(
+                tx.clone(),
+                |sender, partition_idx| -> Result<()> {
                     // Each worker opens its own engine for thread safety
                     let worker_engine = QueryEngine::open_path(&table_path_owned)?;
                     let iter = worker_engine.scan_partition_iter(partition_idx, &[])?;
@@ -335,7 +327,8 @@ pub fn run_manhattan(args: ManhattanArgs) -> Result<()> {
                     }
 
                     Ok(())
-                })
+                },
+            )
         })();
 
         if let Err(e) = result {
@@ -490,10 +483,7 @@ pub fn run_manhattan_batch(args: ManhattanBatchArgs) -> Result<()> {
     let sample = args.sample.or(job_config.job.sample);
     let limit = args.limit.or(job_config.job.limit);
 
-    println!(
-        "{} Manhattan batch validation",
-        "Running".green().bold()
-    );
+    println!("{} Manhattan batch validation", "Running".green().bold());
     println!("  Assets JSON: {}", assets_json.bright_white());
     println!("  Output dir: {}", output_dir.bright_white());
 
@@ -777,7 +767,9 @@ pub fn run_locus(args: LocusArgs) -> Result<()> {
                 };
 
                 // Ensure exact bounds check
-                if pt.position >= start && pt.position <= end && contig_normalized == chrom_normalized
+                if pt.position >= start
+                    && pt.position <= end
+                    && contig_normalized == chrom_normalized
                 {
                     variants.push(RenderVariant {
                         position: pt.position,

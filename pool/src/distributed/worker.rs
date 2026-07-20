@@ -3,9 +3,7 @@
 //! This module provides a generic worker that polls a coordinator for work
 //! and delegates task execution to a `TaskHandler` implementation.
 
-use crate::distributed::message::{
-    CompleteRequest, HeartbeatRequest, WorkRequest, WorkResponse,
-};
+use crate::distributed::message::{CompleteRequest, HeartbeatRequest, WorkRequest, WorkResponse};
 use crate::traits::TaskHandler;
 use std::sync::Arc;
 use std::time::Duration;
@@ -60,9 +58,9 @@ pub async fn run_worker(
     config: WorkerConfig,
     handler: Arc<dyn TaskHandler>,
 ) -> Result<(), anyhow::Error> {
+    use crate::distributed::telemetry::SystemMetrics;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::signal::unix::{signal, SignalKind};
-    use crate::distributed::telemetry::SystemMetrics;
 
     println!(
         "Worker {} starting (version: {:?}), connecting to {}",
@@ -127,11 +125,7 @@ pub async fn run_worker(
                     .iter()
                     .map(|t| t.label.clone().unwrap_or_else(|| t.id.clone()))
                     .collect();
-                println!(
-                    "Received {} task(s): {:?}",
-                    tasks.len(),
-                    task_labels
-                );
+                println!("Received {} task(s): {:?}", tasks.len(), task_labels);
 
                 // Spawn background heartbeat to keep coordinator from marking us dead
                 // during long-running tasks. The heartbeat runs every 10s and stops
@@ -195,13 +189,13 @@ pub async fn run_worker(
                     eprintln!("Failed to report completion: {}", e);
                 }
 
-                println!(
-                    "Completed tasks {:?} ({} items)",
-                    task_ids, items_processed
-                );
+                println!("Completed tasks {:?} ({} items)", task_ids, items_processed);
             }
             WorkResponse::UpdateBinary { gcs_url } => {
-                println!("Received UpdateBinary request. Self-updating from {}", gcs_url);
+                println!(
+                    "Received UpdateBinary request. Self-updating from {}",
+                    gcs_url
+                );
 
                 async fn update_logic(client: &reqwest::Client, url: &str) -> anyhow::Result<()> {
                     use std::os::unix::fs::PermissionsExt;
@@ -225,7 +219,10 @@ pub async fn run_worker(
                 }
 
                 if let Err(e) = update_logic(&client, &gcs_url).await {
-                    eprintln!("Failed to perform self-update: {}. Continuing with old binary.", e);
+                    eprintln!(
+                        "Failed to perform self-update: {}. Continuing with old binary.",
+                        e
+                    );
                     continue;
                 }
 

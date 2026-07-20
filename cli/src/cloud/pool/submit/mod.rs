@@ -52,7 +52,10 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             );
 
             // Wait for coordinator API to be reachable (it started from startup script)
-            print!("{}", "  Waiting for coordinator API to be reachable".dimmed());
+            print!(
+                "{}",
+                "  Waiting for coordinator API to be reachable".dimmed()
+            );
             use std::io::Write;
             let mut ready = false;
             for _ in 0..15 {
@@ -200,13 +203,14 @@ EOF
         command: &[String],
     ) -> Result<()> {
         // Determine required features based on command
-        let features: Vec<&str> = if command.len() >= 2 && command[0] == "export" && command[1] == "clickhouse" {
-            vec!["clickhouse"]
-        } else if command.len() >= 2 && command[0] == "ingest" && command[1] == "manhattan" {
-            vec!["clickhouse"]  // Ingest manhattan requires clickhouse feature
-        } else {
-            vec![]
-        };
+        let features: Vec<&str> =
+            if command.len() >= 2 && command[0] == "export" && command[1] == "clickhouse" {
+                vec!["clickhouse"]
+            } else if command.len() >= 2 && command[0] == "ingest" && command[1] == "manhattan" {
+                vec!["clickhouse"] // Ingest manhattan requires clickhouse feature
+            } else {
+                vec![]
+            };
 
         // Determine if we should build
         // 1. Explicit skip_build -> skip
@@ -215,7 +219,10 @@ EOF
         let should_build_base = if skip_build {
             false
         } else if self.has_bundled_binary() {
-            println!("{}", "Found bundled worker binary, skipping build...".dimmed());
+            println!(
+                "{}",
+                "Found bundled worker binary, skipping build...".dimmed()
+            );
             false
         } else {
             true
@@ -230,7 +237,10 @@ EOF
             let coordinator = instances.iter().find(|i| i.name.ends_with("-coordinator"));
             if let Some(coord) = coordinator {
                 if self.check_coordinator_status(coord, zone) {
-                    println!("{}", "Coordinator already running, skipping build...".dimmed());
+                    println!(
+                        "{}",
+                        "Coordinator already running, skipping build...".dimmed()
+                    );
                     false
                 } else {
                     should_build_base
@@ -265,7 +275,15 @@ EOF
             );
 
             // Pass skip_build=true because we handled the build logic above
-            self.scale(name, target, zone, binary_path.clone(), worker_binary_path.clone(), true, pool_config)?;
+            self.scale(
+                name,
+                target,
+                zone,
+                binary_path.clone(),
+                worker_binary_path.clone(),
+                true,
+                pool_config,
+            )?;
         }
 
         // Run the actual job
@@ -286,12 +304,17 @@ EOF
         // Handle autoscaling down
         if autoscale {
             if let Some(pool_config) = config {
-                println!(
-                    "\n{} Autoscaling down to 0 workers...",
-                    "Cleanup:".cyan()
-                );
+                println!("\n{} Autoscaling down to 0 workers...", "Cleanup:".cyan());
                 // Ignore errors during scale down to ensure we return the job result
-                if let Err(e) = self.scale(name, 0, zone, binary_path, worker_binary_path, true, pool_config) {
+                if let Err(e) = self.scale(
+                    name,
+                    0,
+                    zone,
+                    binary_path,
+                    worker_binary_path,
+                    true,
+                    pool_config,
+                ) {
                     eprintln!("{} Failed to scale down: {}", "Warning:".yellow(), e);
                 }
             }
@@ -456,10 +479,7 @@ EOF
 
                 // Deploy coordinator binary (always the stock genohype binary)
                 if let Some(ref gcs_url) = staging_url {
-                    println!(
-                        "{}",
-                        "Deploying coordinator binary via GCS...".dimmed()
-                    );
+                    println!("{}", "Deploying coordinator binary via GCS...".dimmed());
                     let update_coord_cmd = format!(
                         "gsutil cp {} /tmp/genohype && chmod +x /tmp/genohype && sudo mv /tmp/genohype /usr/local/bin/genohype",
                         gcs_url
@@ -469,10 +489,7 @@ EOF
                         .status()
                         .map_err(HailError::Io)?;
                 } else {
-                    println!(
-                        "{}",
-                        "Deploying coordinator binary via SCP...".dimmed()
-                    );
+                    println!("{}", "Deploying coordinator binary via SCP...".dimmed());
                     self.deploy_binary(binary, &[coord.clone()], zone)?;
                 }
 
@@ -583,10 +600,7 @@ EOF
                             "OK".green().bold()
                         );
                     } else {
-                        println!(
-                            "{}",
-                            "Workers pulling binary from coordinator...".dimmed()
-                        );
+                        println!("{}", "Workers pulling binary from coordinator...".dimmed());
                         self.propagate_binary_from_coordinator(coord_ip, &workers, zone)?;
                         println!(
                             "{} Binary propagated to {} workers.",
@@ -653,7 +667,9 @@ EOF
         let total_bar = multi_progress.add(ProgressBar::new(0));
         total_bar.set_style(
             ProgressStyle::default_bar()
-                .template("{prefix:.green.bold} [{bar:30.green/white}] {pos}/{len} partitions | {msg}")
+                .template(
+                    "{prefix:.green.bold} [{bar:30.green/white}] {pos}/{len} partitions | {msg}",
+                )
                 .unwrap()
                 .progress_chars("█▓░"),
         );
@@ -683,7 +699,9 @@ EOF
 
                 // Build SSH command
                 let remote_cmd = format!("/usr/local/bin/genohype {}", args);
-                let mut cmd = self.provider.get_ssh_command(&inst_name, &inst_zone, &remote_cmd);
+                let mut cmd = self
+                    .provider
+                    .get_ssh_command(&inst_name, &inst_zone, &remote_cmd);
                 cmd.stdout(std::process::Stdio::piped());
                 cmd.stderr(std::process::Stdio::piped());
 
@@ -732,7 +750,7 @@ EOF
                             );
                             // Update total bar length
                             total_bar.set_length(
-                                total_partitions_expected.load(Ordering::Relaxed) as u64,
+                                total_partitions_expected.load(Ordering::Relaxed) as u64
                             );
                         }
                         pb.set_position(update.partitions_done as u64);
@@ -867,26 +885,41 @@ EOF
         // Supported formats:
         //   export parquet <input> <output> [--where ...]
         //   export json <input> <output> [--where ...]
-        let (input_path, mut job_spec, filters, intervals) = Self::parse_command_to_job_spec(command)?;
+        let (input_path, mut job_spec, filters, intervals) =
+            Self::parse_command_to_job_spec(command)?;
 
         // For IngestManhattan jobs, we don't read Hail table metadata
         // The coordinator discovers phenotypes at runtime
-        let is_idle_batch = if let crate::distributed::message::JobSpec::ManhattanBatch { ref config, .. } = job_spec {
-            config.as_ref().map(|c| c.job.idle).unwrap_or(false)
-        } else {
-            false
-        };
+        let is_idle_batch =
+            if let crate::distributed::message::JobSpec::ManhattanBatch { ref config, .. } =
+                job_spec
+            {
+                config.as_ref().map(|c| c.job.idle).unwrap_or(false)
+            } else {
+                false
+            };
 
         let (total_partitions, engine) = if is_idle_batch {
             println!("Idle batch: skipping metadata read, coordinator will load catalog");
             (0, None)
-        } else if matches!(job_spec, crate::distributed::message::JobSpec::IngestManhattan { .. }) {
+        } else if matches!(
+            job_spec,
+            crate::distributed::message::JobSpec::IngestManhattan { .. }
+        ) {
             println!("Ingestion job: phenotypes will be discovered by coordinator");
-            (0, None)  // Coordinator will set this after discovering phenotypes
+            (0, None) // Coordinator will set this after discovering phenotypes
         } else if let crate::distributed::message::JobSpec::Stress(ref spec) = job_spec {
-            println!("Stress job: queuing {} synthetic partitions", spec.partitions);
+            println!(
+                "Stress job: queuing {} synthetic partitions",
+                spec.partitions
+            );
             (spec.partitions, None)
-        } else if let crate::distributed::message::JobSpec::Custom { ref manifest, tasks, .. } = job_spec {
+        } else if let crate::distributed::message::JobSpec::Custom {
+            ref manifest,
+            tasks,
+            ..
+        } = job_spec
+        {
             let count = manifest.as_ref().map(|m| m.len()).unwrap_or(tasks);
             if manifest.is_some() {
                 println!("Custom job: queuing {} tasks from manifest", count);
@@ -950,7 +983,12 @@ EOF
 
         // For ManhattanBatch jobs, compute partition counts for all unique tables
         // (Layout enrichment is handled by the coordinator via enrich_specs)
-        if let crate::distributed::message::JobSpec::ManhattanBatch { ref mut specs, ref config, .. } = job_spec {
+        if let crate::distributed::message::JobSpec::ManhattanBatch {
+            ref mut specs,
+            ref config,
+            ..
+        } = job_spec
+        {
             use std::collections::HashMap;
 
             let is_idle_batch = config.as_ref().map(|c| c.job.idle).unwrap_or(false);
@@ -963,129 +1001,141 @@ EOF
                     )));
                 }
 
-            // Collect all unique table paths
-            let mut exome_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
-            let mut genome_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+                // Collect all unique table paths
+                let mut exome_paths: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                let mut genome_paths: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
 
-            for spec in specs.iter() {
-                if let Some(ref path) = spec.exome {
-                    exome_paths.insert(path.clone());
-                }
-                if let Some(ref path) = spec.genome {
-                    genome_paths.insert(path.clone());
-                }
-            }
-
-            // Cache partition counts by path (avoid re-opening same tables)
-            let mut partition_cache: HashMap<String, usize> = HashMap::new();
-
-            println!(
-                "  {} Counting partitions for {} unique exome tables...",
-                "Setup:".cyan(),
-                exome_paths.len()
-            );
-            for path in exome_paths {
-                if let Ok(table_engine) = QueryEngine::open_path(&path) {
-                    let parts = table_engine.num_partitions();
-                    partition_cache.insert(path, parts);
-                }
-            }
-
-            println!(
-                "  {} Counting partitions for {} unique genome tables...",
-                "Setup:".cyan(),
-                genome_paths.len()
-            );
-            for path in genome_paths {
-                if let Ok(table_engine) = QueryEngine::open_path(&path) {
-                    let parts = table_engine.num_partitions();
-                    partition_cache.insert(path, parts);
-                }
-            }
-
-            // Apply partition counts to all specs
-            for spec in specs.iter_mut() {
-                if let Some(ref exome_path) = spec.exome {
-                    if let Some(&parts) = partition_cache.get(exome_path) {
-                        spec.exome_partitions = Some(parts);
+                for spec in specs.iter() {
+                    if let Some(ref path) = spec.exome {
+                        exome_paths.insert(path.clone());
+                    }
+                    if let Some(ref path) = spec.genome {
+                        genome_paths.insert(path.clone());
                     }
                 }
-                if let Some(ref genome_path) = spec.genome {
-                    if let Some(&parts) = partition_cache.get(genome_path) {
-                        spec.genome_partitions = Some(parts);
+
+                // Cache partition counts by path (avoid re-opening same tables)
+                let mut partition_cache: HashMap<String, usize> = HashMap::new();
+
+                println!(
+                    "  {} Counting partitions for {} unique exome tables...",
+                    "Setup:".cyan(),
+                    exome_paths.len()
+                );
+                for path in exome_paths {
+                    if let Ok(table_engine) = QueryEngine::open_path(&path) {
+                        let parts = table_engine.num_partitions();
+                        partition_cache.insert(path, parts);
                     }
                 }
-            }
 
-            // Log summary
-            let with_exome = specs.iter().filter(|s| s.exome_partitions.is_some()).count();
-            let with_genome = specs.iter().filter(|s| s.genome_partitions.is_some()).count();
-            println!(
-                "  {} {} phenotypes ({} with exome, {} with genome partitions)",
-                "Prepared".green(),
-                specs.len(),
-                with_exome,
-                with_genome
-            );
+                println!(
+                    "  {} Counting partitions for {} unique genome tables...",
+                    "Setup:".cyan(),
+                    genome_paths.len()
+                );
+                for path in genome_paths {
+                    if let Ok(table_engine) = QueryEngine::open_path(&path) {
+                        let parts = table_engine.num_partitions();
+                        partition_cache.insert(path, parts);
+                    }
+                }
 
-            // Check for already-completed phenotypes via checkpoint file
-            let total_before = specs.len();
-            // Derive checkpoint path from first spec's output_path (clone to avoid borrow issues)
-            // output_path is like gs://bucket/manhattans/meta/1234
-            // checkpoint is at gs://bucket/manhattans/.completed
-            let base_dir: Option<String> = specs.first()
-                .and_then(|s| s.output_path.rsplit_once('/'))
-                .and_then(|(parent, _)| parent.rsplit_once('/'))
-                .map(|(base, _)| base.to_string());
-
-            if let Some(ref base_dir) = base_dir {
-                let checkpoint_path = format!("{}/.completed", base_dir);
-                println!("  {} Checking for completed phenotypes...", "Resume:".cyan());
-
-                match read_completed_checkpoint(&checkpoint_path) {
-                    Ok(completed) => {
-                        if !completed.is_empty() {
-                            let before = specs.len();
-                            specs.retain(|s| {
-                                // Extract relative path (ancestry/id) from output_path
-                                let rel_path = s.output_path
-                                    .strip_prefix(base_dir)
-                                    .map(|p| p.trim_start_matches('/'))
-                                    .unwrap_or(&s.output_path);
-                                !completed.contains(rel_path)
-                            });
-                            let skipped = before - specs.len();
-                            if skipped > 0 {
-                                println!(
-                                    "  {} {} phenotypes already complete, {} remaining",
-                                    "Skipped".yellow(),
-                                    skipped,
-                                    specs.len()
-                                );
-                            }
+                // Apply partition counts to all specs
+                for spec in specs.iter_mut() {
+                    if let Some(ref exome_path) = spec.exome {
+                        if let Some(&parts) = partition_cache.get(exome_path) {
+                            spec.exome_partitions = Some(parts);
                         }
                     }
-                    Err(e) => {
-                        // No checkpoint file or error reading - that's fine, process all
-                        println!("  {} No checkpoint file ({})", "Note:".dimmed(), e);
+                    if let Some(ref genome_path) = spec.genome {
+                        if let Some(&parts) = partition_cache.get(genome_path) {
+                            spec.genome_partitions = Some(parts);
+                        }
                     }
                 }
-            }
 
-            // If all phenotypes are complete, exit early
-            if specs.is_empty() {
+                // Log summary
+                let with_exome = specs
+                    .iter()
+                    .filter(|s| s.exome_partitions.is_some())
+                    .count();
+                let with_genome = specs
+                    .iter()
+                    .filter(|s| s.genome_partitions.is_some())
+                    .count();
                 println!(
-                    "{} All {} phenotypes already complete!",
-                    "Done".green().bold(),
-                    total_before
+                    "  {} {} phenotypes ({} with exome, {} with genome partitions)",
+                    "Prepared".green(),
+                    specs.len(),
+                    with_exome,
+                    with_genome
                 );
-                return Ok(());
-            }
 
+                // Check for already-completed phenotypes via checkpoint file
+                let total_before = specs.len();
+                // Derive checkpoint path from first spec's output_path (clone to avoid borrow issues)
+                // output_path is like gs://bucket/manhattans/meta/1234
+                // checkpoint is at gs://bucket/manhattans/.completed
+                let base_dir: Option<String> = specs
+                    .first()
+                    .and_then(|s| s.output_path.rsplit_once('/'))
+                    .and_then(|(parent, _)| parent.rsplit_once('/'))
+                    .map(|(base, _)| base.to_string());
+
+                if let Some(ref base_dir) = base_dir {
+                    let checkpoint_path = format!("{}/.completed", base_dir);
+                    println!(
+                        "  {} Checking for completed phenotypes...",
+                        "Resume:".cyan()
+                    );
+
+                    match read_completed_checkpoint(&checkpoint_path) {
+                        Ok(completed) => {
+                            if !completed.is_empty() {
+                                let before = specs.len();
+                                specs.retain(|s| {
+                                    // Extract relative path (ancestry/id) from output_path
+                                    let rel_path = s
+                                        .output_path
+                                        .strip_prefix(base_dir)
+                                        .map(|p| p.trim_start_matches('/'))
+                                        .unwrap_or(&s.output_path);
+                                    !completed.contains(rel_path)
+                                });
+                                let skipped = before - specs.len();
+                                if skipped > 0 {
+                                    println!(
+                                        "  {} {} phenotypes already complete, {} remaining",
+                                        "Skipped".yellow(),
+                                        skipped,
+                                        specs.len()
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            // No checkpoint file or error reading - that's fine, process all
+                            println!("  {} No checkpoint file ({})", "Note:".dimmed(), e);
+                        }
+                    }
+                }
+
+                // If all phenotypes are complete, exit early
+                if specs.is_empty() {
+                    println!(
+                        "{} All {} phenotypes already complete!",
+                        "Done".green().bold(),
+                        total_before
+                    );
+                    return Ok(());
+                }
             } // End of if !is_idle_batch
         }
 
-        drop(engine);  // Drop the QueryEngine if it exists (Option<QueryEngine>)
+        drop(engine); // Drop the QueryEngine if it exists (Option<QueryEngine>)
 
         // Get coordinator's internal IP
         let coord_ip = coordinator.ip().ok_or_else(|| {
@@ -1111,10 +1161,9 @@ EOF
             if let Ok(workers_json) =
                 self.fetch_coordinator_api(coordinator, zone, "/api/dashboard/workers", 3000)
             {
-                if let Ok(worker_list) =
-                    serde_json::from_str::<Vec<crate::distributed::message::DashboardWorker>>(
-                        &workers_json,
-                    )
+                if let Ok(worker_list) = serde_json::from_str::<
+                    Vec<crate::distributed::message::DashboardWorker>,
+                >(&workers_json)
                 {
                     connected_count = worker_list
                         .iter()
@@ -1184,11 +1233,7 @@ EOF
                     ))
                 })?;
 
-                println!(
-                    "  {} Table '{}' ready",
-                    "OK".green(),
-                    table_name
-                );
+                println!("  {} Table '{}' ready", "OK".green(), table_name);
             }
 
             // Submit job via API
@@ -1293,10 +1338,9 @@ EOF
             if let Ok(workers_json) =
                 self.fetch_coordinator_api(coordinator, zone, "/api/dashboard/workers", 3000)
             {
-                if let Ok(worker_list) =
-                    serde_json::from_str::<Vec<crate::distributed::message::DashboardWorker>>(
-                        &workers_json,
-                    )
+                if let Ok(worker_list) = serde_json::from_str::<
+                    Vec<crate::distributed::message::DashboardWorker>,
+                >(&workers_json)
                 {
                     connected_count = worker_list
                         .iter()
@@ -1349,15 +1393,15 @@ EOF
         }
 
         println!();
-        println!(
-            "{} Distributed job submitted!",
-            "OK".green().bold()
-        );
+        println!("{} Distributed job submitted!", "OK".green().bold());
         println!("  {} {}", "Coordinator:".cyan(), coordinator.name);
         println!("  {} {}", "Workers:".cyan(), workers.len());
         println!("  {} {}", "Total partitions:".cyan(), total_partitions);
         println!();
-        println!("{}", "Streaming coordinator logs (will exit on job completion)...".dimmed());
+        println!(
+            "{}",
+            "Streaming coordinator logs (will exit on job completion)...".dimmed()
+        );
         println!();
 
         // Stream coordinator logs, detecting job completion to exit automatically
@@ -1387,10 +1431,7 @@ EOF
                         println!("{}", line);
                         if line.contains("Job complete. Coordinator returning to idle mode") {
                             println!();
-                            println!(
-                                "{} Job complete, exiting log stream.",
-                                "OK".green().bold()
-                            );
+                            println!("{} Job complete, exiting log stream.", "OK".green().bold());
                             break;
                         }
                         if line.contains("Job finished with") && line.contains("failed") {
@@ -1429,8 +1470,7 @@ EOF
         if auto_stop {
             println!(
                 "{}",
-                "Job finished. Stopping pool instances (--auto-stop)..."
-                    .yellow()
+                "Job finished. Stopping pool instances (--auto-stop)...".yellow()
             );
             let mut stop_cmd = std::process::Command::new("gcloud");
             stop_cmd.args(["compute", "instances", "stop"]);
@@ -1455,7 +1495,12 @@ EOF
     }
 
     /// Start worker services on the given instances.
-    pub(crate) fn start_worker_services(&self, workers: &[Instance], coord_ip: &str, zone: &str) -> Result<()> {
+    pub(crate) fn start_worker_services(
+        &self,
+        workers: &[Instance],
+        coord_ip: &str,
+        zone: &str,
+    ) -> Result<()> {
         use rayon::prelude::*;
 
         let worker_results: Vec<Result<()>> = workers
@@ -1509,7 +1554,11 @@ EOF
     }
 
     /// Fetch aggregated summary results from coordinator and display them.
-    pub(crate) fn fetch_and_display_summary_results(&self, coordinator: &Instance, zone: &str) -> Result<()> {
+    pub(crate) fn fetch_and_display_summary_results(
+        &self,
+        coordinator: &Instance,
+        zone: &str,
+    ) -> Result<()> {
         use genohype_core::summary::stats::StatsAccumulator;
 
         // Fetch results file saved by coordinator before exit
@@ -1528,15 +1577,23 @@ EOF
         }
 
         // Parse the response
-        let response: serde_json::Value = serde_json::from_slice(&output.stdout)
-            .map_err(|e| HailError::Io(std::io::Error::new(
+        let response: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|e| {
+            HailError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("Failed to parse result JSON: {}", e),
-            )))?;
+            ))
+        })?;
 
         // Check if results are available
-        if !response.get("available").and_then(|v| v.as_bool()).unwrap_or(false) {
-            let error = response.get("error").and_then(|v| v.as_str()).unwrap_or("Unknown error");
+        if !response
+            .get("available")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            let error = response
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown error");
             return Err(HailError::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 format!("Results not available: {}", error),
@@ -1544,12 +1601,15 @@ EOF
         }
 
         // Get the array of partial results from workers
-        let results = response.get("result").and_then(|v| v.as_array()).ok_or_else(|| {
-            HailError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "No result array in response",
-            ))
-        })?;
+        let results = response
+            .get("result")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "No result array in response",
+                ))
+            })?;
 
         // Merge all partial StatsAccumulators
         let mut merged = StatsAccumulator::new();
@@ -1564,13 +1624,23 @@ EOF
 
         // Display results
         println!();
-        println!("{} {}", "Row Count:".green(), total_rows.to_string().bright_white().bold());
+        println!(
+            "{} {}",
+            "Row Count:".green(),
+            total_rows.to_string().bright_white().bold()
+        );
         println!();
 
         // Print field statistics
         println!("{}", "Field Statistics:".green().bold());
-        println!("{:<50} | {:>10} | {:>10} | {:>20} | {:>20}",
-            "Field".cyan(), "Count".cyan(), "Nulls".cyan(), "Min".cyan(), "Max".cyan());
+        println!(
+            "{:<50} | {:>10} | {:>10} | {:>20} | {:>20}",
+            "Field".cyan(),
+            "Count".cyan(),
+            "Nulls".cyan(),
+            "Min".cyan(),
+            "Max".cyan()
+        );
         println!("{}", "-".repeat(120).dimmed());
 
         for key in merged.sorted_fields() {
@@ -1595,12 +1665,9 @@ EOF
                 None => String::new(),
             };
 
-            println!("{:<50} | {:>10} | {:>10} | {:>20} | {:>20}",
-                field_display,
-                s.count,
-                s.null_count,
-                min_display,
-                max_display
+            println!(
+                "{:<50} | {:>10} | {:>10} | {:>20} | {:>20}",
+                field_display, s.count, s.null_count, min_display, max_display
             );
         }
 

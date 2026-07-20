@@ -1,7 +1,9 @@
 //! Hail table export command.
 
 use crate::cli::ExportHailArgs;
-use crate::commands::utils::{parse_export_filters, parse_export_intervals, progress_style_spinner};
+use crate::commands::utils::{
+    parse_export_filters, parse_export_intervals, progress_style_spinner,
+};
 use genohype_core::export::hail::HailTableWriter;
 use genohype_core::query::QueryEngine;
 use genohype_core::Result;
@@ -59,17 +61,12 @@ pub fn run_export_hail(args: ExportHailArgs) -> Result<()> {
         );
     }
     if let Some(l) = args.common.limit {
-        println!(
-            "{} {}",
-            "Row limit:".cyan(),
-            l.to_string().bright_white()
-        );
+        println!("{} {}", "Row limit:".cyan(), l.to_string().bright_white());
     }
     println!();
 
     // Create Hail table writer
-    let mut writer =
-        HailTableWriter::new(&args.output, &row_type, &key_fields, rvd_spec.as_ref())?;
+    let mut writer = HailTableWriter::new(&args.output, &row_type, &key_fields, rvd_spec.as_ref())?;
 
     // Use streaming query with filters and intervals
     let iterator = engine.query_iter_with_intervals(&where_filters, intervals)?;

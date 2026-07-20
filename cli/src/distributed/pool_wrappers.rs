@@ -64,7 +64,9 @@ impl TaskHandler for CliTaskHandler {
             .filter_map(|t| {
                 if let Ok(task_type) = serde_json::from_value::<TaskType>(t.payload.clone()) {
                     match task_type {
-                        TaskType::Partition { partition_index, .. } => return Some(partition_index),
+                        TaskType::Partition {
+                            partition_index, ..
+                        } => return Some(partition_index),
                         TaskType::Stress { iteration } => return Some(iteration),
                         _ => {}
                     }
@@ -72,7 +74,9 @@ impl TaskHandler for CliTaskHandler {
                 // Fallback: try to parse the task ID as a partition index
                 t.id.parse::<usize>().ok().or_else(|| {
                     // Secondary fallback for IDs like "stress_0"
-                    t.id.rsplit('_').next().and_then(|s| s.parse::<usize>().ok())
+                    t.id.rsplit('_')
+                        .next()
+                        .and_then(|s| s.parse::<usize>().ok())
                 })
             })
             .collect();
@@ -166,7 +170,10 @@ impl CliCoordinatorPlugin {
     /// Create with initial partitions.
     pub fn with_partitions(total_partitions: usize, input_path: String) -> Self {
         Self {
-            state: Arc::new(Mutex::new(SimpleWorkQueue::new(total_partitions, input_path))),
+            state: Arc::new(Mutex::new(SimpleWorkQueue::new(
+                total_partitions,
+                input_path,
+            ))),
         }
     }
 
@@ -194,7 +201,10 @@ impl CoordinatorPlugin for CliCoordinatorPlugin {
 
         Some(WorkAssignment {
             tasks: vec![task],
-            payload: queue.job_spec.clone().unwrap_or_else(|| serde_json::json!({})),
+            payload: queue
+                .job_spec
+                .clone()
+                .unwrap_or_else(|| serde_json::json!({})),
             input_path: Some(queue.input_path.clone()),
             filters: queue.filters.clone(),
         })
@@ -280,7 +290,10 @@ mod tests {
 
         // Complete work using the actual task IDs
         let result = TaskResult::success(100, None);
-        plugin.complete_work("worker-1", &task_ids, result).await.unwrap();
+        plugin
+            .complete_work("worker-1", &task_ids, result)
+            .await
+            .unwrap();
 
         // Check status after complete
         let (pending, processing, completed, _) = plugin.get_status().await;

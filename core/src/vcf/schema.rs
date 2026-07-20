@@ -7,8 +7,10 @@
 
 use crate::codec::{EncodedField, EncodedType};
 use crate::Result;
+use noodles::vcf::header::record::value::map::format::{
+    Number as FormatNumber, Type as FormatType,
+};
 use noodles::vcf::header::record::value::map::info::{Number as InfoNumber, Type as InfoType};
-use noodles::vcf::header::record::value::map::format::{Number as FormatNumber, Type as FormatType};
 use noodles::vcf::Header;
 
 /// Generate a Hail-compatible schema from a VCF header

@@ -61,8 +61,13 @@ impl ManhattanRenderer {
         paint.anti_alias = true;
 
         if let Some(path) = PathBuilder::from_circle(x, y, radius) {
-            self.pixmap
-                .fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+            self.pixmap.fill_path(
+                &path,
+                &paint,
+                FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
         }
     }
 

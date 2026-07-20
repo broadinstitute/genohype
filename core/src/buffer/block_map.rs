@@ -145,7 +145,9 @@ impl BlockMap {
 
         // Binary search for the block containing this offset
         // We want the largest block where decompressed_offset <= target
-        let idx = self.blocks.partition_point(|entry| entry.decompressed_offset <= decompressed_offset);
+        let idx = self
+            .blocks
+            .partition_point(|entry| entry.decompressed_offset <= decompressed_offset);
 
         if idx == 0 {
             // Offset is before the first block

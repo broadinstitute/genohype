@@ -348,9 +348,8 @@ impl CloudProvider for GcpClient {
             )));
         }
 
-        let instances: Vec<Instance> = serde_json::from_slice(&output.stdout).map_err(|e| {
-            HailError::ParseError(format!("Failed to parse gcloud output: {}", e))
-        })?;
+        let instances: Vec<Instance> = serde_json::from_slice(&output.stdout)
+            .map_err(|e| HailError::ParseError(format!("Failed to parse gcloud output: {}", e)))?;
 
         Ok(instances)
     }
@@ -485,12 +484,12 @@ impl CloudProvider for GcpClient {
         instance: &str,
         zone: &str,
     ) -> Result<()> {
-        let local_str = local_path
-            .to_str()
-            .ok_or_else(|| HailError::Io(std::io::Error::new(
+        let local_str = local_path.to_str().ok_or_else(|| {
+            HailError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "Invalid local path",
-            )))?;
+            ))
+        })?;
 
         let status = Command::new("gcloud")
             .args([

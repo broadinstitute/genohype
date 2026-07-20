@@ -64,7 +64,11 @@ pub trait DataSource: Send + Sync {
     /// # Arguments
     /// * `partition_idx` - The partition index to scan
     /// * `ranges` - Key range constraints for filtering rows
-    fn scan_partition(&self, partition_idx: usize, ranges: &[KeyRange]) -> Result<Vec<EncodedValue>> {
+    fn scan_partition(
+        &self,
+        partition_idx: usize,
+        ranges: &[KeyRange],
+    ) -> Result<Vec<EncodedValue>> {
         self.scan_partition_stream(partition_idx, ranges)?.collect()
     }
 
@@ -75,7 +79,10 @@ pub trait DataSource: Send + Sync {
     ///
     /// # Arguments
     /// * `ranges` - Key range constraints for filtering rows
-    fn query_stream(&self, ranges: &[KeyRange]) -> Result<Box<dyn Iterator<Item = Result<EncodedValue>> + Send>> {
+    fn query_stream(
+        &self,
+        ranges: &[KeyRange],
+    ) -> Result<Box<dyn Iterator<Item = Result<EncodedValue>> + Send>> {
         self.query_stream_with_intervals(ranges, None)
     }
 

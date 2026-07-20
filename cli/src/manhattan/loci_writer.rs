@@ -4,7 +4,6 @@
 //! - `LocusDefinitionWriter` for `loci.parquet` (one row per locus)
 //! - `LocusVariantWriter` for `loci_variants.parquet` (all variants in all loci)
 
-use genohype_core::error::Result;
 use crate::manhattan::data::{LocusDefinitionRow, LocusVariantRow};
 use arrow::array::{
     ArrayRef, BooleanBuilder, Float32Builder, Float64Builder, Int32Builder, Int64Builder,
@@ -12,6 +11,7 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use genohype_core::error::Result;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use std::fs::File;
@@ -415,12 +415,12 @@ pub fn locus_variant_schema() -> Schema {
         Field::new("pvalue", DataType::Float64, false),
         Field::new("neg_log10_p", DataType::Float32, false),
         Field::new("is_significant", DataType::Boolean, false),
-        Field::new("beta", DataType::Float64, true),  // nullable
-        Field::new("se", DataType::Float64, true),    // nullable
-        Field::new("af", DataType::Float64, true),    // nullable
-        Field::new("ac_cases", DataType::Float64, true),    // nullable
+        Field::new("beta", DataType::Float64, true), // nullable
+        Field::new("se", DataType::Float64, true),   // nullable
+        Field::new("af", DataType::Float64, true),   // nullable
+        Field::new("ac_cases", DataType::Float64, true), // nullable
         Field::new("ac_controls", DataType::Float64, true), // nullable
-        Field::new("af_cases", DataType::Float64, true),    // nullable
+        Field::new("af_cases", DataType::Float64, true), // nullable
         Field::new("af_controls", DataType::Float64, true), // nullable
         Field::new("association_ac", DataType::Float64, true), // nullable
     ])

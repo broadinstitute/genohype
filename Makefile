@@ -10,16 +10,7 @@ all: dashboard release worker
 
 # Build dashboard SPA and copy to cli/static/dist for embedding
 dashboard:
-	@echo "Building pool-dashboard SPA..."
-	@if [ ! -d frontend/pool-dashboard/node_modules ]; then \
-		echo "Installing dashboard dependencies..."; \
-		cd frontend/pool-dashboard && npm install; \
-	fi
-	@cd frontend/pool-dashboard && npm run build
-	@echo "Copying dist to cli/static/dist..."
-	@rm -rf cli/static/dist
-	@cp -r frontend/pool-dashboard/dist cli/static/dist
-	@echo "Dashboard built and installed to cli/static/dist"
+	@./scripts/build-dashboard.sh
 
 # Build macOS release binary (depends on dashboard for embedding)
 release: dashboard

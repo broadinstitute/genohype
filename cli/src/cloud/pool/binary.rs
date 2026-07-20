@@ -69,7 +69,10 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             println!("{}", "Skipping binary build (--skip-build)".dimmed());
             false
         } else if self.has_bundled_binary() {
-            println!("{}", "Found bundled worker binary, skipping build...".dimmed());
+            println!(
+                "{}",
+                "Found bundled worker binary, skipping build...".dimmed()
+            );
             false
         } else {
             true
@@ -173,10 +176,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         };
 
         // Always stop any running coordinator before updating (to avoid "Address already in use")
-        println!(
-            "{}",
-            "Stopping any running coordinator service...".dimmed()
-        );
+        println!("{}", "Stopping any running coordinator service...".dimmed());
         let stop_cmd = "sudo systemctl stop genohype-coordinator 2>/dev/null || true; \
                         sudo systemctl stop genohype-worker 2>/dev/null || true; \
                         fuser -k 3000/tcp 2>/dev/null || true";
@@ -189,10 +189,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
 
         // Update coordinator binary via GCS (fast) or SCP (fallback)
         if let Some(ref gcs_url) = staging_url {
-            println!(
-                "{}",
-                "Updating coordinator binary via GCS pull...".dimmed()
-            );
+            println!("{}", "Updating coordinator binary via GCS pull...".dimmed());
             let update_coord_cmd = format!(
                 "gsutil cp {} /tmp/genohype && chmod +x /tmp/genohype && sudo mv /tmp/genohype /usr/local/bin/genohype",
                 gcs_url
@@ -334,11 +331,7 @@ EOF
                 // Fallback: workers pull from coordinator
                 println!(
                     "{}",
-                    format!(
-                        "Workers pulling binary from coordinator ({})...",
-                        coord_ip
-                    )
-                    .dimmed()
+                    format!("Workers pulling binary from coordinator ({})...", coord_ip).dimmed()
                 );
                 self.propagate_binary_from_coordinator(coord_ip, &workers, zone)?;
             }
@@ -635,7 +628,12 @@ EOF
     }
 
     /// Deploy binary to instances via SCP upload.
-    pub(crate) fn deploy_binary(&self, binary: &Path, instances: &[Instance], zone: &str) -> Result<()> {
+    pub(crate) fn deploy_binary(
+        &self,
+        binary: &Path,
+        instances: &[Instance],
+        zone: &str,
+    ) -> Result<()> {
         instances.par_iter().try_for_each(|inst| {
             // Upload to /tmp first (user writable)
             self.provider

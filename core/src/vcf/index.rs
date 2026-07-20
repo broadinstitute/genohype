@@ -20,10 +20,7 @@ use tracing::debug;
 ///
 /// The optional `on_record` callback is invoked with the record count after each record,
 /// allowing callers to report progress.
-pub fn build_tabix_index(
-    vcf_path: &str,
-    on_record: Option<&dyn Fn(u64)>,
-) -> Result<tabix::Index> {
+pub fn build_tabix_index(vcf_path: &str, on_record: Option<&dyn Fn(u64)>) -> Result<tabix::Index> {
     let reader = crate::io::get_reader(vcf_path)?;
     let bgzf_reader = bgzf::Reader::new(reader);
     let mut vcf_reader = vcf::io::Reader::new(bgzf_reader);
@@ -31,9 +28,7 @@ pub fn build_tabix_index(
     let header = vcf_reader.read_header().map_err(HailError::Io)?;
 
     let mut indexer = tabix::index::Indexer::default();
-    indexer.set_header(
-        noodles::csi::binning_index::index::header::Builder::vcf().build(),
-    );
+    indexer.set_header(noodles::csi::binning_index::index::header::Builder::vcf().build());
 
     let mut record = vcf::Record::default();
     let mut start_position = vcf_reader.get_ref().virtual_position();

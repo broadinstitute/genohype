@@ -28,12 +28,12 @@ pub mod adapter;
 pub mod resolver;
 pub mod writer;
 
+#[cfg(feature = "gcp")]
+pub use adapter::get_gcs_client;
 pub use adapter::{
     get_file_size, get_prefetch_depth, get_reader, is_cloud_path, join_path, range_read,
     read_single_block, set_prefetch_depth, BoxedReader, CloudReader, MmapReader,
     PrefetchingCloudReader,
 };
-#[cfg(feature = "gcp")]
-pub use adapter::get_gcs_client;
 pub use resolver::{resolve_url, resolve_url_for_write, ResolvedStore};
 pub use writer::{CloudWriter, OutputWriter, StreamingCloudWriter};

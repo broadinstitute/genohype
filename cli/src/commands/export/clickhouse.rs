@@ -1,7 +1,9 @@
 //! ClickHouse export command.
 
 use crate::cli::ExportClickhouseArgs;
-use crate::commands::utils::{parse_export_filters, parse_export_intervals, progress_style_spinner};
+use crate::commands::utils::{
+    parse_export_filters, parse_export_intervals, progress_style_spinner,
+};
 use genohype_core::codec::{EncodedField, EncodedType, EncodedValue};
 use genohype_core::export::clickhouse::generate_create_table;
 use genohype_core::export::ClickHouseClient;
@@ -61,9 +63,8 @@ fn list_cloud_files(dir_url: &str, pattern: &str) -> Result<Vec<String>> {
     })?;
 
     // Reconstruct base URL for building full file paths
-    let parsed_url = url::Url::parse(dir_url).map_err(|e| {
-        genohype_core::HailError::InvalidFormat(format!("Invalid URL: {}", e))
-    })?;
+    let parsed_url = url::Url::parse(dir_url)
+        .map_err(|e| genohype_core::HailError::InvalidFormat(format!("Invalid URL: {}", e)))?;
     let scheme = parsed_url.scheme().to_string();
     let host = parsed_url.host_str().unwrap_or("").to_string();
     let base_path = parsed_url.path().trim_end_matches('/').to_string();
@@ -83,7 +84,13 @@ fn list_cloud_files(dir_url: &str, pattern: &str) -> Result<Vec<String>> {
                     && !filename.ends_with(".tbi")
                     && !filename.ends_with(".csi")
                 {
-                    let full_url = format!("{}://{}/{}/{}", scheme, host, base_path.trim_start_matches('/'), filename);
+                    let full_url = format!(
+                        "{}://{}/{}/{}",
+                        scheme,
+                        host,
+                        base_path.trim_start_matches('/'),
+                        filename
+                    );
                     results.push(full_url);
                 }
             }
@@ -223,11 +230,7 @@ fn export_single_file(
     let where_filters = parse_export_filters(args);
     let intervals = parse_export_intervals(args)?;
 
-    println!(
-        "  {} {}",
-        "Processing:".cyan(),
-        file_path.bright_white()
-    );
+    println!("  {} {}", "Processing:".cyan(), file_path.bright_white());
 
     // Open the query engine for this file
     let engine = QueryEngine::open_path(file_path)?;
@@ -333,7 +336,8 @@ fn export_single_file(
         let mut writer = InMemoryParquetWriter::new(&effective_schema)?;
         for start in (0..rows.len()).step_by(PARQUET_BATCH_SIZE) {
             let end = (start + PARQUET_BATCH_SIZE).min(rows.len());
-            let batch = build_record_batch(&rows[start..end], &effective_schema, arrow_schema.clone())?;
+            let batch =
+                build_record_batch(&rows[start..end], &effective_schema, arrow_schema.clone())?;
             writer.write_batch(&batch)?;
         }
         let bytes = writer.finish()?;
@@ -398,25 +402,13 @@ pub fn run_export_clickhouse(args: ExportClickhouseArgs) -> Result<()> {
         "Exporting to ClickHouse:".green().bold(),
         args.common.input.bright_white()
     );
-    println!(
-        "  {} {}",
-        "ClickHouse URL:".cyan(),
-        args.url.bright_white()
-    );
-    println!(
-        "  {} {}",
-        "Target table:".cyan(),
-        args.table.bright_white()
-    );
+    println!("  {} {}", "ClickHouse URL:".cyan(), args.url.bright_white());
+    println!("  {} {}", "Target table:".cyan(), args.table.bright_white());
     if let Some(ref glob) = args.glob {
         println!("  {} {}", "Glob pattern:".cyan(), glob.bright_white());
     }
     if let Some(ref col) = args.filename_column {
-        println!(
-            "  {} {}",
-            "Filename column:".cyan(),
-            col.bright_white()
-        );
+        println!("  {} {}", "Filename column:".cyan(), col.bright_white());
     }
     println!();
 

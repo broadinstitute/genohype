@@ -168,7 +168,6 @@ pub struct ManhattanBatchArgs {
     pub limit: Option<usize>,
 
     // Common Manhattan Options (Global overrides)
-
     /// P-value threshold for significant variants (default: 5e-8)
     #[arg(long, default_value = "5e-8")]
     pub threshold: f64,
@@ -222,7 +221,6 @@ pub struct ManhattanBatchArgs {
     pub genome_annotations: Option<String>,
 
     // Distributed Processing
-
     /// Partitioning arguments for distributed processing
     #[command(flatten)]
     pub partitioning: PartitioningArgs,
@@ -232,7 +230,6 @@ pub struct ManhattanBatchArgs {
     pub progress_json: bool,
 
     // Styling Options
-
     /// Start coordinator in idle mode without automatically queueing phenotypes
     #[arg(long)]
     pub idle: bool,

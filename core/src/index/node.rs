@@ -72,9 +72,8 @@ impl LeafNode {
                     first_idx: first_idx.ok_or_else(|| {
                         HailError::Codec("Missing first_idx in leaf node".to_string())
                     })?,
-                    keys: keys.ok_or_else(|| {
-                        HailError::Codec("Missing keys in leaf node".to_string())
-                    })?,
+                    keys: keys
+                        .ok_or_else(|| HailError::Codec("Missing keys in leaf node".to_string()))?,
                 })
             }
             _ => Err(HailError::Codec(
@@ -107,9 +106,8 @@ impl LeafEntry {
                 }
 
                 Ok(LeafEntry {
-                    key: key.ok_or_else(|| {
-                        HailError::Codec("Missing key in leaf entry".to_string())
-                    })?,
+                    key: key
+                        .ok_or_else(|| HailError::Codec("Missing key in leaf entry".to_string()))?,
                     offset: offset.ok_or_else(|| {
                         HailError::Codec("Missing offset in leaf entry".to_string())
                     })?,
@@ -190,21 +188,17 @@ impl InternalEntry {
                 }
 
                 Ok(InternalEntry {
-                    index_file_offset: index_file_offset.ok_or_else(|| {
-                        HailError::Codec("Missing index_file_offset".to_string())
-                    })?,
-                    first_idx: first_idx.ok_or_else(|| {
-                        HailError::Codec("Missing first_idx".to_string())
-                    })?,
-                    first_key: first_key.ok_or_else(|| {
-                        HailError::Codec("Missing first_key".to_string())
-                    })?,
+                    index_file_offset: index_file_offset
+                        .ok_or_else(|| HailError::Codec("Missing index_file_offset".to_string()))?,
+                    first_idx: first_idx
+                        .ok_or_else(|| HailError::Codec("Missing first_idx".to_string()))?,
+                    first_key: first_key
+                        .ok_or_else(|| HailError::Codec("Missing first_key".to_string()))?,
                     first_record_offset: first_record_offset.ok_or_else(|| {
                         HailError::Codec("Missing first_record_offset".to_string())
                     })?,
-                    first_annotation: first_annotation.ok_or_else(|| {
-                        HailError::Codec("Missing first_annotation".to_string())
-                    })?,
+                    first_annotation: first_annotation
+                        .ok_or_else(|| HailError::Codec("Missing first_annotation".to_string()))?,
                 })
             }
             _ => Err(HailError::Codec(

@@ -2,8 +2,8 @@
 //!
 //! Reads data formatted as: [4-byte length][data block]...
 
-use crate::error::Result;
 use crate::buffer::InputBlockBuffer;
+use crate::error::Result;
 use std::io::Read;
 
 /// Stream block buffer that reads length-prefixed blocks

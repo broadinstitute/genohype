@@ -63,10 +63,7 @@ pub fn row_to_variation_feature(row: &EncodedValue) -> Result<VariationFeature> 
         .find(|(k, _)| k == "alleles")
         .ok_or_else(|| crate::HailError::InvalidFormat("Missing 'alleles' field".into()))?;
     let allele_strings: Vec<String> = match &alleles_val.1 {
-        EncodedValue::Array(arr) => arr
-            .iter()
-            .filter_map(|v| v.as_string())
-            .collect(),
+        EncodedValue::Array(arr) => arr.iter().filter_map(|v| v.as_string()).collect(),
         _ => {
             return Err(crate::HailError::InvalidFormat(
                 "Expected alleles to be an array".into(),
@@ -75,7 +72,9 @@ pub fn row_to_variation_feature(row: &EncodedValue) -> Result<VariationFeature> 
     };
 
     if allele_strings.is_empty() {
-        return Err(crate::HailError::InvalidFormat("Empty alleles array".into()));
+        return Err(crate::HailError::InvalidFormat(
+            "Empty alleles array".into(),
+        ));
     }
 
     let ref_str = &allele_strings[0];
@@ -130,7 +129,10 @@ pub fn row_to_variation_feature(row: &EncodedValue) -> Result<VariationFeature> 
     };
 
     let ref_allele = Allele::from_str(&ref_allele_str);
-    let alt_alleles: Vec<Allele> = alt_allele_strs.iter().map(|s| Allele::from_str(s)).collect();
+    let alt_alleles: Vec<Allele> = alt_allele_strs
+        .iter()
+        .map(|s| Allele::from_str(s))
+        .collect();
 
     // Classify variant type
     let variant_type = classify_variant_type(&ref_allele, &alt_alleles);

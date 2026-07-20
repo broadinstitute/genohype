@@ -37,7 +37,7 @@ pub(crate) fn determine_batch_size(
             | Some(JobSpec::Manhattan { .. }) => 1024, // 1GB per partition for Manhattan
             Some(JobSpec::ExportClickhouse { .. }) => 1024, // 1GB per partition for ClickHouse buffered inserts
             Some(JobSpec::ExportParquet { .. }) | Some(JobSpec::ExportJson { .. }) => 256, // 256MB
-            Some(JobSpec::Summary) => 64, // 64MB, very light
+            Some(JobSpec::Summary) => 64,                   // 64MB, very light
             _ => 500,
         });
 
@@ -45,7 +45,9 @@ pub(crate) fn determine_batch_size(
 
         // We want at least the default_size (so we don't regress if someone manually specified a good default),
         // but if memory dictates a lower cap, we respect it unless the default size itself exceeds memory.
-        let target = core_based.max(default_size).min(max_by_memory.max(default_size));
+        let target = core_based
+            .max(default_size)
+            .min(max_by_memory.max(default_size));
 
         target
     } else {

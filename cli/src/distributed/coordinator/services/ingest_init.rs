@@ -50,7 +50,10 @@ pub fn discover_phenotypes_for_ingestion(
         tokio::task::block_in_place(|| handle.block_on(list_manifests(&client, &prefix, bucket)))
     } else {
         let rt = tokio::runtime::Runtime::new().map_err(|e| {
-            crate::HailError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+            crate::HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string(),
+            ))
         })?;
         rt.block_on(list_manifests(&client, &prefix, bucket))
     };
@@ -72,7 +75,10 @@ pub fn discover_phenotypes_for_ingestion(
         }
 
         if let Some(f) = filter {
-            if !f.iter().any(|(id, anc)| id == &phenotype_id && anc == &ancestry) {
+            if !f
+                .iter()
+                .any(|(id, anc)| id == &phenotype_id && anc == &ancestry)
+            {
                 continue;
             }
         }
@@ -115,8 +121,8 @@ pub fn init_clickhouse_tables(
     init_strategy: &crate::distributed::message::InitStrategy,
 ) -> Result<(), String> {
     use crate::distributed::message::InitStrategy;
-    use genohype_core::export::ClickHouseClient;
     use crate::ingest::get_manhattan_schemas;
+    use genohype_core::export::ClickHouseClient;
 
     if *init_strategy == InitStrategy::Append {
         return Ok(());

@@ -135,12 +135,20 @@ impl<'a> CoreTaskGuard<'a> {
     }
 
     /// Create a guard for a phenotype-based task.
-    pub fn phenotype(ts: &'a Arc<TelemetryState>, phenotype_id: impl Into<String>, label: Option<String>) -> Self {
+    pub fn phenotype(
+        ts: &'a Arc<TelemetryState>,
+        phenotype_id: impl Into<String>,
+        label: Option<String>,
+    ) -> Self {
         Self::new(ts, CoreTaskInfo::phenotype(phenotype_id, label))
     }
 
     /// Create a guard for a custom task type.
-    pub fn custom(ts: &'a Arc<TelemetryState>, task_type: impl Into<String>, task_id: impl Into<String>) -> Self {
+    pub fn custom(
+        ts: &'a Arc<TelemetryState>,
+        task_type: impl Into<String>,
+        task_id: impl Into<String>,
+    ) -> Self {
         Self::new(ts, CoreTaskInfo::custom(task_type, task_id))
     }
 }
@@ -277,9 +285,8 @@ pub fn spawn_telemetry_loop(
             let (net_rx_sec, net_tx_sec, _net_rx_total, _net_tx_total) = {
                 let mut n = networks.lock().unwrap();
                 n.refresh();
-                let (current_rx, current_tx) = n
-                    .iter()
-                    .fold((0u64, 0u64), |(rx, tx), (_, iface)| {
+                let (current_rx, current_tx) =
+                    n.iter().fold((0u64, 0u64), |(rx, tx), (_, iface)| {
                         (rx + iface.total_received(), tx + iface.total_transmitted())
                     });
 
@@ -297,7 +304,12 @@ pub fn spawn_telemetry_loop(
                 prev_net_rx = current_rx;
                 prev_net_tx = current_tx;
 
-                (Some(rx_sec), Some(tx_sec), Some(current_rx), Some(current_tx))
+                (
+                    Some(rx_sec),
+                    Some(tx_sec),
+                    Some(current_rx),
+                    Some(current_tx),
+                )
             };
 
             // Collect the core tasks map (Rayon thread ID -> partition ID)

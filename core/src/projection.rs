@@ -243,18 +243,21 @@ impl ProjectionTree {
         match schema {
             EncodedType::EBaseStruct { fields, .. } => {
                 for (child_name, child_tree) in &self.children {
-                    let field = fields.iter().find(|f| &f.name == child_name).ok_or_else(|| {
-                        path_so_far.push(child_name.clone());
-                        let full_path = path_so_far.join(".");
-                        path_so_far.pop();
-                        let available: Vec<&str> =
-                            fields.iter().map(|f| f.name.as_str()).collect();
-                        HailError::InvalidFormat(format!(
-                            "Field '{}' not found in schema. Available fields: {}",
-                            full_path,
-                            available.join(", ")
-                        ))
-                    })?;
+                    let field = fields
+                        .iter()
+                        .find(|f| &f.name == child_name)
+                        .ok_or_else(|| {
+                            path_so_far.push(child_name.clone());
+                            let full_path = path_so_far.join(".");
+                            path_so_far.pop();
+                            let available: Vec<&str> =
+                                fields.iter().map(|f| f.name.as_str()).collect();
+                            HailError::InvalidFormat(format!(
+                                "Field '{}' not found in schema. Available fields: {}",
+                                full_path,
+                                available.join(", ")
+                            ))
+                        })?;
                     path_so_far.push(child_name.clone());
                     child_tree.validate_recursive(&field.encoded_type, path_so_far)?;
                     path_so_far.pop();
@@ -298,9 +301,9 @@ impl ProjectionTree {
                 let projected: Vec<(String, EncodedValue)> = fields
                     .iter()
                     .filter_map(|(name, val)| {
-                        self.children.get(name).map(|child| {
-                            (name.clone(), child.project(val))
-                        })
+                        self.children
+                            .get(name)
+                            .map(|child| (name.clone(), child.project(val)))
                     })
                     .collect();
                 EncodedValue::Struct(projected)
@@ -408,9 +411,7 @@ impl Projection {
             .split(',')
             .map(|s| FieldPath::parse(s.trim()))
             .collect::<Result<Vec<_>>>()?;
-        Ok(Projection::Fields(ProjectionTree::from_fields(
-            &paths,
-        )))
+        Ok(Projection::Fields(ProjectionTree::from_fields(&paths)))
     }
 
     /// Build the canonical `browser-minimal` strict inclusion-list projection.
@@ -991,7 +992,10 @@ mod tests {
             (
                 "locus".to_string(),
                 EncodedValue::Struct(vec![
-                    ("contig".to_string(), EncodedValue::Binary(b"chr22".to_vec())),
+                    (
+                        "contig".to_string(),
+                        EncodedValue::Binary(b"chr22".to_vec()),
+                    ),
                     ("position".to_string(), EncodedValue::Int32(16050075)),
                 ]),
             ),
@@ -1002,7 +1006,10 @@ mod tests {
                     EncodedValue::Binary(b"G".to_vec()),
                 ]),
             ),
-            ("variant_id".to_string(), EncodedValue::Binary(b"22-16050075-A-G".to_vec())),
+            (
+                "variant_id".to_string(),
+                EncodedValue::Binary(b"22-16050075-A-G".to_vec()),
+            ),
             (
                 "exome".to_string(),
                 EncodedValue::Struct(vec![(
@@ -1017,7 +1024,10 @@ mod tests {
                 )]),
             ),
             // Fields that browser-minimal must drop:
-            ("vep".to_string(), EncodedValue::Array(vec![EncodedValue::Int32(0)])),
+            (
+                "vep".to_string(),
+                EncodedValue::Array(vec![EncodedValue::Int32(0)]),
+            ),
             ("info".to_string(), EncodedValue::Struct(vec![])),
             ("histograms".to_string(), EncodedValue::Struct(vec![])),
         ]);
@@ -1103,7 +1113,10 @@ mod tests {
         let projected_row = proj.apply(&row);
         if let EncodedValue::Struct(row_fields) = &projected_row {
             assert_eq!(
-                row_fields.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+                row_fields
+                    .iter()
+                    .map(|(n, _)| n.as_str())
+                    .collect::<Vec<_>>(),
                 vec!["locus", "freq"]
             );
         } else {

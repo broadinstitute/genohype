@@ -1,10 +1,10 @@
 //! Index metadata structures
 
+use crate::Result;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
-use crate::Result;
 
 /// Index metadata from metadata.json.gz in index directory
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,8 +56,7 @@ impl IndexMetadata {
         file.read_to_end(&mut data)?;
 
         // Try gzipped first, fall back to plain JSON
-        Self::from_gzipped_json(&data)
-            .or_else(|_| Self::from_json(&data))
+        Self::from_gzipped_json(&data).or_else(|_| Self::from_json(&data))
     }
 
     /// Load index metadata from a path string (local or cloud URL)
@@ -73,8 +72,7 @@ impl IndexMetadata {
         reader.read_to_end(&mut data)?;
 
         // Try gzipped first, fall back to plain JSON
-        Self::from_gzipped_json(&data)
-            .or_else(|_| Self::from_json(&data))
+        Self::from_gzipped_json(&data).or_else(|_| Self::from_json(&data))
     }
 }
 
@@ -84,15 +82,21 @@ mod tests {
 
     #[test]
     fn test_parse_index_metadata() {
-        let metadata = IndexMetadata::from_file(
-            "data/gene_models_hds/ht/prep_table.ht/index/part-0-7e0f7fd7-8efe-401a-b28a-ae8ac6d3aa06.idx/metadata.json.gz"
-        ).expect("Failed to parse index metadata");
+        let fixture = std::path::PathBuf::from(
+            "tests/fixtures/tiny-keyed.ht/index/part-0.idx/metadata.json.gz",
+        );
+        let metadata =
+            IndexMetadata::from_file(fixture).expect("failed to parse fixture index metadata");
 
         assert_eq!(metadata.file_version, 66048);
         assert_eq!(metadata.branching_factor, 4096);
         assert_eq!(metadata.height, 2);
-        assert_eq!(metadata.n_keys, 3);
-        assert_eq!(metadata.root_offset, 81);
+        assert_eq!(metadata.n_keys, 2);
+        assert!(metadata.root_offset > 0);
         assert_eq!(metadata.index_path, "index");
+        assert_eq!(
+            metadata.key_type,
+            "Struct{gene_id:String,chrom:String,start:Int32}"
+        );
     }
 }

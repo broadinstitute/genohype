@@ -26,29 +26,29 @@ pub type ResolvedStore = (Arc<dyn ObjectStore>, ObjPath);
 /// use genohype_core::io::resolve_url;
 ///
 /// let (store, path) = resolve_url("gs://my-bucket/data/file.parquet")?;
-/// # Ok::<(), hail_decoder::HailError>(())
+/// # Ok::<(), genohype_core::HailError>(())
 /// ```
 pub fn resolve_url(url_str: &str) -> Result<ResolvedStore> {
-    let url = Url::parse(url_str)
-        .map_err(|e| HailError::InvalidFormat(format!("Invalid URL: {}", e)))?;
+    let url =
+        Url::parse(url_str).map_err(|e| HailError::InvalidFormat(format!("Invalid URL: {}", e)))?;
 
     match url.scheme() {
         #[cfg(feature = "gcp")]
         "gs" => {
-            let bucket = url.host_str().ok_or_else(|| {
-                HailError::InvalidFormat("Missing bucket in GCS URL".to_string())
-            })?;
+            let bucket = url
+                .host_str()
+                .ok_or_else(|| HailError::InvalidFormat("Missing bucket in GCS URL".to_string()))?;
             let path = url.path().trim_start_matches('/');
             Ok((crate::io::get_gcs_client(bucket)?, ObjPath::from(path)))
         }
         #[cfg(feature = "aws")]
         "s3" => {
-            let bucket = url.host_str().ok_or_else(|| {
-                HailError::InvalidFormat("Missing bucket in S3 URL".to_string())
-            })?;
+            let bucket = url
+                .host_str()
+                .ok_or_else(|| HailError::InvalidFormat("Missing bucket in S3 URL".to_string()))?;
             let path = url.path().trim_start_matches('/');
-            let mut s3_builder = object_store::aws::AmazonS3Builder::from_env()
-                .with_bucket_name(bucket);
+            let mut s3_builder =
+                object_store::aws::AmazonS3Builder::from_env().with_bucket_name(bucket);
             if std::env::var("AWS_SKIP_SIGNATURE").ok().as_deref() == Some("true") {
                 s3_builder = s3_builder.with_skip_signature(true);
             }
@@ -78,26 +78,26 @@ pub fn resolve_url(url_str: &str) -> Result<ResolvedStore> {
 ///
 /// HTTP URLs are not supported for writing.
 pub fn resolve_url_for_write(url_str: &str) -> Result<ResolvedStore> {
-    let url = Url::parse(url_str)
-        .map_err(|e| HailError::InvalidFormat(format!("Invalid URL: {}", e)))?;
+    let url =
+        Url::parse(url_str).map_err(|e| HailError::InvalidFormat(format!("Invalid URL: {}", e)))?;
 
     match url.scheme() {
         #[cfg(feature = "gcp")]
         "gs" => {
-            let bucket = url.host_str().ok_or_else(|| {
-                HailError::InvalidFormat("Missing bucket in GCS URL".to_string())
-            })?;
+            let bucket = url
+                .host_str()
+                .ok_or_else(|| HailError::InvalidFormat("Missing bucket in GCS URL".to_string()))?;
             let path = url.path().trim_start_matches('/');
             Ok((crate::io::get_gcs_client(bucket)?, ObjPath::from(path)))
         }
         #[cfg(feature = "aws")]
         "s3" => {
-            let bucket = url.host_str().ok_or_else(|| {
-                HailError::InvalidFormat("Missing bucket in S3 URL".to_string())
-            })?;
+            let bucket = url
+                .host_str()
+                .ok_or_else(|| HailError::InvalidFormat("Missing bucket in S3 URL".to_string()))?;
             let path = url.path().trim_start_matches('/');
-            let mut s3_builder = object_store::aws::AmazonS3Builder::from_env()
-                .with_bucket_name(bucket);
+            let mut s3_builder =
+                object_store::aws::AmazonS3Builder::from_env().with_bucket_name(bucket);
             if std::env::var("AWS_SKIP_SIGNATURE").ok().as_deref() == Some("true") {
                 s3_builder = s3_builder.with_skip_signature(true);
             }
@@ -121,7 +121,10 @@ mod tests {
     fn test_unsupported_scheme() {
         let result = resolve_url("ftp://example.com/path");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Unsupported URL scheme"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Unsupported URL scheme"));
     }
 
     #[test]

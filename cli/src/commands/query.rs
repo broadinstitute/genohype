@@ -157,7 +157,10 @@ pub fn run_query(args: QueryArgs, cache_opts: Option<CacheOptions>) -> Result<()
                 "{} {} filter(s): {:?}",
                 "✓".green(),
                 where_filters.len().to_string().bright_white(),
-                where_filters.iter().map(|r| r.field_path_str()).collect::<Vec<_>>()
+                where_filters
+                    .iter()
+                    .map(|r| r.field_path_str())
+                    .collect::<Vec<_>>()
             );
         }
     }
@@ -170,7 +173,12 @@ pub fn run_query(args: QueryArgs, cache_opts: Option<CacheOptions>) -> Result<()
         // Point lookup using --key
         let key = build_key_from_filters(&key_filters, engine.key_fields())?;
         if !quiet {
-            let _ = writeln!(writer, "{} {:?}", "Point lookup for key:".cyan(), key_filters);
+            let _ = writeln!(
+                writer,
+                "{} {:?}",
+                "Point lookup for key:".cyan(),
+                key_filters
+            );
         }
 
         // Resolve the matched row (if any), applying the interval filter.
@@ -214,7 +222,8 @@ pub fn run_query(args: QueryArgs, cache_opts: Option<CacheOptions>) -> Result<()
         }
     } else {
         // Range query using --where (or full scan if no filters)
-        if !quiet && !stats_mode && !summary_mode && where_filters.is_empty() && intervals.is_none() {
+        if !quiet && !stats_mode && !summary_mode && where_filters.is_empty() && intervals.is_none()
+        {
             eprintln!(
                 "{}",
                 "Warning: No filters specified. This may scan all partitions.".yellow()
@@ -237,7 +246,8 @@ pub fn run_query(args: QueryArgs, cache_opts: Option<CacheOptions>) -> Result<()
         };
 
         // Use streaming query with intervals and optional decode projection
-        let iterator = engine.query_iter_with_projection(&where_filters, intervals, decode_projection)?;
+        let iterator =
+            engine.query_iter_with_projection(&where_filters, intervals, decode_projection)?;
 
         // Apply limit if specified
         let iterator: Box<dyn Iterator<Item = _>> = if let Some(n) = args.limit {
@@ -564,8 +574,7 @@ fn collect_tsv_leaves(value: &EncodedValue, prefix: &str, out: &mut Vec<(String,
 fn tsv_scalar(value: &EncodedValue) -> String {
     match value {
         EncodedValue::Null => String::new(),
-        EncodedValue::Binary(b) => String::from_utf8_lossy(b)
-            .replace(['\t', '\n', '\r'], " "),
+        EncodedValue::Binary(b) => String::from_utf8_lossy(b).replace(['\t', '\n', '\r'], " "),
         EncodedValue::Int32(i) => i.to_string(),
         EncodedValue::Int64(i) => i.to_string(),
         EncodedValue::Float32(f) => f.to_string(),
@@ -600,7 +609,11 @@ fn write_row(writer: &mut dyn Write, row: &EncodedValue, json_output: bool) -> s
     }
 }
 
-fn write_encoded_value(writer: &mut dyn Write, value: &EncodedValue, indent: usize) -> std::io::Result<()> {
+fn write_encoded_value(
+    writer: &mut dyn Write,
+    value: &EncodedValue,
+    indent: usize,
+) -> std::io::Result<()> {
     let prefix = "  ".repeat(indent);
     match value {
         EncodedValue::Null => writeln!(writer, "{}{}", prefix, "null".dimmed()),

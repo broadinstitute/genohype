@@ -48,7 +48,8 @@ pub fn run_export_genes_postgres(args: ExportGenesPostgresArgs) -> Result<()> {
         Box::new(iterator)
     };
 
-    let mut inserter = GenesCopyInserter::new(&mut client, &args.table, args.batch_size).map_err(pg_err)?;
+    let mut inserter =
+        GenesCopyInserter::new(&mut client, &args.table, args.batch_size).map_err(pg_err)?;
 
     let pb = ProgressBar::new_spinner();
     pb.set_style(progress_style_spinner());

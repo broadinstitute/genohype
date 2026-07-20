@@ -120,11 +120,7 @@ pub fn run_export_parquet(args: ExportParquetArgs) -> Result<()> {
         );
     }
     if let Some(l) = args.common.limit {
-        println!(
-            "{} {}",
-            "Row limit:".cyan(),
-            l.to_string().bright_white()
-        );
+        println!("{} {}", "Row limit:".cyan(), l.to_string().bright_white());
     }
     if args.per_partition {
         println!(
@@ -143,8 +139,16 @@ pub fn run_export_parquet(args: ExportParquetArgs) -> Result<()> {
         println!(
             "{} worker {}/{}",
             "Distributed mode:".cyan(),
-            args.common.partitioning.worker_id.to_string().bright_white(),
-            args.common.partitioning.total_workers.to_string().bright_white()
+            args.common
+                .partitioning
+                .worker_id
+                .to_string()
+                .bright_white(),
+            args.common
+                .partitioning
+                .total_workers
+                .to_string()
+                .bright_white()
         );
     }
     println!();
@@ -300,10 +304,7 @@ pub fn run_export_parquet(args: ExportParquetArgs) -> Result<()> {
             where_filters.is_empty() && intervals.is_none() && args.common.limit.is_none();
 
         let total_rows = if can_use_parallel {
-            println!(
-                "{}",
-                "Using parallel export (all CPU cores)...".dimmed()
-            );
+            println!("{}", "Using parallel export (all CPU cores)...".dimmed());
             drop(engine); // Close engine so converter can open its own
             hail_to_parquet_with_options(&args.common.input, &args.output, true, None)?
         } else {
@@ -334,8 +335,7 @@ pub fn run_export_parquet(args: ExportParquetArgs) -> Result<()> {
             // *results* are unchanged. NOTE: the sequential path buffers all rows to
             // sort — fine at smoke scale (~554k rows); see the full-scale caveat in
             // the punch-list.
-            let row_type =
-                genohype_core::export::xpos::augment_type_with_xpos(&row_type);
+            let row_type = genohype_core::export::xpos::augment_type_with_xpos(&row_type);
 
             // Build the decode-time projection so dropped fields are never
             // decoded; keep `locus` for interval filtering.
@@ -349,11 +349,8 @@ pub fn run_export_parquet(args: ExportParquetArgs) -> Result<()> {
             };
 
             // Use streaming query with filters, intervals, and decode projection.
-            let iterator = engine.query_iter_with_projection(
-                &where_filters,
-                intervals,
-                decode_projection,
-            )?;
+            let iterator =
+                engine.query_iter_with_projection(&where_filters, intervals, decode_projection)?;
 
             // Apply the output projection so each row's top-level fields exactly
             // match the (narrowed) `row_type`, then append the derived `xpos`
@@ -410,8 +407,11 @@ pub fn run_export_parquet(args: ExportParquetArgs) -> Result<()> {
                     for start in (0..all_rows.len()).step_by(batch_size) {
                         let end = (start + batch_size).min(all_rows.len());
                         pb.set_message(format!("{} / {} rows written...", end, total_rows));
-                        let batch =
-                            build_record_batch(&all_rows[start..end], &row_type, arrow_schema.clone())?;
+                        let batch = build_record_batch(
+                            &all_rows[start..end],
+                            &row_type,
+                            arrow_schema.clone(),
+                        )?;
                         writer.write_batch(&batch)?;
                     }
 
@@ -479,17 +479,9 @@ pub fn run_export_parquet(args: ExportParquetArgs) -> Result<()> {
             args.output.bright_white()
         );
     } else {
-        println!(
-            "  {} {}",
-            "Output file:".cyan(),
-            args.output.bright_white()
-        );
+        println!("  {} {}", "Output file:".cyan(), args.output.bright_white());
     }
-    println!(
-        "  {} {}",
-        "Output size:".cyan(),
-        output_size.bright_white()
-    );
+    println!("  {} {}", "Output size:".cyan(), output_size.bright_white());
 
     // Finish benchmark and print/write report
     if let Some(collector) = metrics_collector {
@@ -581,9 +573,10 @@ pub fn run_export_parquet(args: ExportParquetArgs) -> Result<()> {
             }).collect::<Vec<_>>(),
         });
 
-        if let Err(e) =
-            std::fs::write(&report_path, serde_json::to_string_pretty(&report_json).unwrap())
-        {
+        if let Err(e) = std::fs::write(
+            &report_path,
+            serde_json::to_string_pretty(&report_json).unwrap(),
+        ) {
             eprintln!(
                 "{} Failed to write benchmark report: {}",
                 "Warning:".yellow(),

@@ -65,17 +65,29 @@ fn transcript_variations_to_encoded(vf: &VariationFeature) -> EncodedValue {
             let exon = aa.exon.map(|(n, t)| format!("{}/{}", n, t));
             let intron = aa.intron.map(|(n, t)| format!("{}/{}", n, t));
 
-            let cdna_pos = aa
-                .cdna_position
-                .map(|(s, e)| if s == e { format!("{}", s) } else { format!("{}-{}", s, e) });
+            let cdna_pos = aa.cdna_position.map(|(s, e)| {
+                if s == e {
+                    format!("{}", s)
+                } else {
+                    format!("{}-{}", s, e)
+                }
+            });
 
-            let cds_pos = aa
-                .cds_position
-                .map(|(s, e)| if s == e { format!("{}", s) } else { format!("{}-{}", s, e) });
+            let cds_pos = aa.cds_position.map(|(s, e)| {
+                if s == e {
+                    format!("{}", s)
+                } else {
+                    format!("{}-{}", s, e)
+                }
+            });
 
-            let protein_pos = aa
-                .protein_position
-                .map(|(s, e)| if s == e { format!("{}", s) } else { format!("{}-{}", s, e) });
+            let protein_pos = aa.protein_position.map(|(s, e)| {
+                if s == e {
+                    format!("{}", s)
+                } else {
+                    format!("{}-{}", s, e)
+                }
+            });
 
             let element = EncodedValue::Struct(vec![
                 ("allele".into(), str_val(&aa.allele.to_string())),
@@ -83,11 +95,7 @@ fn transcript_variations_to_encoded(vf: &VariationFeature) -> EncodedValue {
                 ("impact".into(), str_val(&impact)),
                 (
                     "gene_symbol".into(),
-                    str_val(
-                        tv.gene_symbol
-                            .as_deref()
-                            .unwrap_or("-"),
-                    ),
+                    str_val(tv.gene_symbol.as_deref().unwrap_or("-")),
                 ),
                 ("gene_id".into(), str_val(&tv.gene_id)),
                 ("transcript_id".into(), str_val(&tv.transcript_id)),
@@ -109,10 +117,7 @@ fn transcript_variations_to_encoded(vf: &VariationFeature) -> EncodedValue {
                         .map(|d| EncodedValue::Int64(d))
                         .unwrap_or(EncodedValue::Null),
                 ),
-                (
-                    "mane_select".into(),
-                    opt_str_val(tv.mane_select.as_deref()),
-                ),
+                ("mane_select".into(), opt_str_val(tv.mane_select.as_deref())),
                 (
                     "mane_plus_clinical".into(),
                     opt_str_val(tv.mane_plus_clinical.as_deref()),
@@ -130,23 +135,33 @@ fn transcript_variations_to_encoded(vf: &VariationFeature) -> EncodedValue {
                 ),
                 (
                     "lof_filter".into(),
-                    opt_str_val(aa.loftee.as_ref().and_then(|l| {
-                        if l.filters.is_empty() {
-                            None
-                        } else {
-                            Some(l.filters.join(","))
-                        }
-                    }).as_deref()),
+                    opt_str_val(
+                        aa.loftee
+                            .as_ref()
+                            .and_then(|l| {
+                                if l.filters.is_empty() {
+                                    None
+                                } else {
+                                    Some(l.filters.join(","))
+                                }
+                            })
+                            .as_deref(),
+                    ),
                 ),
                 (
                     "lof_flags".into(),
-                    opt_str_val(aa.loftee.as_ref().and_then(|l| {
-                        if l.flags.is_empty() {
-                            None
-                        } else {
-                            Some(l.flags.join(","))
-                        }
-                    }).as_deref()),
+                    opt_str_val(
+                        aa.loftee
+                            .as_ref()
+                            .and_then(|l| {
+                                if l.flags.is_empty() {
+                                    None
+                                } else {
+                                    Some(l.flags.join(","))
+                                }
+                            })
+                            .as_deref(),
+                    ),
                 ),
             ]);
 
@@ -219,6 +234,7 @@ mod tests {
                 polyphen: Some("benign(0.1)".to_string()),
                 supplementary: Vec::new(),
                 acmg_classification: None,
+                loftee: None,
             }],
             canonical: true,
             strand: Strand::Forward,
@@ -284,10 +300,7 @@ mod tests {
 
         // Check a few fields
         assert_eq!(entry[1].0, "consequence");
-        assert_eq!(
-            entry[1].1.as_string().unwrap(),
-            "missense_variant"
-        );
+        assert_eq!(entry[1].1.as_string().unwrap(), "missense_variant");
         assert_eq!(entry[3].0, "gene_symbol");
         assert_eq!(entry[3].1.as_string().unwrap(), "PCSK9");
         assert_eq!(entry[7].0, "canonical");

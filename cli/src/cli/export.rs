@@ -2,9 +2,9 @@
 
 use clap::{Args, Subcommand};
 
-use super::shared::{CommonExportArgs, HasCommonExportArgs};
 #[cfg(feature = "vep")]
 use super::shared::VepArgs;
+use super::shared::{CommonExportArgs, HasCommonExportArgs};
 
 #[derive(Subcommand)]
 pub enum ExportCommands {

@@ -160,7 +160,11 @@ impl LocusRenderer {
         let radius = self.point_radius;
 
         // Helper to draw variants for a given source
-        let draw_source = |pixmap: &mut Pixmap, config: &LocusPlotConfig, source: VariantSource, paint_color: Color, radius: f32| {
+        let draw_source = |pixmap: &mut Pixmap,
+                           config: &LocusPlotConfig,
+                           source: VariantSource,
+                           paint_color: Color,
+                           radius: f32| {
             let mut paint = Paint::default();
             paint.set_color(paint_color);
             paint.anti_alias = true;
@@ -215,8 +219,20 @@ impl LocusRenderer {
         };
 
         // Draw genome first (background), then exome (foreground)
-        draw_source(&mut self.pixmap, &self.config, VariantSource::Genome, genome_color, radius);
-        draw_source(&mut self.pixmap, &self.config, VariantSource::Exome, exome_color, radius);
+        draw_source(
+            &mut self.pixmap,
+            &self.config,
+            VariantSource::Genome,
+            genome_color,
+            radius,
+        );
+        draw_source(
+            &mut self.pixmap,
+            &self.config,
+            VariantSource::Exome,
+            exome_color,
+            radius,
+        );
     }
 
     /// Encode the rendered pixmap as a PNG byte vector.

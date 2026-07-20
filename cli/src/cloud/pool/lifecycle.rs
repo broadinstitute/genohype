@@ -23,7 +23,10 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             println!("{}", "Skipping binary build (--skip-build)".dimmed());
             false
         } else if self.has_bundled_binary() {
-            println!("{}", "Found bundled worker binary, skipping build...".dimmed());
+            println!(
+                "{}",
+                "Found bundled worker binary, skipping build...".dimmed()
+            );
             false
         } else {
             true
@@ -95,7 +98,12 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
     }
 
     /// Wait for all instances in a pool to complete their startup scripts.
-    pub(crate) fn wait_for_pool_ready(&self, pool_name: &str, zone: &str, timeout_secs: u64) -> Result<()> {
+    pub(crate) fn wait_for_pool_ready(
+        &self,
+        pool_name: &str,
+        zone: &str,
+        timeout_secs: u64,
+    ) -> Result<()> {
         use std::time::{Duration, Instant};
 
         let start = Instant::now();
@@ -155,7 +163,12 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
     ///
     /// Deletes all VMs tagged with the pool name.
     /// If `metrics_bucket` is provided, exports metrics to GCS before deletion.
-    pub(crate) fn destroy(&self, name: &str, zone: &str, metrics_bucket: Option<&str>) -> Result<()> {
+    pub(crate) fn destroy(
+        &self,
+        name: &str,
+        zone: &str,
+        metrics_bucket: Option<&str>,
+    ) -> Result<()> {
         println!("{} pool '{}'...", "Destroying".red(), name.bright_white());
 
         // First list to show what we're deleting
@@ -257,9 +270,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         }
 
         // 2. Identify coordinator (needed for deploying binary to new workers)
-        let coordinator = instances
-            .iter()
-            .find(|i| i.name.ends_with("-coordinator"));
+        let coordinator = instances.iter().find(|i| i.name.ends_with("-coordinator"));
         if coordinator.is_none() && config.with_coordinator {
             println!(
                 "{} Coordinator not found, but configuration expects one.",
@@ -286,7 +297,10 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             let should_build = if skip_build {
                 false
             } else if self.has_bundled_binary() {
-                println!("{}", "Found bundled worker binary, skipping build...".dimmed());
+                println!(
+                    "{}",
+                    "Found bundled worker binary, skipping build...".dimmed()
+                );
                 false
             } else {
                 true
@@ -315,12 +329,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             // Find existing indices and create new workers at gaps or at the end
             let mut existing_indices: Vec<usize> = workers
                 .iter()
-                .filter_map(|w| {
-                    w.name
-                        .split("-worker-")
-                        .nth(1)
-                        .and_then(|s| s.parse().ok())
-                })
+                .filter_map(|w| w.name.split("-worker-").nth(1).and_then(|s| s.parse().ok()))
                 .collect();
             existing_indices.sort();
 
@@ -334,10 +343,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                 }
 
                 let instance_name = format!("{}-worker-{}", name, next_idx);
-                let tags = format!(
-                    "genohype-worker,pool-{},role-worker",
-                    name
-                );
+                let tags = format!("genohype-worker,pool-{},role-worker", name);
 
                 new_instances.push(crate::cloud::InstanceSetup {
                     name: instance_name,
@@ -357,11 +363,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
 
             // Create instances
             self.provider.create_instances(&new_instances)?;
-            println!(
-                "{} Created {} new instances.",
-                "OK".green().bold(),
-                to_add
-            );
+            println!("{} Created {} new instances.", "OK".green().bold(), to_add);
 
             // Wait for readiness
             println!("{}", "Waiting for new instances to be ready...".dimmed());
@@ -381,19 +383,13 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             // (can't use coordinator propagation since coordinator serves a different binary)
             let deploy_bin = worker_bin.as_ref().unwrap_or(&binary);
             if worker_bin.is_some() {
-                println!(
-                    "{}",
-                    "Deploying custom worker binary via SCP...".dimmed()
-                );
+                println!("{}", "Deploying custom worker binary via SCP...".dimmed());
                 self.deploy_binary(deploy_bin, &new_worker_instances, zone)?;
             } else if let Some(coord) = coordinator {
                 if let Some(coord_ip) = coord.ip() {
                     // Coordinator exists, check if it's running to serve binary
                     if self.check_coordinator_status(coord, zone) {
-                        println!(
-                            "{}",
-                            "Deploying binary via coordinator...".dimmed()
-                        );
+                        println!("{}", "Deploying binary via coordinator...".dimmed());
                         self.propagate_binary_from_coordinator(
                             coord_ip,
                             &new_worker_instances,

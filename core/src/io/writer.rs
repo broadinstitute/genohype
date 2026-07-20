@@ -52,7 +52,7 @@ const UPLOAD_CHANNEL_CAPACITY: usize = 4;
 /// let writer = CloudWriter::new("gs://bucket/path/output.parquet")?;
 /// // Write data...
 /// writer.finish()?; // Uploads to GCS
-/// # Ok::<(), hail_decoder::HailError>(())
+/// # Ok::<(), genohype_core::HailError>(())
 /// ```
 pub struct CloudWriter {
     /// The object store to write to
@@ -71,8 +71,10 @@ impl CloudWriter {
     ///
     /// # Example
     /// ```no_run
+    /// use genohype_core::io::CloudWriter;
+    ///
     /// let writer = CloudWriter::new("gs://my-bucket/output.parquet")?;
-    /// # Ok::<(), hail_decoder::HailError>(())
+    /// # Ok::<(), genohype_core::HailError>(())
     /// ```
     pub fn new(url_str: &str) -> Result<Self> {
         let (store, path) = crate::io::resolve_url_for_write(url_str)?;
@@ -111,14 +113,19 @@ impl CloudWriter {
         tracing::trace!("CloudWriter: uploading {} bytes to {:?}", size, path);
         let start_time = std::time::Instant::now();
 
-        IO_RUNTIME.block_on(async move {
-            store.put(&path, data.into()).await
-        }).map_err(|e| HailError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Failed to upload to cloud storage: {}", e),
-        )))?;
+        IO_RUNTIME
+            .block_on(async move { store.put(&path, data.into()).await })
+            .map_err(|e| {
+                HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to upload to cloud storage: {}", e),
+                ))
+            })?;
 
-        tracing::trace!("CloudWriter: upload completed in {:?}", start_time.elapsed());
+        tracing::trace!(
+            "CloudWriter: upload completed in {:?}",
+            start_time.elapsed()
+        );
         Ok(size)
     }
 
@@ -167,14 +174,16 @@ impl Write for CloudWriter {
 /// ## Usage
 ///
 /// ```no_run
+/// use std::io::Write;
 /// use genohype_core::io::StreamingCloudWriter;
 ///
+/// let data = b"example output";
 /// let mut writer = StreamingCloudWriter::new("gs://bucket/large-file.parquet")?;
 /// // Write data in chunks - uploads happen in background
-/// writer.write_all(&data)?;
+/// writer.write_all(data)?;
 /// // Finish uploads and complete the multipart upload
 /// writer.finish()?;
-/// # Ok::<(), hail_decoder::HailError>(())
+/// # Ok::<(), genohype_core::HailError>(())
 /// ```
 pub struct StreamingCloudWriter {
     /// Channel to send completed parts to the upload task
@@ -207,7 +216,11 @@ impl StreamingCloudWriter {
     }
 
     /// Create a streaming writer from an existing ObjectStore
-    pub fn from_store(store: Arc<dyn ObjectStore>, path: ObjPath, part_size: usize) -> Result<Self> {
+    pub fn from_store(
+        store: Arc<dyn ObjectStore>,
+        path: ObjPath,
+        part_size: usize,
+    ) -> Result<Self> {
         let (part_tx, part_rx) = bounded::<Bytes>(UPLOAD_CHANNEL_CAPACITY);
 
         // Start the multipart upload and spawn the background task
@@ -215,7 +228,9 @@ impl StreamingCloudWriter {
         let upload_handle = std::thread::spawn(move || {
             IO_RUNTIME.block_on(async move {
                 // Initialize multipart upload
-                let upload = store.put_multipart(&path_clone).await
+                let upload = store
+                    .put_multipart(&path_clone)
+                    .await
                     .map_err(|e| format!("Failed to initiate multipart upload: {}", e))?;
 
                 let mut writer = WriteMultipart::new(upload);
@@ -226,7 +241,9 @@ impl StreamingCloudWriter {
                 }
 
                 // Complete the multipart upload
-                writer.finish().await
+                writer
+                    .finish()
+                    .await
                     .map_err(|e| format!("Failed to complete multipart upload: {}", e))?;
 
                 Ok(())
@@ -290,7 +307,10 @@ impl StreamingCloudWriter {
         if let Some(handle) = self.upload_handle.take() {
             match handle.join() {
                 Ok(Ok(())) => {
-                    tracing::trace!("StreamingCloudWriter: upload complete, {} bytes total", self.total_bytes);
+                    tracing::trace!(
+                        "StreamingCloudWriter: upload complete, {} bytes total",
+                        self.total_bytes
+                    );
                 }
                 Ok(Err(e)) => {
                     return Err(HailError::Io(std::io::Error::new(

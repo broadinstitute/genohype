@@ -60,10 +60,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                         }
                     }
                     // Otherwise send as log line
-                    let _ = tx.send(WorkerMessage::Log {
-                        worker_id,
-                        line: l,
-                    });
+                    let _ = tx.send(WorkerMessage::Log { worker_id, line: l });
                 }
             }
         }

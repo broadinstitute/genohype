@@ -54,7 +54,10 @@ impl ManhattanJobConfig {
     /// Get the effective input directory for ingestion.
     /// Falls back to job.output_dir if ingest.input_dir is not specified.
     pub fn ingest_input_dir(&self) -> Option<String> {
-        self.ingest.input_dir.clone().or(self.job.output_dir.clone())
+        self.ingest
+            .input_dir
+            .clone()
+            .or(self.job.output_dir.clone())
     }
 }
 

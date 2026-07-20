@@ -90,7 +90,9 @@ pub(crate) async fn get_history_job_summary(
                 eta_secs: None,
                 is_complete: job.status == "completed",
                 input_path: job.input_path,
-                job_spec: job.job_spec_json.and_then(|v| serde_json::from_value(v).ok()),
+                job_spec: job
+                    .job_spec_json
+                    .and_then(|v| serde_json::from_value(v).ok()),
                 idle: true,
                 last_error: if job.status == "failed" {
                     Some("Job failed".to_string())
@@ -116,7 +118,9 @@ pub(crate) async fn get_history_job_summary(
 pub(crate) async fn get_history_job_metrics(
     axum::extract::State(state): axum::extract::State<SharedState>,
     axum::extract::Path(job_id): axum::extract::Path<String>,
-    axum::extract::Query(query): axum::extract::Query<crate::distributed::coordinator::api::jobs::SinceQuery>,
+    axum::extract::Query(query): axum::extract::Query<
+        crate::distributed::coordinator::api::jobs::SinceQuery,
+    >,
 ) -> axum::Json<DashboardMetrics> {
     let data = state.lock().unwrap();
 
@@ -128,7 +132,12 @@ pub(crate) async fn get_history_job_metrics(
                 .iter()
                 .map(|(id, state)| WorkerMetricsSeries {
                     worker_id: id.clone(),
-                    snapshots: state.metrics_history.iter().filter(|s| s.timestamp_ms > query.since_ms).cloned().collect(),
+                    snapshots: state
+                        .metrics_history
+                        .iter()
+                        .filter(|s| s.timestamp_ms > query.since_ms)
+                        .cloned()
+                        .collect(),
                 })
                 .collect();
             return axum::Json(DashboardMetrics { workers });
@@ -248,8 +257,7 @@ pub(crate) async fn get_history_job_batch(
                     batch.phenotype_statuses.values().cloned().collect();
                 return axum::Json(BatchStatusResponse { phenotypes });
             } else if let Some(ref last_batch) = data.last_completed_batch {
-                let phenotypes: Vec<PhenotypeStatus> =
-                    last_batch.values().cloned().collect();
+                let phenotypes: Vec<PhenotypeStatus> = last_batch.values().cloned().collect();
                 return axum::Json(BatchStatusResponse { phenotypes });
             }
         }

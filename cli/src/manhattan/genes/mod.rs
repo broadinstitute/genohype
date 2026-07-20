@@ -6,16 +6,16 @@
 //! - Identification of significant regions of interest
 //! - Parquet export for ClickHouse ingestion
 
-use genohype_core::codec::EncodedValue;
-use genohype_core::io::{is_cloud_path, StreamingCloudWriter};
 use crate::manhattan::config::ResolvedStyle;
 use crate::manhattan::data::{GeneAssociationRow, GenePlotPoint, PlotPoint};
 use crate::manhattan::gene_writer::GeneAssociationWriter;
 use crate::manhattan::layout::{ChromosomeLayout, YScale};
 use crate::manhattan::reference::{calculate_xpos, get_contig_lengths, normalize_contig_name};
 use crate::manhattan::render::ManhattanRenderer;
-use genohype_core::query::{IntervalList, QueryEngine};
 use crate::Result;
+use genohype_core::codec::EncodedValue;
+use genohype_core::io::{is_cloud_path, StreamingCloudWriter};
+use genohype_core::query::{IntervalList, QueryEngine};
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -95,8 +95,14 @@ impl GeneMap {
                 let stop = get_int("stop");
                 let strand = get_str("strand");
 
-                if let (Some(id), Some(symbol), Some(chrom), Some(start), Some(stop), Some(strand)) =
-                    (id, symbol, chrom, start, stop, strand)
+                if let (
+                    Some(id),
+                    Some(symbol),
+                    Some(chrom),
+                    Some(start),
+                    Some(stop),
+                    Some(strand),
+                ) = (id, symbol, chrom, start, stop, strand)
                 {
                     genes.push(Gene {
                         id,
@@ -608,13 +614,17 @@ pub fn scan_gene_burden_to_parquet(
                 // Update best p-value globally if this is lower
                 if min_p < tracker.best_pvalue {
                     tracker.best_pvalue = min_p;
-                    tracker.best_test_desc = format!("{}:{}:maf{:.4}", annotation, best_field, max_maf);
+                    tracker.best_test_desc =
+                        format!("{}:{}:maf{:.4}", annotation, best_field, max_maf);
                 }
 
                 // Update best p-value per (annotation, max_maf) group
                 let maf_str = max_maf.to_string();
                 let group_key = (annotation.clone(), maf_str.clone());
-                let group_entry = tracker.group_best_pvalues.entry(group_key).or_insert((1.0, String::new()));
+                let group_entry = tracker
+                    .group_best_pvalues
+                    .entry(group_key)
+                    .or_insert((1.0, String::new()));
                 if min_p < group_entry.0 {
                     group_entry.0 = min_p;
                     group_entry.1 = format!("{}:{}:maf{}", annotation, best_field, maf_str);
@@ -654,14 +664,17 @@ pub fn scan_gene_burden_to_parquet(
 
         // Populate grouped plot points for each (annotation, MAF) combination
         for (group_key, (best_p, best_desc)) in &tracker.group_best_pvalues {
-            plot_points_by_group.entry(group_key.clone()).or_default().push(GenePlotPoint {
-                gene_id: gene_id.clone(),
-                gene_symbol: tracker.symbol.clone(),
-                contig: tracker.contig.clone(),
-                position: tracker.start,
-                best_pvalue: *best_p,
-                best_test: best_desc.clone(),
-            });
+            plot_points_by_group
+                .entry(group_key.clone())
+                .or_default()
+                .push(GenePlotPoint {
+                    gene_id: gene_id.clone(),
+                    gene_symbol: tracker.symbol.clone(),
+                    contig: tracker.contig.clone(),
+                    position: tracker.start,
+                    best_pvalue: *best_p,
+                    best_test: best_desc.clone(),
+                });
         }
 
         // Only include genes with significant tests in significant_genes list
@@ -793,7 +806,12 @@ pub fn render_gene_manhattan_styled(
     let y_scale = YScale::new(height, max_log_p.max(10.0).min(50.0));
 
     // Draw threshold line
-    renderer.render_threshold_line_styled(y_scale.threshold_y(threshold), width, threshold_color, threshold_alpha);
+    renderer.render_threshold_line_styled(
+        y_scale.threshold_y(threshold),
+        width,
+        threshold_color,
+        threshold_alpha,
+    );
 
     // Draw points
     for pt in points {
@@ -862,4 +880,3 @@ impl GeneWriterTrait for CloudGeneWriter {
         Ok(rows)
     }
 }
-

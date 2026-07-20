@@ -28,7 +28,7 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "genohype",
-    version,
+    version = env!("GENOHYPE_VERSION"),
     about = "Hail Table Decoder and Converter",
     long_about = None
 )]

@@ -68,11 +68,7 @@ pub fn run_export_json(args: ExportJsonArgs) -> Result<()> {
         );
     }
     if let Some(l) = args.common.limit {
-        println!(
-            "{} {}",
-            "Row limit:".cyan(),
-            l.to_string().bright_white()
-        );
+        println!("{} {}", "Row limit:".cyan(), l.to_string().bright_white());
     }
 
     // We only support sharded export for JSON currently
@@ -100,8 +96,16 @@ pub fn run_export_json(args: ExportJsonArgs) -> Result<()> {
         println!(
             "{} worker {}/{}",
             "Distributed mode:".cyan(),
-            args.common.partitioning.worker_id.to_string().bright_white(),
-            args.common.partitioning.total_workers.to_string().bright_white()
+            args.common
+                .partitioning
+                .worker_id
+                .to_string()
+                .bright_white(),
+            args.common
+                .partitioning
+                .total_workers
+                .to_string()
+                .bright_white()
         );
     }
     println!();

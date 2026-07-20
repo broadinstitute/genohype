@@ -6,20 +6,18 @@
 //! Includes a background telemetry loop that sends heartbeats with system
 //! metrics to the coordinator for the dashboard UI.
 
-pub mod telemetry;
 pub mod dispatch;
 pub mod handlers;
+pub mod telemetry;
 
-use crate::distributed::message::{
-    CompleteRequest, JobSpec, TaskType, WorkRequest, WorkResponse,
-};
+use crate::distributed::message::{CompleteRequest, JobSpec, TaskType, WorkRequest, WorkResponse};
 use crate::Result;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
 pub use dispatch::dispatch_job;
-pub use telemetry::{TelemetryState, NO_ACTIVE_PARTITION, spawn_telemetry_loop};
+pub use telemetry::{spawn_telemetry_loop, TelemetryState, NO_ACTIVE_PARTITION};
 
 /// Configuration for a worker.
 pub struct WorkerConfig {
@@ -103,17 +101,18 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
 
     loop {
         // Request work from coordinator
-        let work_response = match request_work(&client, &work_url, &config.worker_id, &hardware).await {
-            Ok(resp) => resp,
-            Err(e) => {
-                eprintln!(
-                    "Failed to connect to coordinator: {}. Retrying in {}ms...",
-                    e, config.poll_interval_ms
-                );
-                tokio::time::sleep(Duration::from_millis(config.poll_interval_ms * 2)).await;
-                continue;
-            }
-        };
+        let work_response =
+            match request_work(&client, &work_url, &config.worker_id, &hardware).await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    eprintln!(
+                        "Failed to connect to coordinator: {}. Retrying in {}ms...",
+                        e, config.poll_interval_ms
+                    );
+                    tokio::time::sleep(Duration::from_millis(config.poll_interval_ms * 2)).await;
+                    continue;
+                }
+            };
 
         match work_response {
             WorkResponse::Exit => {
@@ -122,9 +121,8 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
             }
             WorkResponse::UpdateBinary { gcs_url } => {
                 // Use current executable path so we replace exactly what is running
-                let current_exe = std::env::current_exe().unwrap_or_else(|_| {
-                    std::path::PathBuf::from("/usr/local/bin/genohype")
-                });
+                let current_exe = std::env::current_exe()
+                    .unwrap_or_else(|_| std::path::PathBuf::from("/usr/local/bin/genohype"));
                 let exe_path = current_exe.to_string_lossy().to_string();
 
                 println!(
@@ -217,9 +215,12 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
                 let partitions: Vec<usize> = tasks
                     .iter()
                     .filter_map(|t| {
-                        if let Ok(task_type) = serde_json::from_value::<TaskType>(t.payload.clone()) {
+                        if let Ok(task_type) = serde_json::from_value::<TaskType>(t.payload.clone())
+                        {
                             match task_type {
-                                TaskType::Partition { partition_index, .. } => return Some(partition_index),
+                                TaskType::Partition {
+                                    partition_index, ..
+                                } => return Some(partition_index),
                                 TaskType::Stress { iteration } => return Some(iteration),
                                 _ => {}
                             }
@@ -227,7 +228,9 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
                         // Fallback: try to parse the task ID as a partition index
                         t.id.parse::<usize>().ok().or_else(|| {
                             // Secondary fallback for IDs like "stress_0"
-                            t.id.rsplit('_').next().and_then(|s| s.parse::<usize>().ok())
+                            t.id.rsplit('_')
+                                .next()
+                                .and_then(|s| s.parse::<usize>().ok())
                         })
                     })
                     .collect();
@@ -297,7 +300,9 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
                             error: Some(error_msg),
                             session_id: session_id.clone(),
                         };
-                        if let Err(post_err) = client.post(&complete_url).json(&fail_req).send().await {
+                        if let Err(post_err) =
+                            client.post(&complete_url).json(&fail_req).send().await
+                        {
                             eprintln!("Failed to report error to coordinator: {}", post_err);
                         }
                         continue;
@@ -316,7 +321,9 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
                             error: Some(error_msg),
                             session_id: session_id.clone(),
                         };
-                        if let Err(post_err) = client.post(&complete_url).json(&fail_req).send().await {
+                        if let Err(post_err) =
+                            client.post(&complete_url).json(&fail_req).send().await
+                        {
                             eprintln!("Failed to report panic to coordinator: {}", post_err);
                         }
                         continue;
@@ -347,10 +354,7 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
                     // Continue anyway - coordinator will handle duplicates
                 }
 
-                println!(
-                    "Completed tasks {:?} ({} rows)",
-                    task_ids, rows_processed
-                );
+                println!("Completed tasks {:?} ({} rows)", task_ids, rows_processed);
             }
         }
     }
@@ -375,17 +379,12 @@ async fn request_work(
         build_version: Some(env!("GIT_HASH").to_string()),
     };
 
-    let response = client
-        .post(url)
-        .json(&request)
-        .send()
-        .await
-        .map_err(|e| {
-            crate::HailError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("HTTP request failed: {}", e),
-            ))
-        })?;
+    let response = client.post(url).json(&request).send().await.map_err(|e| {
+        crate::HailError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("HTTP request failed: {}", e),
+        ))
+    })?;
 
     let work_response: WorkResponse = response.json().await.map_err(|e| {
         crate::HailError::Io(std::io::Error::new(
@@ -416,17 +415,12 @@ async fn report_completion(
         session_id,
     };
 
-    client
-        .post(url)
-        .json(&request)
-        .send()
-        .await
-        .map_err(|e| {
-            crate::HailError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("HTTP request failed: {}", e),
-            ))
-        })?;
+    client.post(url).json(&request).send().await.map_err(|e| {
+        crate::HailError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("HTTP request failed: {}", e),
+        ))
+    })?;
 
     Ok(())
 }

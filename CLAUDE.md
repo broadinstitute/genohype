@@ -106,8 +106,8 @@ For local ClickHouse testing, see the Docker container running on `localhost:812
 ## Test
 
 ```bash
-cargo test
-cargo test --features full  # test all features
+cargo test --workspace --locked
+cargo test --workspace --all-features --locked
 ```
 
 Test VCFs and Hail tables can be found in `./data/`.
