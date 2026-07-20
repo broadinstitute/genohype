@@ -9,9 +9,12 @@ use axum::response::{IntoResponse, Response};
 use rust_embed::Embed;
 
 /// Embedded static files for the pool-dashboard SPA.
-/// Files are included at compile time from cli/static/dist.
+///
+/// A dashboard build is served from `static/dist` when present. The tracked
+/// `static/index.html` remains a fallback so a clean Cargo checkout can build
+/// without requiring Node.js.
 #[derive(Embed)]
-#[folder = "static/dist"]
+#[folder = "static"]
 pub(crate) struct DashboardAssets;
 
 /// Handler for serving embedded dashboard assets.
@@ -29,12 +32,17 @@ pub(crate) async fn serve_dashboard_index() -> impl IntoResponse {
 
 /// Serve an embedded file by path, with SPA fallback to index.html.
 pub(crate) fn serve_embedded_file(path: &str) -> Response {
-    // Try to get the requested file
-    let file = DashboardAssets::get(path).or_else(|| {
+    let get_asset = |asset_path: &str| {
+        let built_path = format!("dist/{asset_path}");
+        DashboardAssets::get(&built_path).or_else(|| DashboardAssets::get(asset_path))
+    };
+
+    // Prefer the compiled React app, then use the tracked fallback dashboard.
+    let file = get_asset(path).or_else(|| {
         // For SPA routing: if the path doesn't exist, serve index.html
         // (unless it looks like a file request with an extension)
         if !path.contains('.') {
-            DashboardAssets::get("index.html")
+            get_asset("index.html")
         } else {
             None
         }

@@ -19,5 +19,5 @@ fn main() {
     println!("cargo:rerun-if-changed=.git/index");
 
     // Re-run if embedded dashboard files change (for rust-embed)
-    println!("cargo:rerun-if-changed=static/dist");
+    println!("cargo:rerun-if-changed=static");
 }
