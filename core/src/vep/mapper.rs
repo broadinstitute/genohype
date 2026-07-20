@@ -234,6 +234,7 @@ mod tests {
                 polyphen: Some("benign(0.1)".to_string()),
                 supplementary: Vec::new(),
                 acmg_classification: None,
+                loftee: None,
             }],
             canonical: true,
             strand: Strand::Forward,

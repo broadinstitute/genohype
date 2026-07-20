@@ -458,10 +458,13 @@ impl QueryEngine {
 mod tests {
     use super::*;
 
+    fn keyed_fixture() -> &'static str {
+        "tests/fixtures/tiny-keyed.ht"
+    }
+
     #[test]
     fn test_query_engine_open() {
-        let engine = QueryEngine::open("data/gene_models_hds/ht/prep_table.ht")
-            .expect("Failed to open table");
+        let engine = QueryEngine::open_path(keyed_fixture()).expect("failed to open fixture table");
 
         assert_eq!(engine.key_fields(), &["gene_id", "chrom", "start"]);
         assert_eq!(engine.num_partitions(), 1);
@@ -470,10 +473,9 @@ mod tests {
 
     #[test]
     fn test_query_engine_lookup() {
-        let mut engine = QueryEngine::open("data/gene_models_hds/ht/prep_table.ht")
-            .expect("Failed to open table");
+        let mut engine =
+            QueryEngine::open_path(keyed_fixture()).expect("failed to open fixture table");
 
-        // Create a key to lookup
         let key = EncodedValue::Struct(vec![
             (
                 "gene_id".to_string(),
@@ -483,7 +485,7 @@ mod tests {
             ("start".to_string(), EncodedValue::Int32(121478332)),
         ]);
 
-        let result = engine.lookup(&key);
-        assert!(result.is_ok(), "Lookup failed: {:?}", result.err());
+        let row = engine.lookup(&key).expect("lookup should succeed");
+        assert!(row.is_some(), "fixture key should be present");
     }
 }

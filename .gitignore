@@ -8,6 +8,13 @@ test_hail_data/__pycache__
 target/
 Cargo.lock
 
+# The tiny Hail test fixture includes directories named `parts`, which may be
+# ignored by contributor-level Git configuration. Keep its required data files.
+!core/tests/fixtures/tiny-keyed.ht/globals/parts/
+!core/tests/fixtures/tiny-keyed.ht/globals/parts/part-0
+!core/tests/fixtures/tiny-keyed.ht/rows/parts/
+!core/tests/fixtures/tiny-keyed.ht/rows/parts/part-0
+
 # IDE
 .idea/
 .vscode/

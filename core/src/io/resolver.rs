@@ -26,7 +26,7 @@ pub type ResolvedStore = (Arc<dyn ObjectStore>, ObjPath);
 /// use genohype_core::io::resolve_url;
 ///
 /// let (store, path) = resolve_url("gs://my-bucket/data/file.parquet")?;
-/// # Ok::<(), hail_decoder::HailError>(())
+/// # Ok::<(), genohype_core::HailError>(())
 /// ```
 pub fn resolve_url(url_str: &str) -> Result<ResolvedStore> {
     let url =

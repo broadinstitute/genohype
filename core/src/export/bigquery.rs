@@ -400,8 +400,6 @@ mod tests {
         };
 
         let bq_schema = generate_bq_schema(&schema).unwrap();
-        assert!(bq_schema.fields.is_some());
-        let fields = bq_schema.fields.unwrap();
-        assert_eq!(fields.len(), 2);
+        assert_eq!(bq_schema.fields.len(), 2);
     }
 }

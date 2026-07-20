@@ -675,6 +675,9 @@ mod tests {
             catalog: None,
             ingested_phenotypes: HashSet::new(),
             completed_phenotypes: HashSet::new(),
+            last_completed_batch: None,
+            cached_vms: None,
+            deleted_workers: HashSet::new(),
         };
 
         // Insert the active task with UUID as key and all partition_ids
@@ -775,6 +778,9 @@ mod tests {
             catalog: None,
             ingested_phenotypes: HashSet::new(),
             completed_phenotypes: HashSet::new(),
+            last_completed_batch: None,
+            cached_vms: None,
+            deleted_workers: HashSet::new(),
         };
 
         let mut batch = create_test_batch_state();
@@ -846,6 +852,9 @@ mod tests {
             catalog: None,
             ingested_phenotypes: HashSet::new(),
             completed_phenotypes: HashSet::new(),
+            last_completed_batch: None,
+            cached_vms: None,
+            deleted_workers: HashSet::new(),
         };
 
         // Insert aggregate batch task keyed by UUID (as coordinator does)

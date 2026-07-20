@@ -17,15 +17,16 @@ use crate::traits::GenomicDataProvider;
 /// # Usage
 ///
 /// ```rust,no_run
-/// use genohype_mcp::{GenomicToolServer, GenomicDataProvider};
-/// use rmcp::transport::io::stdio;
+/// use std::sync::Arc;
+/// use genohype_mcp::{GenomicDataProvider, GenomicToolServer};
+/// use rmcp::{transport::io::stdio, ServiceExt};
 ///
-/// let provider = Arc::new(my_provider);
-/// let server = GenomicToolServer::new(provider);
-///
-/// // Run as stdio MCP server
-/// let service = server.serve(stdio()).await?;
-/// service.waiting().await?;
+/// async fn run(provider: Arc<dyn GenomicDataProvider>) -> anyhow::Result<()> {
+///     let server = GenomicToolServer::new(provider);
+///     let service = server.serve(stdio()).await?;
+///     service.waiting().await?;
+///     Ok(())
+/// }
 /// ```
 #[derive(Clone)]
 pub struct GenomicToolServer {

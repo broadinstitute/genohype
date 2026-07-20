@@ -297,24 +297,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_gene_models_rows_metadata() {
-        let metadata = RVDComponentSpec::from_file(
-            "data/gene_models_hds/ht/prep_table.ht/rows/metadata.json.gz",
-        )
-        .expect("Failed to parse metadata");
+    fn test_parse_keyed_rows_metadata() {
+        let fixture =
+            std::path::PathBuf::from("tests/fixtures/tiny-keyed.ht/rows/metadata.json.gz");
+        let metadata =
+            RVDComponentSpec::from_file(fixture).expect("failed to parse fixture rows metadata");
 
-        // Check key fields
         assert_eq!(metadata.key, vec!["gene_id", "chrom", "start"]);
 
-        // Check index spec exists
-        assert!(metadata.index_spec.is_some());
-        let index_spec = metadata.index_spec.unwrap();
+        let index_spec = metadata.index_spec.expect("fixture should have an index");
         assert_eq!(index_spec.rel_path, "../index");
-
-        // Check partition bounds
         assert_eq!(metadata.range_bounds.len(), 1);
-
-        // Check part files
-        assert_eq!(metadata.part_files.len(), 1);
+        assert_eq!(metadata.part_files, vec!["part-0"]);
     }
 }

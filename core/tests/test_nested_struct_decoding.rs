@@ -2,7 +2,6 @@
 ///!
 ///! This test isolates the `interval` field decoding to verify that nested structs
 ///! correctly read their own bitmaps.
-
 use genohype_core::buffer::InputBuffer;
 use genohype_core::codec::{EncodedField, EncodedType, EncodedValue};
 use genohype_core::Result;
@@ -31,8 +30,9 @@ impl TestBuffer {
 
 impl InputBuffer for TestBuffer {
     fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
-        self.cursor.read_exact(buf)
-            .map_err(|e| hail_decoder::error::HailError::Io(e))
+        self.cursor
+            .read_exact(buf)
+            .map_err(|e| genohype_core::HailError::Io(e))
     }
 }
 
@@ -148,32 +148,49 @@ fn test_decode_interval_struct() {
     // includesEnd boolean (true = 1)
     test_data.push(0x01);
 
-    println!("\nTest data ({} bytes): {:02x?}", test_data.len(), test_data);
+    println!(
+        "\nTest data ({} bytes): {:02x?}",
+        test_data.len(),
+        test_data
+    );
 
     // Create a buffer with the test data
     let mut buffer = TestBuffer::new(test_data);
 
     // Decode using read_present_value (simulating that the parent already checked presence)
-    let result = interval_struct.read_present_value(&mut buffer)
+    let result = interval_struct
+        .read_present_value(&mut buffer)
         .expect("Failed to decode interval struct");
 
     // Validate the result
     if let EncodedValue::Struct(fields) = result {
-        println!("\n✓ Successfully decoded interval with {} fields", fields.len());
+        println!(
+            "\n✓ Successfully decoded interval with {} fields",
+            fields.len()
+        );
         assert_eq!(fields.len(), 4);
 
         // Check start struct
-        let start = fields.iter().find(|(name, _)| name == "start")
+        let start = fields
+            .iter()
+            .find(|(name, _)| name == "start")
             .expect("Missing start field");
         if let (_, EncodedValue::Struct(start_fields)) = start {
-            let contig = start_fields.iter().find(|(name, _)| name == "contig")
+            let contig = start_fields
+                .iter()
+                .find(|(name, _)| name == "contig")
                 .and_then(|(_, val)| val.as_string())
                 .expect("Missing contig in start");
-            let position = start_fields.iter().find(|(name, _)| name == "position")
+            let position = start_fields
+                .iter()
+                .find(|(name, _)| name == "position")
                 .and_then(|(_, val)| val.as_i32())
                 .expect("Missing position in start");
 
-            println!("  start: {{ contig: \"{}\", position: {} }}", contig, position);
+            println!(
+                "  start: {{ contig: \"{}\", position: {} }}",
+                contig, position
+            );
             assert_eq!(contig, "chr10");
             assert_eq!(position, 972470716);
         } else {
@@ -181,17 +198,26 @@ fn test_decode_interval_struct() {
         }
 
         // Check end struct
-        let end = fields.iter().find(|(name, _)| name == "end")
+        let end = fields
+            .iter()
+            .find(|(name, _)| name == "end")
             .expect("Missing end field");
         if let (_, EncodedValue::Struct(end_fields)) = end {
-            let contig = end_fields.iter().find(|(name, _)| name == "contig")
+            let contig = end_fields
+                .iter()
+                .find(|(name, _)| name == "contig")
                 .and_then(|(_, val)| val.as_string())
                 .expect("Missing contig in end");
-            let position = end_fields.iter().find(|(name, _)| name == "position")
+            let position = end_fields
+                .iter()
+                .find(|(name, _)| name == "position")
                 .and_then(|(_, val)| val.as_i32())
                 .expect("Missing position in end");
 
-            println!("  end: {{ contig: \"{}\", position: {} }}", contig, position);
+            println!(
+                "  end: {{ contig: \"{}\", position: {} }}",
+                contig, position
+            );
             assert_eq!(contig, "chr10");
             assert_eq!(position, 972940282);
         } else {
@@ -199,9 +225,13 @@ fn test_decode_interval_struct() {
         }
 
         // Check booleans
-        let includes_start = fields.iter().find(|(name, _)| name == "includesStart")
+        let includes_start = fields
+            .iter()
+            .find(|(name, _)| name == "includesStart")
             .map(|(_, val)| val);
-        let includes_end = fields.iter().find(|(name, _)| name == "includesEnd")
+        let includes_end = fields
+            .iter()
+            .find(|(name, _)| name == "includesEnd")
             .map(|(_, val)| val);
 
         if let Some(EncodedValue::Boolean(true)) = includes_start {
@@ -223,5 +253,9 @@ fn test_decode_interval_struct() {
 
     // Verify we consumed all bytes
     let remaining = buffer.get_ref().len() - buffer.position() as usize;
-    assert_eq!(remaining, 0, "Should have consumed all bytes, {} remaining", remaining);
+    assert_eq!(
+        remaining, 0,
+        "Should have consumed all bytes, {} remaining",
+        remaining
+    );
 }

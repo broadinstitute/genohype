@@ -52,7 +52,7 @@ const UPLOAD_CHANNEL_CAPACITY: usize = 4;
 /// let writer = CloudWriter::new("gs://bucket/path/output.parquet")?;
 /// // Write data...
 /// writer.finish()?; // Uploads to GCS
-/// # Ok::<(), hail_decoder::HailError>(())
+/// # Ok::<(), genohype_core::HailError>(())
 /// ```
 pub struct CloudWriter {
     /// The object store to write to
@@ -71,8 +71,10 @@ impl CloudWriter {
     ///
     /// # Example
     /// ```no_run
+    /// use genohype_core::io::CloudWriter;
+    ///
     /// let writer = CloudWriter::new("gs://my-bucket/output.parquet")?;
-    /// # Ok::<(), hail_decoder::HailError>(())
+    /// # Ok::<(), genohype_core::HailError>(())
     /// ```
     pub fn new(url_str: &str) -> Result<Self> {
         let (store, path) = crate::io::resolve_url_for_write(url_str)?;
@@ -172,14 +174,16 @@ impl Write for CloudWriter {
 /// ## Usage
 ///
 /// ```no_run
+/// use std::io::Write;
 /// use genohype_core::io::StreamingCloudWriter;
 ///
+/// let data = b"example output";
 /// let mut writer = StreamingCloudWriter::new("gs://bucket/large-file.parquet")?;
 /// // Write data in chunks - uploads happen in background
-/// writer.write_all(&data)?;
+/// writer.write_all(data)?;
 /// // Finish uploads and complete the multipart upload
 /// writer.finish()?;
-/// # Ok::<(), hail_decoder::HailError>(())
+/// # Ok::<(), genohype_core::HailError>(())
 /// ```
 pub struct StreamingCloudWriter {
     /// Channel to send completed parts to the upload task

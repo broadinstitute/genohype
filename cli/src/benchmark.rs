@@ -5,6 +5,8 @@
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+#[cfg(feature = "benchmark")]
+use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 #[cfg(feature = "benchmark")]
@@ -764,4 +766,49 @@ impl MetricsCollector {
             row_size_stats,
         }
     }
+}
+
+/// Get total disk I/O bytes (read, write) from /proc/diskstats on Linux.
+#[cfg(all(feature = "benchmark", target_os = "linux"))]
+fn get_disk_io_bytes() -> (u64, u64) {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    let mut total_read = 0u64;
+    let mut total_write = 0u64;
+
+    if let Ok(file) = File::open("/proc/diskstats") {
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 10 {
+                continue;
+            }
+
+            // Count whole disks, not partitions or virtual loop/RAM devices.
+            let name = parts[2];
+            if (name.chars().last().is_some_and(|c| c.is_ascii_digit())
+                && !name.starts_with("nvme"))
+                || name.contains("loop")
+                || name.contains("ram")
+            {
+                continue;
+            }
+
+            if let (Ok(read_sectors), Ok(write_sectors)) =
+                (parts[5].parse::<u64>(), parts[9].parse::<u64>())
+            {
+                // Linux reports sectors in 512-byte units.
+                total_read += read_sectors * 512;
+                total_write += write_sectors * 512;
+            }
+        }
+    }
+
+    (total_read, total_write)
+}
+
+/// Disk I/O counters are unavailable on systems without /proc/diskstats.
+#[cfg(all(feature = "benchmark", not(target_os = "linux")))]
+fn get_disk_io_bytes() -> (u64, u64) {
+    (0, 0)
 }

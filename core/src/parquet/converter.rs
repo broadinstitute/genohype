@@ -14,7 +14,7 @@
 //!
 //! // Write to local disk
 //! hail_to_parquet_sharded("gs://bucket/input.ht", "/local/output/", true, None)?;
-//! # Ok::<(), hail_decoder::HailError>(())
+//! # Ok::<(), genohype_core::HailError>(())
 //! ```
 //!
 //! When output is a cloud path, each partition is buffered in memory and uploaded
@@ -50,7 +50,7 @@ use std::thread;
 ///
 /// let rows_written = hail_to_parquet("input.ht", "output.parquet")?;
 /// println!("Wrote {} rows", rows_written);
-/// # Ok::<(), hail_decoder::HailError>(())
+/// # Ok::<(), genohype_core::HailError>(())
 /// ```
 pub fn hail_to_parquet(input_path: &str, output_path: &str) -> Result<usize> {
     hail_to_parquet_with_progress(input_path, output_path, true)

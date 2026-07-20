@@ -1,5 +1,4 @@
 ///! Test EType parser with real metadata from the gene models table
-
 use genohype_core::codec::ETypeParser;
 
 #[test]

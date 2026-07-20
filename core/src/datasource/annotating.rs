@@ -208,12 +208,19 @@ mod tests {
 
     #[test]
     fn test_annotating_datasource_with_vcf() {
-        let vcf_path = "../data/test/pcsk9_test.vcf";
-        let gff3_path = "../data/test/pcsk9_transcripts.gff3";
+        let fixtures = std::path::PathBuf::from("tests/fixtures/vep");
+        let vcf_path = fixtures.join("pcsk9_test.vcf");
 
-        let vcf_source = crate::vcf::VcfDataSource::new(vcf_path).unwrap();
+        // fastVEP creates a cache beside the GFF3. Use a temporary copy so the
+        // checked-in fixture remains immutable when tests run.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let gff3_path = temp_dir.path().join("pcsk9_transcripts.gff3");
+        std::fs::copy(fixtures.join("pcsk9_transcripts.gff3"), &gff3_path).unwrap();
+
+        let vcf_source =
+            crate::vcf::VcfDataSource::new(vcf_path.to_string_lossy().as_ref()).unwrap();
         let options = VepInitOptions {
-            gff3: gff3_path.to_string(),
+            gff3: gff3_path.to_string_lossy().into_owned(),
             fasta: None,
             sa_dir: None,
             distance: 5000,
