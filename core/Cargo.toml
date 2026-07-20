@@ -3,7 +3,7 @@ name = "genohype-core"
 version = "0.1.0"
 edition = "2021"
 description = "Core data engine for Hail table format decoding and Parquet conversion"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 
 [features]
 default = ["gcp", "validation"]

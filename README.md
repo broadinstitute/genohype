@@ -293,3 +293,7 @@ cargo test --features full  # test all features
 - **Streaming by Default** - Memory-efficient processing of arbitrarily large datasets
 - **Parquet as Intermediate** - Bridge between row-oriented sources and columnar targets
 - **Consistent CLI** - Same `--where`/`--limit`/`--interval` options work across all commands
+
+## License
+
+Genohype is available under the [MIT License](LICENSE).

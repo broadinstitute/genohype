@@ -3,6 +3,7 @@ name = "genohype-pool"
 version = "0.1.0"
 edition = "2021"
 description = "Generic distributed worker pool library"
+license = "MIT"
 
 [dependencies]
 async-trait = "0.1"
