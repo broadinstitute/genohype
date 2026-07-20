@@ -251,8 +251,11 @@ cargo build --release --features full
 ## Testing
 
 ```bash
-cargo test
-cargo test --features full  # test all features
+cargo test --workspace
+cargo test --workspace --all-features
+
+# Build the existing pool dashboard and run the complete local CI suite
+./scripts/verify.sh
 ```
 
 ## Architecture
