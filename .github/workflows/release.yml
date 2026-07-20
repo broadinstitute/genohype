@@ -36,6 +36,12 @@ jobs:
         run: |
           ./scripts/check-release-version.sh "$RELEASE_TAG"
 
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && \
+                "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "error: manual release dry runs must use the main branch" >&2
+            exit 1
+          fi
+
           if [[ "$GITHUB_EVENT_NAME" == "push" ]] && \
              ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
             echo "error: release tags must point to a commit on main" >&2
@@ -154,7 +160,13 @@ jobs:
           fi
 
           if [[ "$USE_ZIG" == "true" ]]; then
-            ldd "$binary"
+            dynamic_dependencies="$(ldd "$binary")"
+            echo "$dynamic_dependencies"
+            if grep -Eiq 'lib(ssl|crypto)\.so' <<< "$dynamic_dependencies"; then
+              echo "error: Linux binary has an OpenSSL runtime dependency" >&2
+              exit 1
+            fi
+
             highest_glibc="$(
               strings "$binary" \
                 | grep -Eo 'GLIBC_[0-9]+(\\.[0-9]+)+' \

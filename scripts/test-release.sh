@@ -41,6 +41,19 @@ for asset in "${expected_assets[@]}"; do
     test -s "$temp_dir/release/$asset"
 done
 
+for target in \
+    aarch64-apple-darwin \
+    x86_64-apple-darwin \
+    x86_64-unknown-linux-gnu
+do
+    archive_contents="$(tar -tzf "$temp_dir/release/genohype-v0.1.0-$target.tar.gz")"
+    grep -qx genohype <<< "$archive_contents"
+    grep -qx LICENSE <<< "$archive_contents"
+done
+worker_contents="$(tar -tzf "$temp_dir/release/genohype-worker-v0.1.0-x86_64-unknown-linux-gnu.tar.gz")"
+grep -qx genohype-worker <<< "$worker_contents"
+grep -qx LICENSE <<< "$worker_contents"
+
 if command -v sha256sum >/dev/null 2>&1; then
     (cd "$temp_dir/release" && sha256sum --check SHA256SUMS)
 else
