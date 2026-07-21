@@ -1,8 +1,10 @@
-# Genohype
+<br>
 
 <p align="center">
-  <img src="docs/branding/genohype-wordmark.png" alt="GENOHYPE logo" width="720">
+  <img src="docs/branding/genohype-wordmark.png" alt="GENOHYPE" width="360">
 </p>
+
+<br>
 
 A fast, memory-efficient toolkit for genomic data processing. Read Hail tables and VCF files, export to Parquet/ClickHouse/BigQuery, generate Manhattan plots, and run distributed jobs on GCP.
 
