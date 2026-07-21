@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GENOHYPE logo</title>
+  <!--
+    Recovered from the original TypeScript app in mattsolo1/genohype,
+    commit 532a5fc0967e99f64e06ab98e42f1f0f3a73b44c:
+      frontend/src/Home.tsx
+      frontend/src/home.css
+
+    The wrapper only scales and centers the original CSS wordmark. Render at
+    1280 x 640 for GitHub's social preview, or at 1800 x 620 with the
+    ?transparent query parameter for the high-resolution README wordmark.
+  -->
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+    }
+
+    body {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      background: linear-gradient(135deg, #f5f5f7 0%, #e8e8ec 50%, #dadae6 100%);
+    }
+
+    body.transparent {
+      background: transparent;
+    }
+
+    .logoScale {
+      transform: translateY(40px) scale(1.5);
+    }
+
+    @media (min-width: 1600px) {
+      .logoScale {
+        transform: translateY(80px) scale(3);
+      }
+    }
+
+    .genohype {
+      position: relative;
+      margin-bottom: 150px;
+      font-family: sans-serif;
+      font-size: 80px;
+      color: #fff;
+      text-transform: uppercase;
+      letter-spacing: 5px;
+      font-weight: 900;
+      -webkit-text-stroke: 2px #000;
+      text-stroke: 5px #000;
+      text-shadow:
+        5px 5px 0 #fe4418,
+        10px 10px 0 #fec80d,
+        15px 15px 0 #d1d62e,
+        20px 20px 0 #86d16f,
+        25px 25px 0 #30ab9f;
+    }
+
+    .genohype::after {
+      content: "GENOHYPE";
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: -100px;
+      text-align: center;
+      transform: scaleY(-1);
+      color: #fff;
+      text-stroke: 0;
+      -webkit-text-stroke: 0;
+      text-shadow:
+        5px 5px 0 #fe4418,
+        10px 10px 0 #fec80d,
+        15px 15px 0 #d1d62e,
+        20px 20px 0 #86d16f,
+        25px 25px 0 #30ab9f;
+      opacity: 0.2;
+      background: linear-gradient(
+        to bottom,
+        rgba(255, 255, 255, 0.7) 20%,
+        rgba(255, 255, 255, 0) 100%
+      );
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+  </style>
+</head>
+<body>
+  <div class="logoScale">
+    <div class="genohype">GENOHYPE</div>
+  </div>
+  <script>
+    if (new URLSearchParams(window.location.search).has('transparent')) {
+      document.body.classList.add('transparent');
+    }
+  </script>
+</body>
+</html>
