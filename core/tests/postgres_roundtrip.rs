@@ -9,7 +9,7 @@
 //! it exercises the full COPY path: list-partition routing across contigs, the
 //! COPY-into-staging → `ON CONFLICT` upsert, idempotent re-load, and JSONB
 //! payload round-trip — without needing a variant-shaped Hail fixture (the
-//! `test_hail_data` fixtures are generic type tests with no `locus`/`variant_id`).
+//! checked-in decoder fixture has no `locus`/`variant_id`).
 //! Point it at a real gnomAD v4 sites subset to reconcile against a true Hail
 //! source:
 //!
