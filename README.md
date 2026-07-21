@@ -1,4 +1,13 @@
-# Genohype
+<br>
+
+<p align="left">
+  <img src="docs/branding/genohype-wordmark.png" alt="GENOHYPE" width="360"><br>
+  <a href="https://github.com/broadinstitute/genohype/releases/latest"><img src="https://img.shields.io/github/v/release/broadinstitute/genohype?label=release" alt="Latest release"></a>
+  <a href="https://github.com/broadinstitute/genohype/actions/workflows/ci.yml"><img src="https://github.com/broadinstitute/genohype/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI status"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/broadinstitute/genohype" alt="License: MIT"></a>
+</p>
+
+<br>
 
 A fast, memory-efficient toolkit for genomic data processing. Read Hail tables and VCF files, export to Parquet/ClickHouse/BigQuery, generate Manhattan plots, and run distributed jobs on GCP.
 
