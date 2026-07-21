@@ -10,9 +10,9 @@
       frontend/src/Home.tsx
       frontend/src/home.css
 
-    The wrapper only scales and centers the original CSS wordmark. Render at
+    The wrapper scales and positions the original CSS wordmark. Render at
     1280 x 640 for GitHub's social preview, or at 1800 x 620 with the
-    ?transparent query parameter for the high-resolution README wordmark.
+    ?transparent&right query parameters for the right-aligned README wordmark.
   -->
   <style>
     * {
@@ -38,6 +38,10 @@
       background: transparent;
     }
 
+    body.rightAligned {
+      justify-content: flex-end;
+    }
+
     /* Offset the text left to optically balance the rightward color cascade. */
     .logoScale {
       transform: translate(-16px, 40px) scale(1.5);
@@ -46,6 +50,11 @@
     @media (min-width: 1600px) {
       .logoScale {
         transform: translate(-40px, 80px) scale(3);
+      }
+
+      body.rightAligned .logoScale {
+        transform: translate(-75px, 80px) scale(3);
+        transform-origin: right center;
       }
     }
 
@@ -101,8 +110,12 @@
     <div class="genohype">GENOHYPE</div>
   </div>
   <script>
-    if (new URLSearchParams(window.location.search).has('transparent')) {
+    const params = new URLSearchParams(window.location.search);
+    if (params.has('transparent')) {
       document.body.classList.add('transparent');
+    }
+    if (params.has('right')) {
+      document.body.classList.add('rightAligned');
     }
   </script>
 </body>
