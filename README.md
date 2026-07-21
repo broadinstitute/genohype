@@ -291,6 +291,14 @@ cargo test --workspace --all-features
 
 Release maintainers should follow [RELEASING.md](RELEASING.md).
 
+## Project
+
+- [Roadmap](ROADMAP.md)
+- [Contributing guide](CONTRIBUTING.md)
+- [Maintainers](MAINTAINERS.md)
+- [Security policy](SECURITY.md)
+- [Broad Institute Code of Conduct](https://github.com/broadinstitute/.github/blob/main/CODE_OF_CONDUCT.md)
+
 ## Architecture
 
 ```
