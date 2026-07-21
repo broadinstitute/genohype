@@ -7,7 +7,7 @@
 //! dependency). Run it explicitly when an ES is available:
 //!
 //! ```sh
-//! # default table = ../test_hail_data/04_simple_struct.ht, default url = http://localhost:9200
+//! # default table = tests/fixtures/tiny-keyed.ht, default url = http://localhost:9200
 //! GENOHYPE_ES_TEST_URL=http://localhost:9200 \
 //!   cargo test -p genohype-core --features elasticsearch --test elasticsearch_roundtrip -- --ignored --nocapture
 //!
@@ -30,11 +30,11 @@ fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
-/// Default test table: the `{id, info{name, length}}` fixture. `info.length`
-/// (Int32) stands in for `locus.position` to exercise the hoisted-integer path.
+/// Default test table: the checked-in keyed Hail fixture used by the active
+/// decoder and index tests. `start` exercises the hoisted-integer path.
 fn default_table() -> String {
     format!(
-        "{}/../test_hail_data/04_simple_struct.ht",
+        "{}/tests/fixtures/tiny-keyed.ht",
         env!("CARGO_MANIFEST_DIR")
     )
 }
@@ -81,8 +81,8 @@ fn count_source(table: &str) -> usize {
 fn roundtrip_reconciles_counts_idempotent_and_projection() {
     let url = env_or("GENOHYPE_ES_TEST_URL", "http://localhost:9200");
     let table = env_or("GENOHYPE_ES_TEST_TABLE", &default_table());
-    let index_fields_spec = env_or("GENOHYPE_ES_INDEX_FIELDS", "id,info.length");
-    let id_field = env_or("GENOHYPE_ES_ID_FIELD", "id");
+    let index_fields_spec = env_or("GENOHYPE_ES_INDEX_FIELDS", "gene_id,start");
+    let id_field = env_or("GENOHYPE_ES_ID_FIELD", "gene_id");
     let index = env_or("GENOHYPE_ES_TEST_INDEX", "genohype_es_roundtrip_test");
 
     let client = ElasticsearchClient::new(&url);

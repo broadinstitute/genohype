@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Regenerate the tiny keyed Hail table used by Rust tests.
 
-Run with a Python environment containing Hail, for example:
+This provenance script is not part of the normal build or test path. To run it
+without adding a persistent Python environment to the repository, use:
 
-    test_hail_data/.venv/bin/python core/tests/fixtures/generate_tiny_keyed.py
+    uv run --python 3.12 --with hail python core/tests/fixtures/generate_tiny_keyed.py
 """
 
 import gzip
