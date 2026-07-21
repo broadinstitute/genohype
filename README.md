@@ -1,6 +1,6 @@
 <br>
 
-<p align="right">
+<p align="left">
   <img src="docs/branding/genohype-wordmark.png" alt="GENOHYPE" width="360">
 </p>
 

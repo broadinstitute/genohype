@@ -12,7 +12,7 @@
 
     The wrapper scales and positions the original CSS wordmark. Render at
     1280 x 640 for GitHub's social preview, or at 1800 x 620 with the
-    ?transparent&right query parameters for the right-aligned README wordmark.
+    ?transparent&left query parameters for the left-aligned README wordmark.
   -->
   <style>
     * {
@@ -38,6 +38,10 @@
       background: transparent;
     }
 
+    body.leftAligned {
+      justify-content: flex-start;
+    }
+
     body.rightAligned {
       justify-content: flex-end;
     }
@@ -50,6 +54,11 @@
     @media (min-width: 1600px) {
       .logoScale {
         transform: translate(-40px, 80px) scale(3);
+      }
+
+      body.leftAligned .logoScale {
+        transform: translate(24px, 80px) scale(3);
+        transform-origin: left center;
       }
 
       body.rightAligned .logoScale {
@@ -113,6 +122,9 @@
     const params = new URLSearchParams(window.location.search);
     if (params.has('transparent')) {
       document.body.classList.add('transparent');
+    }
+    if (params.has('left')) {
+      document.body.classList.add('leftAligned');
     }
     if (params.has('right')) {
       document.body.classList.add('rightAligned');
