@@ -41,6 +41,7 @@ Install the latest prebuilt release on Apple Silicon macOS, Intel macOS, or x86-
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/broadinstitute/genohype/main/scripts/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
 genohype --version
 ```
 
@@ -427,35 +428,6 @@ Each downstream repository documents its own maturity, deployment, and supported
 - [Maintainers](MAINTAINERS.md)
 - [Security policy](SECURITY.md)
 - [Broad Institute Code of Conduct](https://github.com/broadinstitute/.github/blob/main/CODE_OF_CONDUCT.md)
-
-## Architecture
-
-```mermaid
-flowchart LR
-    H[Hail tables] --> C[genohype-core<br/>DataSource + QueryEngine]
-    V[VCF] --> C
-    B[BGZF BED-like data] --> C
-    S[Local / GCS / S3 / HTTP] --> C
-
-    C --> CLI[genohype CLI]
-    C --> APP[Downstream Rust applications]
-    P[genohype-pool] --> CLI
-    P --> APP
-    M[genohype-mcp] --> APP
-
-    CLI --> F[Parquet / NDJSON / VCF / Hail]
-    APP --> F
-    CLI --> D[ClickHouse / PostgreSQL / Elasticsearch / BigQuery]
-    APP --> D
-```
-
-**Key principles:**
-
-- **Shared data-source abstraction**: Hail, VCF, and BED-like readers expose the same streaming query interface.
-- **Bounded-memory processing**: Iterators and bounded channels keep memory tied to batches rather than total dataset size.
-- **Index-aware access**: Hail partition metadata and tabix indexes prune work for compatible interval queries.
-- **Composable crates**: Applications can reuse data access, worker-pool, or MCP layers without adopting the complete CLI.
-- **Explicit portability boundaries**: Object-storage access and distributed execution are separate capabilities; the current execution adapter provisions GCP.
 
 ## License
 
