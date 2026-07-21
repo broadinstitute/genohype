@@ -9,17 +9,31 @@
 
 <br>
 
-A fast, memory-efficient toolkit for genomic data processing. Read Hail tables and VCF files, export to Parquet/ClickHouse/BigQuery, generate Manhattan plots, and run distributed jobs on GCP.
+Genohype is Rust toolkit for streaming genomic data from Hail tables and VCF files into interoperable files, databases, and applications. The released `genohype` CLI supports inspection, filtering, validation, export, visualization, and distributed GCP processing without requiring Java or a Hail installation. Reusable Rust crates expose the same data-access engine, worker-pool primitives, and MCP interfaces to downstream applications.
 
-## Features
+> [!IMPORTANT]
+> Genohype is pre-1.0 research software. CLI and library interfaces may change, and the [VEP/LOFTEE integration remains experimental](ROADMAP.md#experimental-annotation-status). Full builds support S3 and HTTP data access, but distributed execution currently targets GCP; AWS and HPC execution adapters are not yet available.
 
-- **No Java runtime**: Prebuilt CLI binaries require no JVM or Hail installation
-- **Multiple input formats**: Hail tables (.ht), VCF files (.vcf.bgz with tabix)
-- **Cloud-native**: Read from local disk, GCS, S3, or HTTP URLs
-- **Multiple outputs**: Export to Parquet, VCF, ClickHouse, BigQuery, or Hail format
-- **Visualization**: Generate Manhattan plots and locus plots from GWAS results
-- **Distributed processing**: Run parallel jobs across GCP VM pools
-- **Memory efficient**: Stream datasets of any size with minimal memory
+## Capabilities
+
+- **Unified data access**: Read Hail tables, VCF files, and BGZF-compressed BED-like files through a shared `DataSource` interface
+- **Local and cloud I/O**: Stream from local disk, GCS, S3, or HTTP(S), depending on enabled features
+- **Indexed querying**: Use Hail partition metadata and tabix indexes for genomic interval queries when available
+- **Interoperable outputs**: Write Parquet, NDJSON, VCF, or Hail tables, and load ClickHouse, PostgreSQL, Elasticsearch, or BigQuery
+- **Validation and annotation**: Generate and validate JSON schemas; optionally run the experimental in-process VEP integration
+- **Visualization**: Generate Manhattan and locus plots from GWAS results
+- **Distributed processing**: Run parallel jobs across GCP VM pools with coordinator, worker, and dashboard support
+- **Bounded-memory streaming**: Decode and process rows incrementally rather than loading a complete dataset into memory
+
+## Workspace Components
+
+| Component | Purpose | Distribution status |
+|-----------|---------|---------------------|
+| `genohype` | Installable CLI for querying, export, visualization, and GCP operations | Published as checksummed macOS and x86-64 Linux binaries |
+| `genohype-core` | Data access, codecs, querying, validation, export, and experimental annotation | Reusable Rust crate; pre-1.0 API |
+| `genohype-pool` | Generic coordinator/worker and task-execution primitives | Reusable Rust crate; pre-1.0 API |
+| `genohype-mcp` | Provider trait, domain types, and generic variant, gene, and region tools | Reusable Rust crate; no standalone MCP binary |
+| `ui/` | React assistant components and a CopilotKit-to-MCP bridge | Experimental source packages; not part of the binary release or primary CI |
 
 ## Installation
 
@@ -45,18 +59,20 @@ less install.sh
 sh install.sh
 ```
 
-To build from source instead:
+Published release binaries are built with the `full` CLI feature set. The optional `genohype-server` binary and the JavaScript packages under `ui/` are not distributed as separate release artifacts.
+
+To build the CLI from source instead:
 
 ```bash
-# Default build (GCS support)
+# Default source build
 ./scripts/build-dashboard.sh
-cargo build --release --locked
+cargo build --release --locked --package genohype-cli --bin genohype
 
-# Local files only (fastest compile)
-cargo build --release --locked --no-default-features
+# Match the feature set used for published CLI releases
+cargo build --release --locked --package genohype-cli --bin genohype --features full
 
-# Build with all features
-cargo build --release --locked --features full
+# Build the optional HTTP server from source
+cargo build --release --locked --package genohype-cli --bin genohype-server --features server
 ```
 
 ## Quick Start
@@ -71,53 +87,70 @@ genohype query path/to/table.ht --where ancestry=EUR --limit 10
 # Export to Parquet
 genohype export parquet path/to/table.ht output.parquet
 
-# Query cloud tables directly
+# The current GCS client uses Google Application Default Credentials,
+# including when reading public buckets.
+gcloud auth application-default login
 genohype info "gs://gcp-public-data--gnomad/release/4.1/ht/exomes/gnomad.exomes.v4.1.sites.ht"
 ```
 
 ## Commands
 
-### Data Exploration
+### Data Access
 
 | Command | Description |
 |---------|-------------|
-| `info` | Show table metadata without scanning data (fast) |
-| `summary` | Full scan to calculate row counts and field statistics |
-| `query` | Stream rows with optional filtering |
+| `info` | Show metadata, keys, partition layout, schema, and optional globals |
+| `summary` | Scan a dataset to calculate row counts and field statistics |
+| `query` | Stream rows with optional field and interval filters |
+| `vcf index` | Create a tabix index for a BGZF-compressed VCF |
+| `cache clear` | Clear locally cached Hail metadata |
 
 ### Export
 
 | Command | Description |
 |---------|-------------|
-| `export parquet` | Convert to Parquet format |
-| `export vcf` | Export to VCF format |
-| `export hail` | Export to Hail table format (useful for subsetting) |
-| `export clickhouse` | Export to ClickHouse database |
-| `export bigquery` | Export to BigQuery |
+| `export parquet` | Export to Parquet |
+| `export json` | Export newline-delimited JSON |
+| `export vcf` | Export to VCF |
+| `export hail` | Export a subset as a Hail table |
+| `export clickhouse` | Load a ClickHouse table |
+| `export postgres` | Load a PostgreSQL table |
+| `export elasticsearch` | Load an Elasticsearch index |
+| `export bigquery` | Load a BigQuery table through GCS staging |
+| `export cache-build` | Materialize per-gene response-cache objects for browser workloads |
+
+Database commands are available in published full-featured binaries. Source builds must enable their corresponding features.
 
 ### Visualization
 
 | Command | Description |
 |---------|-------------|
-| `manhattan` | Generate Manhattan plots from GWAS results |
-| `manhattan-batch` | Batch process multiple phenotypes |
-| `loci` | Generate LocusZoom-style locus plots |
+| `manhattan` | Generate a Manhattan plot and JSON sidecar |
+| `manhattan-batch` | Process multiple phenotypes |
+| `locus` | Render one LocusZoom-style region plot |
+| `loci` | Generate locus plots from existing Manhattan output |
 
-### Schema
-
-| Command | Description |
-|---------|-------------|
-| `schema generate` | Generate JSON schema from table |
-| `schema validate` | Validate table data against JSON schema |
-
-### Distributed Processing
+### Data Quality and Annotation
 
 | Command | Description |
 |---------|-------------|
-| `pool create` | Create a distributed worker pool on GCP |
-| `pool submit` | Submit a job to the worker pool |
-| `pool destroy` | Destroy a worker pool |
-| `pool list` | List instances in a pool |
+| `schema generate` | Generate JSON Schema from a dataset |
+| `schema validate` | Validate rows against JSON Schema |
+| `annotate` | Add experimental VEP consequence predictions |
+
+### Distributed and Operational Commands
+
+| Command | Description |
+|---------|-------------|
+| `pool create`, `pool scale`, `pool destroy`, `pool list` | Manage GCP worker pools |
+| `pool submit`, `pool status`, `pool cancel` | Submit and control distributed jobs |
+| `pool workers`, `pool events`, `pool failures`, `pool logs` | Inspect workers and job activity |
+| `service` | Run coordinator or worker services directly |
+| `clickhouse` | Manage ClickHouse instances on GCP |
+| `env` | Manage `.genohype-env` configuration |
+| `ingest` | Run feature-gated external-system ingestion workflows |
+
+Run `genohype --help` or `genohype <command> --help` for the complete, version-specific interface.
 
 ## Querying
 
@@ -168,6 +201,12 @@ genohype export parquet data/table.ht output.parquet --interval "chr10:121500000
 duckdb -c "SELECT * FROM 'output.parquet' LIMIT 5"
 ```
 
+### NDJSON
+
+```bash
+genohype export json data/table.ht output.ndjson --interval "chr10:121500000-121600000"
+```
+
 ### VCF
 
 ```bash
@@ -185,6 +224,26 @@ genohype export clickhouse \
   --intervals-file regions.bed
 ```
 
+### PostgreSQL
+
+```bash
+genohype export postgres \
+  data/variants.ht \
+  "postgres://user:pass@localhost:5432/gnomad" \
+  variants \
+  --recreate
+```
+
+### Elasticsearch
+
+```bash
+genohype export elasticsearch \
+  data/variants.ht \
+  "http://localhost:9200" \
+  variants \
+  --recreate
+```
+
 ### BigQuery
 
 ```bash
@@ -195,41 +254,80 @@ genohype export bigquery \
   --intervals-file regions.bed
 ```
 
-## VCF Support
+## Input Formats
 
-genohype can read and query VCF files directly, with support for tabix indexing.
+### Hail tables
+
+Hail tables (`.ht`) are the primary input format. Genohype reads their metadata, partitioned row data, and indexes directly from local or supported object storage without starting Hail, Spark, or a JVM.
+
+### VCF
+
+Genohype reads `.vcf`, `.vcf.gz`, and `.vcf.bgz` files directly. Interval queries use a tabix index when one is available.
 
 ```bash
 # View VCF metadata
 genohype info data/variants.vcf.bgz
 
-# Query with interval (uses tabix index if available)
+# Query with interval
 genohype query data/variants.vcf.bgz --interval "chrX:31097677-31100000" --limit 10
 
-# Generate schema from VCF
-genohype schema generate data/variants.vcf.bgz
-
-# Validate VCF with sampling
+# Generate and apply JSON Schema
+genohype schema generate data/variants.vcf.bgz schema.json
 genohype schema validate data/variants.vcf.bgz schema.json --sample 10000
 ```
 
-## Distributed Processing (GCP)
+### BGZF-compressed BED-like data
 
-Run parallel exports across multiple GCP VMs. Prebuilt macOS installations include the Linux worker used by the pool commands; when building from source, run `make worker` first.
+The shared query engine also accepts `.bed.gz` and `.bed.bgz` files. It infers column names and scalar types, and uses a tabix index for interval queries when available. This path is currently used for BED-like long-read and methylation inputs.
 
 ```bash
-# 1. Create a pool of spot VMs
-genohype pool create my-pool --workers 4 --spot
+genohype info data/methylation.bed.gz
+genohype query data/methylation.bed.gz --interval "chr1:1000000-1100000" --limit 10
+```
 
-# 2. Submit a distributed job
+Parquet is currently an output format rather than a `DataSource` input. Query exported Parquet with tools such as DuckDB, Polars, or Spark.
+
+## Experimental Variant Annotation
+
+Full-featured builds include an in-process fastVEP integration. It is experimental and requires separately obtained transcript annotations and, optionally, a reference FASTA and supplementary annotations.
+
+```bash
+genohype annotate data/variants.vcf.bgz \
+  --gff3 path/to/transcripts.gff3.gz \
+  --fasta path/to/reference.fa.gz \
+  --output annotated.vcf
+```
+
+See the [roadmap's annotation status](ROADMAP.md#experimental-annotation-status) for the pinned integration revision and current limitations.
+
+## Distributed Processing (GCP)
+
+Run parallel jobs across GCP VMs. Prebuilt macOS installations include the Linux worker used by pool commands; when building from source, run `make worker` first.
+
+```bash
+# 1. Create a coordinator and four spot workers
+genohype pool create my-pool \
+  --workers 4 \
+  --spot true \
+  --with-coordinator \
+  --wait
+
+# 2. Submit a distributed export
 genohype pool submit my-pool -- \
-    export parquet gs://bucket/input.ht gs://bucket/output/ --shard-count 100
+  export parquet gs://bucket/input.ht gs://bucket/output/ --shard-count 100
 
-# 3. Clean up
+# 3. Inspect progress and worker activity
+genohype pool status my-pool
+genohype pool workers my-pool
+genohype pool events my-pool
+
+# 4. Clean up all pool VMs
 genohype pool destroy my-pool
 ```
 
-Requires `gcloud` CLI configured with appropriate project and credentials.
+A coordinator-backed pool serves an embedded operations dashboard on port 3000. Pool commands require the `gcloud` CLI, an active project, credentials, and appropriate Compute Engine and storage permissions.
+
+GCS, S3, and HTTP are storage-access features. The implemented distributed execution adapter currently provisions GCP only.
 
 ## Interval File Formats
 
@@ -257,26 +355,34 @@ chr2:178525989-178830802
 
 ## Feature Flags
 
-| Feature | Description | Default |
-|---------|-------------|---------|
-| `gcp` | Google Cloud Storage support | Yes |
-| `validation` | `schema validate` and `schema generate` commands | Yes |
-| `aws` | Amazon S3 support | No |
-| `http` | HTTP/HTTPS URL support | No |
-| `clickhouse` | `export clickhouse` command | No |
-| `bigquery` | `export bigquery` command (requires gcp) | No |
-| `server` | `genohype-server` HTTP binary | No |
-| `full` | All features | No |
+Published CLI binaries are built with `full`. The table below describes features on the `genohype-cli` source package.
+
+| Feature | Description | Default source build |
+|---------|-------------|----------------------|
+| `gcp` | Google Cloud Storage access and GCP pool support | Yes |
+| `aws` | Amazon S3 object-storage access | No |
+| `http` | HTTP/HTTPS object access | No |
+| `validation` | `schema validate` and `schema generate` commands | No |
+| `genomic` | Forward the high-level genomic client API from `genohype-core` | No |
+| `vep` | Experimental in-process VEP annotation | No |
+| `clickhouse` | ClickHouse export and ingestion | No |
+| `elasticsearch` | Elasticsearch export | No |
+| `postgres` | PostgreSQL export | No |
+| `bigquery` | BigQuery export; also enables GCP | No |
+| `benchmark` | Compatibility feature; Parquet's `--benchmark` metrics flag is compiled normally | No |
+| `server` | Build the optional `genohype-server` HTTP binary | No |
+| `full` | Release-facing cloud, validation, database, server, benchmark, and VEP features | No |
 
 ```bash
-# Add S3 support
-cargo build --release --features aws
+# Add S3 access
+cargo build --release --locked --package genohype-cli --bin genohype --features aws
 
-# Full cloud support (GCS + S3 + HTTP)
-cargo build --release --features gcp,aws,http
+# Enable all object-storage backends and schema commands
+cargo build --release --locked --package genohype-cli --bin genohype \
+  --features gcp,aws,http,validation
 
-# Everything
-cargo build --release --features full
+# Match the published CLI feature set
+cargo build --release --locked --package genohype-cli --bin genohype --features full
 ```
 
 ## Testing
@@ -291,6 +397,29 @@ cargo test --workspace --all-features
 
 Release maintainers should follow [RELEASING.md](RELEASING.md).
 
+## Using Genohype as Libraries
+
+Downstream Rust applications can import individual workspace crates from a release tag:
+
+```toml
+[dependencies]
+genohype-core = { git = "https://github.com/broadinstitute/genohype.git", tag = "v0.1.0", features = ["gcp", "validation"] }
+genohype-pool = { git = "https://github.com/broadinstitute/genohype.git", tag = "v0.1.0" }
+genohype-mcp = { git = "https://github.com/broadinstitute/genohype.git", tag = "v0.1.0" }
+```
+
+Pin a tag or immutable revision because these APIs remain pre-1.0. `genohype-mcp` is a library rather than a `genohype mcp` command: applications implement `GenomicDataProvider`, construct `GenomicToolServer`, and expose the resulting tools through their chosen transport. The packages under `ui/` provide an experimental React assistant and CopilotKit bridge but are not part of the published CLI release.
+
+## Ecosystem
+
+Genohype crates currently support applications with distinct genomic access patterns:
+
+- [gnomAD Browser Lite](https://github.com/broadinstitute/gnomad-browser-lite), a pre-1.0 reference browser and federation-QC application, imports `genohype-core`, `genohype-pool`, and `genohype-mcp`.
+- [All by All *All of Us* browser](https://github.com/broadinstitute/all-by-all-aou-browser) imports `genohype-core` for Hail-backed access and `genohype-mcp` for genomic tools.
+- [gnomAD Long Read](https://github.com/broadinstitute/gnomad-lr), under active development, imports `genohype-core` and `genohype-pool` for long-read loading workflows.
+
+Each downstream repository documents its own maturity, deployment, and supported interfaces.
+
 ## Project
 
 - [Roadmap](ROADMAP.md)
@@ -301,42 +430,32 @@ Release maintainers should follow [RELEASING.md](RELEASING.md).
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           GENOHYPE DATA FLOW                                │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  INPUT SOURCES                  CORE ENGINE                 OUTPUT TARGETS  │
-│  ─────────────                  ───────────                 ──────────────  │
-│                                                                             │
-│  ┌───────────┐                                              ┌───────────┐  │
-│  │Hail Table │──┐                                        ┌─►│  stdout   │  │
-│  │  (.ht)    │  │                                        │  │  (JSON)   │  │
-│  └───────────┘  │                                        │  └───────────┘  │
-│                 │    ┌─────────────────────────────┐     │                  │
-│  ┌───────────┐  │    │        QueryEngine          │     │  ┌───────────┐  │
-│  │ VCF File  │──┼───►│  ┌───────────────────────┐  │─────┼─►│  Parquet  │  │
-│  │(.vcf.bgz) │  │    │  │   DataSource Trait    │  │     │  │ (.parquet)│  │
-│  └───────────┘  │    │  │  - row_type()         │  │     │  └───────────┘  │
-│                 │    │  │  - query_iter()       │  │     │                  │
-│  ┌───────────┐  │    │  │  - key_fields()       │  │     │  ┌───────────┐  │
-│  │  Remote   │──┘    │  └───────────────────────┘  │     ├─►│ClickHouse │  │
-│  │(gs://,s3://)      │                             │     │  │  (HTTP)   │  │
-│  └───────────┘       │  ┌───────────────────────┐  │     │  └───────────┘  │
-│                      │  │   Index (optional)    │  │     │                  │
-│                      │  │  - Partition bounds   │  │     │  ┌───────────┐  │
-│                      │  │  - Tabix (VCF)        │  │     └─►│ BigQuery  │  │
-│                      │  └───────────────────────┘  │        │(GCS+Load) │  │
-│                      └─────────────────────────────┘        └───────────┘  │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    H[Hail tables] --> C[genohype-core<br/>DataSource + QueryEngine]
+    V[VCF] --> C
+    B[BGZF BED-like data] --> C
+    S[Local / GCS / S3 / HTTP] --> C
+
+    C --> CLI[genohype CLI]
+    C --> APP[Downstream Rust applications]
+    P[genohype-pool] --> CLI
+    P --> APP
+    M[genohype-mcp] --> APP
+
+    CLI --> F[Parquet / NDJSON / VCF / Hail]
+    APP --> F
+    CLI --> D[ClickHouse / PostgreSQL / Elasticsearch / BigQuery]
+    APP --> D
 ```
 
-**Key Principles:**
-- **DataSource Abstraction** - Unified interface for Hail tables and VCF files
-- **Streaming by Default** - Memory-efficient processing of arbitrarily large datasets
-- **Parquet as Intermediate** - Bridge between row-oriented sources and columnar targets
-- **Consistent CLI** - Same `--where`/`--limit`/`--interval` options work across all commands
+**Key principles:**
+
+- **Shared data-source abstraction**: Hail, VCF, and BED-like readers expose the same streaming query interface.
+- **Bounded-memory processing**: Iterators and bounded channels keep memory tied to batches rather than total dataset size.
+- **Index-aware access**: Hail partition metadata and tabix indexes prune work for compatible interval queries.
+- **Composable crates**: Applications can reuse data access, worker-pool, or MCP layers without adopting the complete CLI.
+- **Explicit portability boundaries**: Object-storage access and distributed execution are separate capabilities; the current execution adapter provisions GCP.
 
 ## License
 
