@@ -38,6 +38,10 @@ manhattan.png
 manhattan.json
 manhattan*.png
 
+# Benchmark output artifacts (source lives in benchmarks/*.py)
+benchmarks/*.html
+benchmarks/benchmark_results*.json
+
 # Added by cargo
 
 /target
