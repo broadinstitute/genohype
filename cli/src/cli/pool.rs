@@ -14,7 +14,7 @@ pub enum PoolCommands {
         /// If a profile with this name exists in config, its settings are used as defaults
         name: String,
 
-        /// Number of worker VMs to create (default: 4, or from config profile)
+        /// Number of worker VMs to create (default: 0, or from config profile)
         #[arg(long)]
         workers: Option<usize>,
 
@@ -49,6 +49,10 @@ pub enum PoolCommands {
         /// Skip automatic Linux binary build (use existing binary)
         #[arg(long)]
         skip_build: bool,
+
+        /// Path to a custom binary to deploy to workers (CLI overrides the pool profile)
+        #[arg(long)]
+        worker_binary: Option<String>,
 
         /// Create a dedicated coordinator node for distributed processing
         #[arg(long)]

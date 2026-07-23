@@ -185,7 +185,10 @@ impl CloudProvider for GcpClient {
         // Generate startup scripts (with optional binary download from GCS)
         // Workers auto-start and connect to coordinator via internal DNS
         let worker_script = super::startup::generate_worker_startup_script(
-            config.binary_gcs_url.as_deref(),
+            config
+                .worker_binary_gcs_url
+                .as_deref()
+                .or(config.binary_gcs_url.as_deref()),
             &config.name,
         );
         // Coordinator auto-starts if binary is provided
@@ -544,6 +547,40 @@ mod tests {
 
         let client = GcpClient::with_project("my-project".to_string());
         assert_eq!(client.project, Some("my-project".to_string()));
+    }
+
+    #[test]
+    fn test_custom_worker_and_stock_coordinator_use_separate_artifacts() {
+        let config = PoolConfig {
+            name: "demo".into(),
+            worker_count: 1,
+            machine_type: "e2-standard-2".into(),
+            zone: "us-central1-a".into(),
+            spot: true,
+            project_id: "project".into(),
+            network: None,
+            subnet: None,
+            with_coordinator: true,
+            wireguard: None,
+            pool_db_path: None,
+            binary_gcs_url: Some("gs://bucket/stock-coordinator".into()),
+            worker_binary_gcs_url: Some("gs://bucket/custom-worker".into()),
+            service_account: None,
+        };
+
+        let worker = super::super::startup::generate_worker_startup_script(
+            config.worker_binary_gcs_url.as_deref(),
+            &config.name,
+        );
+        let coordinator = super::super::startup::generate_coordinator_startup_script(
+            None,
+            config.binary_gcs_url.as_deref(),
+            None,
+        );
+        assert!(worker.contains("gs://bucket/custom-worker"));
+        assert!(!worker.contains("stock-coordinator"));
+        assert!(coordinator.contains("gs://bucket/stock-coordinator"));
+        assert!(!coordinator.contains("custom-worker"));
     }
 
     #[test]

@@ -35,6 +35,51 @@ impl Default for WorkerConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateSource {
+    Gcs,
+    Http,
+}
+
+fn update_source(url: &str) -> anyhow::Result<UpdateSource> {
+    if url.starts_with("gs://") {
+        Ok(UpdateSource::Gcs)
+    } else if url.starts_with("http://") || url.starts_with("https://") {
+        Ok(UpdateSource::Http)
+    } else {
+        anyhow::bail!("unsupported worker update URL: {url}")
+    }
+}
+
+async fn download_update(
+    client: &reqwest::Client,
+    url: &str,
+    destination: &str,
+) -> anyhow::Result<()> {
+    match update_source(url)? {
+        UpdateSource::Gcs => {
+            let status = tokio::process::Command::new("gsutil")
+                .args(["cp", url, destination])
+                .status()
+                .await?;
+            if !status.success() {
+                anyhow::bail!("gsutil cp failed with status {status}");
+            }
+        }
+        UpdateSource::Http => {
+            let bytes = client
+                .get(url)
+                .send()
+                .await?
+                .error_for_status()?
+                .bytes()
+                .await?;
+            std::fs::write(destination, &bytes)?;
+        }
+    }
+    Ok(())
+}
+
 /// Run a worker loop that polls for work and delegates to the handler.
 ///
 /// This function runs indefinitely until the coordinator signals exit
@@ -200,20 +245,24 @@ pub async fn run_worker(
                 async fn update_logic(client: &reqwest::Client, url: &str) -> anyhow::Result<()> {
                     use std::os::unix::fs::PermissionsExt;
 
-                    // Download to temp file
-                    let resp = client.get(url).send().await?;
-                    let bytes = resp.bytes().await?;
+                    // The coordinator's update contract normally supplies a
+                    // gs:// URL. HTTP(S) remains supported for other coordinators.
                     let tmp_path = "/tmp/genohype-update";
-                    std::fs::write(tmp_path, &bytes)?;
+                    download_update(client, url, tmp_path).await?;
 
                     // Make executable and replace target
                     std::fs::set_permissions(tmp_path, std::fs::Permissions::from_mode(0o755))?;
                     std::fs::rename(tmp_path, "/usr/local/bin/genohype")?;
 
-                    // Restart via systemd
-                    std::process::Command::new("sudo")
-                        .args(["systemctl", "restart", "genohype-worker"])
-                        .spawn()?;
+                    // Queue a non-blocking restart. Waiting synchronously for
+                    // `restart` from inside the service would deadlock on our own exit.
+                    let status = tokio::process::Command::new("sudo")
+                        .args(["systemctl", "--no-block", "restart", "genohype-worker"])
+                        .status()
+                        .await?;
+                    if !status.success() {
+                        anyhow::bail!("systemctl restart failed with status {status}");
+                    }
 
                     Ok(())
                 }
@@ -258,4 +307,22 @@ async fn request_work(
 
     let work_response: WorkResponse = response.json().await?;
     Ok(work_response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_contract_accepts_gcs_and_http_urls() {
+        assert_eq!(
+            update_source("gs://bucket/bin/worker").unwrap(),
+            UpdateSource::Gcs
+        );
+        assert_eq!(
+            update_source("https://coordinator.example/worker").unwrap(),
+            UpdateSource::Http
+        );
+        assert!(update_source("file:///tmp/worker").is_err());
+    }
 }

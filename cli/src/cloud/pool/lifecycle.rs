@@ -14,7 +14,28 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
     /// If `wait` is true, polls until all VMs have completed their startup scripts.
     /// Automatically builds Linux binary if on macOS (unless `skip_build` is true).
     /// If `with_coordinator` is true, also starts the coordinator in idle mode.
-    pub(crate) fn create(&self, config: &PoolConfig, wait: bool, skip_build: bool) -> Result<()> {
+    pub(crate) fn create(
+        &self,
+        config: &PoolConfig,
+        wait: bool,
+        skip_build: bool,
+        worker_binary_path: Option<String>,
+    ) -> Result<()> {
+        // Validate a custom worker before creating or staging any resources.
+        let worker_binary = worker_binary_path
+            .map(std::path::PathBuf::from)
+            .map(|path| {
+                if path.is_file() {
+                    Ok(path)
+                } else {
+                    Err(HailError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("Worker binary not found at: {}", path.display()),
+                    )))
+                }
+            })
+            .transpose()?;
+
         // Determine if we should build
         // 1. Explicit skip_build -> skip
         // 2. We have a bundled binary -> skip (Release mode)
@@ -40,17 +61,26 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         let mut config = config.clone();
         if let Some(ref db_path) = config.pool_db_path {
             let binary = self.locate_binary(None)?;
-            match self.stage_binary_to_gcs(&binary, db_path) {
-                Ok(gcs_url) => {
-                    config.binary_gcs_url = Some(gcs_url);
-                }
-                Err(e) => {
-                    println!(
-                        "{} GCS staging failed ({}), will deploy via SSH",
+            match self.stage_binary_to_gcs(&binary, db_path, "genohype-coordinator") {
+                Ok(gcs_url) => config.binary_gcs_url = Some(gcs_url),
+                Err(e) => println!(
+                    "{} Coordinator staging failed ({}), will deploy via SSH",
+                    "Warning:".yellow(),
+                    e
+                ),
+            }
+
+            if let Some(ref custom_worker) = worker_binary {
+                match self.stage_binary_to_gcs(custom_worker, db_path, "genohype-worker-custom") {
+                    Ok(gcs_url) => config.worker_binary_gcs_url = Some(gcs_url),
+                    Err(e) => println!(
+                        "{} Custom worker staging failed ({}), will deploy via SSH",
                         "Warning:".yellow(),
                         e
-                    );
+                    ),
                 }
+            } else {
+                config.worker_binary_gcs_url = config.binary_gcs_url.clone();
             }
         }
 
@@ -90,7 +120,9 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                 &config.zone,
                 skip_build,
                 config.pool_db_path.as_deref(),
-                config.binary_gcs_url.is_some(), // skip_binary_deploy if already via startup
+                config.binary_gcs_url.is_some(), // coordinator deployed via startup
+                worker_binary.as_deref(),
+                config.worker_binary_gcs_url.is_some(),
             )?;
         }
 
@@ -385,6 +417,13 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             if worker_bin.is_some() {
                 println!("{}", "Deploying custom worker binary via SCP...".dimmed());
                 self.deploy_binary(deploy_bin, &new_worker_instances, zone)?;
+                let coord_ip = coordinator.and_then(|coord| coord.ip()).ok_or_else(|| {
+                    HailError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "Custom workers require a running coordinator",
+                    ))
+                })?;
+                self.start_worker_services(&new_worker_instances, coord_ip, zone)?;
             } else if let Some(coord) = coordinator {
                 if let Some(coord_ip) = coord.ip() {
                     // Coordinator exists, check if it's running to serve binary
@@ -402,6 +441,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                             "Coordinator not running, deploying via SCP...".dimmed()
                         );
                         self.deploy_binary(deploy_bin, &new_worker_instances, zone)?;
+                        self.start_worker_services(&new_worker_instances, coord_ip, zone)?;
                     }
                 } else {
                     self.deploy_binary(deploy_bin, &new_worker_instances, zone)?;

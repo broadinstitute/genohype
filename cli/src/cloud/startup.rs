@@ -42,7 +42,9 @@ echo "Creating systemd service for worker $WORKER_ID connecting to {}-coordinato
 cat > /etc/systemd/system/genohype-worker.service << 'SVCEOF'
 [Unit]
 Description=Genohype Worker
-After=network.target
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -50,7 +52,6 @@ User=root
 ExecStart=/usr/local/bin/genohype service start-worker --url http://{}-coordinator:3000 --worker-id WORKER_ID_PLACEHOLDER
 Restart=always
 RestartSec=3
-StartLimitIntervalSec=0
 
 [Install]
 WantedBy=multi-user.target

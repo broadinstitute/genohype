@@ -10,7 +10,12 @@ use std::path::{Path, PathBuf};
 
 impl<P: CloudProvider + Sync> PoolManager<P> {
     /// Stage the genohype binary to GCS for fast worker pulls.
-    pub(crate) fn stage_binary_to_gcs(&self, binary: &Path, pool_db_path: &str) -> Result<String> {
+    pub(crate) fn stage_binary_to_gcs(
+        &self,
+        binary: &Path,
+        pool_db_path: &str,
+        artifact_name: &str,
+    ) -> Result<String> {
         use genohype_core::io::CloudWriter;
         use std::io::Write;
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -27,7 +32,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis();
-        let staging_url = format!("{}/bin/genohype-worker-{}", base_dir, timestamp);
+        let staging_url = format!("{}/bin/{}-{}", base_dir, artifact_name, timestamp);
 
         println!(
             "{} Staging binary to {}...",
@@ -159,7 +164,8 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         let pool_db_path = pool_db_path.map(|s| s.to_string());
         let staging_url = if let Some(ref db_path) = pool_db_path {
             println!("{}", "Using fast GCS staging for update...".dimmed());
-            self.stage_binary_to_gcs(&binary, db_path).ok()
+            self.stage_binary_to_gcs(&binary, db_path, "genohype-coordinator")
+                .ok()
         } else {
             None
         };
@@ -167,7 +173,8 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         // Stage worker binary to GCS separately if it differs from coordinator binary
         let worker_staging_url = if let Some(ref wb) = worker_binary {
             if let Some(ref db_path) = pool_db_path {
-                self.stage_binary_to_gcs(wb, db_path).ok()
+                self.stage_binary_to_gcs(wb, db_path, "genohype-worker-custom")
+                    .ok()
             } else {
                 None
             }
@@ -335,6 +342,7 @@ EOF
                 );
                 self.propagate_binary_from_coordinator(coord_ip, &workers, zone)?;
             }
+            self.start_worker_services(&workers, coord_ip, zone)?;
         }
 
         println!();
@@ -393,7 +401,7 @@ EOF
             ))
         })?;
 
-        let gcs_url = self.stage_binary_to_gcs(&binary, pool_db_path)?;
+        let gcs_url = self.stage_binary_to_gcs(&binary, pool_db_path, "genohype-coordinator")?;
 
         // Stage worker binary separately if specified
         let worker_gcs_url = if let Some(ref wb_path) = worker_binary_path {
@@ -409,7 +417,7 @@ EOF
                 "Worker binary:".cyan(),
                 wb.display().to_string().bright_white()
             );
-            self.stage_binary_to_gcs(&wb, pool_db_path)?
+            self.stage_binary_to_gcs(&wb, pool_db_path, "genohype-worker-custom")?
         } else {
             gcs_url.clone()
         };
@@ -725,7 +733,11 @@ EOF
                 worker.name.cyan()
             );
             Ok(())
-        })
+        })?;
+
+        // Rewrite and restart the unit even when one already existed. `enable --now`
+        // alone does not reliably activate a replaced binary or repair a stale unit.
+        self.start_worker_services(workers, coordinator_ip, zone)
     }
 
     /// Build the Linux binary for deployment to workers.

@@ -15,6 +15,13 @@ fn resolve_zone(zone: Option<String>, pool_name: &str, app_config: &config::Conf
         .unwrap_or_else(|| "us-central1-a".to_string())
 }
 
+fn resolve_worker_binary(
+    cli: Option<String>,
+    profile: Option<&config::ResolvedPoolConfig>,
+) -> Option<String> {
+    cli.or_else(|| profile.and_then(|p| p.worker_binary.clone()))
+}
+
 /// Run pool management commands
 pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> Result<()> {
     let client = GcpClient::new();
@@ -32,6 +39,7 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
             subnet,
             wait,
             skip_build,
+            worker_binary,
             with_coordinator,
             service_account,
         } => {
@@ -109,6 +117,8 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
 
             let resolved_service_account = service_account
                 .or_else(|| profile.as_ref().and_then(|p| p.service_account.clone()));
+            // Custom worker selection follows the same precedence as other pool settings.
+            let resolved_worker_binary = resolve_worker_binary(worker_binary, profile.as_ref());
 
             let pool_config = PoolConfig {
                 name,
@@ -122,11 +132,12 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
                 with_coordinator: resolved_with_coordinator,
                 wireguard,
                 pool_db_path: profile.as_ref().and_then(|p| p.pool_db_path.clone()),
-                binary_gcs_url: None, // Set by create() after staging
+                binary_gcs_url: None,        // Set by create() after staging
+                worker_binary_gcs_url: None, // Set independently by create()
                 service_account: resolved_service_account,
             };
 
-            manager.create(&pool_config, wait, skip_build)?;
+            manager.create(&pool_config, wait, skip_build, resolved_worker_binary)?;
         }
         PoolCommands::Submit {
             name,
@@ -430,4 +441,30 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn custom_worker_resolution_prefers_cli_then_profile() {
+        let config: config::Config = toml::from_str(
+            r#"
+[pools.demo]
+worker_binary = "/profile/worker"
+"#,
+        )
+        .unwrap();
+        let profile = config.get_pool("demo").unwrap();
+
+        assert_eq!(
+            resolve_worker_binary(Some("/cli/worker".into()), Some(&profile)).as_deref(),
+            Some("/cli/worker")
+        );
+        assert_eq!(
+            resolve_worker_binary(None, Some(&profile)).as_deref(),
+            Some("/profile/worker")
+        );
+    }
 }

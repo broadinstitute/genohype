@@ -54,8 +54,10 @@ pub struct PoolConfig {
     pub wireguard: Option<WireGuardConfig>,
     /// GCS path for SQLite database backup/restore (e.g., "gs://bucket/pool-ops/dev-pool/ops.db")
     pub pool_db_path: Option<String>,
-    /// GCS URL for pre-staged binary (downloaded by VMs on startup)
+    /// GCS URL for the pre-staged stock coordinator binary.
     pub binary_gcs_url: Option<String>,
+    /// GCS URL for the pre-staged worker binary (custom or stock).
+    pub worker_binary_gcs_url: Option<String>,
     /// GCP service account email to attach to VMs
     pub service_account: Option<String>,
 }
