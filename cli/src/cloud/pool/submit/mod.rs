@@ -18,12 +18,81 @@ use std::sync::{mpsc, Arc};
 use std::time::Instant;
 
 const WORKER_FRESHNESS_SECS: f64 = 15.0;
+const LOG_TAIL_UNHEALTHY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn worker_is_fresh(worker: &crate::distributed::message::DashboardWorker) -> bool {
     worker.status != "suspected_dead" && worker.last_seen_secs <= WORKER_FRESHNESS_SECS
 }
 
+fn require_idle_summary(summary_json: &str) -> Result<()> {
+    let summary: crate::distributed::message::DashboardSummary = serde_json::from_str(summary_json)
+        .map_err(|error| {
+            HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Invalid coordinator summary: {error}"),
+            ))
+        })?;
+    if summary.idle {
+        Ok(())
+    } else {
+        Err(HailError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "Coordinator already has a job running. Use --force to supersede.",
+        )))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TailHealth {
+    Healthy,
+    NoWorkers,
+    CoordinatorUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TailFailure {
+    NoWorkers,
+    CoordinatorUnavailable,
+    StreamEnded,
+}
+
+#[derive(Default)]
+struct TailWatchdog {
+    unhealthy_since: Option<Instant>,
+}
+
+impl TailWatchdog {
+    fn observe(&mut self, health: TailHealth, now: Instant) -> Option<TailFailure> {
+        if health == TailHealth::Healthy {
+            self.unhealthy_since = None;
+            return None;
+        }
+
+        let since = self.unhealthy_since.get_or_insert(now);
+        if now.duration_since(*since) < LOG_TAIL_UNHEALTHY_TIMEOUT {
+            return None;
+        }
+
+        Some(match health {
+            TailHealth::NoWorkers => TailFailure::NoWorkers,
+            TailHealth::CoordinatorUnavailable => TailFailure::CoordinatorUnavailable,
+            TailHealth::Healthy => unreachable!(),
+        })
+    }
+}
+
 impl<P: CloudProvider + Sync> PoolManager<P> {
+    fn ensure_coordinator_idle(&self, coordinator: &Instance, zone: &str) -> Result<()> {
+        let summary_json = self
+            .fetch_coordinator_api(coordinator, zone, "/api/dashboard/summary", 3000)
+            .map_err(|error| {
+                HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    format!("Could not verify that the coordinator is idle: {error}"),
+                ))
+            })?;
+        require_idle_summary(&summary_json)
+    }
     /// Start coordinator in idle mode (binary already deployed via startup script or needs deployment).
     pub(crate) fn start_idle_coordinator(
         &self,
@@ -406,6 +475,13 @@ EOF
         // Auto-detect distributed mode: use coordinator/worker pattern when coordinator exists
         let use_distributed = coordinator.is_some();
 
+        if worker_binary.is_some() && !use_distributed {
+            return Err(HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Custom workers require a running coordinator",
+            )));
+        }
+
         // Validate we have workers for distributed mode
         if use_distributed && total_workers == 0 {
             return Err(HailError::Io(std::io::Error::new(
@@ -436,6 +512,11 @@ EOF
             .as_ref()
             .map(|coord| self.check_coordinator_status(coord, zone))
             .unwrap_or(false);
+        // Binary deployment restarts services. Refuse to disrupt an existing job,
+        // and fail closed when its state cannot be verified.
+        if coordinator_running && !force && (force_redeploy || worker_binary.is_some()) {
+            self.ensure_coordinator_idle(coordinator.as_ref().unwrap(), zone)?;
+        }
         if use_distributed && coordinator_running && !force_redeploy && worker_binary.is_some() {
             let coord = coordinator.as_ref().unwrap();
             let coord_ip = coord.ip().ok_or_else(|| {
@@ -1205,21 +1286,7 @@ EOF
             // Do not disrupt an existing job merely to discover that submission
             // needs --force. Forced replacement intentionally restarts workers.
             if !force {
-                if let Ok(summary_json) =
-                    self.fetch_coordinator_api(coordinator, zone, "/api/dashboard/summary", 3000)
-                {
-                    if let Ok(summary) = serde_json::from_str::<
-                        crate::distributed::message::DashboardSummary,
-                    >(&summary_json)
-                    {
-                        if !summary.idle {
-                            return Err(HailError::Io(std::io::Error::new(
-                                std::io::ErrorKind::AlreadyExists,
-                                "Coordinator already has a job running. Use --force to supersede.",
-                            )));
-                        }
-                    }
-                }
+                self.ensure_coordinator_idle(coordinator, zone)?;
             }
 
             // Reinstall/enable/restart every unit before submission. The
@@ -1478,7 +1545,7 @@ EOF
         );
 
         log_cmd.stdout(std::process::Stdio::piped());
-        log_cmd.stderr(std::process::Stdio::piped());
+        log_cmd.stderr(std::process::Stdio::null());
 
         let mut child = log_cmd.spawn().map_err(|e| {
             HailError::Io(std::io::Error::new(
@@ -1487,7 +1554,7 @@ EOF
             ))
         })?;
 
-        let (job_failed, workers_lost) = if let Some(stdout) = child.stdout.take() {
+        let (job_failed, tail_failure) = if let Some(stdout) = child.stdout.take() {
             use std::io::BufRead;
             use std::sync::mpsc::RecvTimeoutError;
             use std::time::Duration;
@@ -1503,7 +1570,8 @@ EOF
 
             let mut failed = false;
             let mut complete = false;
-            let mut no_worker_since = None;
+            let mut failure = None;
+            let mut watchdog = TailWatchdog::default();
             let mut last_health_check = Instant::now() - Duration::from_secs(10);
 
             while !complete {
@@ -1514,56 +1582,72 @@ EOF
                             line.contains("Job complete. Coordinator returning to idle mode");
                         failed |= line.contains("Job finished with") && line.contains("failed");
                     }
-                    Ok(Err(_)) | Err(RecvTimeoutError::Disconnected) => break,
+                    Ok(Err(_)) | Err(RecvTimeoutError::Disconnected) => {
+                        failure = Some(TailFailure::StreamEnded);
+                        break;
+                    }
                     Err(RecvTimeoutError::Timeout) => {}
+                }
+
+                if complete {
+                    break;
                 }
 
                 if last_health_check.elapsed() >= Duration::from_secs(5) {
                     last_health_check = Instant::now();
-                    if let Ok(json) = self.fetch_coordinator_api(
+                    let health = match self.fetch_coordinator_api(
                         coordinator,
                         zone,
                         "/api/dashboard/workers",
                         3000,
                     ) {
-                        if let Ok(worker_list) = serde_json::from_str::<
+                        Ok(json) => match serde_json::from_str::<
                             Vec<crate::distributed::message::DashboardWorker>,
                         >(&json)
                         {
-                            let healthy = worker_list.iter().filter(|w| worker_is_fresh(w)).count();
-                            if healthy == 0 {
-                                let since = no_worker_since.get_or_insert_with(Instant::now);
-                                if since.elapsed() >= Duration::from_secs(30) {
-                                    break;
-                                }
-                            } else {
-                                no_worker_since = None;
+                            Ok(worker_list) if worker_list.iter().any(worker_is_fresh) => {
+                                TailHealth::Healthy
                             }
-                        }
+                            Ok(_) => TailHealth::NoWorkers,
+                            Err(_) => TailHealth::CoordinatorUnavailable,
+                        },
+                        Err(_) => TailHealth::CoordinatorUnavailable,
+                    };
+
+                    if let Some(reason) = watchdog.observe(health, Instant::now()) {
+                        failure = Some(reason);
+                        break;
                     }
                 }
             }
 
-            let workers_lost = !complete
-                && no_worker_since
-                    .map(|since| since.elapsed() >= Duration::from_secs(30))
-                    .unwrap_or(false);
             let _ = child.kill();
             let _ = child.wait();
             if complete {
                 println!();
                 println!("{} Job complete, exiting log stream.", "OK".green().bold());
+                failure = None;
             }
-            (failed, workers_lost)
+            (failed, failure)
         } else {
+            let _ = child.kill();
             let _ = child.wait();
-            (false, false)
+            (false, Some(TailFailure::StreamEnded))
         };
 
-        if workers_lost {
+        if let Some(failure) = tail_failure {
+            let message = match failure {
+                TailFailure::NoWorkers => {
+                    "All workers stopped heartbeating for 30 seconds; aborting log tail"
+                }
+                TailFailure::CoordinatorUnavailable => {
+                    "Coordinator monitoring was unavailable for 30 seconds; aborting log tail"
+                }
+                TailFailure::StreamEnded => "Coordinator log stream ended before job completion",
+            };
             return Err(HailError::Io(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
-                "All workers stopped heartbeating for 30 seconds; aborting log tail",
+                message,
             )));
         }
 
@@ -1820,5 +1904,70 @@ mod lifecycle_tests {
         assert!(worker_is_fresh(&dashboard_worker("idle", 1.0)));
         assert!(!worker_is_fresh(&dashboard_worker("idle", 16.0)));
         assert!(!worker_is_fresh(&dashboard_worker("suspected_dead", 1.0)));
+    }
+
+    fn summary_json(idle: bool) -> String {
+        serde_json::json!({
+            "progress_percent": 0.0,
+            "total_tasks": 0,
+            "completed_tasks": 0,
+            "processing_tasks": 0,
+            "pending_tasks": 0,
+            "failed_tasks": 0,
+            "total_items": 0,
+            "cluster_items_per_sec": 0.0,
+            "elapsed_secs": 0.0,
+            "eta_secs": null,
+            "is_complete": false,
+            "input_path": "",
+            "job_spec": null,
+            "idle": idle
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn deployment_preflight_requires_verified_idle_coordinator() {
+        assert!(require_idle_summary(&summary_json(true)).is_ok());
+        assert!(require_idle_summary(&summary_json(false))
+            .unwrap_err()
+            .to_string()
+            .contains("already has a job running"));
+        assert!(require_idle_summary("not json").is_err());
+    }
+
+    #[test]
+    fn log_tail_watchdog_bounds_worker_and_api_loss() {
+        use std::time::Duration;
+
+        let start = Instant::now();
+        let mut watchdog = TailWatchdog::default();
+        assert_eq!(
+            watchdog.observe(TailHealth::CoordinatorUnavailable, start),
+            None
+        );
+        assert_eq!(
+            watchdog.observe(
+                TailHealth::CoordinatorUnavailable,
+                start + LOG_TAIL_UNHEALTHY_TIMEOUT
+            ),
+            Some(TailFailure::CoordinatorUnavailable)
+        );
+
+        assert_eq!(
+            watchdog.observe(TailHealth::Healthy, start + Duration::from_secs(31)),
+            None
+        );
+        assert_eq!(
+            watchdog.observe(TailHealth::NoWorkers, start + Duration::from_secs(32)),
+            None
+        );
+        assert_eq!(
+            watchdog.observe(
+                TailHealth::NoWorkers,
+                start + Duration::from_secs(32) + LOG_TAIL_UNHEALTHY_TIMEOUT
+            ),
+            Some(TailFailure::NoWorkers)
+        );
     }
 }

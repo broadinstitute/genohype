@@ -21,6 +21,13 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         skip_build: bool,
         worker_binary_path: Option<String>,
     ) -> Result<()> {
+        if worker_binary_path.is_some() && !config.with_coordinator {
+            return Err(HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Custom workers require a coordinator; enable --with-coordinator or set with_coordinator = true",
+            )));
+        }
+
         // Validate a custom worker before creating or staging any resources.
         let worker_binary = worker_binary_path
             .map(std::path::PathBuf::from)
@@ -283,38 +290,58 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             target_workers.to_string().bright_white()
         );
 
-        // 1. Get current status
+        // 1. Get current status. Stopped Spot VMs remain in GCE and must be
+        // deleted before their indices can be reused; they are not capacity.
         let instances = self.provider.list_instances(name)?;
-        let workers: Vec<&Instance> = instances
+        let project_id = config
+            .project
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
+        let all_workers: Vec<&Instance> = instances
             .iter()
             .filter(|i| i.name.contains("-worker-"))
             .collect();
+        let stale_workers: Vec<String> = all_workers
+            .iter()
+            .filter(|worker| !worker.is_running())
+            .map(|worker| worker.name.clone())
+            .collect();
 
+        if !stale_workers.is_empty() {
+            println!(
+                "{} Removing {} non-running worker(s) before scaling...",
+                "Cleanup:".cyan(),
+                stale_workers.len()
+            );
+            self.provider
+                .delete_instances(&stale_workers, zone, &project_id)?;
+        }
+
+        let workers: Vec<&Instance> = all_workers
+            .into_iter()
+            .filter(|worker| worker.is_running())
+            .collect();
         let current_count = workers.len();
 
         if current_count == target_workers {
             println!(
-                "{} Pool already has {} workers.",
+                "{} Pool already has {} running workers.",
                 "OK".green().bold(),
                 current_count
             );
             return Ok(());
         }
 
-        // 2. Identify coordinator (needed for deploying binary to new workers)
-        let coordinator = instances.iter().find(|i| i.name.ends_with("-coordinator"));
+        // 2. Identify a running coordinator (needed for worker services).
+        let coordinator = instances
+            .iter()
+            .find(|i| i.name.ends_with("-coordinator") && i.is_running());
         if coordinator.is_none() && config.with_coordinator {
             println!(
-                "{} Coordinator not found, but configuration expects one.",
+                "{} Running coordinator not found, but configuration expects one.",
                 "Warning:".yellow()
             );
         }
-
-        // Get project ID for operations
-        let project_id = config
-            .project
-            .clone()
-            .unwrap_or_else(|| "default".to_string());
 
         if target_workers > current_count {
             // SCALE UP
@@ -324,6 +351,23 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                 "Scaling up:".cyan(),
                 to_add.to_string().bright_white()
             );
+
+            // A TaskHandler-based custom worker has no legacy execution mode.
+            // Fail before creating VMs if its stock coordinator is unavailable.
+            if worker_binary_path.is_some() {
+                let coordinator = coordinator.ok_or_else(|| {
+                    HailError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "Custom workers require a running coordinator",
+                    ))
+                })?;
+                if !self.check_coordinator_status(coordinator, zone) {
+                    return Err(HailError::Io(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "Custom workers require a healthy coordinator",
+                    )));
+                }
+            }
 
             // Determine if we should build (fail fast before creating VMs)
             let should_build = if skip_build {
@@ -548,5 +592,137 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
 
             std::thread::sleep(Duration::from_secs(5));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cloud::{InstanceSetup, NetworkInterface, ScalingConfig};
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct RecordingProvider {
+        instances: Vec<Instance>,
+        deleted: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl CloudProvider for RecordingProvider {
+        fn create_pool(&self, _: &PoolConfig) -> Result<()> {
+            panic!("create_pool must not be called")
+        }
+
+        fn list_instances(&self, _: &str) -> Result<Vec<Instance>> {
+            Ok(self.instances.clone())
+        }
+
+        fn destroy_pool(&self, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn create_instances(&self, _: &[InstanceSetup]) -> Result<()> {
+            panic!("create_instances must not be called")
+        }
+
+        fn delete_instances(&self, names: &[String], _: &str, _: &str) -> Result<()> {
+            self.deleted.lock().unwrap().extend_from_slice(names);
+            Ok(())
+        }
+
+        fn upload_file(&self, _: &Path, _: &str, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn get_ssh_command(&self, _: &str, _: &str, _: &str) -> std::process::Command {
+            let mut command = std::process::Command::new("sh");
+            command.args(["-c", "true"]);
+            command
+        }
+    }
+
+    fn worker(name: &str, status: &str) -> Instance {
+        Instance {
+            name: name.into(),
+            zone: "us-central1-a".into(),
+            network_interfaces: vec![NetworkInterface {
+                network_ip: "10.0.0.2".into(),
+                network: None,
+                subnetwork: None,
+            }],
+            status: status.into(),
+            machine_type: None,
+            scheduling: None,
+        }
+    }
+
+    fn scaling_config() -> ScalingConfig {
+        ScalingConfig {
+            machine_type: "e2-standard-2".into(),
+            workers: 1,
+            spot: true,
+            network: None,
+            subnet: None,
+            project: Some("project".into()),
+            with_coordinator: true,
+            pool_db_path: None,
+            worker_binary: None,
+            service_account: None,
+        }
+    }
+
+    #[test]
+    fn scale_removes_terminated_workers_instead_of_counting_them() {
+        let deleted = Arc::new(Mutex::new(Vec::new()));
+        let manager = PoolManager::new(RecordingProvider {
+            instances: vec![
+                worker("demo-worker-0", "RUNNING"),
+                worker("demo-worker-1", "TERMINATED"),
+            ],
+            deleted: deleted.clone(),
+        });
+
+        manager
+            .scale(
+                "demo",
+                1,
+                "us-central1-a",
+                None,
+                None,
+                true,
+                &scaling_config(),
+            )
+            .unwrap();
+
+        assert_eq!(*deleted.lock().unwrap(), vec!["demo-worker-1"]);
+    }
+
+    #[test]
+    fn create_rejects_custom_worker_without_coordinator_before_provisioning() {
+        let manager = PoolManager::new(RecordingProvider {
+            instances: Vec::new(),
+            deleted: Arc::new(Mutex::new(Vec::new())),
+        });
+        let config = PoolConfig {
+            name: "demo".into(),
+            worker_count: 1,
+            machine_type: "e2-standard-2".into(),
+            zone: "us-central1-a".into(),
+            spot: true,
+            project_id: "project".into(),
+            network: None,
+            subnet: None,
+            with_coordinator: false,
+            wireguard: None,
+            pool_db_path: None,
+            binary_gcs_url: None,
+            worker_binary_gcs_url: None,
+            service_account: None,
+        };
+
+        let error = manager
+            .create(&config, false, true, Some("custom-worker".into()))
+            .unwrap_err();
+        assert!(error.to_string().contains("require a coordinator"));
     }
 }
