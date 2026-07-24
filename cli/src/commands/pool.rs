@@ -22,10 +22,44 @@ fn resolve_worker_binary(
     cli.or_else(|| profile.and_then(|p| p.worker_binary.clone()))
 }
 
+fn command_pool_name_and_project(command: &PoolCommands) -> (&str, Option<&str>) {
+    match command {
+        PoolCommands::Create { name, project, .. } => (name, project.as_deref()),
+        PoolCommands::Submit { name, .. }
+        | PoolCommands::Scale { name, .. }
+        | PoolCommands::Destroy { name, .. }
+        | PoolCommands::List { name }
+        | PoolCommands::Status { name, .. }
+        | PoolCommands::UpdateBinary { name, .. }
+        | PoolCommands::Cancel { name, .. }
+        | PoolCommands::Workers { name, .. }
+        | PoolCommands::Events { name, .. }
+        | PoolCommands::Failures { name, .. }
+        | PoolCommands::Logs { name, .. } => (name, None),
+    }
+}
+
+fn configured_project(
+    cli_project: Option<&str>,
+    pool_name: &str,
+    app_config: &config::Config,
+) -> Option<String> {
+    cli_project
+        .map(String::from)
+        .or_else(|| app_config.get_pool(pool_name).and_then(|p| p.project))
+        .or_else(|| app_config.defaults.project.clone())
+}
+
 /// Run pool management commands
 pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> Result<()> {
-    let client = GcpClient::new();
-    let manager = PoolManager::new(client);
+    // Resolve the project once for the whole command. GcpClient then adds it to
+    // discovery, SSH/SCP, and lifecycle calls so an operation cannot switch to
+    // a different ambient gcloud project after provisioning.
+    let (pool_name, cli_project) = command_pool_name_and_project(&command);
+    let project_id = configured_project(cli_project, pool_name, app_config)
+        .map(Ok)
+        .unwrap_or_else(|| GcpClient::new().get_current_project())?;
+    let manager = PoolManager::new(GcpClient::with_project(project_id.clone()));
 
     match command {
         PoolCommands::Create {
@@ -34,7 +68,7 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
             machine_type,
             zone,
             spot,
-            project,
+            project: _,
             network,
             subnet,
             wait,
@@ -64,13 +98,6 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
             let resolved_subnet = subnet
                 .or_else(|| profile.as_ref().and_then(|p| p.subnet.clone()))
                 .or_else(|| app_config.defaults.subnet.clone());
-
-            // Resolve project ID: CLI > config > gcloud default
-            let project_id = project
-                .or_else(|| profile.as_ref().and_then(|p| p.project.clone()))
-                .or_else(|| app_config.defaults.project.clone())
-                .map(Ok)
-                .unwrap_or_else(|| GcpClient::new().get_current_project())?;
 
             // Convert WireGuard config from config module to cloud module
             // Resolve env: prefixes (for USB-sourced secrets) at this point
@@ -446,6 +473,27 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_project_prefers_cli_then_config_and_ignores_ambient() {
+        let config: config::Config = toml::from_str(
+            r#"
+[defaults]
+project = "configured-project"
+[pools.demo]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            configured_project(Some("cli-project"), "demo", &config).as_deref(),
+            Some("cli-project")
+        );
+        assert_eq!(
+            configured_project(None, "demo", &config).as_deref(),
+            Some("configured-project")
+        );
+    }
 
     #[test]
     fn custom_worker_resolution_prefers_cli_then_profile() {

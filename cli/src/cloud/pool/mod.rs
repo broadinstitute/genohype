@@ -28,6 +28,14 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
     pub fn new(provider: P) -> Self {
         Self { provider }
     }
+
+    pub(crate) fn coordinator_identity_args(&self, pool_name: &str, zone: &str) -> String {
+        let mut args = format!(" --pool-name {} --gcp-zone {}", pool_name, zone);
+        if let Some(project) = self.provider.project_id() {
+            args.push_str(&format!(" --gcp-project {}", project));
+        }
+        args
+    }
 }
 
 #[cfg(test)]

@@ -73,7 +73,7 @@ const VM_CACHE_TTL_SECS: u64 = 15;
 
 /// GET /api/cluster/vms - Returns the current GCP VM state
 pub async fn get_vms(State(state): State<SharedState>) -> Json<serde_json::Value> {
-    let (pool_name, cached) = {
+    let (pool_name, gcp_project, cached) = {
         let data = state.lock().unwrap();
         let cached = data.cached_vms.as_ref().and_then(|(json, ts)| {
             if ts.elapsed().as_secs() < VM_CACHE_TTL_SECS {
@@ -82,7 +82,11 @@ pub async fn get_vms(State(state): State<SharedState>) -> Json<serde_json::Value
                 None
             }
         });
-        (data.config.pool_name.clone(), cached)
+        (
+            data.config.pool_name.clone(),
+            data.config.gcp_project.clone(),
+            cached,
+        )
     };
 
     // Return cached result if fresh enough
@@ -102,7 +106,9 @@ pub async fn get_vms(State(state): State<SharedState>) -> Json<serde_json::Value
 
     // Run gcloud list in a blocking task to avoid blocking the async runtime
     let current_vms = tokio::task::spawn_blocking(move || {
-        let client = crate::cloud::gcp::GcpClient::new();
+        let client = gcp_project
+            .map(crate::cloud::gcp::GcpClient::with_project)
+            .unwrap_or_default();
         client.list_instances(&pool_name)
     })
     .await;
@@ -250,8 +256,11 @@ pub async fn scale_cluster(
 
     // Get current worker VMs
     let pool_name_clone = pool_name.clone();
+    let project_for_list = gcp_project.clone();
     let current_vms = tokio::task::spawn_blocking(move || {
-        let client = crate::cloud::gcp::GcpClient::new();
+        let client = project_for_list
+            .map(crate::cloud::gcp::GcpClient::with_project)
+            .unwrap_or_default();
         client.list_instances(&pool_name_clone)
     })
     .await;
@@ -426,7 +435,11 @@ pub async fn scale_cluster(
 
         // Spawn creation in background
         tokio::task::spawn_blocking(move || {
-            let client = crate::cloud::gcp::GcpClient::new();
+            let client = if project.is_empty() {
+                crate::cloud::gcp::GcpClient::new()
+            } else {
+                crate::cloud::gcp::GcpClient::with_project(project)
+            };
             if let Err(e) = client.create_instances(&instance_setups) {
                 eprintln!("Failed to create instances: {}", e);
             }
@@ -484,7 +497,11 @@ pub async fn scale_cluster(
 
         // Spawn deletion in background
         tokio::task::spawn_blocking(move || {
-            let client = crate::cloud::gcp::GcpClient::new();
+            let client = if project.is_empty() {
+                crate::cloud::gcp::GcpClient::new()
+            } else {
+                crate::cloud::gcp::GcpClient::with_project(project.clone())
+            };
             if let Err(e) = client.delete_instances(&names_to_delete, &zone_clone, &project) {
                 eprintln!("Failed to delete instances: {}", e);
             }

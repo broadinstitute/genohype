@@ -36,6 +36,49 @@ impl GcpClient {
         }
     }
 
+    fn add_project_arg(&self, command: &mut Command) {
+        if let Some(project) = &self.project {
+            command.args(["--project", project]);
+        }
+    }
+
+    fn list_instances_command(&self, pool_name: &str) -> Command {
+        let mut command = Command::new("gcloud");
+        command.args([
+            "compute",
+            "instances",
+            "list",
+            "--filter",
+            &format!("tags.items:pool-{}", pool_name),
+            "--format",
+            "json(name,zone,status,networkInterfaces[].networkIP,networkInterfaces[].network,networkInterfaces[].subnetwork,machineType,scheduling.provisioningModel)",
+        ]);
+        self.add_project_arg(&mut command);
+        command
+    }
+
+    fn scp_command(
+        &self,
+        local_path: &str,
+        remote_path: &str,
+        instance: &str,
+        zone: &str,
+    ) -> Command {
+        let mut command = Command::new("gcloud");
+        command.args([
+            "compute",
+            "scp",
+            local_path,
+            &format!("{}:{}", instance, remote_path),
+            "--zone",
+            zone,
+            "--tunnel-through-iap",
+            "--quiet",
+        ]);
+        self.add_project_arg(&mut command);
+        command
+    }
+
     /// Check that gcloud CLI is installed and accessible.
     fn check_gcloud_installed(&self) -> Result<()> {
         let output = Command::new("gcloud").arg("--version").output();
@@ -112,19 +155,19 @@ impl GcpClient {
                 )));
             }
 
-            let output = Command::new("gcloud")
-                .args([
-                    "compute",
-                    "instances",
-                    "describe",
-                    instance,
-                    "--zone",
-                    zone,
-                    "--format",
-                    "value(status)",
-                ])
-                .output()
-                .map_err(HailError::Io)?;
+            let mut command = Command::new("gcloud");
+            command.args([
+                "compute",
+                "instances",
+                "describe",
+                instance,
+                "--zone",
+                zone,
+                "--format",
+                "value(status)",
+            ]);
+            self.add_project_arg(&mut command);
+            let output = command.output().map_err(HailError::Io)?;
 
             let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if status == "RUNNING" {
@@ -179,6 +222,10 @@ impl Default for GcpClient {
 }
 
 impl CloudProvider for GcpClient {
+    fn project_id(&self) -> Option<&str> {
+        self.project.as_deref()
+    }
+
     fn create_pool(&self, config: &PoolConfig) -> Result<()> {
         self.check_gcloud_installed()?;
 
@@ -193,6 +240,9 @@ impl CloudProvider for GcpClient {
         );
         // Coordinator auto-starts if binary is provided
         let cluster_cfg = super::startup::CoordinatorClusterConfig {
+            pool_name: Some(&config.name),
+            project: Some(&config.project_id),
+            zone: Some(&config.zone),
             machine_type: Some(&config.machine_type),
             spot: Some(config.spot),
             network: config.network.as_deref(),
@@ -328,16 +378,8 @@ impl CloudProvider for GcpClient {
     }
 
     fn list_instances(&self, pool_name: &str) -> Result<Vec<Instance>> {
-        let output = Command::new("gcloud")
-            .args([
-                "compute",
-                "instances",
-                "list",
-                "--filter",
-                &format!("tags.items:pool-{}", pool_name),
-                "--format",
-                "json(name,zone,status,networkInterfaces[].networkIP,networkInterfaces[].network,networkInterfaces[].subnetwork,machineType,scheduling.provisioningModel)",
-            ])
+        let output = self
+            .list_instances_command(pool_name)
             .output()
             .map_err(HailError::Io)?;
 
@@ -366,12 +408,13 @@ impl CloudProvider for GcpClient {
         let instance_names: Vec<&str> = instances.iter().map(|i| i.name.as_str()).collect();
 
         // gcloud supports bulk delete
-        let status = Command::new("gcloud")
+        let mut command = Command::new("gcloud");
+        command
             .args(["compute", "instances", "delete"])
             .args(&instance_names)
-            .args(["--zone", zone, "--quiet"])
-            .status()
-            .map_err(HailError::Io)?;
+            .args(["--zone", zone, "--quiet"]);
+        self.add_project_arg(&mut command);
+        let status = command.status().map_err(HailError::Io)?;
 
         if !status.success() {
             return Err(HailError::Io(std::io::Error::new(
@@ -480,6 +523,27 @@ impl CloudProvider for GcpClient {
         Ok(())
     }
 
+    fn stop_instances(&self, names: &[String], zone: &str) -> Result<()> {
+        if names.is_empty() {
+            return Ok(());
+        }
+
+        let mut command = Command::new("gcloud");
+        command
+            .args(["compute", "instances", "stop"])
+            .args(names)
+            .args(["--zone", zone, "--quiet"]);
+        self.add_project_arg(&mut command);
+        let status = command.status().map_err(HailError::Io)?;
+        if !status.success() {
+            return Err(HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Failed to stop instances",
+            )));
+        }
+        Ok(())
+    }
+
     fn upload_file(
         &self,
         local_path: &Path,
@@ -494,17 +558,8 @@ impl CloudProvider for GcpClient {
             ))
         })?;
 
-        let status = Command::new("gcloud")
-            .args([
-                "compute",
-                "scp",
-                local_str,
-                &format!("{}:{}", instance, remote_path),
-                "--zone",
-                zone,
-                "--tunnel-through-iap",
-                "--quiet",
-            ])
+        let status = self
+            .scp_command(local_str, remote_path, instance, zone)
             .status()
             .map_err(HailError::Io)?;
 
@@ -531,6 +586,7 @@ impl CloudProvider for GcpClient {
             command,
             "--quiet",
         ]);
+        self.add_project_arg(&mut cmd);
         cmd
     }
 }
@@ -547,6 +603,47 @@ mod tests {
 
         let client = GcpClient::with_project("my-project".to_string());
         assert_eq!(client.project, Some("my-project".to_string()));
+    }
+
+    fn args(command: &Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn assert_project_arg(command: &Command, expected: &str) {
+        let args = args(command);
+        let position = args.iter().position(|arg| arg == "--project").unwrap();
+        assert_eq!(args.get(position + 1).map(String::as_str), Some(expected));
+    }
+
+    #[test]
+    fn configured_project_is_added_to_discovery_ssh_and_scp() {
+        let client = GcpClient::with_project("configured-project".to_string());
+
+        assert_project_arg(&client.list_instances_command("demo"), "configured-project");
+        assert_project_arg(
+            &client.get_ssh_command("demo-coordinator", "us-central1-a", "true"),
+            "configured-project",
+        );
+        assert_project_arg(
+            &client.scp_command(
+                "/tmp/local",
+                "/tmp/remote",
+                "demo-worker-0",
+                "us-central1-a",
+            ),
+            "configured-project",
+        );
+    }
+
+    #[test]
+    fn ambient_project_fallback_does_not_add_an_override() {
+        let client = GcpClient::new();
+        assert!(!args(&client.list_instances_command("demo"))
+            .iter()
+            .any(|arg| arg == "--project"));
     }
 
     #[test]

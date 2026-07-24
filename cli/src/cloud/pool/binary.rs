@@ -228,6 +228,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             .as_ref()
             .map(|b| format!(" --backup-path {}", b))
             .unwrap_or_default();
+        let identity_args = self.coordinator_identity_args(name, zone);
         let coord_cmd = format!(
             "sudo bash -c 'cat > /etc/systemd/system/genohype-coordinator.service << EOF
 [Unit]
@@ -237,7 +238,7 @@ After=network.target
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/local/bin/genohype service start-coordinator --port 3000 --db-path /var/lib/genohype/ops.db{}
+ExecStart=/usr/local/bin/genohype service start-coordinator --port 3000 --db-path /var/lib/genohype/ops.db{}{}
 Restart=always
 RestartSec=3
 StartLimitIntervalSec=0
@@ -246,7 +247,7 @@ StartLimitIntervalSec=0
 WantedBy=multi-user.target
 EOF
 ' && sudo systemctl daemon-reload && sudo systemctl restart genohype-coordinator",
-            backup_arg
+            backup_arg, identity_args
         );
         let status = self
             .provider

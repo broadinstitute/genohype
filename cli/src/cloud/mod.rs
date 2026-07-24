@@ -172,6 +172,11 @@ pub struct ScalingConfig {
 /// This trait allows swapping out the underlying cloud provider implementation
 /// (e.g., gcloud CLI wrapper vs native SDK) without changing the orchestration logic.
 pub trait CloudProvider {
+    /// Stable project selected for this provider operation, if explicitly resolved.
+    fn project_id(&self) -> Option<&str> {
+        None
+    }
+
     /// Provision a cluster of worker VMs.
     ///
     /// Creates `config.worker_count` VMs with names `{pool_name}-worker-{i}`.
@@ -192,6 +197,15 @@ pub trait CloudProvider {
     /// Delete specific instances by name.
     /// Used for scaling down worker pools.
     fn delete_instances(&self, names: &[String], zone: &str, project_id: &str) -> Result<()>;
+
+    /// Stop specific instances without deleting them.
+    fn stop_instances(&self, names: &[String], zone: &str) -> Result<()> {
+        let _ = (names, zone);
+        Err(crate::HailError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Stopping instances is not supported by this cloud provider",
+        )))
+    }
 
     /// Upload a file to a specific instance via SCP.
     fn upload_file(

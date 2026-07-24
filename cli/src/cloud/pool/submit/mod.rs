@@ -173,6 +173,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             let backup_arg = pool_db_path
                 .map(|b| format!(" --backup-path {}", b))
                 .unwrap_or_default();
+            let identity_args = self.coordinator_identity_args(pool_name, zone);
             let coord_cmd = format!(
                 "sudo bash -c 'cat > /etc/systemd/system/genohype-coordinator.service << EOF
 [Unit]
@@ -182,7 +183,7 @@ After=network.target
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/local/bin/genohype service start-coordinator --port 3000 --db-path /var/lib/genohype/ops.db{}
+ExecStart=/usr/local/bin/genohype service start-coordinator --port 3000 --db-path /var/lib/genohype/ops.db{}{}
 Restart=always
 RestartSec=3
 StartLimitIntervalSec=0
@@ -191,7 +192,7 @@ StartLimitIntervalSec=0
 WantedBy=multi-user.target
 EOF
 ' && sudo systemctl daemon-reload && sudo systemctl enable --now genohype-coordinator",
-                backup_arg
+                backup_arg, identity_args
             );
 
             let status = self
@@ -625,6 +626,7 @@ EOF
                 let backup_arg = pool_db_path
                     .map(|b| format!(" --backup-path {}", b))
                     .unwrap_or_default();
+                let identity_args = self.coordinator_identity_args(name, zone);
                 let coord_cmd = format!(
                     "sudo bash -c 'cat > /etc/systemd/system/genohype-coordinator.service << EOF
 [Unit]
@@ -634,7 +636,7 @@ After=network.target
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/local/bin/genohype service start-coordinator --port 3000 --db-path /var/lib/genohype/ops.db{}
+ExecStart=/usr/local/bin/genohype service start-coordinator --port 3000 --db-path /var/lib/genohype/ops.db{}{}
 Restart=always
 RestartSec=3
 StartLimitIntervalSec=0
@@ -643,7 +645,7 @@ StartLimitIntervalSec=0
 WantedBy=multi-user.target
 EOF
 ' && sudo systemctl daemon-reload && sudo systemctl restart genohype-coordinator",
-                    backup_arg
+                    backup_arg, identity_args
                 );
                 let status = self
                     .provider
@@ -993,7 +995,7 @@ EOF
     /// 6. Streams coordinator logs for progress monitoring
     pub(crate) fn submit_distributed(
         &self,
-        _pool_name: &str,
+        pool_name: &str,
         zone: &str,
         coordinator: &Instance,
         workers: &[Instance],
@@ -1413,6 +1415,7 @@ EOF
                 .and_then(|c| c.pool_db_path.as_deref())
                 .map(|b| format!(" --backup-path {}", b))
                 .unwrap_or_default();
+            let identity_args = self.coordinator_identity_args(pool_name, zone);
             let coord_cmd = format!(
                 "sudo bash -c 'cat > /etc/systemd/system/genohype-coordinator.service << EOF
 [Unit]
@@ -1422,7 +1425,7 @@ After=network.target
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/local/bin/genohype service start-coordinator --port 3000 --db-path /var/lib/genohype/ops.db{}
+ExecStart=/usr/local/bin/genohype service start-coordinator --port 3000 --db-path /var/lib/genohype/ops.db{}{}
 Restart=always
 RestartSec=3
 StartLimitIntervalSec=0
@@ -1431,7 +1434,7 @@ StartLimitIntervalSec=0
 WantedBy=multi-user.target
 EOF
 ' && sudo systemctl daemon-reload && sudo systemctl enable --now genohype-coordinator",
-                backup_arg
+                backup_arg, identity_args
             );
 
             let status = self
@@ -1672,22 +1675,12 @@ EOF
                 "{}",
                 "Job finished. Stopping pool instances (--auto-stop)...".yellow()
             );
-            let mut stop_cmd = std::process::Command::new("gcloud");
-            stop_cmd.args(["compute", "instances", "stop"]);
+            let mut instance_names = vec![coordinator.name.clone()];
+            instance_names.extend(workers.iter().map(|worker| worker.name.clone()));
 
-            let mut instance_names = vec![coordinator.name.as_str()];
-            for w in workers {
-                instance_names.push(&w.name);
-            }
-
-            stop_cmd.args(&instance_names);
-            stop_cmd.args(["--zone", zone, "--quiet"]);
-
-            match stop_cmd.status() {
-                Ok(s) if s.success() => {
-                    println!("{} Instances stopped.", "OK".green().bold())
-                }
-                _ => eprintln!("{} Failed to stop instances.", "Error:".red()),
+            match self.provider.stop_instances(&instance_names, zone) {
+                Ok(()) => println!("{} Instances stopped.", "OK".green().bold()),
+                Err(_) => eprintln!("{} Failed to stop instances.", "Error:".red()),
             }
         }
 
