@@ -103,6 +103,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         binary_deployed_via_startup: bool,
         worker_binary: Option<&std::path::Path>,
         worker_deployed_via_startup: bool,
+        pool_config: &crate::cloud::PoolConfig,
     ) -> Result<()> {
         // Get coordinator instance
         let instances = self.provider.list_instances(pool_name)?;
@@ -173,7 +174,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             let backup_arg = pool_db_path
                 .map(|b| format!(" --backup-path {}", b))
                 .unwrap_or_default();
-            let identity_args = self.coordinator_identity_args(pool_name, zone);
+            let identity_args = self.coordinator_pool_args(pool_config);
             let coord_cmd = format!(
                 "sudo bash -c 'cat > /etc/systemd/system/genohype-coordinator.service << EOF
 [Unit]
@@ -626,7 +627,7 @@ EOF
                 let backup_arg = pool_db_path
                     .map(|b| format!(" --backup-path {}", b))
                     .unwrap_or_default();
-                let identity_args = self.coordinator_identity_args(name, zone);
+                let identity_args = self.coordinator_scaling_args(name, zone, config);
                 let coord_cmd = format!(
                     "sudo bash -c 'cat > /etc/systemd/system/genohype-coordinator.service << EOF
 [Unit]
@@ -1415,7 +1416,7 @@ EOF
                 .and_then(|c| c.pool_db_path.as_deref())
                 .map(|b| format!(" --backup-path {}", b))
                 .unwrap_or_default();
-            let identity_args = self.coordinator_identity_args(pool_name, zone);
+            let identity_args = self.coordinator_scaling_args(pool_name, zone, config);
             let coord_cmd = format!(
                 "sudo bash -c 'cat > /etc/systemd/system/genohype-coordinator.service << EOF
 [Unit]

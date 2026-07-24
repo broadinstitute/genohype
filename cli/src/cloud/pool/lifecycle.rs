@@ -130,6 +130,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                 config.binary_gcs_url.is_some(), // coordinator deployed via startup
                 worker_binary.as_deref(),
                 config.worker_binary_gcs_url.is_some(),
+                &config,
             )?;
         }
 
@@ -296,6 +297,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         let project_id = config
             .project
             .clone()
+            .or_else(|| self.provider.project_id().map(String::from))
             .unwrap_or_else(|| "default".to_string());
         let all_workers: Vec<&Instance> = instances
             .iter()
@@ -430,6 +432,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                     spot: config.spot,
                     network: config.network.clone(),
                     subnet: config.subnet.clone(),
+                    public_ip: config.public_ip,
                     project_id: project_id.clone(),
                     service_account: config.service_account.clone(),
                 });
@@ -663,6 +666,8 @@ mod tests {
             spot: true,
             network: None,
             subnet: None,
+            public_ip: true,
+            manage_firewall: true,
             project: Some("project".into()),
             with_coordinator: true,
             pool_db_path: None,
@@ -712,6 +717,8 @@ mod tests {
             project_id: "project".into(),
             network: None,
             subnet: None,
+            public_ip: true,
+            manage_firewall: true,
             with_coordinator: false,
             wireguard: None,
             pool_db_path: None,

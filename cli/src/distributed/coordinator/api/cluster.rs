@@ -19,6 +19,8 @@ pub struct ClusterConfigResponse {
     pub spot: Option<bool>,
     pub network: Option<String>,
     pub subnet: Option<String>,
+    pub public_ip: Option<bool>,
+    pub manage_firewall: Option<bool>,
 }
 
 /// A GCP VM instance in the cluster
@@ -65,6 +67,8 @@ pub async fn get_config(State(state): State<SharedState>) -> Json<ClusterConfigR
         spot: data.config.spot,
         network: data.config.network.clone(),
         subnet: data.config.subnet.clone(),
+        public_ip: data.config.public_ip,
+        manage_firewall: data.config.manage_firewall,
     })
 }
 
@@ -225,6 +229,8 @@ pub async fn scale_cluster(
         binary_gcs_url,
         mut machine_type,
         mut spot,
+        public_ip,
+        manage_firewall,
     ) = {
         let data = state.lock().unwrap();
         (
@@ -237,6 +243,8 @@ pub async fn scale_cluster(
             data.update_fleet_url.clone(),
             data.config.machine_type.clone(),
             data.config.spot,
+            data.config.public_ip,
+            data.config.manage_firewall,
         )
     };
 
@@ -353,6 +361,12 @@ pub async fn scale_cluster(
         if data.config.spot.is_none() {
             data.config.spot = spot;
         }
+        if data.config.public_ip.is_none() {
+            data.config.public_ip = public_ip;
+        }
+        if data.config.manage_firewall.is_none() {
+            data.config.manage_firewall = manage_firewall;
+        }
     }
 
     if target == current_count {
@@ -367,6 +381,7 @@ pub async fn scale_cluster(
     let zone = gcp_zone.unwrap_or_else(|| "us-central1-b".to_string());
     let machine_type = machine_type.unwrap_or_else(|| "n1-standard-4".to_string());
     let spot = spot.unwrap_or(true);
+    let public_ip = public_ip.unwrap_or(true);
 
     if target > current_count {
         // Scale UP: create new workers
@@ -422,6 +437,7 @@ pub async fn scale_cluster(
                 spot,
                 network: net.clone(),
                 subnet: sub.clone(),
+                public_ip,
                 project_id: project.clone(),
                 service_account: None,
             })

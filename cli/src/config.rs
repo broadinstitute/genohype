@@ -79,6 +79,10 @@ pub struct Defaults {
     pub network: Option<String>,
     /// Subnet name
     pub subnet: Option<String>,
+    /// Assign external IP addresses to pool VMs (default: true)
+    pub public_ip: Option<bool>,
+    /// Let Genohype create the coordinator firewall rule (default: true)
+    pub manage_firewall: Option<bool>,
     /// SSH user (defaults to current user)
     pub ssh_user: Option<String>,
 }
@@ -132,6 +136,10 @@ pub struct PoolProfile {
     pub network: Option<String>,
     /// Subnet name (overrides defaults)
     pub subnet: Option<String>,
+    /// Assign external IP addresses to pool VMs
+    pub public_ip: Option<bool>,
+    /// Let Genohype create the coordinator firewall rule
+    pub manage_firewall: Option<bool>,
     /// Create a dedicated coordinator node
     pub with_coordinator: Option<bool>,
     /// WireGuard configuration for coordinator
@@ -341,6 +349,12 @@ impl Config {
             if config.defaults.subnet.is_none() {
                 config.defaults.subnet = user.defaults.subnet;
             }
+            if config.defaults.public_ip.is_none() {
+                config.defaults.public_ip = user.defaults.public_ip;
+            }
+            if config.defaults.manage_firewall.is_none() {
+                config.defaults.manage_firewall = user.defaults.manage_firewall;
+            }
             if config.defaults.ssh_user.is_none() {
                 config.defaults.ssh_user = user.defaults.ssh_user;
             }
@@ -439,6 +453,14 @@ impl Config {
                     .subnet
                     .clone()
                     .or_else(|| self.defaults.subnet.clone()),
+                public_ip: profile
+                    .public_ip
+                    .or(self.defaults.public_ip)
+                    .unwrap_or(true),
+                manage_firewall: profile
+                    .manage_firewall
+                    .or(self.defaults.manage_firewall)
+                    .unwrap_or(true),
                 project: self.defaults.project.clone(),
                 with_coordinator,
                 wireguard: profile.wireguard.clone(),
@@ -531,6 +553,10 @@ pub struct ResolvedPoolConfig {
     pub network: Option<String>,
     /// Subnet
     pub subnet: Option<String>,
+    /// Assign external IP addresses to pool VMs
+    pub public_ip: bool,
+    /// Let Genohype create the coordinator firewall rule
+    pub manage_firewall: bool,
     /// GCP project (may need CLI override)
     pub project: Option<String>,
     /// Create a dedicated coordinator node
@@ -781,6 +807,31 @@ workers = 8
 
         assert_eq!(resolved.starting_workers, 0); // default: coordinator-only
         assert_eq!(resolved.workers, 4); // default autoscale target
+        assert!(resolved.public_ip); // legacy behavior
+        assert!(resolved.manage_firewall); // legacy behavior
+    }
+
+    #[test]
+    fn pool_networking_uses_profile_then_defaults() {
+        let config: Config = toml::from_str(
+            r#"
+[defaults]
+public_ip = false
+manage_firewall = false
+[pools.inherited]
+[pools.overridden]
+public_ip = true
+manage_firewall = true
+"#,
+        )
+        .unwrap();
+
+        let inherited = config.get_pool("inherited").unwrap();
+        assert!(!inherited.public_ip);
+        assert!(!inherited.manage_firewall);
+        let overridden = config.get_pool("overridden").unwrap();
+        assert!(overridden.public_ip);
+        assert!(overridden.manage_firewall);
     }
 
     #[test]

@@ -71,6 +71,8 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
             project: _,
             network,
             subnet,
+            public_ip,
+            manage_firewall,
             wait,
             skip_build,
             worker_binary,
@@ -98,6 +100,14 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
             let resolved_subnet = subnet
                 .or_else(|| profile.as_ref().and_then(|p| p.subnet.clone()))
                 .or_else(|| app_config.defaults.subnet.clone());
+            let resolved_public_ip = public_ip
+                .or_else(|| profile.as_ref().map(|p| p.public_ip))
+                .or(app_config.defaults.public_ip)
+                .unwrap_or(true);
+            let resolved_manage_firewall = manage_firewall
+                .or_else(|| profile.as_ref().map(|p| p.manage_firewall))
+                .or(app_config.defaults.manage_firewall)
+                .unwrap_or(true);
 
             // Convert WireGuard config from config module to cloud module
             // Resolve env: prefixes (for USB-sourced secrets) at this point
@@ -156,6 +166,8 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
                 project_id,
                 network: resolved_network,
                 subnet: resolved_subnet,
+                public_ip: resolved_public_ip,
+                manage_firewall: resolved_manage_firewall,
                 with_coordinator: resolved_with_coordinator,
                 wireguard,
                 pool_db_path: profile.as_ref().and_then(|p| p.pool_db_path.clone()),
@@ -308,6 +320,8 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
                     spot: p.spot,
                     network: p.network.clone(),
                     subnet: p.subnet.clone(),
+                    public_ip: p.public_ip,
+                    manage_firewall: p.manage_firewall,
                     project: p.project.clone(),
                     with_coordinator: p.with_coordinator,
                     pool_db_path: p.pool_db_path.clone(),
@@ -341,6 +355,8 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
             name,
             workers,
             zone,
+            public_ip,
+            manage_firewall,
             binary,
             worker_binary,
             skip_build,
@@ -361,6 +377,8 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
                 spot: pool_config.spot,
                 network: pool_config.network.clone(),
                 subnet: pool_config.subnet.clone(),
+                public_ip: public_ip.unwrap_or(pool_config.public_ip),
+                manage_firewall: manage_firewall.unwrap_or(pool_config.manage_firewall),
                 project: pool_config.project.clone(),
                 with_coordinator: pool_config.with_coordinator,
                 pool_db_path: pool_config.pool_db_path.clone(),
@@ -408,6 +426,20 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
             let resolved_zone = resolve_zone(zone, &name, app_config);
             let pool_config = app_config.get_pool(&name);
             let pool_db_path = pool_config.as_ref().and_then(|p| p.pool_db_path.clone());
+            let scaling_config = pool_config.as_ref().map(|p| crate::cloud::ScalingConfig {
+                machine_type: p.machine_type.clone(),
+                workers: p.workers,
+                spot: p.spot,
+                network: p.network.clone(),
+                subnet: p.subnet.clone(),
+                public_ip: p.public_ip,
+                manage_firewall: p.manage_firewall,
+                project: p.project.clone(),
+                with_coordinator: p.with_coordinator,
+                pool_db_path: p.pool_db_path.clone(),
+                worker_binary: p.worker_binary.clone(),
+                service_account: p.service_account.clone(),
+            });
             // Resolve worker binary: CLI flag > config profile
             let resolved_worker_binary = worker_binary
                 .or_else(|| pool_config.as_ref().and_then(|p| p.worker_binary.clone()));
@@ -442,6 +474,7 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
                     resolved_worker_binary,
                     skip_build,
                     pool_db_path.as_deref(),
+                    scaling_config.as_ref(),
                 )?;
             }
         }

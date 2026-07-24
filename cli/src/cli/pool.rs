@@ -42,6 +42,14 @@ pub enum PoolCommands {
         #[arg(long)]
         subnet: Option<String>,
 
+        /// Assign external IP addresses to VMs (set false for private-only pools)
+        #[arg(long)]
+        public_ip: Option<bool>,
+
+        /// Create the per-pool coordinator firewall rule (set false when infrastructure manages it)
+        #[arg(long)]
+        manage_firewall: Option<bool>,
+
         /// Wait for VMs to be ready (startup script complete)
         #[arg(long)]
         wait: bool,
@@ -129,6 +137,14 @@ pub enum PoolCommands {
         /// GCP zone (default: from config or us-central1-a)
         #[arg(long)]
         zone: Option<String>,
+
+        /// Assign external IP addresses to newly created workers
+        #[arg(long)]
+        public_ip: Option<bool>,
+
+        /// Preserve whether Genohype manages the coordinator firewall rule
+        #[arg(long)]
+        manage_firewall: Option<bool>,
 
         /// Path to the Linux-compiled binary (optional)
         #[arg(long)]
@@ -326,6 +342,14 @@ pub enum ServiceCommands {
         /// Subnet name
         #[arg(long)]
         cluster_subnet: Option<String>,
+
+        /// Whether cluster VMs receive external IP addresses
+        #[arg(long)]
+        cluster_public_ip: Option<bool>,
+
+        /// Whether Genohype manages the coordinator firewall rule
+        #[arg(long)]
+        cluster_manage_firewall: Option<bool>,
     },
 
     /// Start a worker process (connects to coordinator for work)

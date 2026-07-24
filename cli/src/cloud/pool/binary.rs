@@ -66,6 +66,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         worker_binary_path: Option<String>,
         skip_build: bool,
         pool_db_path: Option<&str>,
+        config: Option<&crate::cloud::ScalingConfig>,
     ) -> Result<()> {
         // Determine if we should build
         // Note: update_binary doesn't know about job features, defaulting to none.
@@ -228,7 +229,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             .as_ref()
             .map(|b| format!(" --backup-path {}", b))
             .unwrap_or_default();
-        let identity_args = self.coordinator_identity_args(name, zone);
+        let identity_args = self.coordinator_scaling_args(name, zone, config);
         let coord_cmd = format!(
             "sudo bash -c 'cat > /etc/systemd/system/genohype-coordinator.service << EOF
 [Unit]

@@ -92,6 +92,10 @@ pub struct CoordinatorConfig {
     pub network: Option<String>,
     /// Subnet name
     pub subnet: Option<String>,
+    /// Whether workers receive external IP addresses
+    pub public_ip: Option<bool>,
+    /// Whether Genohype manages the coordinator firewall rule
+    pub manage_firewall: Option<bool>,
 }
 
 impl Default for CoordinatorConfig {
@@ -116,6 +120,8 @@ impl Default for CoordinatorConfig {
             spot: None,
             network: None,
             subnet: None,
+            public_ip: None,
+            manage_firewall: None,
         }
     }
 }

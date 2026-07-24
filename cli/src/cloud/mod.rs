@@ -48,6 +48,10 @@ pub struct PoolConfig {
     pub network: Option<String>,
     /// Subnet name (required for custom networks)
     pub subnet: Option<String>,
+    /// Assign external IP addresses to VMs
+    pub public_ip: bool,
+    /// Create the per-pool coordinator firewall rule
+    pub manage_firewall: bool,
     /// Create a dedicated coordinator node for distributed processing
     pub with_coordinator: bool,
     /// WireGuard configuration for coordinator (optional)
@@ -135,6 +139,8 @@ pub struct InstanceSetup {
     pub network: Option<String>,
     /// Subnet name
     pub subnet: Option<String>,
+    /// Assign an external IP address to the VM
+    pub public_ip: bool,
     /// GCP project ID
     pub project_id: String,
     /// GCP service account email to attach to the VM
@@ -155,6 +161,10 @@ pub struct ScalingConfig {
     pub network: Option<String>,
     /// Subnet name
     pub subnet: Option<String>,
+    /// Assign external IP addresses to workers
+    pub public_ip: bool,
+    /// Whether Genohype manages the coordinator firewall rule
+    pub manage_firewall: bool,
     /// GCP project ID
     pub project: Option<String>,
     /// Whether the pool has a coordinator

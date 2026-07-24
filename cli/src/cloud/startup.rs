@@ -120,6 +120,8 @@ pub struct CoordinatorClusterConfig<'a> {
     pub spot: Option<bool>,
     pub network: Option<&'a str>,
     pub subnet: Option<&'a str>,
+    pub public_ip: Option<bool>,
+    pub manage_firewall: Option<bool>,
 }
 
 pub fn generate_coordinator_startup_script(
@@ -165,6 +167,12 @@ pub fn generate_coordinator_startup_script_with_cluster(
             }
             if let Some(sub) = cc.subnet {
                 cluster_args.push_str(&format!(" --cluster-subnet {}", sub));
+            }
+            if let Some(public_ip) = cc.public_ip {
+                cluster_args.push_str(&format!(" --cluster-public-ip {}", public_ip));
+            }
+            if let Some(manage_firewall) = cc.manage_firewall {
+                cluster_args.push_str(&format!(" --cluster-manage-firewall {}", manage_firewall));
             }
         }
 
@@ -394,6 +402,8 @@ mod tests {
             spot: Some(true),
             network: None,
             subnet: None,
+            public_ip: Some(false),
+            manage_firewall: Some(false),
         };
         let script = generate_coordinator_startup_script_with_cluster(
             None,
@@ -405,6 +415,8 @@ mod tests {
         assert!(script.contains("--pool-name demo"));
         assert!(script.contains("--gcp-project configured-project"));
         assert!(script.contains("--gcp-zone us-central1-a"));
+        assert!(script.contains("--cluster-public-ip false"));
+        assert!(script.contains("--cluster-manage-firewall false"));
     }
 
     #[test]
