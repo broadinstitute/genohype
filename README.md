@@ -402,6 +402,8 @@ cargo test --workspace --all-features
 ./scripts/verify.sh
 ```
 
+The [GCP build/install/pool E2E harness](scripts/e2e/gcp/README.md) provides a plan-first, disposable test of current Linux artifacts, core functionality, a one-worker pool, dashboard APIs, stress scheduling, distributed Parquet export, and exact cleanup. Use only a dedicated non-production project.
+
 Release maintainers should follow [RELEASING.md](RELEASING.md).
 
 ## Using Genohype as Libraries
