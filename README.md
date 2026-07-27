@@ -305,6 +305,12 @@ See the [roadmap's annotation status](ROADMAP.md#experimental-annotation-status)
 
 Run parallel jobs across GCP VMs. Prebuilt macOS installations include the Linux worker used by pool commands; when building from source, run `make worker` first.
 
+Practical guides:
+
+- [Create, inspect, connect to, and destroy a minimal GCP pool](examples/gcp-pool/minimal.md)
+- [Run and observe a synthetic pool stress test](examples/gcp-pool/stress-test.md)
+- [Export gnomAD v4.1.1 to Parquet locally or with GCP pools](examples/gcp-pool/gnomad-4.1.1-parquet.md)
+
 ```bash
 # 1. Create a coordinator and four spot workers
 genohype pool create my-pool \
@@ -315,7 +321,7 @@ genohype pool create my-pool \
 
 # 2. Submit a distributed export
 genohype pool submit my-pool -- \
-  export parquet gs://bucket/input.ht gs://bucket/output/ --shard-count 100
+  export parquet gs://bucket/input.ht gs://bucket/output/
 
 # 3. Inspect progress and worker activity
 genohype pool status my-pool
