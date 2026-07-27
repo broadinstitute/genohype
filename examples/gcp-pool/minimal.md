@@ -29,6 +29,22 @@ export ZONE="us-central1-a"
 gcloud services enable compute.googleapis.com --project "$PROJECT"
 ```
 
+Check whether the project has a default VPC:
+
+```bash
+gcloud compute networks describe default --project "$PROJECT"
+```
+
+If that command fails, choose an existing VPC and subnet:
+
+```bash
+gcloud compute networks list --project "$PROJECT"
+gcloud compute networks subnets list --project "$PROJECT" \
+  --filter="region:${ZONE%-*}"
+```
+
+Then add `network = "YOUR_VPC"` and `subnet = "YOUR_SUBNET"` under `[defaults]` in the configuration below. Genohype otherwise asks GCP to use a network named `default`, which not every project provides.
+
 Verify the local tools and select a unique pool name:
 
 ```bash

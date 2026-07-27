@@ -25,12 +25,14 @@ Set the source once:
 export INPUT="gs://gcp-public-data--gnomad/release/4.1.1/ht/browser/gnomad.browser.v4.1.1.sites.ht"
 ```
 
-Genohype's current GCS client uses Google Application Default Credentials, including for public buckets:
+Genohype's current GCS client uses Google Application Default Credentials, including for public buckets. On a workstation, initialize them with:
 
 ```bash
 gcloud auth application-default login
 genohype info "$INPUT"
 ```
+
+On a GCE VM, the attached service account is discovered automatically instead; it must have the required storage permissions.
 
 `genohype info` reads table metadata without scanning the complete dataset. Confirm that it reports the expected `locus, alleles` keyed variant table and note its partition count before continuing. At the time this guide was validated, v4.1.1 reported 9,694 source partitions.
 
@@ -72,6 +74,8 @@ Check the file:
 ls -lh "$LOCAL_OUTPUT"
 file "$LOCAL_OUTPUT"
 ```
+
+As a clean-room baseline, the published v0.1.0 Linux release exported 5,166 rows and produced a 4.47 MiB file for this interval. Runtime and compressed size can vary by machine and library version, but the fixed source and interval should retain the same biological row count.
 
 If DuckDB is installed, verify the row count and sample records:
 
@@ -116,6 +120,27 @@ export OUTPUT_BUCKET="gs://YOUR-WRITABLE-BUCKET"
 gcloud services enable compute.googleapis.com --project "$PROJECT"
 gcloud storage ls "$OUTPUT_BUCKET"
 command -v genohype-worker
+```
+
+Check whether the project has a default VPC:
+
+```bash
+gcloud compute networks describe default --project "$PROJECT"
+```
+
+If it does not, select an existing network and regional subnet:
+
+```bash
+gcloud compute networks list --project "$PROJECT"
+gcloud compute networks subnets list --project "$PROJECT" \
+  --filter="region:${ZONE%-*}"
+```
+
+Add the selected values under `[defaults]` in each pool profile below:
+
+```toml
+network = "YOUR_VPC"
+subnet = "YOUR_SUBNET"
 ```
 
 Use an output bucket near the source data and workers when possible. You can inspect bucket locations with:
