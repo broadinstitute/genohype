@@ -154,6 +154,8 @@ pub struct PoolProfile {
     pub worker_binary: Option<String>,
     /// GCP service account email to attach to worker VMs
     pub service_account: Option<String>,
+    /// GCP service account email to attach to the coordinator VM
+    pub coordinator_service_account: Option<String>,
 }
 
 /// A named ClickHouse instance profile.
@@ -469,6 +471,7 @@ impl Config {
                 update_api_port: profile.update_api_port.unwrap_or(3000),
                 worker_binary: profile.worker_binary.clone(),
                 service_account: profile.service_account.clone(),
+                coordinator_service_account: profile.coordinator_service_account.clone(),
             }
         })
     }
@@ -573,6 +576,8 @@ pub struct ResolvedPoolConfig {
     pub worker_binary: Option<String>,
     /// GCP service account email to attach to worker VMs
     pub service_account: Option<String>,
+    /// GCP service account email to attach to the coordinator VM
+    pub coordinator_service_account: Option<String>,
 }
 
 /// Status of a cluster deployment.
@@ -832,6 +837,28 @@ manage_firewall = true
         let overridden = config.get_pool("overridden").unwrap();
         assert!(overridden.public_ip);
         assert!(overridden.manage_firewall);
+    }
+
+    #[test]
+    fn pool_resolves_separate_worker_and_coordinator_service_accounts() {
+        let config: Config = toml::from_str(
+            r#"
+[pools.private]
+service_account = "worker@project.iam.gserviceaccount.com"
+coordinator_service_account = "coordinator@project.iam.gserviceaccount.com"
+"#,
+        )
+        .unwrap();
+
+        let resolved = config.get_pool("private").unwrap();
+        assert_eq!(
+            resolved.service_account.as_deref(),
+            Some("worker@project.iam.gserviceaccount.com")
+        );
+        assert_eq!(
+            resolved.coordinator_service_account.as_deref(),
+            Some("coordinator@project.iam.gserviceaccount.com")
+        );
     }
 
     #[test]

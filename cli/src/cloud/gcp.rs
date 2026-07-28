@@ -81,6 +81,17 @@ impl GcpClient {
         Some(command)
     }
 
+    fn instance_service_account(config: &PoolConfig, is_coordinator: bool) -> Option<String> {
+        if is_coordinator {
+            config
+                .coordinator_service_account
+                .clone()
+                .or_else(|| config.service_account.clone())
+        } else {
+            config.service_account.clone()
+        }
+    }
+
     fn instance_create_command(setup: &InstanceSetup) -> Command {
         let mut command = Command::new("gcloud");
         command.args([
@@ -316,6 +327,7 @@ impl CloudProvider for GcpClient {
             subnet: config.subnet.as_deref(),
             public_ip: Some(config.public_ip),
             manage_firewall: Some(config.manage_firewall),
+            worker_service_account: config.service_account.as_deref(),
         };
         let coordinator_script = super::startup::generate_coordinator_startup_script_with_cluster(
             config.wireguard.as_ref(),
@@ -371,7 +383,7 @@ impl CloudProvider for GcpClient {
                     subnet: config.subnet.clone(),
                     public_ip: config.public_ip,
                     project_id: config.project_id.clone(),
-                    service_account: config.service_account.clone(),
+                    service_account: Self::instance_service_account(config, is_coordinator),
                 };
                 let output = Self::instance_create_command(&setup)
                     .output()
@@ -645,6 +657,7 @@ mod tests {
             binary_gcs_url: Some("gs://bucket/stock-coordinator".into()),
             worker_binary_gcs_url: Some("gs://bucket/custom-worker".into()),
             service_account: None,
+            coordinator_service_account: None,
         };
 
         let worker = super::super::startup::generate_worker_startup_script(
@@ -680,7 +693,61 @@ mod tests {
             binary_gcs_url: None,
             worker_binary_gcs_url: None,
             service_account: None,
+            coordinator_service_account: None,
         }
+    }
+
+    fn instance_create_args_for(config: &PoolConfig, is_coordinator: bool) -> Vec<String> {
+        let setup = InstanceSetup {
+            name: if is_coordinator {
+                "demo-coordinator".into()
+            } else {
+                "demo-worker-0".into()
+            },
+            machine_type: config.machine_type.clone(),
+            zone: config.zone.clone(),
+            tags: vec![],
+            startup_script: "true".into(),
+            spot: config.spot,
+            network: config.network.clone(),
+            subnet: config.subnet.clone(),
+            public_ip: config.public_ip,
+            project_id: config.project_id.clone(),
+            service_account: GcpClient::instance_service_account(config, is_coordinator),
+        };
+        args(&GcpClient::instance_create_command(&setup))
+    }
+
+    #[test]
+    fn legacy_service_account_is_attached_to_coordinator_and_worker_commands() {
+        let mut config = pool_config(false, false);
+        config.service_account = Some("legacy@project.iam.gserviceaccount.com".into());
+
+        for is_coordinator in [true, false] {
+            assert!(instance_create_args_for(&config, is_coordinator)
+                .iter()
+                .any(|arg| arg == "--service-account=legacy@project.iam.gserviceaccount.com"));
+        }
+    }
+
+    #[test]
+    fn coordinator_and_worker_commands_use_separate_service_accounts() {
+        let mut config = pool_config(false, false);
+        config.service_account = Some("worker@project.iam.gserviceaccount.com".into());
+        config.coordinator_service_account =
+            Some("coordinator@project.iam.gserviceaccount.com".into());
+
+        let worker = instance_create_args_for(&config, false);
+        assert!(worker
+            .iter()
+            .any(|arg| arg == "--service-account=worker@project.iam.gserviceaccount.com"));
+        let coordinator = instance_create_args_for(&config, true);
+        assert!(coordinator
+            .iter()
+            .any(|arg| arg == "--service-account=coordinator@project.iam.gserviceaccount.com"));
+        assert!(!coordinator
+            .iter()
+            .any(|arg| arg == "--service-account=worker@project.iam.gserviceaccount.com"));
     }
 
     #[test]
@@ -700,9 +767,14 @@ mod tests {
             service_account: None,
         };
 
-        assert!(args(&GcpClient::instance_create_command(&setup))
-            .iter()
-            .any(|arg| arg == "--no-address"));
+        let command_args = args(&GcpClient::instance_create_command(&setup));
+        assert!(command_args.iter().any(|arg| arg == "--no-address"));
+        assert!(command_args
+            .windows(2)
+            .any(|args| args == ["--network", "network"]));
+        assert!(command_args
+            .windows(2)
+            .any(|args| args == ["--subnet", "subnet"]));
     }
 
     #[test]

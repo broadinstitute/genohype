@@ -69,6 +69,10 @@ pub enum PoolCommands {
         /// GCP service account email to attach to worker VMs
         #[arg(long)]
         service_account: Option<String>,
+
+        /// GCP service account email to attach to the coordinator VM
+        #[arg(long)]
+        coordinator_service_account: Option<String>,
     },
 
     /// Submit a job to run on the worker pool
@@ -350,6 +354,10 @@ pub enum ServiceCommands {
         /// Whether Genohype manages the coordinator firewall rule
         #[arg(long)]
         cluster_manage_firewall: Option<bool>,
+
+        /// Service account attached to workers created by coordinator scaling
+        #[arg(long)]
+        cluster_worker_service_account: Option<String>,
     },
 
     /// Start a worker process (connects to coordinator for work)

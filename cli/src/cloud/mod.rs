@@ -62,8 +62,10 @@ pub struct PoolConfig {
     pub binary_gcs_url: Option<String>,
     /// GCS URL for the pre-staged worker binary (custom or stock).
     pub worker_binary_gcs_url: Option<String>,
-    /// GCP service account email to attach to VMs
+    /// GCP service account email to attach to worker VMs
     pub service_account: Option<String>,
+    /// GCP service account email to attach to the coordinator VM
+    pub coordinator_service_account: Option<String>,
 }
 
 /// Information about a cloud instance.
@@ -173,7 +175,7 @@ pub struct ScalingConfig {
     pub pool_db_path: Option<String>,
     /// Path to a custom binary to deploy to workers instead of the coordinator binary
     pub worker_binary: Option<String>,
-    /// GCP service account email to attach to VMs
+    /// GCP service account email to attach to workers created by the coordinator
     pub service_account: Option<String>,
 }
 

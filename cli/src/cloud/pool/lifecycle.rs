@@ -725,6 +725,7 @@ mod tests {
             binary_gcs_url: None,
             worker_binary_gcs_url: None,
             service_account: None,
+            coordinator_service_account: None,
         };
 
         let error = manager

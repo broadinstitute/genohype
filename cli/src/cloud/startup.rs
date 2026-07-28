@@ -122,6 +122,7 @@ pub struct CoordinatorClusterConfig<'a> {
     pub subnet: Option<&'a str>,
     pub public_ip: Option<bool>,
     pub manage_firewall: Option<bool>,
+    pub worker_service_account: Option<&'a str>,
 }
 
 pub fn generate_coordinator_startup_script(
@@ -173,6 +174,12 @@ pub fn generate_coordinator_startup_script_with_cluster(
             }
             if let Some(manage_firewall) = cc.manage_firewall {
                 cluster_args.push_str(&format!(" --cluster-manage-firewall {}", manage_firewall));
+            }
+            if let Some(service_account) = cc.worker_service_account {
+                cluster_args.push_str(&format!(
+                    " --cluster-worker-service-account {}",
+                    service_account
+                ));
             }
         }
 
@@ -404,6 +411,7 @@ mod tests {
             subnet: None,
             public_ip: Some(false),
             manage_firewall: Some(false),
+            worker_service_account: Some("worker@project.iam.gserviceaccount.com"),
         };
         let script = generate_coordinator_startup_script_with_cluster(
             None,
@@ -417,6 +425,8 @@ mod tests {
         assert!(script.contains("--gcp-zone us-central1-a"));
         assert!(script.contains("--cluster-public-ip false"));
         assert!(script.contains("--cluster-manage-firewall false"));
+        assert!(script
+            .contains("--cluster-worker-service-account worker@project.iam.gserviceaccount.com"));
     }
 
     #[test]

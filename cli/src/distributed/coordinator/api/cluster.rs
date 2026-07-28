@@ -21,6 +21,7 @@ pub struct ClusterConfigResponse {
     pub subnet: Option<String>,
     pub public_ip: Option<bool>,
     pub manage_firewall: Option<bool>,
+    pub worker_service_account: Option<String>,
 }
 
 /// A GCP VM instance in the cluster
@@ -56,6 +57,38 @@ pub struct ScaleResponse {
     pub target_workers: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
+fn build_worker_instance_setups(
+    pool_name: &str,
+    indices: &[usize],
+    machine_type: &str,
+    zone: &str,
+    startup_script: &str,
+    spot: bool,
+    network: Option<String>,
+    subnet: Option<String>,
+    public_ip: bool,
+    project: &str,
+    service_account: Option<String>,
+) -> Vec<crate::cloud::InstanceSetup> {
+    indices
+        .iter()
+        .map(|&i| crate::cloud::InstanceSetup {
+            name: format!("{}-worker-{}", pool_name, i),
+            machine_type: machine_type.to_string(),
+            zone: zone.to_string(),
+            tags: vec![format!("genohype-worker,pool-{},role-worker", pool_name)],
+            startup_script: startup_script.to_string(),
+            spot,
+            network: network.clone(),
+            subnet: subnet.clone(),
+            public_ip,
+            project_id: project.to_string(),
+            service_account: service_account.clone(),
+        })
+        .collect()
+}
+
 /// GET /api/cluster/config - Returns the current cluster configuration
 pub async fn get_config(State(state): State<SharedState>) -> Json<ClusterConfigResponse> {
     let data = state.lock().unwrap();
@@ -69,6 +102,7 @@ pub async fn get_config(State(state): State<SharedState>) -> Json<ClusterConfigR
         subnet: data.config.subnet.clone(),
         public_ip: data.config.public_ip,
         manage_firewall: data.config.manage_firewall,
+        worker_service_account: data.config.worker_service_account.clone(),
     })
 }
 
@@ -231,6 +265,7 @@ pub async fn scale_cluster(
         mut spot,
         public_ip,
         manage_firewall,
+        worker_service_account,
     ) = {
         let data = state.lock().unwrap();
         (
@@ -245,6 +280,7 @@ pub async fn scale_cluster(
             data.config.spot,
             data.config.public_ip,
             data.config.manage_firewall,
+            data.config.worker_service_account.clone(),
         )
     };
 
@@ -426,22 +462,19 @@ pub async fn scale_cluster(
         let sub = subnet;
         let zone_clone = zone.clone();
 
-        let instance_setups: Vec<crate::cloud::InstanceSetup> = new_indices
-            .iter()
-            .map(|&i| crate::cloud::InstanceSetup {
-                name: format!("{}-worker-{}", pool_name, i),
-                machine_type: machine_type.clone(),
-                zone: zone_clone.clone(),
-                tags: vec![format!("genohype-worker,pool-{},role-worker", pool_name)],
-                startup_script: startup_script.clone(),
-                spot,
-                network: net.clone(),
-                subnet: sub.clone(),
-                public_ip,
-                project_id: project.clone(),
-                service_account: None,
-            })
-            .collect();
+        let instance_setups = build_worker_instance_setups(
+            &pool_name,
+            &new_indices,
+            &machine_type,
+            &zone_clone,
+            &startup_script,
+            spot,
+            net,
+            sub,
+            public_ip,
+            &project,
+            worker_service_account,
+        );
 
         // Invalidate VM cache so next poll picks up the new worker
         {
@@ -532,5 +565,41 @@ pub async fn scale_cluster(
             previous_workers: current_count,
             target_workers: target,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_worker_instance_setups;
+
+    #[test]
+    fn zero_to_64_workers_preserves_private_identity_configuration() {
+        let indices: Vec<usize> = (0..64).collect();
+        let setups = build_worker_instance_setups(
+            "prototype",
+            &indices,
+            "c4-highcpu-48",
+            "us-central1-a",
+            "startup",
+            true,
+            Some("shared-vpc".into()),
+            Some("private-subnet".into()),
+            false,
+            "project",
+            Some("worker@project.iam.gserviceaccount.com".into()),
+        );
+
+        assert_eq!(setups.len(), 64);
+        assert_eq!(setups.first().unwrap().name, "prototype-worker-0");
+        assert_eq!(setups.last().unwrap().name, "prototype-worker-63");
+        assert!(setups.iter().all(|setup| !setup.public_ip));
+        assert!(setups
+            .iter()
+            .all(|setup| setup.network.as_deref() == Some("shared-vpc")));
+        assert!(setups
+            .iter()
+            .all(|setup| setup.subnet.as_deref() == Some("private-subnet")));
+        assert!(setups.iter().all(|setup| setup.service_account.as_deref()
+            == Some("worker@project.iam.gserviceaccount.com")));
     }
 }

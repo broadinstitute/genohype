@@ -55,6 +55,12 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             if let Some(subnet) = &config.subnet {
                 args.push_str(&format!(" --cluster-subnet {}", subnet));
             }
+            if let Some(service_account) = &config.service_account {
+                args.push_str(&format!(
+                    " --cluster-worker-service-account {}",
+                    service_account
+                ));
+            }
         }
         args
     }
@@ -70,6 +76,12 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         }
         if let Some(subnet) = &config.subnet {
             args.push_str(&format!(" --cluster-subnet {}", subnet));
+        }
+        if let Some(service_account) = &config.service_account {
+            args.push_str(&format!(
+                " --cluster-worker-service-account {}",
+                service_account
+            ));
         }
         args
     }
@@ -156,7 +168,7 @@ mod tests {
             with_coordinator: true,
             pool_db_path: None,
             worker_binary: None,
-            service_account: None,
+            service_account: Some("worker@project.iam.gserviceaccount.com".into()),
         };
         let args = PoolManager::new(ProjectProvider).coordinator_scaling_args(
             "demo",
@@ -167,6 +179,8 @@ mod tests {
         assert!(args.contains("--cluster-manage-firewall false"));
         assert!(args.contains("--cluster-network vpc"));
         assert!(args.contains("--cluster-subnet subnet"));
+        assert!(args
+            .contains("--cluster-worker-service-account worker@project.iam.gserviceaccount.com"));
     }
 
     #[test]

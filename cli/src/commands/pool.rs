@@ -22,6 +22,18 @@ fn resolve_worker_binary(
     cli.or_else(|| profile.and_then(|p| p.worker_binary.clone()))
 }
 
+fn resolve_service_accounts(
+    worker: Option<String>,
+    coordinator: Option<String>,
+    profile: Option<&config::ResolvedPoolConfig>,
+) -> (Option<String>, Option<String>) {
+    let worker = worker.or_else(|| profile.and_then(|p| p.service_account.clone()));
+    let coordinator = coordinator
+        .or_else(|| profile.and_then(|p| p.coordinator_service_account.clone()))
+        .or_else(|| worker.clone());
+    (worker, coordinator)
+}
+
 fn command_pool_name_and_project(command: &PoolCommands) -> (&str, Option<&str>) {
     match command {
         PoolCommands::Create { name, project, .. } => (name, project.as_deref()),
@@ -78,6 +90,7 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
             worker_binary,
             with_coordinator,
             service_account,
+            coordinator_service_account,
         } => {
             // Try to load pool profile from config (if exists)
             let profile = app_config.get_pool(&name);
@@ -152,8 +165,12 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
                 );
             }
 
-            let resolved_service_account = service_account
-                .or_else(|| profile.as_ref().and_then(|p| p.service_account.clone()));
+            let (resolved_service_account, resolved_coordinator_service_account) =
+                resolve_service_accounts(
+                    service_account,
+                    coordinator_service_account,
+                    profile.as_ref(),
+                );
             // Custom worker selection follows the same precedence as other pool settings.
             let resolved_worker_binary = resolve_worker_binary(worker_binary, profile.as_ref());
 
@@ -174,6 +191,7 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
                 binary_gcs_url: None,        // Set by create() after staging
                 worker_binary_gcs_url: None, // Set independently by create()
                 service_account: resolved_service_account,
+                coordinator_service_account: resolved_coordinator_service_account,
             };
 
             manager.create(&pool_config, wait, skip_build, resolved_worker_binary)?;
@@ -546,6 +564,38 @@ worker_binary = "/profile/worker"
         assert_eq!(
             resolve_worker_binary(None, Some(&profile)).as_deref(),
             Some("/profile/worker")
+        );
+    }
+
+    #[test]
+    fn create_account_resolution_preserves_legacy_and_separate_identities() {
+        let legacy_config: config::Config = toml::from_str(
+            r#"
+[pools.legacy]
+service_account = "legacy@project.iam.gserviceaccount.com"
+"#,
+        )
+        .unwrap();
+        let legacy = legacy_config.get_pool("legacy").unwrap();
+        let (worker, coordinator) = resolve_service_accounts(None, None, Some(&legacy));
+        assert_eq!(worker, coordinator);
+        assert_eq!(
+            coordinator.as_deref(),
+            Some("legacy@project.iam.gserviceaccount.com")
+        );
+
+        let (worker, coordinator) = resolve_service_accounts(
+            Some("worker@project.iam.gserviceaccount.com".into()),
+            Some("coordinator@project.iam.gserviceaccount.com".into()),
+            Some(&legacy),
+        );
+        assert_eq!(
+            worker.as_deref(),
+            Some("worker@project.iam.gserviceaccount.com")
+        );
+        assert_eq!(
+            coordinator.as_deref(),
+            Some("coordinator@project.iam.gserviceaccount.com")
         );
     }
 }

@@ -96,6 +96,8 @@ pub struct CoordinatorConfig {
     pub public_ip: Option<bool>,
     /// Whether Genohype manages the coordinator firewall rule
     pub manage_firewall: Option<bool>,
+    /// Service account attached to workers created by coordinator scaling
+    pub worker_service_account: Option<String>,
 }
 
 impl Default for CoordinatorConfig {
@@ -122,6 +124,7 @@ impl Default for CoordinatorConfig {
             subnet: None,
             public_ip: None,
             manage_firewall: None,
+            worker_service_account: None,
         }
     }
 }

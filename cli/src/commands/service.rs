@@ -31,6 +31,7 @@ pub fn run_service_command(command: ServiceCommands) -> Result<()> {
             cluster_subnet,
             cluster_public_ip,
             cluster_manage_firewall,
+            cluster_worker_service_account,
         } => {
             // If no job parameters provided, start in idle mode (0 partitions)
             // Job can be submitted later via POST /api/job
@@ -52,6 +53,7 @@ pub fn run_service_command(command: ServiceCommands) -> Result<()> {
                 cluster_subnet,
                 cluster_public_ip,
                 cluster_manage_firewall,
+                cluster_worker_service_account,
             ))
         }
         ServiceCommands::StartWorker {

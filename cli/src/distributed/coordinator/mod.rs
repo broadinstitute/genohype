@@ -90,6 +90,7 @@ pub async fn start_coordinator(config: CoordinatorConfig) -> Result<()> {
         config.subnet,
         config.public_ip,
         config.manage_firewall,
+        config.worker_service_account,
     )
     .await
 }
@@ -117,6 +118,7 @@ pub async fn run_coordinator(
     subnet: Option<String>,
     public_ip: Option<bool>,
     manage_firewall: Option<bool>,
+    worker_service_account: Option<String>,
 ) -> Result<()> {
     use axum::{
         routing::{delete, get, post},
@@ -290,6 +292,7 @@ pub async fn run_coordinator(
             subnet,
             public_ip,
             manage_firewall,
+            worker_service_account,
         },
         total_rows: 0,
         scan_cpu_secs: 0.0,
