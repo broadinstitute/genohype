@@ -39,7 +39,7 @@ pub(crate) use state::{
 use crate::distributed::message::{
     ActiveTaskInfo, CompleteRequest, CompleteResponse, FailureRecord, HeartbeatRequest,
     HeartbeatResponse, JobEvent, JobResultResponse, JobSpec, ManhattanSource, StatusResponse,
-    TaskDescriptor, WorkRequest, WorkResponse,
+    TaskDescriptor, WorkRequest, WorkResponse, CUSTOM_WORKER_PROTOCOL_VERSION,
 };
 use crate::distributed::metrics_db::MetricsDb;
 use crate::Result;
@@ -296,6 +296,8 @@ pub async fn run_coordinator(
         aggregate_cpu_secs: 0.0,
         wasted_cpu_secs: 0.0,
         retry_counts: HashMap::new(),
+        custom_assignment_attempts: HashMap::new(),
+        custom_assignments: HashMap::new(),
         failed_partitions: HashSet::new(),
         worker_registry: HashMap::new(),
         job_start_time: Instant::now(),
@@ -660,6 +662,8 @@ pub async fn run_coordinator(
                     data.completed_tasks.clear();
                     data.failed_partitions.clear();
                     data.retry_counts.clear();
+                    data.custom_assignment_attempts.clear();
+                    data.custom_assignments.clear();
                     data.job_state = JobExecutionState::Standard;
                     data.active_tasks.clear();
                     data.aggregated_results.clear();
@@ -798,6 +802,23 @@ async fn get_work(
     axum::Json(req): axum::Json<WorkRequest>,
 ) -> axum::Json<WorkResponse> {
     let mut data = state.lock().unwrap();
+
+    // Custom tasks require workers that understand lease/session fencing. Reject
+    // legacy custom workers before assignment so incompatibility is immediate
+    // rather than surfacing as repeated completion timeouts.
+    if matches!(data.config.job_spec, Some(JobSpec::Custom { .. }))
+        && req.protocol_version.unwrap_or(0) < CUSTOM_WORKER_PROTOCOL_VERSION
+    {
+        return axum::Json(WorkResponse::Incompatible {
+            required_protocol_version: CUSTOM_WORKER_PROTOCOL_VERSION,
+            message: format!(
+                "custom jobs require worker protocol {} or newer; worker reported {}",
+                CUSTOM_WORKER_PROTOCOL_VERSION,
+                req.protocol_version.unwrap_or(0)
+            ),
+        });
+    }
+
     data.touch_worker(
         &req.worker_id,
         req.hardware.clone(),
@@ -904,7 +925,7 @@ async fn get_work(
         let input_path = data.config.input_path.clone();
         // Pre-generate all tasks once, then select the ones we need
         let all_tasks = job_spec.generate_tasks(&input_path, total_tasks);
-        let tasks: Vec<TaskDescriptor> = partitions
+        let mut tasks: Vec<TaskDescriptor> = partitions
             .iter()
             .map(|&i| {
                 // Try to find by index first (most common case), then by ID
@@ -916,6 +937,17 @@ async fn get_work(
                     .unwrap_or_else(|| TaskDescriptor::partition(i, total_tasks))
             })
             .collect();
+
+        // Custom tasks are side-effecting and may outlive a timeout or Spot
+        // preemption. Fence each assignment independently so a late worker can
+        // never complete a newer retry of the same manifest task.
+        if matches!(job_spec, JobSpec::Custom { .. }) {
+            for (&partition_id, task) in partitions.iter().zip(tasks.iter_mut()) {
+                let lease = data.issue_custom_assignment(&task.id, partition_id, &req.worker_id);
+                task.assignment_attempt = Some(lease.assignment_attempt);
+                task.lease_token = Some(lease.lease_token);
+            }
+        }
         let task_ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
         let task_labels: Vec<String> = tasks
             .iter()
@@ -998,10 +1030,40 @@ async fn complete_work(
         if *req_session_id != data.session_id {
             // Silently ignore stale completions - don't spam warnings
             // The work will be re-assigned if still pending, or the worker will get new work
-            return axum::Json(CompleteResponse { acknowledged: true });
+            return axum::Json(CompleteResponse {
+                acknowledged: false,
+            });
         }
     }
-    // Note: If session_id is None (old worker), we process normally for backwards compatibility
+
+    let is_custom_job = matches!(data.config.job_spec, Some(JobSpec::Custom { .. }));
+    if is_custom_job {
+        // Fencing cannot be optional for side-effecting custom tasks: accepting a
+        // legacy completion here would reintroduce the stale-writer race.
+        if req.session_id.as_deref() != Some(data.session_id.as_str()) {
+            return axum::Json(CompleteResponse {
+                acknowledged: false,
+            });
+        }
+        if let Err(reason) = data.validate_custom_assignments(
+            req.session_id.as_deref(),
+            &req.worker_id,
+            &req.tasks,
+            &req.assignments,
+        ) {
+            println!(
+                "Rejected custom completion from {}: {}",
+                req.worker_id, reason
+            );
+            return axum::Json(CompleteResponse {
+                acknowledged: false,
+            });
+        }
+        for task_id in &req.tasks {
+            data.custom_assignments.remove(task_id);
+        }
+    }
+    // Missing session/lease metadata remains accepted only for legacy built-in jobs.
 
     // Extract config values before borrowing worker_registry mutably
     let config_batch_size = data.config.batch_size;
@@ -1602,6 +1664,33 @@ async fn handle_heartbeat(
     axum::Json(mut req): axum::Json<HeartbeatRequest>,
 ) -> axum::Json<HeartbeatResponse> {
     let mut data = state.lock().unwrap();
+
+    if matches!(data.config.job_spec, Some(JobSpec::Custom { .. })) {
+        let mut expected_tasks: Vec<String> = data
+            .custom_assignments
+            .iter()
+            .filter(|(_, assignment)| assignment.worker_id == req.worker_id)
+            .map(|(task_id, _)| task_id.clone())
+            .collect();
+        expected_tasks.sort();
+        if !expected_tasks.is_empty() || !req.assignments.is_empty() {
+            if req.session_id.as_deref() != Some(data.session_id.as_str())
+                || data
+                    .validate_custom_assignments(
+                        req.session_id.as_deref(),
+                        &req.worker_id,
+                        &expected_tasks,
+                        &req.assignments,
+                    )
+                    .is_err()
+            {
+                return axum::Json(HeartbeatResponse {
+                    acknowledged: false,
+                });
+            }
+        }
+    }
+
     data.touch_worker(&req.worker_id, None, req.build_version.clone());
 
     // Extract config value before mutable borrow of worker_registry
@@ -1680,4 +1769,638 @@ async fn handle_heartbeat(
     }
 
     axum::Json(HeartbeatResponse { acknowledged: true })
+}
+
+#[cfg(test)]
+mod lease_coordinator_tests {
+    use super::*;
+    use crate::distributed::message::{
+        AssignmentLease, CancelRequest, CompleteResponse, HardwareSpec, HeartbeatResponse,
+        TelemetrySnapshot,
+    };
+    use axum::{routing::post, Router};
+
+    fn custom_job(tasks: usize) -> JobSpec {
+        JobSpec::Custom {
+            payload: serde_json::json!({"test": true}),
+            tasks,
+            manifest: None,
+        }
+    }
+
+    fn test_state(tasks: usize) -> SharedState {
+        let mut config = CoordinatorConfig::default();
+        config.job_spec = Some(custom_job(tasks));
+        config.total_tasks = tasks;
+        config.batch_size = 1;
+        Arc::new(Mutex::new(CoordinatorData {
+            pending_partitions: (0..tasks).collect(),
+            processing_partitions: HashMap::new(),
+            completed_tasks: HashSet::new(),
+            config,
+            total_rows: 0,
+            scan_cpu_secs: 0.0,
+            aggregate_cpu_secs: 0.0,
+            wasted_cpu_secs: 0.0,
+            retry_counts: HashMap::new(),
+            custom_assignment_attempts: HashMap::new(),
+            custom_assignments: HashMap::new(),
+            failed_partitions: HashSet::new(),
+            worker_registry: HashMap::new(),
+            job_start_time: Instant::now(),
+            last_progress_time: Instant::now(),
+            idle: false,
+            metrics_db: MetricsDb::in_memory().unwrap(),
+            aggregated_results: Vec::new(),
+            job_state: JobExecutionState::Standard,
+            active_tasks: HashMap::new(),
+            last_error: None,
+            events: VecDeque::new(),
+            failures: VecDeque::new(),
+            events_since_backup: 0,
+            last_backup_at: None,
+            update_fleet_url: None,
+            updated_workers: HashSet::new(),
+            current_job_id: None,
+            session_id: "session-1".to_string(),
+            catalog: None,
+            ingested_phenotypes: HashSet::new(),
+            completed_phenotypes: HashSet::new(),
+            last_completed_batch: None,
+            cached_vms: None,
+            deleted_workers: HashSet::new(),
+        }))
+    }
+
+    async fn assign(state: &SharedState, worker_id: &str) -> (String, String, AssignmentLease) {
+        let response = get_work(
+            axum::extract::State(state.clone()),
+            axum::Json(WorkRequest {
+                worker_id: worker_id.to_string(),
+                hardware: None,
+                build_version: Some("test-build".to_string()),
+                protocol_version: Some(CUSTOM_WORKER_PROTOCOL_VERSION),
+            }),
+        )
+        .await
+        .0;
+        match response {
+            WorkResponse::Task {
+                tasks, session_id, ..
+            } => {
+                assert_eq!(tasks.len(), 1);
+                let task = tasks.into_iter().next().unwrap();
+                let lease = task.assignment_lease().expect("custom task lease");
+                (task.id, session_id.expect("coordinator session"), lease)
+            }
+            other => panic!("expected task assignment, got {other:?}"),
+        }
+    }
+
+    fn completion(
+        worker_id: &str,
+        task_id: &str,
+        session_id: &str,
+        lease: AssignmentLease,
+        error: Option<&str>,
+    ) -> CompleteRequest {
+        CompleteRequest {
+            worker_id: worker_id.to_string(),
+            tasks: vec![task_id.to_string()],
+            items_processed: if error.is_none() { 17 } else { 0 },
+            result_json: error
+                .is_none()
+                .then(|| serde_json::json!({"task": task_id})),
+            error: error.map(str::to_string),
+            session_id: Some(session_id.to_string()),
+            assignments: vec![lease],
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct StateSignature {
+        pending: Vec<usize>,
+        processing: Vec<(usize, String)>,
+        completed: Vec<usize>,
+        attempts: Vec<(String, u64)>,
+        assignments: Vec<(String, usize, String, u64, String)>,
+        retry_counts: Vec<(usize, usize)>,
+        failed: Vec<usize>,
+        total_rows: usize,
+        wasted_cpu_bits: u64,
+        aggregated_results: Vec<serde_json::Value>,
+        last_error: Option<String>,
+        events: usize,
+        failures: usize,
+        last_progress_time: Instant,
+        workers: Vec<(
+            String,
+            Instant,
+            usize,
+            usize,
+            usize,
+            Option<String>,
+            Option<String>,
+        )>,
+    }
+
+    fn signature(state: &SharedState) -> StateSignature {
+        let data = state.lock().unwrap();
+        let mut processing: Vec<_> = data
+            .processing_partitions
+            .iter()
+            .map(|(id, (worker, _))| (*id, worker.clone()))
+            .collect();
+        processing.sort();
+        let mut completed: Vec<_> = data.completed_tasks.iter().copied().collect();
+        completed.sort();
+        let mut attempts: Vec<_> = data
+            .custom_assignment_attempts
+            .iter()
+            .map(|(task, attempt)| (task.clone(), *attempt))
+            .collect();
+        attempts.sort();
+        let mut assignments: Vec<_> = data
+            .custom_assignments
+            .iter()
+            .map(|(task, assignment)| {
+                (
+                    task.clone(),
+                    assignment.partition_id,
+                    assignment.worker_id.clone(),
+                    assignment.assignment_attempt,
+                    assignment.lease_token.clone(),
+                )
+            })
+            .collect();
+        assignments.sort();
+        let mut retry_counts: Vec<_> = data.retry_counts.iter().map(|(k, v)| (*k, *v)).collect();
+        retry_counts.sort();
+        let mut failed: Vec<_> = data.failed_partitions.iter().copied().collect();
+        failed.sort();
+        let mut workers: Vec<_> = data
+            .worker_registry
+            .iter()
+            .map(|(id, worker)| {
+                (
+                    id.clone(),
+                    worker.last_seen,
+                    worker.metrics_history.len(),
+                    worker.total_rows,
+                    worker.partitions_completed,
+                    worker.build_version.clone(),
+                    worker
+                        .current_task
+                        .as_ref()
+                        .map(|task| task.task_id.clone()),
+                )
+            })
+            .collect();
+        workers.sort_by(|a, b| a.0.cmp(&b.0));
+        StateSignature {
+            pending: data.pending_partitions.iter().copied().collect(),
+            processing,
+            completed,
+            attempts,
+            assignments,
+            retry_counts,
+            failed,
+            total_rows: data.total_rows,
+            wasted_cpu_bits: data.wasted_cpu_secs.to_bits(),
+            aggregated_results: data.aggregated_results.clone(),
+            last_error: data.last_error.clone(),
+            events: data.events.len(),
+            failures: data.failures.len(),
+            last_progress_time: data.last_progress_time,
+            workers,
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_completion_cleans_current_assignment_and_updates_real_coordinator_state() {
+        let state = test_state(1);
+        let (task_id, session, lease) = assign(&state, "worker-a").await;
+
+        let response = complete_work(
+            axum::extract::State(state.clone()),
+            axum::Json(completion("worker-a", &task_id, &session, lease, None)),
+        )
+        .await;
+        assert!(response.0.acknowledged);
+
+        let data = state.lock().unwrap();
+        assert!(data.custom_assignments.is_empty());
+        assert!(data.processing_partitions.is_empty());
+        assert_eq!(data.completed_tasks, HashSet::from([0]));
+        assert_eq!(data.total_rows, 17);
+        assert_eq!(
+            data.aggregated_results,
+            vec![serde_json::json!({"task": task_id})]
+        );
+        assert_eq!(data.custom_assignment_attempts.get("custom_0"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn stale_completion_after_timeout_and_reassignment_mutates_no_state() {
+        let state = test_state(1);
+        let (task_id, session, stale_lease) = assign(&state, "worker-old").await;
+        {
+            let mut data = state.lock().unwrap();
+            data.processing_partitions.get_mut(&0).unwrap().1 =
+                Instant::now() - Duration::from_secs(10);
+        }
+        check_timeouts(&state, 1);
+        let (_, _, fresh_lease) = assign(&state, "worker-new").await;
+        assert_eq!(
+            fresh_lease.assignment_attempt,
+            stale_lease.assignment_attempt + 1
+        );
+        assert_ne!(fresh_lease.lease_token, stale_lease.lease_token);
+
+        let before = signature(&state);
+        let response = complete_work(
+            axum::extract::State(state.clone()),
+            axum::Json(completion(
+                "worker-old",
+                &task_id,
+                &session,
+                stale_lease,
+                None,
+            )),
+        )
+        .await;
+        assert!(!response.0.acknowledged);
+        assert_eq!(signature(&state), before);
+    }
+
+    async fn assert_rejected_heartbeat_unchanged(state: &SharedState, req: HeartbeatRequest) {
+        let before = signature(state);
+        let response = handle_heartbeat(axum::extract::State(state.clone()), axum::Json(req)).await;
+        assert!(!response.0.acknowledged);
+        assert_eq!(signature(state), before, "rejected heartbeat mutated state");
+    }
+
+    fn heartbeat(
+        worker_id: &str,
+        session_id: Option<&str>,
+        lease: AssignmentLease,
+    ) -> HeartbeatRequest {
+        let mut telemetry = TelemetrySnapshot::empty();
+        telemetry.cpu_percent = Some(99.0);
+        HeartbeatRequest {
+            worker_id: worker_id.to_string(),
+            telemetry,
+            build_version: Some("rejected-build".to_string()),
+            session_id: session_id.map(str::to_string),
+            assignments: vec![lease],
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_heartbeats_do_not_refresh_liveness_or_mutate_telemetry() {
+        let state = test_state(1);
+        let (_, session, lease) = assign(&state, "worker-a").await;
+
+        assert_rejected_heartbeat_unchanged(&state, heartbeat("worker-a", None, lease.clone()))
+            .await;
+        assert_rejected_heartbeat_unchanged(
+            &state,
+            heartbeat("worker-a", Some("stale-session"), lease.clone()),
+        )
+        .await;
+
+        let mut wrong_attempt = lease.clone();
+        wrong_attempt.assignment_attempt += 1;
+        assert_rejected_heartbeat_unchanged(
+            &state,
+            heartbeat("worker-a", Some(&session), wrong_attempt),
+        )
+        .await;
+
+        let mut wrong_token = lease.clone();
+        wrong_token.lease_token = "wrong-token".to_string();
+        assert_rejected_heartbeat_unchanged(
+            &state,
+            heartbeat("worker-a", Some(&session), wrong_token),
+        )
+        .await;
+        assert_rejected_heartbeat_unchanged(
+            &state,
+            heartbeat("worker-b", Some(&session), lease.clone()),
+        )
+        .await;
+
+        {
+            let mut data = state.lock().unwrap();
+            data.processing_partitions.get_mut(&0).unwrap().1 =
+                Instant::now() - Duration::from_secs(10);
+        }
+        check_timeouts(&state, 1);
+        let _ = assign(&state, "worker-b").await;
+        assert_rejected_heartbeat_unchanged(&state, heartbeat("worker-a", Some(&session), lease))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn stock_cli_preflight_and_fenced_reports_use_real_http_endpoints() {
+        let state = test_state(2);
+        let app = Router::new()
+            .route("/work", post(get_work))
+            .route("/complete", post(complete_work))
+            .route("/heartbeat", post(handle_heartbeat))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let base_url = format!("http://{address}");
+
+        // Exercise the exact request built by the stock CLI worker. Because that
+        // worker has no arbitrary-custom-payload handler, it must fail preflight
+        // without registering itself or consuming an assignment.
+        let stock_request = crate::distributed::worker::build_work_request(
+            "stock-cli",
+            &HardwareSpec {
+                num_cores: 4,
+                total_memory_mb: 8192,
+            },
+        );
+        assert_eq!(stock_request.protocol_version, None);
+        let before_preflight = signature(&state);
+        let preflight: WorkResponse = client
+            .post(format!("{base_url}/work"))
+            .json(&stock_request)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(matches!(
+            preflight,
+            WorkResponse::Incompatible {
+                required_protocol_version: CUSTOM_WORKER_PROTOCOL_VERSION,
+                ..
+            }
+        ));
+        assert_eq!(signature(&state), before_preflight);
+
+        // A handler-backed protocol-v1 worker receives a fenced assignment over
+        // the same endpoint and must echo the exact identity on both report paths.
+        let capable_request = WorkRequest {
+            worker_id: "capable-worker".to_string(),
+            hardware: None,
+            build_version: Some("integration-test".to_string()),
+            protocol_version: Some(CUSTOM_WORKER_PROTOCOL_VERSION),
+        };
+        let assignment: WorkResponse = client
+            .post(format!("{base_url}/work"))
+            .json(&capable_request)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let (task_id, session, lease) = match assignment {
+            WorkResponse::Task {
+                tasks, session_id, ..
+            } => {
+                let task = tasks.into_iter().next().unwrap();
+                let lease = task.assignment_lease().unwrap();
+                (task.id, session_id.unwrap(), lease)
+            }
+            other => panic!("expected task assignment, got {other:?}"),
+        };
+
+        let accepted_heartbeat: HeartbeatResponse = client
+            .post(format!("{base_url}/heartbeat"))
+            .json(&heartbeat("capable-worker", Some(&session), lease.clone()))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(accepted_heartbeat.acknowledged);
+
+        let mut wrong_lease = lease.clone();
+        wrong_lease.lease_token = "wrong-token".to_string();
+        let rejected_heartbeat: HeartbeatResponse = client
+            .post(format!("{base_url}/heartbeat"))
+            .json(&heartbeat(
+                "capable-worker",
+                Some(&session),
+                wrong_lease.clone(),
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(!rejected_heartbeat.acknowledged);
+
+        let stale_completion = completion(
+            "capable-worker",
+            &task_id,
+            "stale-session",
+            lease.clone(),
+            None,
+        );
+        let rejected_stale: CompleteResponse = client
+            .post(format!("{base_url}/complete"))
+            .json(&stale_completion)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(!rejected_stale.acknowledged);
+
+        let rejected_wrong: CompleteResponse = client
+            .post(format!("{base_url}/complete"))
+            .json(&completion(
+                "capable-worker",
+                &task_id,
+                &session,
+                wrong_lease,
+                None,
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(!rejected_wrong.acknowledged);
+
+        let accepted_completion: CompleteResponse = client
+            .post(format!("{base_url}/complete"))
+            .json(&completion(
+                "capable-worker",
+                &task_id,
+                &session,
+                lease,
+                None,
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(accepted_completion.acknowledged);
+        assert_eq!(state.lock().unwrap().completed_tasks, HashSet::from([0]));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn every_failure_death_and_timeout_requeue_gets_monotonic_fresh_identity() {
+        let state = test_state(1);
+        let (task_id, session, first) = assign(&state, "worker-1").await;
+        let failed = complete_work(
+            axum::extract::State(state.clone()),
+            axum::Json(completion(
+                "worker-1",
+                &task_id,
+                &session,
+                first.clone(),
+                Some("explicit failure"),
+            )),
+        )
+        .await;
+        assert!(failed.0.acknowledged);
+        assert!(state.lock().unwrap().custom_assignments.is_empty());
+
+        let (_, _, second) = assign(&state, "worker-2").await;
+        state.lock().unwrap().requeue_worker_tasks("worker-2");
+        assert!(state.lock().unwrap().custom_assignments.is_empty());
+
+        let (_, _, third) = assign(&state, "worker-3").await;
+        {
+            let mut data = state.lock().unwrap();
+            data.processing_partitions.get_mut(&0).unwrap().1 =
+                Instant::now() - Duration::from_secs(10);
+        }
+        check_timeouts(&state, 1);
+        assert!(state.lock().unwrap().custom_assignments.is_empty());
+        let (_, _, fourth) = assign(&state, "worker-4").await;
+
+        assert_eq!(
+            [
+                first.assignment_attempt,
+                second.assignment_attempt,
+                third.assignment_attempt,
+                fourth.assignment_attempt,
+            ],
+            [1, 2, 3, 4]
+        );
+        let tokens: HashSet<_> = [first, second, third, fourth]
+            .into_iter()
+            .map(|lease| lease.lease_token)
+            .collect();
+        assert_eq!(tokens.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn restart_cancel_and_supersede_paths_reject_or_clean_fenced_state() {
+        let state = test_state(1);
+        let (task_id, old_session, lease) = assign(&state, "worker-a").await;
+        state.lock().unwrap().session_id = "session-2".to_string();
+        let before = signature(&state);
+        let stale = complete_work(
+            axum::extract::State(state.clone()),
+            axum::Json(completion("worker-a", &task_id, &old_session, lease, None)),
+        )
+        .await;
+        assert!(!stale.0.acknowledged);
+        assert_eq!(signature(&state), before);
+
+        let cancelled = api::jobs::cancel_job(
+            axum::extract::State(state.clone()),
+            axum::Json(CancelRequest {
+                reason: Some("test".to_string()),
+            }),
+        )
+        .await;
+        assert!(cancelled.0.success);
+        {
+            let data = state.lock().unwrap();
+            assert!(data.custom_assignments.is_empty());
+            assert!(data.custom_assignment_attempts.is_empty());
+        }
+
+        {
+            let mut data = state.lock().unwrap();
+            data.idle = false;
+            data.custom_assignment_attempts.insert("old".to_string(), 9);
+            data.custom_assignments.insert(
+                "old".to_string(),
+                state::CustomAssignment {
+                    partition_id: 9,
+                    worker_id: "old-worker".to_string(),
+                    assignment_attempt: 9,
+                    lease_token: "old-token".to_string(),
+                },
+            );
+            services::start_new_job(
+                &mut data,
+                custom_job(2),
+                "input".to_string(),
+                2,
+                Some(1),
+                None,
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap();
+            assert!(data.custom_assignments.is_empty());
+            assert!(data.custom_assignment_attempts.is_empty());
+            assert_eq!(
+                data.pending_partitions.iter().copied().collect::<Vec<_>>(),
+                vec![0, 1]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_version_custom_worker_is_rejected_before_state_mutation() {
+        let state = test_state(1);
+        let legacy: WorkRequest = serde_json::from_value(serde_json::json!({
+            "worker_id": "legacy-worker",
+            "build_version": "old"
+        }))
+        .unwrap();
+        assert_eq!(legacy.protocol_version, None);
+        let before = signature(&state);
+        let response = get_work(axum::extract::State(state.clone()), axum::Json(legacy))
+            .await
+            .0;
+        assert!(matches!(
+            response,
+            WorkResponse::Incompatible {
+                required_protocol_version: CUSTOM_WORKER_PROTOCOL_VERSION,
+                ..
+            }
+        ));
+        assert_eq!(signature(&state), before);
+
+        let builtin = test_state(1);
+        builtin.lock().unwrap().config.job_spec = Some(JobSpec::Summary);
+        let response = get_work(
+            axum::extract::State(builtin),
+            axum::Json(WorkRequest {
+                worker_id: "legacy-built-in".to_string(),
+                hardware: None,
+                build_version: None,
+                protocol_version: None,
+            }),
+        )
+        .await
+        .0;
+        assert!(matches!(response, WorkResponse::Task { .. }));
+    }
 }

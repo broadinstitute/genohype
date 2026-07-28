@@ -166,6 +166,10 @@ pub async fn run_worker(
                 session_id,
             } => {
                 let task_ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
+                let assignments: Vec<_> = tasks
+                    .iter()
+                    .filter_map(|task| task.assignment_lease())
+                    .collect();
                 let task_labels: Vec<String> = tasks
                     .iter()
                     .map(|t| t.label.clone().unwrap_or_else(|| t.id.clone()))
@@ -183,6 +187,8 @@ pub async fn run_worker(
                     let worker_id = config.worker_id.clone();
                     let build_version = config.build_version.clone();
                     let metrics = metrics.clone();
+                    let heartbeat_session_id = session_id.clone();
+                    let heartbeat_assignments = assignments.clone();
 
                     tokio::spawn(async move {
                         loop {
@@ -192,6 +198,8 @@ pub async fn run_worker(
                                         worker_id: worker_id.clone(),
                                         telemetry: metrics.snapshot(10.0),
                                         build_version: build_version.clone(),
+                                        session_id: heartbeat_session_id.clone(),
+                                        assignments: heartbeat_assignments.clone(),
                                     };
                                     let _ = client.post(&heartbeat_url).json(&req).send().await;
                                 }
@@ -228,6 +236,7 @@ pub async fn run_worker(
                     result_json,
                     error,
                     session_id,
+                    assignments,
                 };
 
                 if let Err(e) = client.post(&complete_url).json(&request).send().await {
@@ -235,6 +244,16 @@ pub async fn run_worker(
                 }
 
                 println!("Completed tasks {:?} ({} items)", task_ids, items_processed);
+            }
+            WorkResponse::Incompatible {
+                required_protocol_version,
+                message,
+            } => {
+                anyhow::bail!(
+                    "coordinator rejected worker protocol (requires {}): {}",
+                    required_protocol_version,
+                    message
+                );
             }
             WorkResponse::UpdateBinary { gcs_url } => {
                 println!(
@@ -301,6 +320,7 @@ async fn request_work(
         worker_id: config.worker_id.clone(),
         hardware: None,
         build_version: config.build_version.clone(),
+        protocol_version: Some(super::message::CUSTOM_WORKER_PROTOCOL_VERSION),
     };
 
     let response = client.post(url).json(&request).send().await?;

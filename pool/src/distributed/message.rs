@@ -7,6 +7,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Minimum worker protocol that understands custom-task lease fencing.
+pub const CUSTOM_WORKER_PROTOCOL_VERSION: u32 = 1;
+
 /// A self-describing work unit in the coordinator's queue.
 ///
 /// Unlike bare indices, `TaskDescriptor` carries full context for logging,
@@ -52,6 +55,16 @@ pub struct TaskDescriptor {
 
     /// Domain-specific operation details (serialized TaskType enum)
     pub payload: Value,
+
+    /// Monotonic coordinator-issued attempt number for this task assignment.
+    /// Present for fenced custom tasks; absent for legacy and built-in jobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignment_attempt: Option<u64>,
+
+    /// Random capability token for this exact assignment attempt.
+    /// Workers must echo it in completions and active-task heartbeats.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_token: Option<String>,
 }
 
 impl TaskDescriptor {
@@ -66,7 +79,18 @@ impl TaskDescriptor {
             payload: serde_json::json!({
                 "partition_index": index
             }),
+            assignment_attempt: None,
+            lease_token: None,
         }
+    }
+
+    /// Return the fenced identity attached by the coordinator, if any.
+    pub fn assignment_lease(&self) -> Option<AssignmentLease> {
+        Some(AssignmentLease {
+            task_id: self.id.clone(),
+            assignment_attempt: self.assignment_attempt?,
+            lease_token: self.lease_token.clone()?,
+        })
     }
 
     /// Convert to CoreTaskInfo for per-core telemetry tracking.
@@ -100,6 +124,9 @@ pub struct WorkRequest {
     /// Git commit hash of the worker binary
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_version: Option<String>,
+    /// Custom-worker wire protocol version. Legacy workers omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<u32>,
 }
 
 /// Response from coordinator with work assignment.
@@ -137,12 +164,26 @@ pub enum WorkResponse {
     /// Update binary and restart
     #[serde(rename = "update")]
     UpdateBinary { gcs_url: String },
+    /// The worker cannot safely execute the configured custom job.
+    #[serde(rename = "incompatible")]
+    Incompatible {
+        required_protocol_version: u32,
+        message: String,
+    },
 }
 
 /// Request to update the fleet binary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateFleetRequest {
     pub gcs_url: String,
+}
+
+/// Coordinator-issued identity for one exact task assignment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssignmentLease {
+    pub task_id: String,
+    pub assignment_attempt: u64,
+    pub lease_token: String,
 }
 
 /// Request from a worker reporting completion.
@@ -163,6 +204,9 @@ pub struct CompleteRequest {
     /// Session ID echoed from WorkResponse (for detecting stale completions after coordinator restart)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Fenced assignment identities echoed from the task descriptors.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assignments: Vec<AssignmentLease>,
 }
 
 /// Response to completion request.
@@ -372,6 +416,12 @@ pub struct HeartbeatRequest {
     /// Git commit hash of the worker binary
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_version: Option<String>,
+    /// Coordinator session that issued the active assignments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Assignments currently executing on this worker.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assignments: Vec<AssignmentLease>,
 }
 
 /// Heartbeat response from coordinator.
@@ -464,4 +514,82 @@ pub struct DashboardBottleneck {
     pub description: String,
     /// Severity (0-100)
     pub severity: f64,
+}
+
+#[cfg(test)]
+mod lease_protocol_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_wire_messages_default_fencing_fields_without_weakening_new_messages() {
+        let task: TaskDescriptor = serde_json::from_value(serde_json::json!({
+            "id": "custom_0",
+            "task_type": "custom",
+            "payload": {"input": "x"}
+        }))
+        .unwrap();
+        assert_eq!(task.assignment_attempt, None);
+        assert_eq!(task.lease_token, None);
+        assert_eq!(task.assignment_lease(), None);
+
+        let completion: CompleteRequest = serde_json::from_value(serde_json::json!({
+            "worker_id": "legacy",
+            "tasks": ["custom_0"],
+            "items_processed": 1
+        }))
+        .unwrap();
+        assert_eq!(completion.session_id, None);
+        assert!(completion.assignments.is_empty());
+
+        let heartbeat: HeartbeatRequest = serde_json::from_value(serde_json::json!({
+            "worker_id": "legacy",
+            "telemetry": TelemetrySnapshot::empty()
+        }))
+        .unwrap();
+        assert_eq!(heartbeat.session_id, None);
+        assert!(heartbeat.assignments.is_empty());
+
+        let work: WorkRequest = serde_json::from_value(serde_json::json!({
+            "worker_id": "legacy"
+        }))
+        .unwrap();
+        assert_eq!(work.protocol_version, None);
+    }
+
+    #[test]
+    fn fenced_wire_messages_round_trip_exact_assignment_identity() {
+        let lease = AssignmentLease {
+            task_id: "custom_0".to_string(),
+            assignment_attempt: 42,
+            lease_token: "secret-token".to_string(),
+        };
+        let request = CompleteRequest {
+            worker_id: "worker".to_string(),
+            tasks: vec![lease.task_id.clone()],
+            items_processed: 3,
+            result_json: None,
+            error: None,
+            session_id: Some("session".to_string()),
+            assignments: vec![lease.clone()],
+        };
+        let decoded: CompleteRequest =
+            serde_json::from_value(serde_json::to_value(request).unwrap()).unwrap();
+        assert_eq!(decoded.session_id.as_deref(), Some("session"));
+        assert_eq!(decoded.assignments, vec![lease]);
+
+        let incompatible = WorkResponse::Incompatible {
+            required_protocol_version: CUSTOM_WORKER_PROTOCOL_VERSION,
+            message: "upgrade required".to_string(),
+        };
+        let json = serde_json::to_value(incompatible).unwrap();
+        assert_eq!(json["type"], "incompatible");
+        assert_eq!(json["required_protocol_version"], 1);
+        assert!(matches!(
+            serde_json::from_value::<WorkResponse>(json).unwrap(),
+            WorkResponse::Incompatible {
+                required_protocol_version: CUSTOM_WORKER_PROTOCOL_VERSION,
+                ..
+            }
+        ));
+    }
 }

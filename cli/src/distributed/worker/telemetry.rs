@@ -369,6 +369,8 @@ pub fn spawn_telemetry_loop(
                 worker_id: worker_id.clone(),
                 telemetry: snapshot,
                 build_version: Some(env!("GIT_HASH").to_string()),
+                session_id: None,
+                assignments: Vec::new(),
             };
 
             // Best-effort: don't let heartbeat failures block the worker

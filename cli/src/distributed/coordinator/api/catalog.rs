@@ -461,6 +461,8 @@ pub(crate) async fn ingest_catalog_api(
     data.completed_tasks.clear();
     data.failed_partitions.clear();
     data.retry_counts.clear();
+    data.custom_assignment_attempts.clear();
+    data.custom_assignments.clear();
 
     let pheno_count = phenotypes.len();
 

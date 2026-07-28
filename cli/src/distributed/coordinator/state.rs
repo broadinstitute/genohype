@@ -310,6 +310,15 @@ pub(crate) struct WorkerState {
     pub(crate) effective_status: Option<String>,
 }
 
+/// Current owner and identity of a fenced custom task assignment.
+#[derive(Debug, Clone)]
+pub(crate) struct CustomAssignment {
+    pub(crate) partition_id: usize,
+    pub(crate) worker_id: String,
+    pub(crate) assignment_attempt: u64,
+    pub(crate) lease_token: String,
+}
+
 /// Internal state of the coordinator.
 pub(crate) struct CoordinatorData {
     /// Partitions waiting to be assigned
@@ -330,6 +339,10 @@ pub(crate) struct CoordinatorData {
     pub(crate) wasted_cpu_secs: f64,
     /// Track retry counts per partition
     pub(crate) retry_counts: HashMap<usize, usize>,
+    /// Last coordinator-issued attempt number for each custom task ID.
+    pub(crate) custom_assignment_attempts: HashMap<String, u64>,
+    /// Current fenced custom assignments, keyed by stable task ID.
+    pub(crate) custom_assignments: HashMap<String, CustomAssignment>,
     /// Partitions that permanently failed (exceeded max retries)
     pub(crate) failed_partitions: HashSet<usize>,
     /// Registry of all known workers and their telemetry
@@ -384,7 +397,107 @@ pub(crate) struct CoordinatorData {
 
 pub(crate) type SharedState = Arc<Mutex<CoordinatorData>>;
 
+fn issue_custom_assignment(
+    attempts: &mut HashMap<String, u64>,
+    assignments: &mut HashMap<String, CustomAssignment>,
+    task_id: &str,
+    partition_id: usize,
+    worker_id: &str,
+) -> crate::distributed::message::AssignmentLease {
+    let attempt = attempts.entry(task_id.to_string()).or_insert(0);
+    *attempt += 1;
+    let lease = crate::distributed::message::AssignmentLease {
+        task_id: task_id.to_string(),
+        assignment_attempt: *attempt,
+        lease_token: uuid::Uuid::new_v4().to_string(),
+    };
+    assignments.insert(
+        task_id.to_string(),
+        CustomAssignment {
+            partition_id,
+            worker_id: worker_id.to_string(),
+            assignment_attempt: lease.assignment_attempt,
+            lease_token: lease.lease_token.clone(),
+        },
+    );
+    lease
+}
+
+fn validate_custom_assignment_report(
+    current_session_id: &str,
+    report_session_id: Option<&str>,
+    assignments: &HashMap<String, CustomAssignment>,
+    worker_id: &str,
+    task_ids: &[String],
+    leases: &[crate::distributed::message::AssignmentLease],
+) -> Result<(), String> {
+    if report_session_id != Some(current_session_id) {
+        return Err("stale or missing coordinator session".to_string());
+    }
+    if task_ids.len() != leases.len() {
+        return Err(format!(
+            "expected {} assignment leases, received {}",
+            task_ids.len(),
+            leases.len()
+        ));
+    }
+    let mut seen = HashSet::new();
+    for task_id in task_ids {
+        if !seen.insert(task_id) {
+            return Err(format!("duplicate task ID {task_id}"));
+        }
+        let lease = leases
+            .iter()
+            .find(|lease| lease.task_id == *task_id)
+            .ok_or_else(|| format!("missing lease for task {task_id}"))?;
+        let current = assignments
+            .get(task_id)
+            .ok_or_else(|| format!("task {task_id} has no current assignment"))?;
+        if current.worker_id != worker_id
+            || current.assignment_attempt != lease.assignment_attempt
+            || current.lease_token != lease.lease_token
+        {
+            return Err(format!("stale or wrong-owner lease for task {task_id}"));
+        }
+    }
+    Ok(())
+}
+
 impl CoordinatorData {
+    /// Allocate and remember a fresh identity for a custom task assignment.
+    pub(crate) fn issue_custom_assignment(
+        &mut self,
+        task_id: &str,
+        partition_id: usize,
+        worker_id: &str,
+    ) -> crate::distributed::message::AssignmentLease {
+        issue_custom_assignment(
+            &mut self.custom_assignment_attempts,
+            &mut self.custom_assignments,
+            task_id,
+            partition_id,
+            worker_id,
+        )
+    }
+
+    /// Validate that a worker is reporting the exact current fenced assignments.
+    pub(crate) fn validate_custom_assignments(
+        &self,
+        session_id: Option<&str>,
+        worker_id: &str,
+        task_ids: &[String],
+        leases: &[crate::distributed::message::AssignmentLease],
+    ) -> Result<(), String> {
+        validate_custom_assignment_report(
+            &self.session_id,
+            session_id,
+            &self.custom_assignments,
+            worker_id,
+            task_ids,
+            leases,
+        )
+    }
+
     /// Ensure a worker exists in the registry and update last_seen.
     /// Ignores heartbeats from workers that were intentionally deleted by scale-down.
     pub(crate) fn touch_worker(
@@ -478,6 +591,8 @@ impl CoordinatorData {
 
         for part_id in lost_parts {
             self.processing_partitions.remove(&part_id);
+            self.custom_assignments
+                .retain(|_, assignment| assignment.partition_id != part_id);
             let retry_count = {
                 let retries = self.retry_counts.entry(part_id).or_insert(0);
                 *retries += 1;
@@ -644,5 +759,83 @@ impl CoordinatorData {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod lease_tests {
+    use super::*;
+
+    #[test]
+    fn preemption_requeue_issues_monotonic_fresh_identity_and_fences_stale_completion() {
+        let mut attempts = HashMap::new();
+        let mut assignments = HashMap::new();
+        let task_ids = vec!["custom_7".to_string()];
+
+        let first = issue_custom_assignment(
+            &mut attempts,
+            &mut assignments,
+            &task_ids[0],
+            7,
+            "preempted-worker",
+        );
+        assignments.remove(&task_ids[0]); // timeout/preemption requeue
+        let second = issue_custom_assignment(
+            &mut attempts,
+            &mut assignments,
+            &task_ids[0],
+            7,
+            "replacement-worker",
+        );
+
+        assert_eq!(first.assignment_attempt, 1);
+        assert_eq!(second.assignment_attempt, 2);
+        assert_ne!(first.lease_token, second.lease_token);
+        assert!(validate_custom_assignment_report(
+            "session-a",
+            Some("session-a"),
+            &assignments,
+            "preempted-worker",
+            &task_ids,
+            &[first],
+        )
+        .is_err());
+        assert!(validate_custom_assignment_report(
+            "session-a",
+            Some("session-a"),
+            &assignments,
+            "replacement-worker",
+            &task_ids,
+            &[second],
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn restart_and_wrong_owner_reports_are_rejected() {
+        let mut attempts = HashMap::new();
+        let mut assignments = HashMap::new();
+        let task_ids = vec!["custom_2".to_string()];
+        let lease =
+            issue_custom_assignment(&mut attempts, &mut assignments, &task_ids[0], 2, "worker-a");
+
+        assert!(validate_custom_assignment_report(
+            "new-session",
+            Some("old-session"),
+            &assignments,
+            "worker-a",
+            &task_ids,
+            std::slice::from_ref(&lease),
+        )
+        .is_err());
+        assert!(validate_custom_assignment_report(
+            "new-session",
+            Some("new-session"),
+            &assignments,
+            "worker-b",
+            &task_ids,
+            &[lease],
+        )
+        .is_err());
     }
 }

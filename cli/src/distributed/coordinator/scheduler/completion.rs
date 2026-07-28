@@ -654,6 +654,8 @@ mod tests {
             aggregate_cpu_secs: 0.0,
             wasted_cpu_secs: 0.0,
             retry_counts: HashMap::new(),
+            custom_assignment_attempts: HashMap::new(),
+            custom_assignments: HashMap::new(),
             failed_partitions: HashSet::new(),
             worker_registry: HashMap::new(),
             job_start_time: Instant::now(),
@@ -708,6 +710,7 @@ mod tests {
             result_json: None,
             error: None,
             session_id: Some("test-session".to_string()),
+            assignments: Vec::new(),
         };
 
         // Execute the completion handler
@@ -757,6 +760,8 @@ mod tests {
             aggregate_cpu_secs: 0.0,
             wasted_cpu_secs: 0.0,
             retry_counts: HashMap::new(),
+            custom_assignment_attempts: HashMap::new(),
+            custom_assignments: HashMap::new(),
             failed_partitions: HashSet::new(),
             worker_registry: HashMap::new(),
             job_start_time: Instant::now(),
@@ -793,6 +798,7 @@ mod tests {
             result_json: None,
             error: None,
             session_id: Some("test-session".to_string()),
+            assignments: Vec::new(),
         };
 
         // Should not panic - just return early after logging warning
@@ -831,6 +837,8 @@ mod tests {
             aggregate_cpu_secs: 0.0,
             wasted_cpu_secs: 0.0,
             retry_counts: HashMap::new(),
+            custom_assignment_attempts: HashMap::new(),
+            custom_assignments: HashMap::new(),
             failed_partitions: HashSet::new(),
             worker_registry: HashMap::new(),
             job_start_time: Instant::now(),
@@ -926,6 +934,7 @@ mod tests {
             result_json: None,
             error: None,
             session_id: Some("test-session".to_string()),
+            assignments: Vec::new(),
         };
 
         complete_batch_work(&mut data, &mut batch, &req);

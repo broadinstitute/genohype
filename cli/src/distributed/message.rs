@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 pub use genohype_pool::distributed::{
-    CompleteRequest, CompleteResponse, CoreTaskInfo, HardwareSpec, HeartbeatRequest,
-    HeartbeatResponse, StatusResponse, TaskDescriptor, TelemetrySnapshot, UpdateFleetRequest,
-    WorkRequest, WorkResponse,
+    AssignmentLease, CompleteRequest, CompleteResponse, CoreTaskInfo, HardwareSpec,
+    HeartbeatRequest, HeartbeatResponse, StatusResponse, TaskDescriptor, TelemetrySnapshot,
+    UpdateFleetRequest, WorkRequest, WorkResponse, CUSTOM_WORKER_PROTOCOL_VERSION,
 };
 
 // ============================================================================
@@ -127,6 +127,8 @@ impl TaskType {
             index,
             total,
             payload: serde_json::to_value(self).unwrap_or_default(),
+            assignment_attempt: None,
+            lease_token: None,
         }
     }
 }
@@ -877,6 +879,8 @@ impl JobSpec {
                                 index: Some(i),
                                 total: Some(total),
                                 payload: task_payload,
+                                assignment_attempt: None,
+                                lease_token: None,
                             }
                         })
                         .collect()
