@@ -2,7 +2,7 @@
 
 use crate::distributed::message::{
     CompleteRequest, CustomReceiptSet, CustomTaskReceipt, FailureRecord, JobEvent, JobRecord,
-    PhenotypeStatus, TelemetrySnapshot,
+    JobSpec, PhenotypeStatus, TelemetrySnapshot,
 };
 use rusqlite::{
     backup::{Backup, StepResult},
@@ -893,6 +893,75 @@ impl MetricsDb {
         Ok(CustomCompletionOutcome::Stored)
     }
 
+    /// Fail closed any custom jobs that were running in a restored backup.
+    /// Restored receipts remain immutable audit records, but cannot authorize
+    /// completion, and every restored assignment fence is removed atomically.
+    pub(crate) fn reconcile_restored_custom_jobs(&self, end_time_ms: u64) -> Result<usize, String> {
+        let end_time_ms = i64::try_from(end_time_ms)
+            .map_err(|_| "restore reconciliation timestamp exceeds SQLite INTEGER".to_string())?;
+        let summary = serde_json::json!({
+            "error": "Custom job interrupted by coordinator startup after database backup restore; restored receipts are not completion authority"
+        })
+        .to_string();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let running_jobs = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT job_id, job_type, job_spec_json FROM jobs WHERE status = 'running'",
+                )
+                .map_err(|error| error.to_string())?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })
+                .map_err(|error| error.to_string())?;
+            rows.collect::<SqliteResult<Vec<_>>>()
+                .map_err(|error| error.to_string())?
+        };
+        let custom_job_ids: Vec<String> = running_jobs
+            .into_iter()
+            .filter_map(|(job_id, job_type, job_spec_json)| {
+                let is_custom_type =
+                    matches!(job_type.as_deref(), Some("custom" | "custom payload"));
+                let is_custom_spec = job_spec_json
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str::<JobSpec>(json).ok())
+                    .is_some_and(|spec| matches!(spec, JobSpec::Custom { .. }));
+                (is_custom_type || is_custom_spec).then_some(job_id)
+            })
+            .collect();
+
+        for job_id in &custom_job_ids {
+            let updated = tx
+                .execute(
+                    "UPDATE jobs SET status = 'failed', end_time_ms = ?2,
+                                     final_summary_json = ?3
+                     WHERE job_id = ?1 AND status = 'running'",
+                    params![job_id, end_time_ms, summary],
+                )
+                .map_err(|error| {
+                    format!("failed to terminalize restored custom job {job_id}: {error}")
+                })?;
+            if updated != 1 {
+                return Err(format!(
+                    "restored custom job {job_id} changed during reconciliation"
+                ));
+            }
+            tx.execute(
+                "DELETE FROM current_custom_assignments WHERE job_id = ?1",
+                [job_id],
+            )
+            .map_err(|error| format!("failed to fence restored custom job {job_id}: {error}"))?;
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(custom_job_ids.len())
+    }
+
     /// Atomically cancel a running custom job and remove every durable current
     /// assignment fence. Callers must not acknowledge or clear memory before
     /// this transaction commits.
@@ -1375,6 +1444,15 @@ impl MetricsDb {
         self.conn.lock().unwrap().execute_batch(sql)
     }
 
+    #[cfg(test)]
+    pub(crate) fn current_custom_assignment_count(&self, job_id: &str) -> SqliteResult<usize> {
+        self.conn.lock().unwrap().query_row(
+            "SELECT COUNT(*) FROM current_custom_assignments WHERE job_id = ?1",
+            [job_id],
+            |row| row.get::<_, i64>(0).map(|count| count as usize),
+        )
+    }
+
     /// Get metrics for a specific job.
     pub fn get_job_metrics(
         &self,
@@ -1473,7 +1551,15 @@ mod tests {
             .ok(),
             input_path: "input".to_string(),
             total_tasks,
-            job_type: Some("custom".to_string()),
+            job_type: Some(
+                JobSpec::Custom {
+                    payload: serde_json::Value::Null,
+                    tasks: total_tasks,
+                    manifest: None,
+                }
+                .description()
+                .to_string(),
+            ),
         })
         .unwrap();
     }

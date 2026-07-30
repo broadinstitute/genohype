@@ -95,6 +95,57 @@ pub async fn start_coordinator(config: CoordinatorConfig) -> Result<()> {
     .await
 }
 
+fn restore_and_reconcile_database<F>(
+    db_path: &str,
+    copy_backup: F,
+) -> std::result::Result<bool, String>
+where
+    F: FnOnce(&str) -> std::result::Result<bool, String>,
+{
+    if let Some(parent) = std::path::Path::new(db_path).parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("failed to create database directory: {error}"))?;
+    }
+
+    // A stale WAL can overwrite the newly copied main database, so backup
+    // installation and reconciliation always begin from an empty destination.
+    for path in [
+        db_path.to_string(),
+        format!("{db_path}-wal"),
+        format!("{db_path}-shm"),
+    ] {
+        if let Err(error) = std::fs::remove_file(&path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(format!(
+                    "failed to remove stale database file {path}: {error}"
+                ));
+            }
+        }
+    }
+
+    if !copy_backup(db_path)? {
+        return Ok(false);
+    }
+    let metadata = std::fs::metadata(db_path)
+        .map_err(|error| format!("restored database file is unavailable: {error}"))?;
+    if metadata.len() == 0 {
+        return Err("restored database file is empty".to_string());
+    }
+    eprintln!("  Successfully restored DB ({} bytes)", metadata.len());
+
+    let restored = MetricsDb::open(db_path)
+        .map_err(|error| format!("failed to open restored metrics database: {error}"))?;
+    let reconciled = restored
+        .reconcile_restored_custom_jobs(CoordinatorData::now_ms())
+        .map_err(|error| format!("failed to reconcile restored custom jobs: {error}"))?;
+    if reconciled > 0 {
+        eprintln!(
+            "  Marked {reconciled} restored running custom job(s) failed and fenced assignments"
+        );
+    }
+    Ok(true)
+}
+
 /// Properly structured coordinator startup.
 ///
 /// Note: For backward compatibility, `output_path` is converted to a default
@@ -160,57 +211,51 @@ pub async fn run_coordinator(
     println!("  Batch size: {}", batch_size);
     println!("  Timeout: {}s", timeout_secs);
 
-    // Try to restore from backup path if configured
+    // Try to restore from backup path if configured. Any successfully copied
+    // database is reconciled before the server or its receipt endpoints exist.
     if let Some(ref bp) = backup_path {
         eprintln!("  Checking for database backup at {}", bp);
         let bp_clone = bp.clone();
         let db_path_clone = db_path.clone();
 
         let restore_result = tokio::task::spawn_blocking(move || {
-            // First, ensure the parent directory exists
-            if let Some(parent) = std::path::Path::new(&db_path_clone).parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-
-            // Clean up any existing db files that might corrupt the restored state
-            // If a stale -wal file exists, SQLite will overwrite the restored .db!
-            let _ = std::fs::remove_file(&db_path_clone);
-            let _ = std::fs::remove_file(format!("{}-wal", db_path_clone));
-            let _ = std::fs::remove_file(format!("{}-shm", db_path_clone));
-
-            if bp_clone.starts_with("gs://") {
-                eprintln!("  Running gsutil cp {} {}", bp_clone, db_path_clone);
+            restore_and_reconcile_database(&db_path_clone, |destination| {
+                if !bp_clone.starts_with("gs://") {
+                    eprintln!("  Warning: Automatic restore only supported for gs:// paths");
+                    return Ok(false);
+                }
+                eprintln!("  Running gsutil cp {} {}", bp_clone, destination);
                 match std::process::Command::new("gsutil")
-                    .args(["cp", &bp_clone, &db_path_clone])
+                    .args(["cp", &bp_clone, destination])
                     .status()
                 {
-                    Ok(status) if status.success() => {
-                        // Verify file exists and has size
-                        if let Ok(metadata) = std::fs::metadata(&db_path_clone) {
-                            if metadata.len() > 0 {
-                                eprintln!("  Successfully restored DB ({} bytes)", metadata.len());
-                                return true;
-                            } else {
-                                eprintln!("  Warning: Restored DB file is empty");
-                            }
-                        } else {
-                            eprintln!(
-                                "  Warning: gsutil succeeded but file not found at {}",
-                                db_path_clone
-                            );
-                        }
+                    Ok(status) if status.success() => Ok(true),
+                    Ok(status) => {
+                        eprintln!("  gsutil cp failed with status: {}", status);
+                        Ok(false)
                     }
-                    Ok(status) => eprintln!("  gsutil cp failed with status: {}", status),
-                    Err(e) => eprintln!("  Failed to execute gsutil: {}", e),
+                    Err(error) => {
+                        eprintln!("  Failed to execute gsutil: {}", error);
+                        Ok(false)
+                    }
                 }
-            } else {
-                eprintln!("  Warning: Automatic restore only supported for gs:// paths");
-            }
-            false
+            })
         })
-        .await;
+        .await
+        .map_err(|error| {
+            crate::HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("database restore task failed: {error}"),
+            ))
+        })?
+        .map_err(|error| {
+            crate::HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("database restore reconciliation failed: {error}"),
+            ))
+        })?;
 
-        if restore_result.unwrap_or(false) {
+        if restore_result {
             eprintln!("  Restored ops database from {}", bp);
         } else {
             eprintln!("  Starting with fresh database (restore skipped or failed)");
@@ -2182,6 +2227,194 @@ mod lease_coordinator_tests {
         let receipts = data.metrics_db.get_custom_receipts("job-1").unwrap();
         assert_eq!(receipts.job_status.as_deref(), Some("running"));
         assert!(receipts.complete);
+    }
+
+    #[test]
+    fn restored_running_custom_jobs_fail_closed_before_startup_serves() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.db");
+        let backup_path = dir.path().join("older-valid-backup.db");
+        let restored_path = dir.path().join("restored.db");
+        let source = MetricsDb::open(&source_path).unwrap();
+
+        for job_id in ["job-accepted", "job-assigned"] {
+            source
+                .insert_job(&JobRecord {
+                    job_id: job_id.to_string(),
+                    status: "running".to_string(),
+                    start_time_ms: 1,
+                    end_time_ms: None,
+                    job_spec_json: serde_json::to_value(custom_job(1)).ok(),
+                    input_path: "input".to_string(),
+                    total_tasks: 1,
+                    job_type: Some(custom_job(1).description().to_string()),
+                })
+                .unwrap();
+        }
+
+        source
+            .persist_custom_assignments(
+                "job-accepted",
+                "old-session",
+                "worker-accepted",
+                Some("assignment-build-a"),
+                &[DurableCustomAssignment {
+                    task_id: "custom_0",
+                    partition_id: 0,
+                    assignment_attempt: 1,
+                    lease_token: "accepted-lease",
+                }],
+                10,
+            )
+            .unwrap();
+        source
+            .accept_custom_completion(
+                "job-accepted",
+                &completion(
+                    "worker-accepted",
+                    "custom_0",
+                    "old-session",
+                    AssignmentLease {
+                        task_id: "custom_0".to_string(),
+                        assignment_attempt: 1,
+                        lease_token: "accepted-lease".to_string(),
+                    },
+                    None,
+                ),
+                20,
+            )
+            .unwrap();
+        assert!(source.get_custom_receipts("job-accepted").unwrap().complete);
+
+        source
+            .persist_custom_assignments(
+                "job-assigned",
+                "old-session",
+                "worker-assigned",
+                Some("assignment-build-b"),
+                &[DurableCustomAssignment {
+                    task_id: "custom_0",
+                    partition_id: 0,
+                    assignment_attempt: 1,
+                    lease_token: "current-lease",
+                }],
+                30,
+            )
+            .unwrap();
+        let stale_completion = completion(
+            "worker-assigned",
+            "custom_0",
+            "old-session",
+            AssignmentLease {
+                task_id: "custom_0".to_string(),
+                assignment_attempt: 1,
+                lease_token: "current-lease".to_string(),
+            },
+            None,
+        );
+        source.write_verified_backup_snapshot(&backup_path).unwrap();
+        drop(source);
+
+        let restored = restore_and_reconcile_database(restored_path.to_str().unwrap(), |dest| {
+            std::fs::copy(&backup_path, dest)
+                .map(|_| true)
+                .map_err(|error| error.to_string())
+        })
+        .unwrap();
+        assert!(restored);
+
+        let db = MetricsDb::open(&restored_path).unwrap();
+        let accepted = db.get_custom_receipts("job-accepted").unwrap();
+        assert_eq!(accepted.job_status.as_deref(), Some("failed"));
+        assert_eq!(accepted.accepted_count, 1);
+        assert_eq!(accepted.expected_task_count, 1);
+        assert!(!accepted.complete);
+        assert_eq!(
+            accepted.receipts[0].worker_build_version.as_deref(),
+            Some("assignment-build-a")
+        );
+        assert_eq!(
+            db.current_custom_assignment_count("job-assigned").unwrap(),
+            0
+        );
+        assert!(db
+            .accept_custom_completion("job-assigned", &stale_completion, 40)
+            .unwrap_err()
+            .contains("not durably running"));
+        let summary = db
+            .get_job_summary("job-accepted")
+            .unwrap()
+            .expect("restore interruption summary");
+        assert!(summary.contains("interrupted"));
+        assert!(summary.contains("not completion authority"));
+    }
+
+    #[test]
+    fn restore_reconciliation_failure_is_fatal_and_atomic() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.db");
+        let backup_path = dir.path().join("backup.db");
+        let restored_path = dir.path().join("restored.db");
+        let source = MetricsDb::open(&source_path).unwrap();
+        source
+            .insert_job(&JobRecord {
+                job_id: "job-blocked".to_string(),
+                status: "running".to_string(),
+                start_time_ms: 1,
+                end_time_ms: None,
+                job_spec_json: serde_json::to_value(custom_job(1)).ok(),
+                input_path: "input".to_string(),
+                total_tasks: 1,
+                job_type: Some(custom_job(1).description().to_string()),
+            })
+            .unwrap();
+        source
+            .persist_custom_assignments(
+                "job-blocked",
+                "old-session",
+                "worker-a",
+                Some("build-a"),
+                &[DurableCustomAssignment {
+                    task_id: "custom_0",
+                    partition_id: 0,
+                    assignment_attempt: 1,
+                    lease_token: "current-lease",
+                }],
+                10,
+            )
+            .unwrap();
+        source
+            .execute_test_sql(
+                "CREATE TRIGGER block_restore_reconciliation
+                 BEFORE UPDATE OF status ON jobs
+                 WHEN OLD.job_id = 'job-blocked'
+                 BEGIN SELECT RAISE(FAIL, 'injected restore failure'); END;",
+            )
+            .unwrap();
+        source.write_verified_backup_snapshot(&backup_path).unwrap();
+        drop(source);
+
+        let error = restore_and_reconcile_database(restored_path.to_str().unwrap(), |dest| {
+            std::fs::copy(&backup_path, dest)
+                .map(|_| true)
+                .map_err(|error| error.to_string())
+        })
+        .unwrap_err();
+        assert!(error.contains("failed to reconcile restored custom jobs"));
+        assert!(error.contains("injected restore failure"));
+
+        let db = MetricsDb::open(&restored_path).unwrap();
+        assert_eq!(
+            db.get_custom_receipts("job-blocked")
+                .unwrap()
+                .job_status
+                .as_deref(),
+            Some("running")
+        );
+        assert_eq!(
+            db.current_custom_assignment_count("job-blocked").unwrap(),
+            1
+        );
     }
 
     #[tokio::test]
