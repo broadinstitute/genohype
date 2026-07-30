@@ -297,24 +297,44 @@ pub(crate) async fn cancel_job(
         });
     }
 
-    // Update job status in database
-    if let Some(ref job_id) = data.current_job_id {
+    // Custom jobs use their durable assignments as an authority boundary. The
+    // terminal status and fence removal must commit together before cancellation
+    // is acknowledged or any corresponding in-memory state is cleared.
+    let is_custom_job = matches!(data.config.job_spec, Some(JobSpec::Custom { .. }));
+    if is_custom_job {
+        let Some(job_id) = data.current_job_id.as_deref() else {
+            return axum::Json(CancelResponse {
+                success: false,
+                message: "Custom job has no durable job identity".to_string(),
+            });
+        };
+        if let Err(error) = data
+            .metrics_db
+            .cancel_custom_job(job_id, CoordinatorData::now_ms())
+        {
+            eprintln!("Rejected custom job cancellation: {error}");
+            return axum::Json(CancelResponse {
+                success: false,
+                message: format!("Cancellation was not committed: {error}"),
+            });
+        }
+    } else if let Some(ref job_id) = data.current_job_id {
+        // Preserve the existing best-effort behavior for generic jobs, which do
+        // not use custom assignment receipts as an authorization boundary.
         let end_time_ms = CoordinatorData::now_ms();
-        if let Err(e) =
+        if let Err(error) =
             data.metrics_db
                 .update_job_status(job_id, "cancelled", Some(end_time_ms), None)
         {
-            eprintln!("Warning: failed to update job status in DB: {}", e);
+            eprintln!("Warning: failed to update job status in DB: {error}");
         }
-        if let Err(e) = data.metrics_db.clear_current_custom_assignments(job_id) {
-            eprintln!(
-                "Warning: failed to clear cancelled custom assignments: {}",
-                e
-            );
+        if let Err(error) = data.metrics_db.clear_current_custom_assignments(job_id) {
+            eprintln!("Warning: failed to clear cancelled custom assignments: {error}");
         }
     }
 
-    // Reset job state
+    // Reset job state only after the durable custom cancellation commits.
+    // Generic jobs retain their pre-existing behavior.
     data.pending_partitions.clear();
     data.processing_partitions.clear();
     data.custom_assignment_attempts.clear();

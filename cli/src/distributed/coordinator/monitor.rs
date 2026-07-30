@@ -11,57 +11,57 @@ use std::time::{Duration, Instant};
 
 /// Backup the database to GCS.
 ///
-/// This function checkpoints the WAL to ensure all data is in the main file,
-/// then uploads the database to the specified GCS path.
+/// This function creates and verifies a transactionally consistent standalone
+/// SQLite snapshot, then uploads only that snapshot. Any checkpoint, snapshot,
+/// or integrity failure aborts before publication.
 /// Returns true if backup succeeded.
 pub(crate) async fn backup_db(metrics_db: &MetricsDb, db_path: &str, backup_path: &str) -> bool {
-    // Checkpoint the WAL to ensure the main DB file is up-to-date
-    if let Err(e) = metrics_db.checkpoint_for_backup() {
-        eprintln!("Warning: failed to checkpoint DB before backup: {}", e);
-    }
-
-    // Read the database file and upload to GCS in a blocking task
-    let db_path = db_path.to_string();
+    let metrics_db = metrics_db.clone();
+    let snapshot_path = format!("{db_path}.backup-{}.sqlite", uuid::Uuid::new_v4());
     let backup_path = backup_path.to_string();
     let backup_path_display = backup_path.clone();
     let result = tokio::task::spawn_blocking(move || {
         use genohype_core::io::CloudWriter;
         use std::io::Write;
 
-        let db_contents = match std::fs::read(&db_path) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!(
-                    "Warning: failed to read database file at {}: {}",
-                    db_path, e
-                );
+        if let Err(error) = metrics_db.write_verified_backup_snapshot(&snapshot_path) {
+            eprintln!("Warning: refusing unsafe database backup: {error}");
+            let _ = std::fs::remove_file(&snapshot_path);
+            return false;
+        }
+        let db_contents = match std::fs::read(&snapshot_path) {
+            Ok(contents) => contents,
+            Err(error) => {
+                eprintln!("Warning: failed to read verified database snapshot: {error}");
+                let _ = std::fs::remove_file(&snapshot_path);
                 return false;
             }
         };
+        let _ = std::fs::remove_file(&snapshot_path);
 
         let mut writer = match CloudWriter::new(&backup_path) {
-            Ok(w) => w,
-            Err(e) => {
+            Ok(writer) => writer,
+            Err(error) => {
                 eprintln!(
                     "Warning: failed to create cloud writer for {}: {}",
-                    backup_path, e
+                    backup_path, error
                 );
                 return false;
             }
         };
 
-        if let Err(e) = writer.write_all(&db_contents) {
+        if let Err(error) = writer.write_all(&db_contents) {
             eprintln!(
                 "Warning: failed to write backup data to {}: {}",
-                backup_path, e
+                backup_path, error
             );
             return false;
         }
 
-        if let Err(e) = writer.finish() {
+        if let Err(error) = writer.finish() {
             eprintln!(
                 "Warning: failed to finalize backup upload to {}: {}",
-                backup_path, e
+                backup_path, error
             );
             return false;
         }

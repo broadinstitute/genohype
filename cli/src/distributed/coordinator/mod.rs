@@ -976,6 +976,9 @@ async fn get_work(
                 &job_id,
                 &data.session_id,
                 &req.worker_id,
+                // Coordinator-observed but worker-self-reported. This value is
+                // assignment-bound, not authenticated build attestation.
+                req.build_version.as_deref(),
                 &durable,
                 CoordinatorData::now_ms(),
             ) {
@@ -1123,16 +1126,10 @@ async fn complete_work(
                 acknowledged: false,
             });
         }
-        let worker_build_version = data
-            .worker_registry
-            .get(&req.worker_id)
-            .and_then(|worker| worker.build_version.clone());
-        match data.metrics_db.accept_custom_completion(
-            &job_id,
-            worker_build_version.as_deref(),
-            &req,
-            now_ms,
-        ) {
+        match data
+            .metrics_db
+            .accept_custom_completion(&job_id, &req, now_ms)
+        {
             Ok(CustomCompletionOutcome::Stored) => {
                 for task_id in &req.tasks {
                     data.custom_assignments.remove(task_id);
@@ -2085,6 +2082,20 @@ mod lease_coordinator_tests {
         let raw_lease = lease.lease_token.clone();
         let request = completion("worker-a", &task_id, &session, lease, None);
 
+        // The same worker ID may report different mutable registry metadata,
+        // but the outstanding durable assignment remains bound to build A.
+        let replacement = get_work(
+            axum::extract::State(state.clone()),
+            axum::Json(WorkRequest {
+                worker_id: "worker-a".to_string(),
+                hardware: None,
+                build_version: Some("replacement-build-b".to_string()),
+                protocol_version: Some(CUSTOM_WORKER_PROTOCOL_VERSION),
+            }),
+        )
+        .await;
+        assert!(matches!(replacement.0, WorkResponse::Wait));
+
         let response = complete_work(
             axum::extract::State(state.clone()),
             axum::Json(request.clone()),
@@ -2130,6 +2141,47 @@ mod lease_coordinator_tests {
             receipts.receipts[0].worker_build_version.as_deref(),
             Some("test-build")
         );
+        assert_eq!(
+            data.worker_registry["worker-a"].build_version.as_deref(),
+            Some("replacement-build-b")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_custom_cancellation_is_not_acknowledged_and_retains_live_state() {
+        let state = test_state(1);
+        let (task_id, session, lease) = assign(&state, "worker-a").await;
+        let accepted = complete_work(
+            axum::extract::State(state.clone()),
+            axum::Json(completion("worker-a", &task_id, &session, lease, None)),
+        )
+        .await;
+        assert!(accepted.0.acknowledged);
+        let before = signature(&state);
+        state
+            .lock()
+            .unwrap()
+            .metrics_db
+            .execute_test_sql(
+                "CREATE TEMP TRIGGER fail_cancel BEFORE UPDATE OF status ON jobs
+             WHEN NEW.status = 'cancelled' BEGIN SELECT RAISE(FAIL, 'injected'); END;",
+            )
+            .unwrap();
+
+        let cancelled = api::jobs::cancel_job(
+            axum::extract::State(state.clone()),
+            axum::Json(CancelRequest {
+                reason: Some("fault".to_string()),
+            }),
+        )
+        .await;
+        assert!(!cancelled.0.success);
+        assert_eq!(signature(&state), before);
+        let data = state.lock().unwrap();
+        assert!(!data.idle);
+        let receipts = data.metrics_db.get_custom_receipts("job-1").unwrap();
+        assert_eq!(receipts.job_status.as_deref(), Some("running"));
+        assert!(receipts.complete);
     }
 
     #[tokio::test]

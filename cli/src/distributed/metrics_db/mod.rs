@@ -4,7 +4,10 @@ use crate::distributed::message::{
     CompleteRequest, CustomReceiptSet, CustomTaskReceipt, FailureRecord, JobEvent, JobRecord,
     PhenotypeStatus, TelemetrySnapshot,
 };
-use rusqlite::{params, Connection, OptionalExtension, Result as SqliteResult};
+use rusqlite::{
+    backup::{Backup, StepResult},
+    params, Connection, OpenFlags, OptionalExtension, Result as SqliteResult,
+};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::Path;
@@ -190,6 +193,7 @@ impl MetricsDb {
                 assignment_attempt INTEGER NOT NULL,
                 lease_identity_sha256 TEXT NOT NULL,
                 worker_id TEXT NOT NULL,
+                worker_build_version TEXT,
                 assigned_at_ms INTEGER NOT NULL,
                 PRIMARY KEY (job_id, task_id)
             );
@@ -295,6 +299,23 @@ impl MetricsDb {
         if !has_max_cap {
             let _ =
                 conn.execute_batch("ALTER TABLE telemetry ADD COLUMN max_batch_capacity INTEGER;");
+        }
+
+        // Assignment-bound build identity was added after durable custom
+        // assignment fencing. Existing outstanding assignments migrate as
+        // unknown rather than borrowing mutable registry metadata.
+        let has_assignment_build: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('current_custom_assignments') WHERE name = 'worker_build_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0)
+            > 0;
+        if !has_assignment_build {
+            conn.execute_batch(
+                "ALTER TABLE current_custom_assignments ADD COLUMN worker_build_version TEXT;",
+            )?;
         }
 
         Ok(Self {
@@ -499,15 +520,91 @@ impl MetricsDb {
         Ok(count as usize)
     }
 
-    /// Force a WAL checkpoint to ensure all data is written to the main DB file
-    /// before performing a backup to GCS.
-    ///
-    /// This flushes the Write-Ahead Log (WAL) into the main database file and
-    /// truncates the WAL, ensuring the single .db file contains the complete
-    /// current state. Call this before uploading ops.db to GCS.
-    pub fn checkpoint_for_backup(&self) -> SqliteResult<()> {
+    /// Require a complete WAL checkpoint before backup. SQLite reports busy
+    /// checkpoints as successful pragma rows, so all result columns must be
+    /// inspected explicitly.
+    pub fn checkpoint_for_backup(&self) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        let (busy, log_frames, checkpointed_frames): (i64, i64, i64) = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(|error| format!("WAL checkpoint failed: {error}"))?;
+        if busy != 0 || checkpointed_frames != log_frames {
+            return Err(format!(
+                "WAL checkpoint incomplete (busy={busy}, log={log_frames}, checkpointed={checkpointed_frames})"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Write a transactionally consistent standalone SQLite snapshot and
+    /// verify it before callers may upload it. The live main file is never
+    /// copied directly.
+    pub(crate) fn write_verified_backup_snapshot<P: AsRef<Path>>(
+        &self,
+        snapshot_path: P,
+    ) -> Result<(), String> {
+        self.checkpoint_for_backup()?;
+        let snapshot_path = snapshot_path.as_ref();
+        if snapshot_path.exists() {
+            return Err(format!(
+                "backup snapshot destination already exists: {}",
+                snapshot_path.display()
+            ));
+        }
+
+        {
+            let source = self.conn.lock().unwrap();
+            let mut destination = Connection::open(snapshot_path)
+                .map_err(|error| format!("failed to create backup snapshot: {error}"))?;
+            let backup = Backup::new(&source, &mut destination)
+                .map_err(|error| format!("failed to initialize SQLite backup: {error}"))?;
+            match backup
+                .step(-1)
+                .map_err(|error| format!("SQLite backup failed: {error}"))?
+            {
+                StepResult::Done => {}
+                StepResult::Busy => return Err("SQLite backup source was busy".to_string()),
+                StepResult::Locked => return Err("SQLite backup source was locked".to_string()),
+                StepResult::More => {
+                    return Err("SQLite backup did not produce a complete snapshot".to_string())
+                }
+                _ => return Err("SQLite backup returned an unknown incomplete state".to_string()),
+            }
+        }
+
+        let verified = (|| -> Result<(), String> {
+            let snapshot =
+                Connection::open_with_flags(snapshot_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .map_err(|error| format!("failed to reopen backup snapshot: {error}"))?;
+            let integrity: String = snapshot
+                .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+                .map_err(|error| format!("failed to verify backup integrity: {error}"))?;
+            if integrity != "ok" {
+                return Err(format!(
+                    "backup snapshot failed integrity_check: {integrity}"
+                ));
+            }
+            let required_tables: i64 = snapshot
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table' AND name IN ('jobs', 'current_custom_assignments', 'custom_task_receipts')",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|error| format!("failed to verify backup schema: {error}"))?;
+            if required_tables != 3 {
+                return Err(format!(
+                    "backup snapshot is missing receipt-authority tables ({required_tables}/3 present)"
+                ));
+            }
+            Ok(())
+        })();
+        if let Err(error) = verified {
+            let _ = std::fs::remove_file(snapshot_path);
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -519,6 +616,7 @@ impl MetricsDb {
         job_id: &str,
         coordinator_session_id: &str,
         worker_id: &str,
+        worker_build_version: Option<&str>,
         assignments: &[DurableCustomAssignment<'_>],
         assigned_at_ms: u64,
     ) -> Result<(), String> {
@@ -582,14 +680,16 @@ impl MetricsDb {
             tx.execute(
                 "INSERT INTO current_custom_assignments (
                      job_id, coordinator_session_id, task_id, partition_id,
-                     assignment_attempt, lease_identity_sha256, worker_id, assigned_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     assignment_attempt, lease_identity_sha256, worker_id,
+                     worker_build_version, assigned_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(job_id, task_id) DO UPDATE SET
                      coordinator_session_id = excluded.coordinator_session_id,
                      partition_id = excluded.partition_id,
                      assignment_attempt = excluded.assignment_attempt,
                      lease_identity_sha256 = excluded.lease_identity_sha256,
                      worker_id = excluded.worker_id,
+                     worker_build_version = excluded.worker_build_version,
                      assigned_at_ms = excluded.assigned_at_ms",
                 params![
                     job_id,
@@ -599,6 +699,7 @@ impl MetricsDb {
                     attempt,
                     lease_identity(assignment.lease_token),
                     worker_id,
+                    worker_build_version,
                     assigned_at_ms,
                 ],
             )
@@ -673,7 +774,6 @@ impl MetricsDb {
     pub(crate) fn accept_custom_completion(
         &self,
         job_id: &str,
-        worker_build_version: Option<&str>,
         request: &CompleteRequest,
         accepted_at_ms: u64,
     ) -> Result<CustomCompletionOutcome, String> {
@@ -717,9 +817,9 @@ impl MetricsDb {
             let attempt = i64::try_from(lease.assignment_attempt)
                 .map_err(|_| "assignment attempt exceeds SQLite INTEGER".to_string())?;
             let lease_hash = lease_identity(&lease.lease_token);
-            let current: Option<(i64, String, String, i64)> = tx
+            let current: Option<(i64, Option<String>)> = tx
                 .query_row(
-                    "SELECT partition_id, coordinator_session_id, worker_id, assignment_attempt
+                    "SELECT partition_id, worker_build_version
                      FROM current_custom_assignments
                      WHERE job_id = ?1 AND task_id = ?2 AND assignment_attempt = ?3
                        AND coordinator_session_id = ?4 AND lease_identity_sha256 = ?5
@@ -732,11 +832,11 @@ impl MetricsDb {
                         lease_hash,
                         request.worker_id,
                     ],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()
                 .map_err(|error| error.to_string())?;
-            let Some((partition_id, _, _, _)) = current else {
+            let Some((partition_id, worker_build_version)) = current else {
                 return Err(format!(
                     "task {task_id} has no matching durable current assignment"
                 ));
@@ -757,7 +857,7 @@ impl MetricsDb {
                     attempt,
                     lease_hash,
                     request.worker_id,
-                    worker_build_version,
+                    worker_build_version.as_deref(),
                     terminal_status,
                     report_json,
                     report_sha256,
@@ -791,6 +891,35 @@ impl MetricsDb {
         }
         tx.commit().map_err(|error| error.to_string())?;
         Ok(CustomCompletionOutcome::Stored)
+    }
+
+    /// Atomically cancel a running custom job and remove every durable current
+    /// assignment fence. Callers must not acknowledge or clear memory before
+    /// this transaction commits.
+    pub(crate) fn cancel_custom_job(&self, job_id: &str, end_time_ms: u64) -> Result<(), String> {
+        let end_time_ms = i64::try_from(end_time_ms)
+            .map_err(|_| "cancellation timestamp exceeds SQLite INTEGER".to_string())?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let updated = tx
+            .execute(
+                "UPDATE jobs SET status = 'cancelled', end_time_ms = ?2,
+                                 final_summary_json = NULL
+                 WHERE job_id = ?1 AND status = 'running'",
+                params![job_id, end_time_ms],
+            )
+            .map_err(|error| error.to_string())?;
+        if updated != 1 {
+            return Err(format!(
+                "custom job {job_id} is missing or is not durably running"
+            ));
+        }
+        tx.execute(
+            "DELETE FROM current_custom_assignments WHERE job_id = ?1",
+            [job_id],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())
     }
 
     /// Remove live durable assignment fences for a terminal or superseded job.
@@ -1241,6 +1370,11 @@ impl MetricsDb {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn execute_test_sql(&self, sql: &str) -> SqliteResult<()> {
+        self.conn.lock().unwrap().execute_batch(sql)
+    }
+
     /// Get metrics for a specific job.
     pub fn get_job_metrics(
         &self,
@@ -1378,6 +1512,14 @@ mod tests {
                          start_time_ms INTEGER NOT NULL, end_time_ms INTEGER,
                          job_spec_json TEXT, input_path TEXT, total_tasks INTEGER,
                          job_type TEXT, final_summary_json TEXT
+                     );
+                     CREATE TABLE current_custom_assignments (
+                         job_id TEXT NOT NULL, coordinator_session_id TEXT NOT NULL,
+                         task_id TEXT NOT NULL, partition_id INTEGER NOT NULL,
+                         assignment_attempt INTEGER NOT NULL,
+                         lease_identity_sha256 TEXT NOT NULL, worker_id TEXT NOT NULL,
+                         assigned_at_ms INTEGER NOT NULL,
+                         PRIMARY KEY (job_id, task_id)
                      );",
                 )
                 .unwrap();
@@ -1390,6 +1532,7 @@ mod tests {
             "job-backup",
             "session-1",
             "worker-a",
+            Some("build-a"),
             &[DurableCustomAssignment {
                 task_id: "custom_0",
                 partition_id: 0,
@@ -1401,7 +1544,7 @@ mod tests {
         .unwrap();
         let request = completion("worker-a", "custom_0", 1, raw_lease);
         assert_eq!(
-            db.accept_custom_completion("job-backup", Some("build-a"), &request, 20)
+            db.accept_custom_completion("job-backup", &request, 20)
                 .unwrap(),
             CustomCompletionOutcome::Stored
         );
@@ -1409,7 +1552,7 @@ mod tests {
         assert!(first.complete);
         assert_eq!(first.accepted_count, 1);
         assert_eq!(
-            db.accept_custom_completion("job-backup", Some("build-a"), &request, 30)
+            db.accept_custom_completion("job-backup", &request, 30)
                 .unwrap(),
             CustomCompletionOutcome::Duplicate
         );
@@ -1424,20 +1567,86 @@ mod tests {
             )
             .is_err());
 
-        db.checkpoint_for_backup().unwrap();
+        db.cancel_custom_job("job-backup", 40).unwrap();
+        let cancelled = db.get_custom_receipts("job-backup").unwrap();
+        assert_eq!(cancelled.job_status.as_deref(), Some("cancelled"));
+        assert!(!cancelled.complete);
+        assert_eq!(cancelled.receipts, first.receipts);
+
         let backup_path = dir.path().join("restored.db");
-        std::fs::copy(&db_path, &backup_path).unwrap();
+        db.write_verified_backup_snapshot(&backup_path).unwrap();
         drop(db);
 
-        // Opening twice proves the migration remains idempotent on restored ops.db.
         let restored = MetricsDb::open(&backup_path).unwrap();
         drop(restored);
         let restored = MetricsDb::open(&backup_path).unwrap();
-        assert_eq!(restored.get_custom_receipts("job-backup").unwrap(), first);
+        assert_eq!(
+            restored.get_custom_receipts("job-backup").unwrap(),
+            cancelled
+        );
+        let integrity: String = restored
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
         let bytes = std::fs::read(&backup_path).unwrap();
         assert!(!bytes
             .windows(raw_lease.len())
             .any(|window| window == raw_lease.as_bytes()));
+    }
+
+    #[test]
+    fn held_reader_blocks_checkpoint_and_cannot_publish_a_stale_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ops.db");
+        let snapshot_path = dir.path().join("snapshot.db");
+        let db = MetricsDb::open(&db_path).unwrap();
+        insert_custom_job(&db, "job-busy", 1);
+        db.persist_custom_assignments(
+            "job-busy",
+            "session-1",
+            "worker-a",
+            Some("build-a"),
+            &[DurableCustomAssignment {
+                task_id: "custom_0",
+                partition_id: 0,
+                assignment_attempt: 1,
+                lease_token: "lease-a",
+            }],
+            10,
+        )
+        .unwrap();
+        db.accept_custom_completion(
+            "job-busy",
+            &completion("worker-a", "custom_0", 1, "lease-a"),
+            20,
+        )
+        .unwrap();
+        db.checkpoint_for_backup().unwrap();
+
+        let reader = Connection::open(&db_path).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let status: String = reader
+            .query_row(
+                "SELECT status FROM jobs WHERE job_id = 'job-busy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "running");
+        db.cancel_custom_job("job-busy", 30).unwrap();
+
+        let error = db
+            .write_verified_backup_snapshot(&snapshot_path)
+            .unwrap_err();
+        assert!(
+            error.contains("busy") || error.contains("incomplete"),
+            "{error}"
+        );
+        assert!(!snapshot_path.exists());
+        reader.execute_batch("ROLLBACK").unwrap();
     }
 
     #[test]
@@ -1449,6 +1658,7 @@ mod tests {
             "job-a",
             "session-1",
             "worker-a",
+            Some("build-a"),
             &[DurableCustomAssignment {
                 task_id: "custom_0",
                 partition_id: 0,
@@ -1465,9 +1675,7 @@ mod tests {
             completion("worker-a", "custom_0", 1, "wrong-lease"),
             completion("worker-a", "wrong-task", 1, "lease-a"),
         ] {
-            assert!(db
-                .accept_custom_completion("job-a", None, &wrong, 20)
-                .is_err());
+            assert!(db.accept_custom_completion("job-a", &wrong, 20).is_err());
             assert_eq!(
                 db.get_custom_receipts("job-a")
                     .unwrap()
@@ -1478,15 +1686,12 @@ mod tests {
 
         let correct = completion("worker-a", "custom_0", 1, "lease-a");
         assert_eq!(
-            db.accept_custom_completion("job-a", None, &correct, 20)
-                .unwrap(),
+            db.accept_custom_completion("job-a", &correct, 20).unwrap(),
             CustomCompletionOutcome::Stored
         );
         let mut conflict = correct.clone();
         conflict.items_processed = 8;
-        assert!(db
-            .accept_custom_completion("job-a", None, &conflict, 21)
-            .is_err());
+        assert!(db.accept_custom_completion("job-a", &conflict, 21).is_err());
         let a = db.get_custom_receipts("job-a").unwrap();
         let b = db.get_custom_receipts("job-b").unwrap();
         assert_eq!(a.accepted_count, 1);
