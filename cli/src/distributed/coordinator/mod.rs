@@ -1904,7 +1904,7 @@ mod lease_coordinator_tests {
     use super::*;
     use crate::distributed::message::{
         AssignmentLease, CancelRequest, CompleteResponse, HardwareSpec, HeartbeatResponse,
-        JobRecord, TelemetrySnapshot,
+        JobConfigRequest, JobConfigResponse, JobRecord, TelemetrySnapshot,
     };
     use axum::{
         routing::{get, post},
@@ -1974,6 +1974,157 @@ mod lease_coordinator_tests {
             cached_vms: None,
             deleted_workers: HashSet::new(),
         }))
+    }
+
+    fn idle_test_state() -> SharedState {
+        let state = test_state(0);
+        {
+            let mut data = state.lock().unwrap();
+            data.config = CoordinatorConfig::default();
+            data.pending_partitions.clear();
+            data.current_job_id = None;
+            data.idle = true;
+        }
+        state
+    }
+
+    fn job_request(job_spec: JobSpec, force: bool) -> JobConfigRequest {
+        JobConfigRequest {
+            input_path: "custom".to_string(),
+            job_spec,
+            total_tasks: 2,
+            batch_size: Some(1),
+            force,
+            filters: Vec::new(),
+            intervals: Vec::new(),
+            memory_weight_mb: Some(512),
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_worker_custom_job_is_durable_but_unassigned_until_worker_registers() {
+        let state = idle_test_state();
+        let app = Router::new()
+            .route("/api/job", post(api::jobs::submit_job))
+            .route("/work", post(get_work))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let base_url = format!("http://{address}");
+
+        let noncustom: JobConfigResponse = client
+            .post(format!("{base_url}/api/job"))
+            .json(&job_request(JobSpec::Summary, false))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(!noncustom.acknowledged);
+        assert!(noncustom.error.unwrap().contains("No active workers"));
+
+        let forced: JobConfigResponse = client
+            .post(format!("{base_url}/api/job"))
+            .json(&job_request(custom_job(2), true))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(!forced.acknowledged);
+        assert!(forced.error.unwrap().contains("does not allow --force"));
+
+        let accepted: JobConfigResponse = client
+            .post(format!("{base_url}/api/job"))
+            .json(&job_request(custom_job(2), false))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(accepted.acknowledged, "{:?}", accepted.error);
+
+        let job_id = {
+            let data = state.lock().unwrap();
+            let job_id = data.current_job_id.clone().expect("registered job id");
+            assert!(!data.idle);
+            assert!(data.worker_registry.is_empty());
+            assert_eq!(
+                data.pending_partitions.iter().copied().collect::<Vec<_>>(),
+                vec![0, 1]
+            );
+            assert!(data.processing_partitions.is_empty());
+            assert!(data.custom_assignments.is_empty());
+
+            let job = data
+                .metrics_db
+                .get_job(&job_id)
+                .unwrap()
+                .expect("durable job");
+            assert_eq!(job.status, "running");
+            assert_eq!(job.total_tasks, 2);
+            let receipts = data.metrics_db.get_custom_receipts(&job_id).unwrap();
+            assert_eq!(receipts.accepted_count, 0);
+            assert_eq!(receipts.expected_task_count, 2);
+            assert_eq!(
+                data.metrics_db
+                    .current_custom_assignment_count(&job_id)
+                    .unwrap(),
+                0
+            );
+            job_id
+        };
+
+        let active_replacement: JobConfigResponse = client
+            .post(format!("{base_url}/api/job"))
+            .json(&job_request(custom_job(2), false))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(!active_replacement.acknowledged);
+        assert!(active_replacement
+            .error
+            .unwrap()
+            .contains("already has a job running"));
+
+        let assignment: WorkResponse = client
+            .post(format!("{base_url}/work"))
+            .json(&WorkRequest {
+                worker_id: "worker-after-scale".to_string(),
+                hardware: None,
+                build_version: Some("test-build".to_string()),
+                protocol_version: Some(CUSTOM_WORKER_PROTOCOL_VERSION),
+            })
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let task_id = match assignment {
+            WorkResponse::Task { tasks, .. } => tasks.into_iter().next().unwrap().id,
+            other => panic!("expected task assignment, got {other:?}"),
+        };
+        assert_eq!(task_id, "custom_0");
+        let data = state.lock().unwrap();
+        assert!(data.worker_registry.contains_key("worker-after-scale"));
+        assert_eq!(data.processing_partitions.len(), 1);
+        assert_eq!(
+            data.metrics_db
+                .current_custom_assignment_count(&job_id)
+                .unwrap(),
+            1
+        );
+        drop(data);
+        server.abort();
     }
 
     async fn assign(state: &SharedState, worker_id: &str) -> (String, String, AssignmentLease) {

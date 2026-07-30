@@ -93,20 +93,26 @@ pub(crate) async fn submit_job(
 
     let mut data = state.lock().unwrap();
 
-    // R1: Check if workers are available
+    // R1: Check if workers are available. A custom job may be durably
+    // registered while the pool is intentionally at zero workers, but it may
+    // not use that exception to bypass active-job authority with --force.
     let active_workers = data
         .worker_registry
         .values()
         .filter(|w| w.status != WorkerStatus::SuspectedDead)
         .count();
+    let zero_worker_custom = active_workers == 0 && matches!(&req.job_spec, JobSpec::Custom { .. });
 
-    // Allow if we have workers OR if force is used (force bypasses worker check too for testing)
-    if active_workers == 0 && !req.force {
+    if active_workers == 0 && !zero_worker_custom {
         return axum::Json(JobConfigResponse {
             acknowledged: false,
-            error: Some(
-                "No active workers connected. Scale up workers first or use --force.".to_string(),
-            ),
+            error: Some("No active workers connected. Scale up workers first.".to_string()),
+        });
+    }
+    if zero_worker_custom && req.force {
+        return axum::Json(JobConfigResponse {
+            acknowledged: false,
+            error: Some("Zero-worker custom submission does not allow --force".to_string()),
         });
     }
 

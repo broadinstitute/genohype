@@ -24,6 +24,44 @@ fn worker_is_fresh(worker: &crate::distributed::message::DashboardWorker) -> boo
     worker.status != "suspected_dead" && worker.last_seen_secs <= WORKER_FRESHNESS_SECS
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmissionMode {
+    Standard,
+    ZeroWorkerCustom,
+}
+
+fn classify_submission(
+    pool_name: &str,
+    use_distributed: bool,
+    total_workers: usize,
+    has_custom_worker: bool,
+    command: &[String],
+) -> Result<SubmissionMode> {
+    if has_custom_worker && !use_distributed {
+        return Err(HailError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Custom workers require a running coordinator",
+        )));
+    }
+
+    if use_distributed && total_workers == 0 {
+        if has_custom_worker && command.first().map(String::as_str) == Some("custom") {
+            return Ok(SubmissionMode::ZeroWorkerCustom);
+        }
+        return Err(HailError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "No workers available for pool '{}'. Either:\n\
+                 - Scale up workers: genohype pool scale {} --workers N\n\
+                 - Use --autoscale to automatically scale workers for the job",
+                pool_name, pool_name
+            ),
+        )));
+    }
+
+    Ok(SubmissionMode::Standard)
+}
+
 fn require_idle_summary(summary_json: &str) -> Result<()> {
     let summary: crate::distributed::message::DashboardSummary = serde_json::from_str(summary_json)
         .map_err(|error| {
@@ -357,8 +395,16 @@ EOF
                 ))
             })?;
 
-            // Scale up to target workers
+            // Scale up to target workers. Autoscale-to-zero is not a durable
+            // registration request because its lifecycle would immediately run
+            // the autoscale cleanup path.
             let target = pool_config.workers;
+            if target == 0 {
+                return Err(HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Autoscaling requires a positive worker target",
+                )));
+            }
             println!(
                 "{} Autoscaling up to {} workers...",
                 "Setup:".cyan(),
@@ -477,25 +523,14 @@ EOF
         // Auto-detect distributed mode: use coordinator/worker pattern when coordinator exists
         let use_distributed = coordinator.is_some();
 
-        if worker_binary.is_some() && !use_distributed {
-            return Err(HailError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Custom workers require a running coordinator",
-            )));
-        }
-
-        // Validate we have workers for distributed mode
-        if use_distributed && total_workers == 0 {
-            return Err(HailError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "No workers available for pool '{}'. Either:\n\
-                     - Scale up workers: genohype pool scale {} --workers N\n\
-                     - Use --autoscale to automatically scale workers for the job",
-                    name, name
-                ),
-            )));
-        }
+        let submission_mode = classify_submission(
+            name,
+            use_distributed,
+            total_workers,
+            worker_binary.is_some(),
+            command,
+        )?;
+        let zero_worker_custom = submission_mode == SubmissionMode::ZeroWorkerCustom;
 
         println!(
             "{} {} running worker(s){}",
@@ -514,12 +549,46 @@ EOF
             .as_ref()
             .map(|coord| self.check_coordinator_status(coord, zone))
             .unwrap_or(false);
-        // Binary deployment restarts services. Refuse to disrupt an existing job,
-        // and fail closed when its state cannot be verified.
-        if coordinator_running && !force && (force_redeploy || worker_binary.is_some()) {
+        // Zero-worker registration is deliberately narrower than deployment:
+        // it requires an already-healthy idle coordinator and cannot supersede,
+        // redeploy, auto-stop, or create compute as a side effect.
+        if zero_worker_custom {
+            if !coordinator_running {
+                return Err(HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "Zero-worker custom submission requires a healthy running coordinator",
+                )));
+            }
+            if force {
+                return Err(HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Zero-worker custom submission does not allow --force",
+                )));
+            }
+            if force_redeploy {
+                return Err(HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Zero-worker custom submission does not allow --redeploy-binary",
+                )));
+            }
+            if auto_stop {
+                return Err(HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Zero-worker custom submission does not allow --auto-stop",
+                )));
+            }
+            self.ensure_coordinator_idle(coordinator.as_ref().unwrap(), zone)?;
+        } else if coordinator_running && !force && (force_redeploy || worker_binary.is_some()) {
+            // Binary deployment restarts services. Refuse to disrupt an existing
+            // job, and fail closed when its state cannot be verified.
             self.ensure_coordinator_idle(coordinator.as_ref().unwrap(), zone)?;
         }
-        if use_distributed && coordinator_running && !force_redeploy && worker_binary.is_some() {
+        if use_distributed
+            && coordinator_running
+            && !force_redeploy
+            && worker_binary.is_some()
+            && !workers.is_empty()
+        {
             let coord = coordinator.as_ref().unwrap();
             let coord_ip = coord.ip().ok_or_else(|| {
                 HailError::Io(std::io::Error::new(
@@ -1535,6 +1604,14 @@ EOF
         println!("  {} {}", "Workers:".cyan(), workers.len());
         println!("  {} {}", "Total partitions:".cyan(), total_partitions);
         println!();
+        if workers.is_empty() {
+            println!(
+                "{}",
+                "Job is durably registered with zero workers; scale explicitly to begin processing."
+                    .yellow()
+            );
+            return Ok(());
+        }
         println!(
             "{}",
             "Streaming coordinator logs (will exit on job completion)...".dimmed()
@@ -1891,6 +1968,27 @@ mod lifecycle_tests {
             build_version: None,
             effective_status: None,
         }
+    }
+
+    #[test]
+    fn zero_worker_mode_is_only_for_custom_jobs_with_a_custom_worker() {
+        let custom = vec!["custom".to_string(), "--tasks".to_string(), "1".to_string()];
+        assert_eq!(
+            classify_submission("pool", true, 0, true, &custom).unwrap(),
+            SubmissionMode::ZeroWorkerCustom
+        );
+
+        let stock = vec!["summary".to_string(), "input.ht".to_string()];
+        assert!(classify_submission("pool", true, 0, true, &stock).is_err());
+        assert!(classify_submission("pool", true, 0, false, &custom).is_err());
+        assert!(classify_submission("pool", false, 0, true, &custom)
+            .unwrap_err()
+            .to_string()
+            .contains("running coordinator"));
+        assert_eq!(
+            classify_submission("pool", true, 1, true, &custom).unwrap(),
+            SubmissionMode::Standard
+        );
     }
 
     #[test]
