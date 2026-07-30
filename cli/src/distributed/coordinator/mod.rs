@@ -41,7 +41,7 @@ use crate::distributed::message::{
     HeartbeatResponse, JobEvent, JobResultResponse, JobSpec, ManhattanSource, StatusResponse,
     TaskDescriptor, WorkRequest, WorkResponse, CUSTOM_WORKER_PROTOCOL_VERSION,
 };
-use crate::distributed::metrics_db::MetricsDb;
+use crate::distributed::metrics_db::{CustomCompletionOutcome, DurableCustomAssignment, MetricsDb};
 use crate::Result;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
@@ -736,6 +736,10 @@ pub async fn run_coordinator(
         .route("/api/job", post(api::jobs::submit_job))
         .route("/api/cancel", post(api::jobs::cancel_job))
         .route("/api/result", get(api::jobs::get_job_result))
+        .route(
+            "/api/jobs/:job_id/custom-receipts",
+            get(api::jobs::get_custom_receipts),
+        )
         .route("/api/binary", get(api::jobs::serve_binary))
         .route("/api/export-metrics", post(api::jobs::export_metrics))
         .route("/api/events", get(api::jobs::get_events))
@@ -950,6 +954,39 @@ async fn get_work(
                 task.assignment_attempt = Some(lease.assignment_attempt);
                 task.lease_token = Some(lease.lease_token);
             }
+            let Some(job_id) = data.current_job_id.clone() else {
+                for (&partition_id, task) in partitions.iter().zip(tasks.iter()).rev() {
+                    data.processing_partitions.remove(&partition_id);
+                    data.custom_assignments.remove(&task.id);
+                    data.pending_partitions.push_front(partition_id);
+                }
+                return axum::Json(WorkResponse::Wait);
+            };
+            let durable: Vec<_> = partitions
+                .iter()
+                .zip(tasks.iter())
+                .map(|(&partition_id, task)| DurableCustomAssignment {
+                    task_id: &task.id,
+                    partition_id,
+                    assignment_attempt: task.assignment_attempt.expect("custom attempt"),
+                    lease_token: task.lease_token.as_deref().expect("custom lease"),
+                })
+                .collect();
+            if let Err(error) = data.metrics_db.persist_custom_assignments(
+                &job_id,
+                &data.session_id,
+                &req.worker_id,
+                &durable,
+                CoordinatorData::now_ms(),
+            ) {
+                eprintln!("Rejected unsafe custom assignment dispatch: {error}");
+                for (&partition_id, task) in partitions.iter().zip(tasks.iter()).rev() {
+                    data.processing_partitions.remove(&partition_id);
+                    data.custom_assignments.remove(&task.id);
+                    data.pending_partitions.push_front(partition_id);
+                }
+                return axum::Json(WorkResponse::Wait);
+            }
         }
         let task_ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
         let task_labels: Vec<String> = tasks
@@ -1043,11 +1080,35 @@ async fn complete_work(
     if is_custom_job {
         // Fencing cannot be optional for side-effecting custom tasks: accepting a
         // legacy completion here would reintroduce the stale-writer race.
+        let Some(job_id) = data.current_job_id.clone() else {
+            return axum::Json(CompleteResponse {
+                acknowledged: false,
+            });
+        };
         if req.session_id.as_deref() != Some(data.session_id.as_str()) {
             return axum::Json(CompleteResponse {
                 acknowledged: false,
             });
         }
+
+        // An exact retry after an uncertain response is idempotently acknowledged
+        // from durable state and must not replay any in-memory state transition.
+        match data
+            .metrics_db
+            .is_identical_custom_completion(&job_id, &req)
+        {
+            Ok(true) => {
+                return axum::Json(CompleteResponse { acknowledged: true });
+            }
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("Rejected custom completion: durable receipt lookup failed: {error}");
+                return axum::Json(CompleteResponse {
+                    acknowledged: false,
+                });
+            }
+        }
+
         if let Err(reason) = data.validate_custom_assignments(
             req.session_id.as_deref(),
             &req.worker_id,
@@ -1062,8 +1123,30 @@ async fn complete_work(
                 acknowledged: false,
             });
         }
-        for task_id in &req.tasks {
-            data.custom_assignments.remove(task_id);
+        let worker_build_version = data
+            .worker_registry
+            .get(&req.worker_id)
+            .and_then(|worker| worker.build_version.clone());
+        match data.metrics_db.accept_custom_completion(
+            &job_id,
+            worker_build_version.as_deref(),
+            &req,
+            now_ms,
+        ) {
+            Ok(CustomCompletionOutcome::Stored) => {
+                for task_id in &req.tasks {
+                    data.custom_assignments.remove(task_id);
+                }
+            }
+            Ok(CustomCompletionOutcome::Duplicate) => {
+                return axum::Json(CompleteResponse { acknowledged: true });
+            }
+            Err(error) => {
+                eprintln!("Rejected custom completion: durable acceptance failed: {error}");
+                return axum::Json(CompleteResponse {
+                    acknowledged: false,
+                });
+            }
         }
     }
     // Missing session/lease metadata remains accepted only for legacy built-in jobs.
@@ -1779,9 +1862,12 @@ mod lease_coordinator_tests {
     use super::*;
     use crate::distributed::message::{
         AssignmentLease, CancelRequest, CompleteResponse, HardwareSpec, HeartbeatResponse,
-        TelemetrySnapshot,
+        JobRecord, TelemetrySnapshot,
     };
-    use axum::{routing::post, Router};
+    use axum::{
+        routing::{get, post},
+        Router,
+    };
 
     fn custom_job(tasks: usize) -> JobSpec {
         JobSpec::Custom {
@@ -1796,6 +1882,19 @@ mod lease_coordinator_tests {
         config.job_spec = Some(custom_job(tasks));
         config.total_tasks = tasks;
         config.batch_size = 1;
+        let metrics_db = MetricsDb::in_memory().unwrap();
+        metrics_db
+            .insert_job(&JobRecord {
+                job_id: "job-1".to_string(),
+                status: "running".to_string(),
+                start_time_ms: 1,
+                end_time_ms: None,
+                job_spec_json: serde_json::to_value(custom_job(tasks)).ok(),
+                input_path: "input".to_string(),
+                total_tasks: tasks,
+                job_type: Some("custom".to_string()),
+            })
+            .unwrap();
         Arc::new(Mutex::new(CoordinatorData {
             pending_partitions: (0..tasks).collect(),
             processing_partitions: HashMap::new(),
@@ -1813,7 +1912,7 @@ mod lease_coordinator_tests {
             job_start_time: Instant::now(),
             last_progress_time: Instant::now(),
             idle: false,
-            metrics_db: MetricsDb::in_memory().unwrap(),
+            metrics_db,
             aggregated_results: Vec::new(),
             job_state: JobExecutionState::Standard,
             active_tasks: HashMap::new(),
@@ -1824,7 +1923,7 @@ mod lease_coordinator_tests {
             last_backup_at: None,
             update_fleet_url: None,
             updated_workers: HashSet::new(),
-            current_job_id: None,
+            current_job_id: Some("job-1".to_string()),
             session_id: "session-1".to_string(),
             catalog: None,
             ingested_phenotypes: HashSet::new(),
@@ -1983,13 +2082,31 @@ mod lease_coordinator_tests {
     async fn valid_completion_cleans_current_assignment_and_updates_real_coordinator_state() {
         let state = test_state(1);
         let (task_id, session, lease) = assign(&state, "worker-a").await;
+        let raw_lease = lease.lease_token.clone();
+        let request = completion("worker-a", &task_id, &session, lease, None);
 
         let response = complete_work(
             axum::extract::State(state.clone()),
-            axum::Json(completion("worker-a", &task_id, &session, lease, None)),
+            axum::Json(request.clone()),
         )
         .await;
         assert!(response.0.acknowledged);
+
+        let accepted_signature = signature(&state);
+        let duplicate = complete_work(
+            axum::extract::State(state.clone()),
+            axum::Json(request.clone()),
+        )
+        .await;
+        assert!(duplicate.0.acknowledged);
+        assert_eq!(signature(&state), accepted_signature);
+
+        let mut conflict = request;
+        conflict.result_json = Some(serde_json::json!({"conflicting": true}));
+        let rejected =
+            complete_work(axum::extract::State(state.clone()), axum::Json(conflict)).await;
+        assert!(!rejected.0.acknowledged);
+        assert_eq!(signature(&state), accepted_signature);
 
         let data = state.lock().unwrap();
         assert!(data.custom_assignments.is_empty());
@@ -2001,6 +2118,18 @@ mod lease_coordinator_tests {
             vec![serde_json::json!({"task": task_id})]
         );
         assert_eq!(data.custom_assignment_attempts.get("custom_0"), Some(&1));
+        let receipts = data.metrics_db.get_custom_receipts("job-1").unwrap();
+        assert!(receipts.complete);
+        assert_eq!(receipts.accepted_count, 1);
+        assert_eq!(receipts.terminal_receipt_count, 1);
+        assert!(receipts.canonical_sha256.is_some());
+        let machine_json = serde_json::to_string(&receipts).unwrap();
+        assert!(!machine_json.contains(&raw_lease));
+        assert_ne!(receipts.receipts[0].lease_identity_sha256, raw_lease);
+        assert_eq!(
+            receipts.receipts[0].worker_build_version.as_deref(),
+            Some("test-build")
+        );
     }
 
     #[tokio::test]
@@ -2034,6 +2163,72 @@ mod lease_coordinator_tests {
         .await;
         assert!(!response.0.acknowledged);
         assert_eq!(signature(&state), before);
+        assert_eq!(
+            state
+                .lock()
+                .unwrap()
+                .metrics_db
+                .get_custom_receipts("job-1")
+                .unwrap()
+                .terminal_receipt_count,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_and_legacy_unfenced_custom_completions_create_no_receipt() {
+        let cancelled_state = test_state(1);
+        let (task_id, session, lease) = assign(&cancelled_state, "worker-a").await;
+        let cancelled = api::jobs::cancel_job(
+            axum::extract::State(cancelled_state.clone()),
+            axum::Json(CancelRequest {
+                reason: Some("test cancellation".to_string()),
+            }),
+        )
+        .await;
+        assert!(cancelled.0.success);
+        let response = complete_work(
+            axum::extract::State(cancelled_state.clone()),
+            axum::Json(completion("worker-a", &task_id, &session, lease, None)),
+        )
+        .await;
+        assert!(!response.0.acknowledged);
+        let cancelled_receipts = cancelled_state
+            .lock()
+            .unwrap()
+            .metrics_db
+            .get_custom_receipts("job-1")
+            .unwrap();
+        assert_eq!(cancelled_receipts.terminal_receipt_count, 0);
+        assert!(!cancelled_receipts.complete);
+
+        let legacy_state = test_state(1);
+        let (task_id, _, _) = assign(&legacy_state, "legacy-worker").await;
+        let legacy = CompleteRequest {
+            worker_id: "legacy-worker".to_string(),
+            tasks: vec![task_id],
+            items_processed: 1,
+            result_json: Some(serde_json::json!({"unsafe": true})),
+            error: None,
+            session_id: None,
+            assignments: Vec::new(),
+        };
+        let response = complete_work(
+            axum::extract::State(legacy_state.clone()),
+            axum::Json(legacy),
+        )
+        .await;
+        assert!(!response.0.acknowledged);
+        assert_eq!(
+            legacy_state
+                .lock()
+                .unwrap()
+                .metrics_db
+                .get_custom_receipts("job-1")
+                .unwrap()
+                .terminal_receipt_count,
+            0
+        );
     }
 
     async fn assert_rejected_heartbeat_unchanged(state: &SharedState, req: HeartbeatRequest) {
@@ -2111,6 +2306,10 @@ mod lease_coordinator_tests {
             .route("/work", post(get_work))
             .route("/complete", post(complete_work))
             .route("/heartbeat", post(handle_heartbeat))
+            .route(
+                "/api/jobs/:job_id/custom-receipts",
+                get(api::jobs::get_custom_receipts),
+            )
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -2257,6 +2456,30 @@ mod lease_coordinator_tests {
         assert!(accepted_completion.acknowledged);
         assert_eq!(state.lock().unwrap().completed_tasks, HashSet::from([0]));
 
+        let receipt_set: crate::distributed::message::CustomReceiptSet = client
+            .get(format!("{base_url}/api/jobs/job-1/custom-receipts"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(receipt_set.job_id, "job-1");
+        assert_eq!(receipt_set.accepted_count, 1);
+        assert_eq!(receipt_set.receipts[0].task_id, task_id);
+        let missing: crate::distributed::message::CustomReceiptSet = client
+            .get(format!("{base_url}/api/jobs/other-job/custom-receipts"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(!missing.job_found);
+        assert_eq!(missing.accepted_count, 0);
+        assert!(missing.receipts.is_empty());
+        assert!(missing.error.is_some());
+
         server.abort();
     }
 
@@ -2301,6 +2524,37 @@ mod lease_coordinator_tests {
             ],
             [1, 2, 3, 4]
         );
+        let accepted = complete_work(
+            axum::extract::State(state.clone()),
+            axum::Json(completion(
+                "worker-4",
+                &task_id,
+                &session,
+                fourth.clone(),
+                None,
+            )),
+        )
+        .await;
+        assert!(accepted.0.acknowledged);
+        let receipt_set = state
+            .lock()
+            .unwrap()
+            .metrics_db
+            .get_custom_receipts("job-1")
+            .unwrap();
+        assert!(receipt_set.complete);
+        assert_eq!(receipt_set.accepted_count, 1);
+        assert_eq!(receipt_set.failed_attempt_count, 1);
+        assert_eq!(receipt_set.terminal_receipt_count, 2);
+        assert_eq!(
+            receipt_set
+                .receipts
+                .iter()
+                .map(|receipt| (receipt.assignment_attempt, receipt.terminal_status.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "failed"), (4, "accepted")]
+        );
+
         let tokens: HashSet<_> = [first, second, third, fourth]
             .into_iter()
             .map(|lease| lease.lease_token)
@@ -2367,6 +2621,40 @@ mod lease_coordinator_tests {
                 vec![0, 1]
             );
         }
+    }
+
+    #[tokio::test]
+    async fn superseded_job_completion_cannot_create_a_receipt_in_either_job() {
+        let state = test_state(1);
+        let (task_id, session, lease) = assign(&state, "old-worker").await;
+        let stale_request = completion("old-worker", &task_id, &session, lease, None);
+        let new_job_id = {
+            let mut data = state.lock().unwrap();
+            services::start_new_job(
+                &mut data,
+                custom_job(1),
+                "new-input".to_string(),
+                1,
+                Some(1),
+                None,
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap();
+            data.current_job_id.clone().unwrap()
+        };
+        let response = complete_work(
+            axum::extract::State(state.clone()),
+            axum::Json(stale_request),
+        )
+        .await;
+        assert!(!response.0.acknowledged);
+        let data = state.lock().unwrap();
+        let old = data.metrics_db.get_custom_receipts("job-1").unwrap();
+        let new = data.metrics_db.get_custom_receipts(&new_job_id).unwrap();
+        assert_eq!(old.job_status.as_deref(), Some("superseded"));
+        assert_eq!(old.terminal_receipt_count, 0);
+        assert_eq!(new.terminal_receipt_count, 0);
     }
 
     #[tokio::test]

@@ -42,6 +42,7 @@ fn command_pool_name_and_project(command: &PoolCommands) -> (&str, Option<&str>)
         | PoolCommands::Destroy { name, .. }
         | PoolCommands::List { name }
         | PoolCommands::Status { name, .. }
+        | PoolCommands::Receipts { name, .. }
         | PoolCommands::UpdateBinary { name, .. }
         | PoolCommands::Cancel { name, .. }
         | PoolCommands::Workers { name, .. }
@@ -431,6 +432,10 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
         PoolCommands::Status { name, zone } => {
             let resolved_zone = resolve_zone(zone, &name, app_config);
             manager.status(&name, &resolved_zone)?;
+        }
+        PoolCommands::Receipts { name, job_id, zone } => {
+            let resolved_zone = resolve_zone(zone, &name, app_config);
+            manager.custom_receipts(&name, &resolved_zone, &job_id)?;
         }
         PoolCommands::UpdateBinary {
             name,

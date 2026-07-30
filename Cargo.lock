@@ -1795,6 +1795,7 @@ dependencies = [
  "rust-embed",
  "serde",
  "serde_json",
+ "sha2",
  "sysinfo 0.32.1",
  "tempfile",
  "thiserror 1.0.69",

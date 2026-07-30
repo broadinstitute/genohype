@@ -132,6 +132,9 @@ pub(crate) fn check_stuck_job(state: &SharedState, timeout_secs: u64) {
             {
                 eprintln!("Warning: failed to update job status in DB: {}", e);
             }
+            if let Err(e) = data.metrics_db.clear_current_custom_assignments(job_id) {
+                eprintln!("Warning: failed to clear failed custom assignments: {}", e);
+            }
         }
 
         // Reset state

@@ -8,9 +8,9 @@ use crate::distributed::coordinator::state::{
     CoordinatorData, JobExecutionState, SharedState, WorkerStatus,
 };
 use crate::distributed::message::{
-    CancelRequest, CancelResponse, EventsResponse, ExportMetricsRequest, ExportMetricsResponse,
-    FailuresResponse, JobConfigRequest, JobConfigResponse, JobResultResponse, JobSpec,
-    UpdateFleetRequest,
+    CancelRequest, CancelResponse, CustomReceiptSet, EventsResponse, ExportMetricsRequest,
+    ExportMetricsResponse, FailuresResponse, JobConfigRequest, JobConfigResponse,
+    JobResultResponse, JobSpec, UpdateFleetRequest,
 };
 
 /// Query parameters for incremental GET endpoints
@@ -306,6 +306,12 @@ pub(crate) async fn cancel_job(
         {
             eprintln!("Warning: failed to update job status in DB: {}", e);
         }
+        if let Err(e) = data.metrics_db.clear_current_custom_assignments(job_id) {
+            eprintln!(
+                "Warning: failed to clear cancelled custom assignments: {}",
+                e
+            );
+        }
     }
 
     // Reset job state
@@ -368,6 +374,33 @@ pub(crate) async fn get_job_result(
         result: Some(serde_json::Value::Array(data.aggregated_results.clone())),
         error: None,
     })
+}
+
+/// Handler for GET /api/jobs/:job_id/custom-receipts.
+/// Reads only exact-job durable SQLite receipts; no live aggregate cache or
+/// temporary result file participates in this response.
+pub(crate) async fn get_custom_receipts(
+    axum::extract::State(state): axum::extract::State<SharedState>,
+    axum::extract::Path(job_id): axum::extract::Path<String>,
+) -> axum::Json<CustomReceiptSet> {
+    let data = state.lock().unwrap();
+    match data.metrics_db.get_custom_receipts(&job_id) {
+        Ok(receipts) => axum::Json(receipts),
+        Err(error) => axum::Json(CustomReceiptSet {
+            schema_version: 1,
+            job_id,
+            job_found: false,
+            job_status: None,
+            expected_task_count: 0,
+            complete: false,
+            accepted_count: 0,
+            failed_attempt_count: 0,
+            terminal_receipt_count: 0,
+            canonical_sha256: None,
+            receipts: Vec::new(),
+            error: Some(format!("failed to read durable custom receipts: {error}")),
+        }),
+    }
 }
 
 /// Handler for GET /api/events - get recent events.

@@ -1,15 +1,83 @@
 //! SQLite-backed metrics storage for persistent dashboard data.
 
 use crate::distributed::message::{
-    FailureRecord, JobEvent, JobRecord, PhenotypeStatus, TelemetrySnapshot,
+    CompleteRequest, CustomReceiptSet, CustomTaskReceipt, FailureRecord, JobEvent, JobRecord,
+    PhenotypeStatus, TelemetrySnapshot,
 };
-use rusqlite::{params, Connection, Result as SqliteResult};
+use rusqlite::{params, Connection, OptionalExtension, Result as SqliteResult};
+use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 /// Database handle for metrics storage.
 pub struct MetricsDb {
     conn: Arc<Mutex<Connection>>,
+}
+
+/// One coordinator-issued custom assignment to fence durably before dispatch.
+pub(crate) struct DurableCustomAssignment<'a> {
+    pub task_id: &'a str,
+    pub partition_id: usize,
+    pub assignment_attempt: u64,
+    pub lease_token: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CustomCompletionOutcome {
+    Stored,
+    Duplicate,
+}
+
+fn sha256_hex(domain: &[u8], bytes: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update([0]);
+    digest.update(bytes);
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn lease_identity(lease_token: &str) -> String {
+    sha256_hex(
+        b"genohype/custom-assignment-lease/v1",
+        lease_token.as_bytes(),
+    )
+}
+
+fn has_exact_completion_shape(request: &CompleteRequest) -> bool {
+    if request.tasks.is_empty() || request.tasks.len() != request.assignments.len() {
+        return false;
+    }
+    let task_ids: HashSet<&str> = request.tasks.iter().map(String::as_str).collect();
+    let assignment_ids: HashSet<&str> = request
+        .assignments
+        .iter()
+        .map(|assignment| assignment.task_id.as_str())
+        .collect();
+    task_ids.len() == request.tasks.len()
+        && assignment_ids.len() == request.assignments.len()
+        && task_ids == assignment_ids
+}
+
+fn canonical_report(request: &CompleteRequest) -> Result<(String, String, &'static str), String> {
+    let value = serde_json::json!({
+        "error": request.error,
+        "items_processed": request.items_processed,
+        "result_json": request.result_json,
+    });
+    let json = serde_json::to_string(&value)
+        .map_err(|error| format!("failed to serialize custom completion report: {error}"))?;
+    let digest = sha256_hex(b"genohype/custom-task-report/v1", json.as_bytes());
+    let status = if request.error.is_some() {
+        "failed"
+    } else {
+        "accepted"
+    };
+    Ok((json, digest, status))
 }
 
 impl MetricsDb {
@@ -110,6 +178,53 @@ impl MetricsDb {
                 read_path TEXT,
                 write_dir TEXT
             );
+
+            -- Live custom assignments are durable only so receipt creation can
+            -- validate and consume the exact current fence in one transaction.
+            -- Raw lease capabilities are never persisted.
+            CREATE TABLE IF NOT EXISTS current_custom_assignments (
+                job_id TEXT NOT NULL,
+                coordinator_session_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                partition_id INTEGER NOT NULL,
+                assignment_attempt INTEGER NOT NULL,
+                lease_identity_sha256 TEXT NOT NULL,
+                worker_id TEXT NOT NULL,
+                assigned_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (job_id, task_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS custom_task_receipts (
+                job_id TEXT NOT NULL,
+                coordinator_session_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                partition_id INTEGER NOT NULL,
+                assignment_attempt INTEGER NOT NULL,
+                lease_identity_sha256 TEXT NOT NULL,
+                worker_id TEXT NOT NULL,
+                worker_build_version TEXT,
+                terminal_status TEXT NOT NULL CHECK (terminal_status IN ('accepted', 'failed')),
+                report_json TEXT NOT NULL,
+                report_sha256 TEXT NOT NULL,
+                accepted_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (job_id, task_id, assignment_attempt)
+            );
+            CREATE INDEX IF NOT EXISTS idx_custom_task_receipts_job
+                ON custom_task_receipts(job_id, task_id, assignment_attempt);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_custom_task_receipts_one_accepted
+                ON custom_task_receipts(job_id, task_id)
+                WHERE terminal_status = 'accepted';
+
+            CREATE TRIGGER IF NOT EXISTS custom_task_receipts_immutable_update
+            BEFORE UPDATE ON custom_task_receipts
+            BEGIN
+                SELECT RAISE(ABORT, 'custom task receipts are immutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS custom_task_receipts_immutable_delete
+            BEFORE DELETE ON custom_task_receipts
+            BEGIN
+                SELECT RAISE(ABORT, 'custom task receipts are immutable');
+            END;
             "#,
         )?;
 
@@ -394,6 +509,399 @@ impl MetricsDb {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         Ok(())
+    }
+
+    /// Persist a batch of custom assignments before exposing their lease tokens
+    /// to a worker. Existing stale assignments may only be replaced by a newer
+    /// attempt for the same exact job and task.
+    pub(crate) fn persist_custom_assignments(
+        &self,
+        job_id: &str,
+        coordinator_session_id: &str,
+        worker_id: &str,
+        assignments: &[DurableCustomAssignment<'_>],
+        assigned_at_ms: u64,
+    ) -> Result<(), String> {
+        if assignments.is_empty() {
+            return Err("custom assignment batch is empty".to_string());
+        }
+        let assigned_at_ms = i64::try_from(assigned_at_ms)
+            .map_err(|_| "assignment timestamp exceeds SQLite INTEGER".to_string())?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let status: Option<String> = tx
+            .query_row(
+                "SELECT status FROM jobs WHERE job_id = ?1",
+                [job_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if status.as_deref() != Some("running") {
+            return Err(format!(
+                "custom job {job_id} is not durably running (status={status:?})"
+            ));
+        }
+
+        for assignment in assignments {
+            let partition_id = i64::try_from(assignment.partition_id)
+                .map_err(|_| "partition ID exceeds SQLite INTEGER".to_string())?;
+            let attempt = i64::try_from(assignment.assignment_attempt)
+                .map_err(|_| "assignment attempt exceeds SQLite INTEGER".to_string())?;
+            let accepted: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM custom_task_receipts
+                     WHERE job_id = ?1 AND task_id = ?2 AND terminal_status = 'accepted'",
+                    params![job_id, assignment.task_id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            if accepted != 0 {
+                return Err(format!(
+                    "task {} already has an accepted terminal receipt",
+                    assignment.task_id
+                ));
+            }
+            let prior_attempt: Option<i64> = tx
+                .query_row(
+                    "SELECT MAX(assignment_attempt) FROM (
+                         SELECT assignment_attempt FROM custom_task_receipts WHERE job_id = ?1 AND task_id = ?2
+                         UNION ALL
+                         SELECT assignment_attempt FROM current_custom_assignments WHERE job_id = ?1 AND task_id = ?2
+                     )",
+                    params![job_id, assignment.task_id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            if prior_attempt.is_some_and(|prior| attempt <= prior) {
+                return Err(format!(
+                    "assignment attempt {} for task {} is not newer than durable attempt {:?}",
+                    assignment.assignment_attempt, assignment.task_id, prior_attempt
+                ));
+            }
+            tx.execute(
+                "INSERT INTO current_custom_assignments (
+                     job_id, coordinator_session_id, task_id, partition_id,
+                     assignment_attempt, lease_identity_sha256, worker_id, assigned_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(job_id, task_id) DO UPDATE SET
+                     coordinator_session_id = excluded.coordinator_session_id,
+                     partition_id = excluded.partition_id,
+                     assignment_attempt = excluded.assignment_attempt,
+                     lease_identity_sha256 = excluded.lease_identity_sha256,
+                     worker_id = excluded.worker_id,
+                     assigned_at_ms = excluded.assigned_at_ms",
+                params![
+                    job_id,
+                    coordinator_session_id,
+                    assignment.task_id,
+                    partition_id,
+                    attempt,
+                    lease_identity(assignment.lease_token),
+                    worker_id,
+                    assigned_at_ms,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    /// Return whether a delivery exactly matches immutable receipts already
+    /// committed for every assignment in the request.
+    pub(crate) fn is_identical_custom_completion(
+        &self,
+        job_id: &str,
+        request: &CompleteRequest,
+    ) -> Result<bool, String> {
+        if !has_exact_completion_shape(request) {
+            return Ok(false);
+        }
+        let (report_json, report_sha256, terminal_status) = canonical_report(request)?;
+        let conn = self.conn.lock().unwrap();
+        let job_status: Option<String> = conn
+            .query_row(
+                "SELECT status FROM jobs WHERE job_id = ?1",
+                [job_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if !matches!(job_status.as_deref(), Some("running" | "completed")) {
+            return Ok(false);
+        }
+        for task_id in &request.tasks {
+            let Some(lease) = request
+                .assignments
+                .iter()
+                .find(|assignment| assignment.task_id == *task_id)
+            else {
+                return Ok(false);
+            };
+            let attempt = i64::try_from(lease.assignment_attempt)
+                .map_err(|_| "assignment attempt exceeds SQLite INTEGER".to_string())?;
+            let matches: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM custom_task_receipts
+                     WHERE job_id = ?1 AND task_id = ?2 AND assignment_attempt = ?3
+                       AND coordinator_session_id = ?4 AND lease_identity_sha256 = ?5
+                       AND worker_id = ?6 AND terminal_status = ?7
+                       AND report_json = ?8 AND report_sha256 = ?9",
+                    params![
+                        job_id,
+                        task_id,
+                        attempt,
+                        request.session_id.as_deref(),
+                        lease_identity(&lease.lease_token),
+                        request.worker_id,
+                        terminal_status,
+                        report_json,
+                        report_sha256,
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            if matches != 1 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Validate and consume every durable current assignment and insert the
+    /// corresponding immutable terminal receipts in the same SQLite transaction.
+    pub(crate) fn accept_custom_completion(
+        &self,
+        job_id: &str,
+        worker_build_version: Option<&str>,
+        request: &CompleteRequest,
+        accepted_at_ms: u64,
+    ) -> Result<CustomCompletionOutcome, String> {
+        if self.is_identical_custom_completion(job_id, request)? {
+            return Ok(CustomCompletionOutcome::Duplicate);
+        }
+        if !has_exact_completion_shape(request) {
+            return Err(
+                "custom completion must contain a non-empty one-to-one task/lease set".into(),
+            );
+        }
+        let coordinator_session_id = request
+            .session_id
+            .as_deref()
+            .ok_or_else(|| "custom completion is missing coordinator session".to_string())?;
+        let accepted_at_ms = i64::try_from(accepted_at_ms)
+            .map_err(|_| "receipt timestamp exceeds SQLite INTEGER".to_string())?;
+        let (report_json, report_sha256, terminal_status) = canonical_report(request)?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let status: Option<String> = tx
+            .query_row(
+                "SELECT status FROM jobs WHERE job_id = ?1",
+                [job_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if status.as_deref() != Some("running") {
+            return Err(format!(
+                "custom job {job_id} is not durably running (status={status:?})"
+            ));
+        }
+
+        for task_id in &request.tasks {
+            let lease = request
+                .assignments
+                .iter()
+                .find(|assignment| assignment.task_id == *task_id)
+                .ok_or_else(|| format!("missing assignment lease for task {task_id}"))?;
+            let attempt = i64::try_from(lease.assignment_attempt)
+                .map_err(|_| "assignment attempt exceeds SQLite INTEGER".to_string())?;
+            let lease_hash = lease_identity(&lease.lease_token);
+            let current: Option<(i64, String, String, i64)> = tx
+                .query_row(
+                    "SELECT partition_id, coordinator_session_id, worker_id, assignment_attempt
+                     FROM current_custom_assignments
+                     WHERE job_id = ?1 AND task_id = ?2 AND assignment_attempt = ?3
+                       AND coordinator_session_id = ?4 AND lease_identity_sha256 = ?5
+                       AND worker_id = ?6",
+                    params![
+                        job_id,
+                        task_id,
+                        attempt,
+                        coordinator_session_id,
+                        lease_hash,
+                        request.worker_id,
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            let Some((partition_id, _, _, _)) = current else {
+                return Err(format!(
+                    "task {task_id} has no matching durable current assignment"
+                ));
+            };
+
+            tx.execute(
+                "INSERT INTO custom_task_receipts (
+                     job_id, coordinator_session_id, task_id, partition_id,
+                     assignment_attempt, lease_identity_sha256, worker_id,
+                     worker_build_version, terminal_status, report_json,
+                     report_sha256, accepted_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    job_id,
+                    coordinator_session_id,
+                    task_id,
+                    partition_id,
+                    attempt,
+                    lease_hash,
+                    request.worker_id,
+                    worker_build_version,
+                    terminal_status,
+                    report_json,
+                    report_sha256,
+                    accepted_at_ms,
+                ],
+            )
+            .map_err(|error| {
+                format!("conflicting custom completion for task {task_id}: {error}")
+            })?;
+            let removed = tx
+                .execute(
+                    "DELETE FROM current_custom_assignments
+                     WHERE job_id = ?1 AND task_id = ?2 AND assignment_attempt = ?3
+                       AND coordinator_session_id = ?4 AND lease_identity_sha256 = ?5
+                       AND worker_id = ?6",
+                    params![
+                        job_id,
+                        task_id,
+                        attempt,
+                        coordinator_session_id,
+                        lease_hash,
+                        request.worker_id,
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+            if removed != 1 {
+                return Err(format!(
+                    "durable assignment for task {task_id} changed during acceptance"
+                ));
+            }
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(CustomCompletionOutcome::Stored)
+    }
+
+    /// Remove live durable assignment fences for a terminal or superseded job.
+    pub(crate) fn clear_current_custom_assignments(&self, job_id: &str) -> SqliteResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM current_custom_assignments WHERE job_id = ?1",
+            [job_id],
+        )?;
+        Ok(())
+    }
+
+    /// Exact-job receipt query. Results are sorted deterministically and the
+    /// canonical digest covers accepted receipts only, so failed retry attempts
+    /// can never become authoritative output.
+    pub(crate) fn get_custom_receipts(&self, job_id: &str) -> Result<CustomReceiptSet, String> {
+        let conn = self.conn.lock().unwrap();
+        let job: Option<(String, i64)> = conn
+            .query_row(
+                "SELECT status, total_tasks FROM jobs WHERE job_id = ?1",
+                [job_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT coordinator_session_id, task_id, partition_id, assignment_attempt,
+                        lease_identity_sha256, worker_id, worker_build_version, terminal_status,
+                        report_json, report_sha256, accepted_at_ms
+                 FROM custom_task_receipts WHERE job_id = ?1
+                 ORDER BY task_id COLLATE BINARY ASC, assignment_attempt ASC",
+            )
+            .map_err(|error| error.to_string())?;
+        let receipts = stmt
+            .query_map([job_id], |row| {
+                let report_json: String = row.get(8)?;
+                let report = serde_json::from_str(&report_json).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        report_json.len(),
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                Ok(CustomTaskReceipt {
+                    schema_version: 1,
+                    job_id: job_id.to_string(),
+                    coordinator_session_id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    partition_id: row.get::<_, i64>(2)? as usize,
+                    assignment_attempt: row.get::<_, i64>(3)? as u64,
+                    lease_identity_sha256: row.get(4)?,
+                    worker_id: row.get(5)?,
+                    worker_build_version: row.get(6)?,
+                    terminal_status: row.get(7)?,
+                    report,
+                    report_sha256: row.get(9)?,
+                    accepted_at_ms: row.get::<_, i64>(10)? as u64,
+                })
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<SqliteResult<Vec<_>>>()
+            .map_err(|error| error.to_string())?;
+        let accepted: Vec<&CustomTaskReceipt> = receipts
+            .iter()
+            .filter(|receipt| receipt.terminal_status == "accepted")
+            .collect();
+        let accepted_count = accepted.len();
+        let failed_attempt_count = receipts.len() - accepted_count;
+        let canonical_sha256 = if accepted.is_empty() {
+            None
+        } else {
+            let canonical = serde_json::to_vec(&accepted).map_err(|error| error.to_string())?;
+            Some(sha256_hex(b"genohype/custom-receipt-set/v1", &canonical))
+        };
+        let (job_found, job_status, expected_task_count) = match job {
+            Some((status, total)) => (true, Some(status), total.max(0) as usize),
+            None => (false, None, 0),
+        };
+        let non_terminal_job = !matches!(
+            job_status.as_deref(),
+            Some("cancelled" | "superseded" | "failed")
+        );
+        let complete = job_found
+            && non_terminal_job
+            && expected_task_count > 0
+            && accepted_count == expected_task_count;
+        let error = if !job_found {
+            Some(format!("job {job_id} not found"))
+        } else if !complete {
+            Some(format!(
+                "receipt set incomplete: {accepted_count}/{expected_task_count} accepted custom tasks (job status {})",
+                job_status.as_deref().unwrap_or("unknown")
+            ))
+        } else {
+            None
+        };
+        Ok(CustomReceiptSet {
+            schema_version: 1,
+            job_id: job_id.to_string(),
+            job_found,
+            job_status,
+            expected_task_count,
+            complete,
+            accepted_count,
+            failed_attempt_count,
+            terminal_receipt_count: receipts.len(),
+            canonical_sha256,
+            receipts,
+            error,
+        })
     }
 
     // =========================================================================
@@ -705,8 +1213,9 @@ impl MetricsDb {
 
     /// Delete a job and all its associated data.
     ///
-    /// Performs a cascading delete across all tables: jobs, events, failures,
-    /// batch_phenotypes, stress_job_params, and telemetry. Uses a transaction for atomicity.
+    /// Performs a cascading delete across mutable history tables. Immutable
+    /// custom-task receipts are intentionally retained as durable audit records.
+    /// Uses a transaction for atomicity.
     pub fn delete_job(&self, job_id: &str) -> SqliteResult<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
@@ -723,6 +1232,10 @@ impl MetricsDb {
             params![job_id],
         )?;
         tx.execute("DELETE FROM telemetry WHERE job_id = ?1", params![job_id])?;
+        tx.execute(
+            "DELETE FROM current_custom_assignments WHERE job_id = ?1",
+            params![job_id],
+        )?;
 
         tx.commit()?;
         Ok(())
@@ -810,6 +1323,179 @@ impl Clone for MetricsDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::distributed::message::{AssignmentLease, JobSpec};
+
+    fn insert_custom_job(db: &MetricsDb, job_id: &str, total_tasks: usize) {
+        db.insert_job(&JobRecord {
+            job_id: job_id.to_string(),
+            status: "running".to_string(),
+            start_time_ms: 1,
+            end_time_ms: None,
+            job_spec_json: serde_json::to_value(JobSpec::Custom {
+                payload: serde_json::json!({"test": true}),
+                tasks: total_tasks,
+                manifest: None,
+            })
+            .ok(),
+            input_path: "input".to_string(),
+            total_tasks,
+            job_type: Some("custom".to_string()),
+        })
+        .unwrap();
+    }
+
+    fn completion(
+        worker_id: &str,
+        task_id: &str,
+        attempt: u64,
+        lease_token: &str,
+    ) -> CompleteRequest {
+        CompleteRequest {
+            worker_id: worker_id.to_string(),
+            tasks: vec![task_id.to_string()],
+            items_processed: 7,
+            result_json: Some(serde_json::json!({"task": task_id, "rows": 7})),
+            error: None,
+            session_id: Some("session-1".to_string()),
+            assignments: vec![AssignmentLease {
+                task_id: task_id.to_string(),
+                assignment_attempt: attempt,
+                lease_token: lease_token.to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn custom_receipt_migration_is_idempotent_and_backup_roundtrip_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ops.db");
+        {
+            let legacy = Connection::open(&db_path).unwrap();
+            legacy
+                .execute_batch(
+                    "CREATE TABLE jobs (
+                         job_id TEXT PRIMARY KEY, status TEXT NOT NULL,
+                         start_time_ms INTEGER NOT NULL, end_time_ms INTEGER,
+                         job_spec_json TEXT, input_path TEXT, total_tasks INTEGER,
+                         job_type TEXT, final_summary_json TEXT
+                     );",
+                )
+                .unwrap();
+        }
+
+        let db = MetricsDb::open(&db_path).unwrap();
+        insert_custom_job(&db, "job-backup", 1);
+        let raw_lease = "raw-secret-lease-capability";
+        db.persist_custom_assignments(
+            "job-backup",
+            "session-1",
+            "worker-a",
+            &[DurableCustomAssignment {
+                task_id: "custom_0",
+                partition_id: 0,
+                assignment_attempt: 1,
+                lease_token: raw_lease,
+            }],
+            10,
+        )
+        .unwrap();
+        let request = completion("worker-a", "custom_0", 1, raw_lease);
+        assert_eq!(
+            db.accept_custom_completion("job-backup", Some("build-a"), &request, 20)
+                .unwrap(),
+            CustomCompletionOutcome::Stored
+        );
+        let first = db.get_custom_receipts("job-backup").unwrap();
+        assert!(first.complete);
+        assert_eq!(first.accepted_count, 1);
+        assert_eq!(
+            db.accept_custom_completion("job-backup", Some("build-a"), &request, 30)
+                .unwrap(),
+            CustomCompletionOutcome::Duplicate
+        );
+        assert_eq!(db.get_custom_receipts("job-backup").unwrap(), first);
+        assert!(db
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE custom_task_receipts SET terminal_status = 'failed' WHERE job_id = ?1",
+                ["job-backup"],
+            )
+            .is_err());
+
+        db.checkpoint_for_backup().unwrap();
+        let backup_path = dir.path().join("restored.db");
+        std::fs::copy(&db_path, &backup_path).unwrap();
+        drop(db);
+
+        // Opening twice proves the migration remains idempotent on restored ops.db.
+        let restored = MetricsDb::open(&backup_path).unwrap();
+        drop(restored);
+        let restored = MetricsDb::open(&backup_path).unwrap();
+        assert_eq!(restored.get_custom_receipts("job-backup").unwrap(), first);
+        let bytes = std::fs::read(&backup_path).unwrap();
+        assert!(!bytes
+            .windows(raw_lease.len())
+            .any(|window| window == raw_lease.as_bytes()));
+    }
+
+    #[test]
+    fn custom_receipt_acceptance_is_atomic_and_exact_job_scoped() {
+        let db = MetricsDb::in_memory().unwrap();
+        insert_custom_job(&db, "job-a", 1);
+        insert_custom_job(&db, "job-b", 1);
+        db.persist_custom_assignments(
+            "job-a",
+            "session-1",
+            "worker-a",
+            &[DurableCustomAssignment {
+                task_id: "custom_0",
+                partition_id: 0,
+                assignment_attempt: 1,
+                lease_token: "lease-a",
+            }],
+            10,
+        )
+        .unwrap();
+
+        for wrong in [
+            completion("worker-b", "custom_0", 1, "lease-a"),
+            completion("worker-a", "custom_0", 2, "lease-a"),
+            completion("worker-a", "custom_0", 1, "wrong-lease"),
+            completion("worker-a", "wrong-task", 1, "lease-a"),
+        ] {
+            assert!(db
+                .accept_custom_completion("job-a", None, &wrong, 20)
+                .is_err());
+            assert_eq!(
+                db.get_custom_receipts("job-a")
+                    .unwrap()
+                    .terminal_receipt_count,
+                0
+            );
+        }
+
+        let correct = completion("worker-a", "custom_0", 1, "lease-a");
+        assert_eq!(
+            db.accept_custom_completion("job-a", None, &correct, 20)
+                .unwrap(),
+            CustomCompletionOutcome::Stored
+        );
+        let mut conflict = correct.clone();
+        conflict.items_processed = 8;
+        assert!(db
+            .accept_custom_completion("job-a", None, &conflict, 21)
+            .is_err());
+        let a = db.get_custom_receipts("job-a").unwrap();
+        let b = db.get_custom_receipts("job-b").unwrap();
+        assert_eq!(a.accepted_count, 1);
+        assert_eq!(a.terminal_receipt_count, 1);
+        assert_eq!(b.accepted_count, 0);
+        assert!(b.receipts.is_empty());
+        assert!(!b.complete);
+        assert_ne!(a.canonical_sha256, b.canonical_sha256);
+    }
 
     #[test]
     fn test_metrics_db_basic() {

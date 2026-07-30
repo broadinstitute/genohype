@@ -12,6 +12,46 @@ pub use genohype_pool::distributed::{
     UpdateFleetRequest, WorkRequest, WorkResponse, CUSTOM_WORKER_PROTOCOL_VERSION,
 };
 
+/// Durable coordinator receipt for one terminal custom-task assignment attempt.
+/// Lease capabilities are represented only by a domain-separated SHA-256 identity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CustomTaskReceipt {
+    pub schema_version: u32,
+    pub job_id: String,
+    pub coordinator_session_id: String,
+    pub task_id: String,
+    pub partition_id: usize,
+    pub assignment_attempt: u64,
+    pub lease_identity_sha256: String,
+    pub worker_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_build_version: Option<String>,
+    pub terminal_status: String,
+    pub report: serde_json::Value,
+    pub report_sha256: String,
+    pub accepted_at_ms: u64,
+}
+
+/// Exact-job, deterministic machine response for durable custom-task receipts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CustomReceiptSet {
+    pub schema_version: u32,
+    pub job_id: String,
+    pub job_found: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_status: Option<String>,
+    pub expected_task_count: usize,
+    pub complete: bool,
+    pub accepted_count: usize,
+    pub failed_attempt_count: usize,
+    pub terminal_receipt_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical_sha256: Option<String>,
+    pub receipts: Vec<CustomTaskReceipt>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 // ============================================================================
 // Domain-Specific Task Types
 // ============================================================================
