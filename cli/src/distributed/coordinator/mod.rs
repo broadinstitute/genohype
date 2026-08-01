@@ -41,7 +41,7 @@ use crate::distributed::message::{
     HeartbeatResponse, JobEvent, JobResultResponse, JobSpec, ManhattanSource, StatusResponse,
     TaskDescriptor, WorkRequest, WorkResponse, CUSTOM_WORKER_PROTOCOL_VERSION,
 };
-use crate::distributed::metrics_db::MetricsDb;
+use crate::distributed::metrics_db::{CustomCompletionOutcome, DurableCustomAssignment, MetricsDb};
 use crate::Result;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
@@ -93,6 +93,57 @@ pub async fn start_coordinator(config: CoordinatorConfig) -> Result<()> {
         config.worker_service_account,
     )
     .await
+}
+
+fn restore_and_reconcile_database<F>(
+    db_path: &str,
+    copy_backup: F,
+) -> std::result::Result<bool, String>
+where
+    F: FnOnce(&str) -> std::result::Result<bool, String>,
+{
+    if let Some(parent) = std::path::Path::new(db_path).parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("failed to create database directory: {error}"))?;
+    }
+
+    // A stale WAL can overwrite the newly copied main database, so backup
+    // installation and reconciliation always begin from an empty destination.
+    for path in [
+        db_path.to_string(),
+        format!("{db_path}-wal"),
+        format!("{db_path}-shm"),
+    ] {
+        if let Err(error) = std::fs::remove_file(&path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(format!(
+                    "failed to remove stale database file {path}: {error}"
+                ));
+            }
+        }
+    }
+
+    if !copy_backup(db_path)? {
+        return Ok(false);
+    }
+    let metadata = std::fs::metadata(db_path)
+        .map_err(|error| format!("restored database file is unavailable: {error}"))?;
+    if metadata.len() == 0 {
+        return Err("restored database file is empty".to_string());
+    }
+    eprintln!("  Successfully restored DB ({} bytes)", metadata.len());
+
+    let restored = MetricsDb::open(db_path)
+        .map_err(|error| format!("failed to open restored metrics database: {error}"))?;
+    let reconciled = restored
+        .reconcile_restored_custom_jobs(CoordinatorData::now_ms())
+        .map_err(|error| format!("failed to reconcile restored custom jobs: {error}"))?;
+    if reconciled > 0 {
+        eprintln!(
+            "  Marked {reconciled} restored running custom job(s) failed and fenced assignments"
+        );
+    }
+    Ok(true)
 }
 
 /// Properly structured coordinator startup.
@@ -160,57 +211,51 @@ pub async fn run_coordinator(
     println!("  Batch size: {}", batch_size);
     println!("  Timeout: {}s", timeout_secs);
 
-    // Try to restore from backup path if configured
+    // Try to restore from backup path if configured. Any successfully copied
+    // database is reconciled before the server or its receipt endpoints exist.
     if let Some(ref bp) = backup_path {
         eprintln!("  Checking for database backup at {}", bp);
         let bp_clone = bp.clone();
         let db_path_clone = db_path.clone();
 
         let restore_result = tokio::task::spawn_blocking(move || {
-            // First, ensure the parent directory exists
-            if let Some(parent) = std::path::Path::new(&db_path_clone).parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-
-            // Clean up any existing db files that might corrupt the restored state
-            // If a stale -wal file exists, SQLite will overwrite the restored .db!
-            let _ = std::fs::remove_file(&db_path_clone);
-            let _ = std::fs::remove_file(format!("{}-wal", db_path_clone));
-            let _ = std::fs::remove_file(format!("{}-shm", db_path_clone));
-
-            if bp_clone.starts_with("gs://") {
-                eprintln!("  Running gsutil cp {} {}", bp_clone, db_path_clone);
+            restore_and_reconcile_database(&db_path_clone, |destination| {
+                if !bp_clone.starts_with("gs://") {
+                    eprintln!("  Warning: Automatic restore only supported for gs:// paths");
+                    return Ok(false);
+                }
+                eprintln!("  Running gsutil cp {} {}", bp_clone, destination);
                 match std::process::Command::new("gsutil")
-                    .args(["cp", &bp_clone, &db_path_clone])
+                    .args(["cp", &bp_clone, destination])
                     .status()
                 {
-                    Ok(status) if status.success() => {
-                        // Verify file exists and has size
-                        if let Ok(metadata) = std::fs::metadata(&db_path_clone) {
-                            if metadata.len() > 0 {
-                                eprintln!("  Successfully restored DB ({} bytes)", metadata.len());
-                                return true;
-                            } else {
-                                eprintln!("  Warning: Restored DB file is empty");
-                            }
-                        } else {
-                            eprintln!(
-                                "  Warning: gsutil succeeded but file not found at {}",
-                                db_path_clone
-                            );
-                        }
+                    Ok(status) if status.success() => Ok(true),
+                    Ok(status) => {
+                        eprintln!("  gsutil cp failed with status: {}", status);
+                        Ok(false)
                     }
-                    Ok(status) => eprintln!("  gsutil cp failed with status: {}", status),
-                    Err(e) => eprintln!("  Failed to execute gsutil: {}", e),
+                    Err(error) => {
+                        eprintln!("  Failed to execute gsutil: {}", error);
+                        Ok(false)
+                    }
                 }
-            } else {
-                eprintln!("  Warning: Automatic restore only supported for gs:// paths");
-            }
-            false
+            })
         })
-        .await;
+        .await
+        .map_err(|error| {
+            crate::HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("database restore task failed: {error}"),
+            ))
+        })?
+        .map_err(|error| {
+            crate::HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("database restore reconciliation failed: {error}"),
+            ))
+        })?;
 
-        if restore_result.unwrap_or(false) {
+        if restore_result {
             eprintln!("  Restored ops database from {}", bp);
         } else {
             eprintln!("  Starting with fresh database (restore skipped or failed)");
@@ -736,6 +781,10 @@ pub async fn run_coordinator(
         .route("/api/job", post(api::jobs::submit_job))
         .route("/api/cancel", post(api::jobs::cancel_job))
         .route("/api/result", get(api::jobs::get_job_result))
+        .route(
+            "/api/jobs/:job_id/custom-receipts",
+            get(api::jobs::get_custom_receipts),
+        )
         .route("/api/binary", get(api::jobs::serve_binary))
         .route("/api/export-metrics", post(api::jobs::export_metrics))
         .route("/api/events", get(api::jobs::get_events))
@@ -950,6 +999,42 @@ async fn get_work(
                 task.assignment_attempt = Some(lease.assignment_attempt);
                 task.lease_token = Some(lease.lease_token);
             }
+            let Some(job_id) = data.current_job_id.clone() else {
+                for (&partition_id, task) in partitions.iter().zip(tasks.iter()).rev() {
+                    data.processing_partitions.remove(&partition_id);
+                    data.custom_assignments.remove(&task.id);
+                    data.pending_partitions.push_front(partition_id);
+                }
+                return axum::Json(WorkResponse::Wait);
+            };
+            let durable: Vec<_> = partitions
+                .iter()
+                .zip(tasks.iter())
+                .map(|(&partition_id, task)| DurableCustomAssignment {
+                    task_id: &task.id,
+                    partition_id,
+                    assignment_attempt: task.assignment_attempt.expect("custom attempt"),
+                    lease_token: task.lease_token.as_deref().expect("custom lease"),
+                })
+                .collect();
+            if let Err(error) = data.metrics_db.persist_custom_assignments(
+                &job_id,
+                &data.session_id,
+                &req.worker_id,
+                // Coordinator-observed but worker-self-reported. This value is
+                // assignment-bound, not authenticated build attestation.
+                req.build_version.as_deref(),
+                &durable,
+                CoordinatorData::now_ms(),
+            ) {
+                eprintln!("Rejected unsafe custom assignment dispatch: {error}");
+                for (&partition_id, task) in partitions.iter().zip(tasks.iter()).rev() {
+                    data.processing_partitions.remove(&partition_id);
+                    data.custom_assignments.remove(&task.id);
+                    data.pending_partitions.push_front(partition_id);
+                }
+                return axum::Json(WorkResponse::Wait);
+            }
         }
         let task_ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
         let task_labels: Vec<String> = tasks
@@ -1043,11 +1128,35 @@ async fn complete_work(
     if is_custom_job {
         // Fencing cannot be optional for side-effecting custom tasks: accepting a
         // legacy completion here would reintroduce the stale-writer race.
+        let Some(job_id) = data.current_job_id.clone() else {
+            return axum::Json(CompleteResponse {
+                acknowledged: false,
+            });
+        };
         if req.session_id.as_deref() != Some(data.session_id.as_str()) {
             return axum::Json(CompleteResponse {
                 acknowledged: false,
             });
         }
+
+        // An exact retry after an uncertain response is idempotently acknowledged
+        // from durable state and must not replay any in-memory state transition.
+        match data
+            .metrics_db
+            .is_identical_custom_completion(&job_id, &req)
+        {
+            Ok(true) => {
+                return axum::Json(CompleteResponse { acknowledged: true });
+            }
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("Rejected custom completion: durable receipt lookup failed: {error}");
+                return axum::Json(CompleteResponse {
+                    acknowledged: false,
+                });
+            }
+        }
+
         if let Err(reason) = data.validate_custom_assignments(
             req.session_id.as_deref(),
             &req.worker_id,
@@ -1062,8 +1171,24 @@ async fn complete_work(
                 acknowledged: false,
             });
         }
-        for task_id in &req.tasks {
-            data.custom_assignments.remove(task_id);
+        match data
+            .metrics_db
+            .accept_custom_completion(&job_id, &req, now_ms)
+        {
+            Ok(CustomCompletionOutcome::Stored) => {
+                for task_id in &req.tasks {
+                    data.custom_assignments.remove(task_id);
+                }
+            }
+            Ok(CustomCompletionOutcome::Duplicate) => {
+                return axum::Json(CompleteResponse { acknowledged: true });
+            }
+            Err(error) => {
+                eprintln!("Rejected custom completion: durable acceptance failed: {error}");
+                return axum::Json(CompleteResponse {
+                    acknowledged: false,
+                });
+            }
         }
     }
     // Missing session/lease metadata remains accepted only for legacy built-in jobs.
@@ -1779,9 +1904,12 @@ mod lease_coordinator_tests {
     use super::*;
     use crate::distributed::message::{
         AssignmentLease, CancelRequest, CompleteResponse, HardwareSpec, HeartbeatResponse,
-        TelemetrySnapshot,
+        JobConfigRequest, JobConfigResponse, JobRecord, TelemetrySnapshot,
     };
-    use axum::{routing::post, Router};
+    use axum::{
+        routing::{get, post},
+        Router,
+    };
 
     fn custom_job(tasks: usize) -> JobSpec {
         JobSpec::Custom {
@@ -1796,6 +1924,19 @@ mod lease_coordinator_tests {
         config.job_spec = Some(custom_job(tasks));
         config.total_tasks = tasks;
         config.batch_size = 1;
+        let metrics_db = MetricsDb::in_memory().unwrap();
+        metrics_db
+            .insert_job(&JobRecord {
+                job_id: "job-1".to_string(),
+                status: "running".to_string(),
+                start_time_ms: 1,
+                end_time_ms: None,
+                job_spec_json: serde_json::to_value(custom_job(tasks)).ok(),
+                input_path: "input".to_string(),
+                total_tasks: tasks,
+                job_type: Some("custom".to_string()),
+            })
+            .unwrap();
         Arc::new(Mutex::new(CoordinatorData {
             pending_partitions: (0..tasks).collect(),
             processing_partitions: HashMap::new(),
@@ -1813,7 +1954,7 @@ mod lease_coordinator_tests {
             job_start_time: Instant::now(),
             last_progress_time: Instant::now(),
             idle: false,
-            metrics_db: MetricsDb::in_memory().unwrap(),
+            metrics_db,
             aggregated_results: Vec::new(),
             job_state: JobExecutionState::Standard,
             active_tasks: HashMap::new(),
@@ -1824,7 +1965,7 @@ mod lease_coordinator_tests {
             last_backup_at: None,
             update_fleet_url: None,
             updated_workers: HashSet::new(),
-            current_job_id: None,
+            current_job_id: Some("job-1".to_string()),
             session_id: "session-1".to_string(),
             catalog: None,
             ingested_phenotypes: HashSet::new(),
@@ -1833,6 +1974,157 @@ mod lease_coordinator_tests {
             cached_vms: None,
             deleted_workers: HashSet::new(),
         }))
+    }
+
+    fn idle_test_state() -> SharedState {
+        let state = test_state(0);
+        {
+            let mut data = state.lock().unwrap();
+            data.config = CoordinatorConfig::default();
+            data.pending_partitions.clear();
+            data.current_job_id = None;
+            data.idle = true;
+        }
+        state
+    }
+
+    fn job_request(job_spec: JobSpec, force: bool) -> JobConfigRequest {
+        JobConfigRequest {
+            input_path: "custom".to_string(),
+            job_spec,
+            total_tasks: 2,
+            batch_size: Some(1),
+            force,
+            filters: Vec::new(),
+            intervals: Vec::new(),
+            memory_weight_mb: Some(512),
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_worker_custom_job_is_durable_but_unassigned_until_worker_registers() {
+        let state = idle_test_state();
+        let app = Router::new()
+            .route("/api/job", post(api::jobs::submit_job))
+            .route("/work", post(get_work))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let base_url = format!("http://{address}");
+
+        let noncustom: JobConfigResponse = client
+            .post(format!("{base_url}/api/job"))
+            .json(&job_request(JobSpec::Summary, false))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(!noncustom.acknowledged);
+        assert!(noncustom.error.unwrap().contains("No active workers"));
+
+        let forced: JobConfigResponse = client
+            .post(format!("{base_url}/api/job"))
+            .json(&job_request(custom_job(2), true))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(!forced.acknowledged);
+        assert!(forced.error.unwrap().contains("does not allow --force"));
+
+        let accepted: JobConfigResponse = client
+            .post(format!("{base_url}/api/job"))
+            .json(&job_request(custom_job(2), false))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(accepted.acknowledged, "{:?}", accepted.error);
+
+        let job_id = {
+            let data = state.lock().unwrap();
+            let job_id = data.current_job_id.clone().expect("registered job id");
+            assert!(!data.idle);
+            assert!(data.worker_registry.is_empty());
+            assert_eq!(
+                data.pending_partitions.iter().copied().collect::<Vec<_>>(),
+                vec![0, 1]
+            );
+            assert!(data.processing_partitions.is_empty());
+            assert!(data.custom_assignments.is_empty());
+
+            let job = data
+                .metrics_db
+                .get_job(&job_id)
+                .unwrap()
+                .expect("durable job");
+            assert_eq!(job.status, "running");
+            assert_eq!(job.total_tasks, 2);
+            let receipts = data.metrics_db.get_custom_receipts(&job_id).unwrap();
+            assert_eq!(receipts.accepted_count, 0);
+            assert_eq!(receipts.expected_task_count, 2);
+            assert_eq!(
+                data.metrics_db
+                    .current_custom_assignment_count(&job_id)
+                    .unwrap(),
+                0
+            );
+            job_id
+        };
+
+        let active_replacement: JobConfigResponse = client
+            .post(format!("{base_url}/api/job"))
+            .json(&job_request(custom_job(2), false))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(!active_replacement.acknowledged);
+        assert!(active_replacement
+            .error
+            .unwrap()
+            .contains("already has a job running"));
+
+        let assignment: WorkResponse = client
+            .post(format!("{base_url}/work"))
+            .json(&WorkRequest {
+                worker_id: "worker-after-scale".to_string(),
+                hardware: None,
+                build_version: Some("test-build".to_string()),
+                protocol_version: Some(CUSTOM_WORKER_PROTOCOL_VERSION),
+            })
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let task_id = match assignment {
+            WorkResponse::Task { tasks, .. } => tasks.into_iter().next().unwrap().id,
+            other => panic!("expected task assignment, got {other:?}"),
+        };
+        assert_eq!(task_id, "custom_0");
+        let data = state.lock().unwrap();
+        assert!(data.worker_registry.contains_key("worker-after-scale"));
+        assert_eq!(data.processing_partitions.len(), 1);
+        assert_eq!(
+            data.metrics_db
+                .current_custom_assignment_count(&job_id)
+                .unwrap(),
+            1
+        );
+        drop(data);
+        server.abort();
     }
 
     async fn assign(state: &SharedState, worker_id: &str) -> (String, String, AssignmentLease) {
@@ -1983,13 +2275,45 @@ mod lease_coordinator_tests {
     async fn valid_completion_cleans_current_assignment_and_updates_real_coordinator_state() {
         let state = test_state(1);
         let (task_id, session, lease) = assign(&state, "worker-a").await;
+        let raw_lease = lease.lease_token.clone();
+        let request = completion("worker-a", &task_id, &session, lease, None);
+
+        // The same worker ID may report different mutable registry metadata,
+        // but the outstanding durable assignment remains bound to build A.
+        let replacement = get_work(
+            axum::extract::State(state.clone()),
+            axum::Json(WorkRequest {
+                worker_id: "worker-a".to_string(),
+                hardware: None,
+                build_version: Some("replacement-build-b".to_string()),
+                protocol_version: Some(CUSTOM_WORKER_PROTOCOL_VERSION),
+            }),
+        )
+        .await;
+        assert!(matches!(replacement.0, WorkResponse::Wait));
 
         let response = complete_work(
             axum::extract::State(state.clone()),
-            axum::Json(completion("worker-a", &task_id, &session, lease, None)),
+            axum::Json(request.clone()),
         )
         .await;
         assert!(response.0.acknowledged);
+
+        let accepted_signature = signature(&state);
+        let duplicate = complete_work(
+            axum::extract::State(state.clone()),
+            axum::Json(request.clone()),
+        )
+        .await;
+        assert!(duplicate.0.acknowledged);
+        assert_eq!(signature(&state), accepted_signature);
+
+        let mut conflict = request;
+        conflict.result_json = Some(serde_json::json!({"conflicting": true}));
+        let rejected =
+            complete_work(axum::extract::State(state.clone()), axum::Json(conflict)).await;
+        assert!(!rejected.0.acknowledged);
+        assert_eq!(signature(&state), accepted_signature);
 
         let data = state.lock().unwrap();
         assert!(data.custom_assignments.is_empty());
@@ -2001,6 +2325,247 @@ mod lease_coordinator_tests {
             vec![serde_json::json!({"task": task_id})]
         );
         assert_eq!(data.custom_assignment_attempts.get("custom_0"), Some(&1));
+        let receipts = data.metrics_db.get_custom_receipts("job-1").unwrap();
+        assert!(receipts.complete);
+        assert_eq!(receipts.accepted_count, 1);
+        assert_eq!(receipts.terminal_receipt_count, 1);
+        assert!(receipts.canonical_sha256.is_some());
+        let machine_json = serde_json::to_string(&receipts).unwrap();
+        assert!(!machine_json.contains(&raw_lease));
+        assert_ne!(receipts.receipts[0].lease_identity_sha256, raw_lease);
+        assert_eq!(
+            receipts.receipts[0].worker_build_version.as_deref(),
+            Some("test-build")
+        );
+        assert_eq!(
+            data.worker_registry["worker-a"].build_version.as_deref(),
+            Some("replacement-build-b")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_custom_cancellation_is_not_acknowledged_and_retains_live_state() {
+        let state = test_state(1);
+        let (task_id, session, lease) = assign(&state, "worker-a").await;
+        let accepted = complete_work(
+            axum::extract::State(state.clone()),
+            axum::Json(completion("worker-a", &task_id, &session, lease, None)),
+        )
+        .await;
+        assert!(accepted.0.acknowledged);
+        let before = signature(&state);
+        state
+            .lock()
+            .unwrap()
+            .metrics_db
+            .execute_test_sql(
+                "CREATE TEMP TRIGGER fail_cancel BEFORE UPDATE OF status ON jobs
+             WHEN NEW.status = 'cancelled' BEGIN SELECT RAISE(FAIL, 'injected'); END;",
+            )
+            .unwrap();
+
+        let cancelled = api::jobs::cancel_job(
+            axum::extract::State(state.clone()),
+            axum::Json(CancelRequest {
+                reason: Some("fault".to_string()),
+            }),
+        )
+        .await;
+        assert!(!cancelled.0.success);
+        assert_eq!(signature(&state), before);
+        let data = state.lock().unwrap();
+        assert!(!data.idle);
+        let receipts = data.metrics_db.get_custom_receipts("job-1").unwrap();
+        assert_eq!(receipts.job_status.as_deref(), Some("running"));
+        assert!(receipts.complete);
+    }
+
+    #[test]
+    fn restored_running_custom_jobs_fail_closed_before_startup_serves() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.db");
+        let backup_path = dir.path().join("older-valid-backup.db");
+        let restored_path = dir.path().join("restored.db");
+        let source = MetricsDb::open(&source_path).unwrap();
+
+        for job_id in ["job-accepted", "job-assigned"] {
+            source
+                .insert_job(&JobRecord {
+                    job_id: job_id.to_string(),
+                    status: "running".to_string(),
+                    start_time_ms: 1,
+                    end_time_ms: None,
+                    job_spec_json: serde_json::to_value(custom_job(1)).ok(),
+                    input_path: "input".to_string(),
+                    total_tasks: 1,
+                    job_type: Some(custom_job(1).description().to_string()),
+                })
+                .unwrap();
+        }
+
+        source
+            .persist_custom_assignments(
+                "job-accepted",
+                "old-session",
+                "worker-accepted",
+                Some("assignment-build-a"),
+                &[DurableCustomAssignment {
+                    task_id: "custom_0",
+                    partition_id: 0,
+                    assignment_attempt: 1,
+                    lease_token: "accepted-lease",
+                }],
+                10,
+            )
+            .unwrap();
+        source
+            .accept_custom_completion(
+                "job-accepted",
+                &completion(
+                    "worker-accepted",
+                    "custom_0",
+                    "old-session",
+                    AssignmentLease {
+                        task_id: "custom_0".to_string(),
+                        assignment_attempt: 1,
+                        lease_token: "accepted-lease".to_string(),
+                    },
+                    None,
+                ),
+                20,
+            )
+            .unwrap();
+        assert!(source.get_custom_receipts("job-accepted").unwrap().complete);
+
+        source
+            .persist_custom_assignments(
+                "job-assigned",
+                "old-session",
+                "worker-assigned",
+                Some("assignment-build-b"),
+                &[DurableCustomAssignment {
+                    task_id: "custom_0",
+                    partition_id: 0,
+                    assignment_attempt: 1,
+                    lease_token: "current-lease",
+                }],
+                30,
+            )
+            .unwrap();
+        let stale_completion = completion(
+            "worker-assigned",
+            "custom_0",
+            "old-session",
+            AssignmentLease {
+                task_id: "custom_0".to_string(),
+                assignment_attempt: 1,
+                lease_token: "current-lease".to_string(),
+            },
+            None,
+        );
+        source.write_verified_backup_snapshot(&backup_path).unwrap();
+        drop(source);
+
+        let restored = restore_and_reconcile_database(restored_path.to_str().unwrap(), |dest| {
+            std::fs::copy(&backup_path, dest)
+                .map(|_| true)
+                .map_err(|error| error.to_string())
+        })
+        .unwrap();
+        assert!(restored);
+
+        let db = MetricsDb::open(&restored_path).unwrap();
+        let accepted = db.get_custom_receipts("job-accepted").unwrap();
+        assert_eq!(accepted.job_status.as_deref(), Some("failed"));
+        assert_eq!(accepted.accepted_count, 1);
+        assert_eq!(accepted.expected_task_count, 1);
+        assert!(!accepted.complete);
+        assert_eq!(
+            accepted.receipts[0].worker_build_version.as_deref(),
+            Some("assignment-build-a")
+        );
+        assert_eq!(
+            db.current_custom_assignment_count("job-assigned").unwrap(),
+            0
+        );
+        assert!(db
+            .accept_custom_completion("job-assigned", &stale_completion, 40)
+            .unwrap_err()
+            .contains("not durably running"));
+        let summary = db
+            .get_job_summary("job-accepted")
+            .unwrap()
+            .expect("restore interruption summary");
+        assert!(summary.contains("interrupted"));
+        assert!(summary.contains("not completion authority"));
+    }
+
+    #[test]
+    fn restore_reconciliation_failure_is_fatal_and_atomic() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.db");
+        let backup_path = dir.path().join("backup.db");
+        let restored_path = dir.path().join("restored.db");
+        let source = MetricsDb::open(&source_path).unwrap();
+        source
+            .insert_job(&JobRecord {
+                job_id: "job-blocked".to_string(),
+                status: "running".to_string(),
+                start_time_ms: 1,
+                end_time_ms: None,
+                job_spec_json: serde_json::to_value(custom_job(1)).ok(),
+                input_path: "input".to_string(),
+                total_tasks: 1,
+                job_type: Some(custom_job(1).description().to_string()),
+            })
+            .unwrap();
+        source
+            .persist_custom_assignments(
+                "job-blocked",
+                "old-session",
+                "worker-a",
+                Some("build-a"),
+                &[DurableCustomAssignment {
+                    task_id: "custom_0",
+                    partition_id: 0,
+                    assignment_attempt: 1,
+                    lease_token: "current-lease",
+                }],
+                10,
+            )
+            .unwrap();
+        source
+            .execute_test_sql(
+                "CREATE TRIGGER block_restore_reconciliation
+                 BEFORE UPDATE OF status ON jobs
+                 WHEN OLD.job_id = 'job-blocked'
+                 BEGIN SELECT RAISE(FAIL, 'injected restore failure'); END;",
+            )
+            .unwrap();
+        source.write_verified_backup_snapshot(&backup_path).unwrap();
+        drop(source);
+
+        let error = restore_and_reconcile_database(restored_path.to_str().unwrap(), |dest| {
+            std::fs::copy(&backup_path, dest)
+                .map(|_| true)
+                .map_err(|error| error.to_string())
+        })
+        .unwrap_err();
+        assert!(error.contains("failed to reconcile restored custom jobs"));
+        assert!(error.contains("injected restore failure"));
+
+        let db = MetricsDb::open(&restored_path).unwrap();
+        assert_eq!(
+            db.get_custom_receipts("job-blocked")
+                .unwrap()
+                .job_status
+                .as_deref(),
+            Some("running")
+        );
+        assert_eq!(
+            db.current_custom_assignment_count("job-blocked").unwrap(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -2034,6 +2599,72 @@ mod lease_coordinator_tests {
         .await;
         assert!(!response.0.acknowledged);
         assert_eq!(signature(&state), before);
+        assert_eq!(
+            state
+                .lock()
+                .unwrap()
+                .metrics_db
+                .get_custom_receipts("job-1")
+                .unwrap()
+                .terminal_receipt_count,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_and_legacy_unfenced_custom_completions_create_no_receipt() {
+        let cancelled_state = test_state(1);
+        let (task_id, session, lease) = assign(&cancelled_state, "worker-a").await;
+        let cancelled = api::jobs::cancel_job(
+            axum::extract::State(cancelled_state.clone()),
+            axum::Json(CancelRequest {
+                reason: Some("test cancellation".to_string()),
+            }),
+        )
+        .await;
+        assert!(cancelled.0.success);
+        let response = complete_work(
+            axum::extract::State(cancelled_state.clone()),
+            axum::Json(completion("worker-a", &task_id, &session, lease, None)),
+        )
+        .await;
+        assert!(!response.0.acknowledged);
+        let cancelled_receipts = cancelled_state
+            .lock()
+            .unwrap()
+            .metrics_db
+            .get_custom_receipts("job-1")
+            .unwrap();
+        assert_eq!(cancelled_receipts.terminal_receipt_count, 0);
+        assert!(!cancelled_receipts.complete);
+
+        let legacy_state = test_state(1);
+        let (task_id, _, _) = assign(&legacy_state, "legacy-worker").await;
+        let legacy = CompleteRequest {
+            worker_id: "legacy-worker".to_string(),
+            tasks: vec![task_id],
+            items_processed: 1,
+            result_json: Some(serde_json::json!({"unsafe": true})),
+            error: None,
+            session_id: None,
+            assignments: Vec::new(),
+        };
+        let response = complete_work(
+            axum::extract::State(legacy_state.clone()),
+            axum::Json(legacy),
+        )
+        .await;
+        assert!(!response.0.acknowledged);
+        assert_eq!(
+            legacy_state
+                .lock()
+                .unwrap()
+                .metrics_db
+                .get_custom_receipts("job-1")
+                .unwrap()
+                .terminal_receipt_count,
+            0
+        );
     }
 
     async fn assert_rejected_heartbeat_unchanged(state: &SharedState, req: HeartbeatRequest) {
@@ -2111,6 +2742,10 @@ mod lease_coordinator_tests {
             .route("/work", post(get_work))
             .route("/complete", post(complete_work))
             .route("/heartbeat", post(handle_heartbeat))
+            .route(
+                "/api/jobs/:job_id/custom-receipts",
+                get(api::jobs::get_custom_receipts),
+            )
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -2257,6 +2892,30 @@ mod lease_coordinator_tests {
         assert!(accepted_completion.acknowledged);
         assert_eq!(state.lock().unwrap().completed_tasks, HashSet::from([0]));
 
+        let receipt_set: crate::distributed::message::CustomReceiptSet = client
+            .get(format!("{base_url}/api/jobs/job-1/custom-receipts"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(receipt_set.job_id, "job-1");
+        assert_eq!(receipt_set.accepted_count, 1);
+        assert_eq!(receipt_set.receipts[0].task_id, task_id);
+        let missing: crate::distributed::message::CustomReceiptSet = client
+            .get(format!("{base_url}/api/jobs/other-job/custom-receipts"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(!missing.job_found);
+        assert_eq!(missing.accepted_count, 0);
+        assert!(missing.receipts.is_empty());
+        assert!(missing.error.is_some());
+
         server.abort();
     }
 
@@ -2301,6 +2960,37 @@ mod lease_coordinator_tests {
             ],
             [1, 2, 3, 4]
         );
+        let accepted = complete_work(
+            axum::extract::State(state.clone()),
+            axum::Json(completion(
+                "worker-4",
+                &task_id,
+                &session,
+                fourth.clone(),
+                None,
+            )),
+        )
+        .await;
+        assert!(accepted.0.acknowledged);
+        let receipt_set = state
+            .lock()
+            .unwrap()
+            .metrics_db
+            .get_custom_receipts("job-1")
+            .unwrap();
+        assert!(receipt_set.complete);
+        assert_eq!(receipt_set.accepted_count, 1);
+        assert_eq!(receipt_set.failed_attempt_count, 1);
+        assert_eq!(receipt_set.terminal_receipt_count, 2);
+        assert_eq!(
+            receipt_set
+                .receipts
+                .iter()
+                .map(|receipt| (receipt.assignment_attempt, receipt.terminal_status.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "failed"), (4, "accepted")]
+        );
+
         let tokens: HashSet<_> = [first, second, third, fourth]
             .into_iter()
             .map(|lease| lease.lease_token)
@@ -2367,6 +3057,40 @@ mod lease_coordinator_tests {
                 vec![0, 1]
             );
         }
+    }
+
+    #[tokio::test]
+    async fn superseded_job_completion_cannot_create_a_receipt_in_either_job() {
+        let state = test_state(1);
+        let (task_id, session, lease) = assign(&state, "old-worker").await;
+        let stale_request = completion("old-worker", &task_id, &session, lease, None);
+        let new_job_id = {
+            let mut data = state.lock().unwrap();
+            services::start_new_job(
+                &mut data,
+                custom_job(1),
+                "new-input".to_string(),
+                1,
+                Some(1),
+                None,
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap();
+            data.current_job_id.clone().unwrap()
+        };
+        let response = complete_work(
+            axum::extract::State(state.clone()),
+            axum::Json(stale_request),
+        )
+        .await;
+        assert!(!response.0.acknowledged);
+        let data = state.lock().unwrap();
+        let old = data.metrics_db.get_custom_receipts("job-1").unwrap();
+        let new = data.metrics_db.get_custom_receipts(&new_job_id).unwrap();
+        assert_eq!(old.job_status.as_deref(), Some("superseded"));
+        assert_eq!(old.terminal_receipt_count, 0);
+        assert_eq!(new.terminal_receipt_count, 0);
     }
 
     #[tokio::test]

@@ -8,9 +8,9 @@ use crate::distributed::coordinator::state::{
     CoordinatorData, JobExecutionState, SharedState, WorkerStatus,
 };
 use crate::distributed::message::{
-    CancelRequest, CancelResponse, EventsResponse, ExportMetricsRequest, ExportMetricsResponse,
-    FailuresResponse, JobConfigRequest, JobConfigResponse, JobResultResponse, JobSpec,
-    UpdateFleetRequest,
+    CancelRequest, CancelResponse, CustomReceiptSet, EventsResponse, ExportMetricsRequest,
+    ExportMetricsResponse, FailuresResponse, JobConfigRequest, JobConfigResponse,
+    JobResultResponse, JobSpec, UpdateFleetRequest,
 };
 
 /// Query parameters for incremental GET endpoints
@@ -93,20 +93,26 @@ pub(crate) async fn submit_job(
 
     let mut data = state.lock().unwrap();
 
-    // R1: Check if workers are available
+    // R1: Check if workers are available. A custom job may be durably
+    // registered while the pool is intentionally at zero workers, but it may
+    // not use that exception to bypass active-job authority with --force.
     let active_workers = data
         .worker_registry
         .values()
         .filter(|w| w.status != WorkerStatus::SuspectedDead)
         .count();
+    let zero_worker_custom = active_workers == 0 && matches!(&req.job_spec, JobSpec::Custom { .. });
 
-    // Allow if we have workers OR if force is used (force bypasses worker check too for testing)
-    if active_workers == 0 && !req.force {
+    if active_workers == 0 && !zero_worker_custom {
         return axum::Json(JobConfigResponse {
             acknowledged: false,
-            error: Some(
-                "No active workers connected. Scale up workers first or use --force.".to_string(),
-            ),
+            error: Some("No active workers connected. Scale up workers first.".to_string()),
+        });
+    }
+    if zero_worker_custom && req.force {
+        return axum::Json(JobConfigResponse {
+            acknowledged: false,
+            error: Some("Zero-worker custom submission does not allow --force".to_string()),
         });
     }
 
@@ -297,18 +303,44 @@ pub(crate) async fn cancel_job(
         });
     }
 
-    // Update job status in database
-    if let Some(ref job_id) = data.current_job_id {
+    // Custom jobs use their durable assignments as an authority boundary. The
+    // terminal status and fence removal must commit together before cancellation
+    // is acknowledged or any corresponding in-memory state is cleared.
+    let is_custom_job = matches!(data.config.job_spec, Some(JobSpec::Custom { .. }));
+    if is_custom_job {
+        let Some(job_id) = data.current_job_id.as_deref() else {
+            return axum::Json(CancelResponse {
+                success: false,
+                message: "Custom job has no durable job identity".to_string(),
+            });
+        };
+        if let Err(error) = data
+            .metrics_db
+            .cancel_custom_job(job_id, CoordinatorData::now_ms())
+        {
+            eprintln!("Rejected custom job cancellation: {error}");
+            return axum::Json(CancelResponse {
+                success: false,
+                message: format!("Cancellation was not committed: {error}"),
+            });
+        }
+    } else if let Some(ref job_id) = data.current_job_id {
+        // Preserve the existing best-effort behavior for generic jobs, which do
+        // not use custom assignment receipts as an authorization boundary.
         let end_time_ms = CoordinatorData::now_ms();
-        if let Err(e) =
+        if let Err(error) =
             data.metrics_db
                 .update_job_status(job_id, "cancelled", Some(end_time_ms), None)
         {
-            eprintln!("Warning: failed to update job status in DB: {}", e);
+            eprintln!("Warning: failed to update job status in DB: {error}");
+        }
+        if let Err(error) = data.metrics_db.clear_current_custom_assignments(job_id) {
+            eprintln!("Warning: failed to clear cancelled custom assignments: {error}");
         }
     }
 
-    // Reset job state
+    // Reset job state only after the durable custom cancellation commits.
+    // Generic jobs retain their pre-existing behavior.
     data.pending_partitions.clear();
     data.processing_partitions.clear();
     data.custom_assignment_attempts.clear();
@@ -368,6 +400,33 @@ pub(crate) async fn get_job_result(
         result: Some(serde_json::Value::Array(data.aggregated_results.clone())),
         error: None,
     })
+}
+
+/// Handler for GET /api/jobs/:job_id/custom-receipts.
+/// Reads only exact-job durable SQLite receipts; no live aggregate cache or
+/// temporary result file participates in this response.
+pub(crate) async fn get_custom_receipts(
+    axum::extract::State(state): axum::extract::State<SharedState>,
+    axum::extract::Path(job_id): axum::extract::Path<String>,
+) -> axum::Json<CustomReceiptSet> {
+    let data = state.lock().unwrap();
+    match data.metrics_db.get_custom_receipts(&job_id) {
+        Ok(receipts) => axum::Json(receipts),
+        Err(error) => axum::Json(CustomReceiptSet {
+            schema_version: 1,
+            job_id,
+            job_found: false,
+            job_status: None,
+            expected_task_count: 0,
+            complete: false,
+            accepted_count: 0,
+            failed_attempt_count: 0,
+            terminal_receipt_count: 0,
+            canonical_sha256: None,
+            receipts: Vec::new(),
+            error: Some(format!("failed to read durable custom receipts: {error}")),
+        }),
+    }
 }
 
 /// Handler for GET /api/events - get recent events.

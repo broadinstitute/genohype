@@ -68,6 +68,7 @@ zstd = "0.13"
 
 # Random (needed by CLI modules)
 rand = "0.8"
+sha2 = "0.10"
 
 # Memory mapping
 memmap2 = "0.9"
@@ -115,7 +116,7 @@ tokio-stream = { version = "0.1", optional = true }
 sysinfo = "0.32"
 
 # SQLite for metrics persistence (coordinator dashboard)
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.31", features = ["backup", "bundled"] }
 
 # XDG directory support
 dirs = "5.0"

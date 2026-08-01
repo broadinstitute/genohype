@@ -32,6 +32,34 @@ pub(crate) fn start_new_job(
         super::batch_init::enrich_specs(specs);
     }
 
+    // Superseding a running job is a durable terminal transition. Clear only
+    // its live assignment fences; immutable receipts remain queryable.
+    if !data.idle {
+        if let Some(ref prior_job_id) = data.current_job_id {
+            let prior_is_custom = matches!(data.config.job_spec, Some(JobSpec::Custom { .. }));
+            if let Err(error) = data.metrics_db.update_job_status(
+                prior_job_id,
+                "superseded",
+                Some(CoordinatorData::now_ms()),
+                None,
+            ) {
+                if prior_is_custom {
+                    return Err(format!("failed to persist superseded job state: {error}"));
+                }
+                eprintln!("Warning: failed to persist superseded job state: {error}");
+            }
+            if let Err(error) = data
+                .metrics_db
+                .clear_current_custom_assignments(prior_job_id)
+            {
+                if prior_is_custom {
+                    return Err(format!("failed to clear superseded assignments: {error}"));
+                }
+                eprintln!("Warning: failed to clear superseded assignments: {error}");
+            }
+        }
+    }
+
     // Configure the job
     data.config.input_path = input_path.clone();
     data.config.job_spec = Some(job_spec.clone());
@@ -83,6 +111,12 @@ pub(crate) fn start_new_job(
     };
 
     if let Err(e) = data.metrics_db.insert_job(&job_record) {
+        if matches!(job_spec, JobSpec::Custom { .. }) {
+            data.current_job_id = None;
+            return Err(format!(
+                "custom jobs require durable coordinator state; failed to persist job: {e}"
+            ));
+        }
         eprintln!("Warning: failed to persist job to DB: {}", e);
     }
 
