@@ -42,7 +42,9 @@ echo "Creating systemd service for worker $WORKER_ID connecting to {}-coordinato
 cat > /etc/systemd/system/genohype-worker.service << 'SVCEOF'
 [Unit]
 Description=Genohype Worker
-After=network.target
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -50,7 +52,6 @@ User=root
 ExecStart=/usr/local/bin/genohype service start-worker --url http://{}-coordinator:3000 --worker-id WORKER_ID_PLACEHOLDER
 Restart=always
 RestartSec=3
-StartLimitIntervalSec=0
 
 [Install]
 WantedBy=multi-user.target
@@ -112,10 +113,16 @@ echo "=== Worker VM initialized ==="
 /// secrets at boot time, avoiding exposure in metadata or logs.
 /// Optional cluster configuration to pass to the coordinator startup.
 pub struct CoordinatorClusterConfig<'a> {
+    pub pool_name: Option<&'a str>,
+    pub project: Option<&'a str>,
+    pub zone: Option<&'a str>,
     pub machine_type: Option<&'a str>,
     pub spot: Option<bool>,
     pub network: Option<&'a str>,
     pub subnet: Option<&'a str>,
+    pub public_ip: Option<bool>,
+    pub manage_firewall: Option<bool>,
+    pub worker_service_account: Option<&'a str>,
 }
 
 pub fn generate_coordinator_startup_script(
@@ -141,6 +148,15 @@ pub fn generate_coordinator_startup_script_with_cluster(
         // Build cluster flags
         let mut cluster_args = String::new();
         if let Some(cc) = cluster_config {
+            if let Some(pool_name) = cc.pool_name {
+                cluster_args.push_str(&format!(" --pool-name {}", pool_name));
+            }
+            if let Some(project) = cc.project {
+                cluster_args.push_str(&format!(" --gcp-project {}", project));
+            }
+            if let Some(zone) = cc.zone {
+                cluster_args.push_str(&format!(" --gcp-zone {}", zone));
+            }
             if let Some(mt) = cc.machine_type {
                 cluster_args.push_str(&format!(" --cluster-machine-type {}", mt));
             }
@@ -152,6 +168,18 @@ pub fn generate_coordinator_startup_script_with_cluster(
             }
             if let Some(sub) = cc.subnet {
                 cluster_args.push_str(&format!(" --cluster-subnet {}", sub));
+            }
+            if let Some(public_ip) = cc.public_ip {
+                cluster_args.push_str(&format!(" --cluster-public-ip {}", public_ip));
+            }
+            if let Some(manage_firewall) = cc.manage_firewall {
+                cluster_args.push_str(&format!(" --cluster-manage-firewall {}", manage_firewall));
+            }
+            if let Some(service_account) = cc.worker_service_account {
+                cluster_args.push_str(&format!(
+                    " --cluster-worker-service-account {}",
+                    service_account
+                ));
             }
         }
 
@@ -369,6 +397,36 @@ mod tests {
         // Check it still has worker essentials
         assert!(script.contains("libssl-dev"));
         assert!(script.contains("genohype-ready"));
+    }
+
+    #[test]
+    fn test_coordinator_startup_script_propagates_cluster_project() {
+        let cluster = CoordinatorClusterConfig {
+            pool_name: Some("demo"),
+            project: Some("configured-project"),
+            zone: Some("us-central1-a"),
+            machine_type: Some("e2-standard-2"),
+            spot: Some(true),
+            network: None,
+            subnet: None,
+            public_ip: Some(false),
+            manage_firewall: Some(false),
+            worker_service_account: Some("worker@project.iam.gserviceaccount.com"),
+        };
+        let script = generate_coordinator_startup_script_with_cluster(
+            None,
+            Some("gs://bucket/genohype"),
+            None,
+            Some(&cluster),
+        );
+
+        assert!(script.contains("--pool-name demo"));
+        assert!(script.contains("--gcp-project configured-project"));
+        assert!(script.contains("--gcp-zone us-central1-a"));
+        assert!(script.contains("--cluster-public-ip false"));
+        assert!(script.contains("--cluster-manage-firewall false"));
+        assert!(script
+            .contains("--cluster-worker-service-account worker@project.iam.gserviceaccount.com"));
     }
 
     #[test]

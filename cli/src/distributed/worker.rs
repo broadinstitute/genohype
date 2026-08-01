@@ -119,6 +119,18 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
                 println!("Received Exit signal. Worker shutting down.");
                 break;
             }
+            WorkResponse::Incompatible {
+                required_protocol_version,
+                message,
+            } => {
+                return Err(crate::HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "coordinator rejected worker protocol (requires {}): {}",
+                        required_protocol_version, message
+                    ),
+                )));
+            }
             WorkResponse::UpdateBinary { gcs_url } => {
                 // Use current executable path so we replace exactly what is running
                 let current_exe = std::env::current_exe()
@@ -299,6 +311,7 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
                             result_json: None,
                             error: Some(error_msg),
                             session_id: session_id.clone(),
+                            assignments: Vec::new(),
                         };
                         if let Err(post_err) =
                             client.post(&complete_url).json(&fail_req).send().await
@@ -320,6 +333,7 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
                             result_json: None,
                             error: Some(error_msg),
                             session_id: session_id.clone(),
+                            assignments: Vec::new(),
                         };
                         if let Err(post_err) =
                             client.post(&complete_url).json(&fail_req).send().await
@@ -373,11 +387,7 @@ async fn request_work(
     worker_id: &str,
     hardware: &crate::distributed::message::HardwareSpec,
 ) -> Result<WorkResponse> {
-    let request = WorkRequest {
-        worker_id: worker_id.to_string(),
-        hardware: Some(hardware.clone()),
-        build_version: Some(env!("GIT_HASH").to_string()),
-    };
+    let request = build_work_request(worker_id, hardware);
 
     let response = client.post(url).json(&request).send().await.map_err(|e| {
         crate::HailError::Io(std::io::Error::new(
@@ -394,6 +404,23 @@ async fn request_work(
     })?;
 
     Ok(work_response)
+}
+
+/// Build the stock CLI worker's work request.
+///
+/// Custom jobs are executed by handler-backed `genohype-pool` workers. The stock
+/// CLI dispatch path intentionally does not execute arbitrary custom payloads, so
+/// it must not advertise the custom lease-fencing protocol capability.
+pub(crate) fn build_work_request(
+    worker_id: &str,
+    hardware: &crate::distributed::message::HardwareSpec,
+) -> WorkRequest {
+    WorkRequest {
+        worker_id: worker_id.to_string(),
+        hardware: Some(hardware.clone()),
+        build_version: Some(env!("GIT_HASH").to_string()),
+        protocol_version: None,
+    }
 }
 
 /// Report completion to the coordinator.
@@ -413,6 +440,7 @@ async fn report_completion(
         result_json,
         error: None,
         session_id,
+        assignments: Vec::new(),
     };
 
     client.post(url).json(&request).send().await.map_err(|e| {

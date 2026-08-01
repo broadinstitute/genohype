@@ -19,6 +19,9 @@ pub struct ClusterConfigResponse {
     pub spot: Option<bool>,
     pub network: Option<String>,
     pub subnet: Option<String>,
+    pub public_ip: Option<bool>,
+    pub manage_firewall: Option<bool>,
+    pub worker_service_account: Option<String>,
 }
 
 /// A GCP VM instance in the cluster
@@ -54,6 +57,38 @@ pub struct ScaleResponse {
     pub target_workers: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
+fn build_worker_instance_setups(
+    pool_name: &str,
+    indices: &[usize],
+    machine_type: &str,
+    zone: &str,
+    startup_script: &str,
+    spot: bool,
+    network: Option<String>,
+    subnet: Option<String>,
+    public_ip: bool,
+    project: &str,
+    service_account: Option<String>,
+) -> Vec<crate::cloud::InstanceSetup> {
+    indices
+        .iter()
+        .map(|&i| crate::cloud::InstanceSetup {
+            name: format!("{}-worker-{}", pool_name, i),
+            machine_type: machine_type.to_string(),
+            zone: zone.to_string(),
+            tags: vec![format!("genohype-worker,pool-{},role-worker", pool_name)],
+            startup_script: startup_script.to_string(),
+            spot,
+            network: network.clone(),
+            subnet: subnet.clone(),
+            public_ip,
+            project_id: project.to_string(),
+            service_account: service_account.clone(),
+        })
+        .collect()
+}
+
 /// GET /api/cluster/config - Returns the current cluster configuration
 pub async fn get_config(State(state): State<SharedState>) -> Json<ClusterConfigResponse> {
     let data = state.lock().unwrap();
@@ -65,6 +100,9 @@ pub async fn get_config(State(state): State<SharedState>) -> Json<ClusterConfigR
         spot: data.config.spot,
         network: data.config.network.clone(),
         subnet: data.config.subnet.clone(),
+        public_ip: data.config.public_ip,
+        manage_firewall: data.config.manage_firewall,
+        worker_service_account: data.config.worker_service_account.clone(),
     })
 }
 
@@ -73,7 +111,7 @@ const VM_CACHE_TTL_SECS: u64 = 15;
 
 /// GET /api/cluster/vms - Returns the current GCP VM state
 pub async fn get_vms(State(state): State<SharedState>) -> Json<serde_json::Value> {
-    let (pool_name, cached) = {
+    let (pool_name, gcp_project, cached) = {
         let data = state.lock().unwrap();
         let cached = data.cached_vms.as_ref().and_then(|(json, ts)| {
             if ts.elapsed().as_secs() < VM_CACHE_TTL_SECS {
@@ -82,7 +120,11 @@ pub async fn get_vms(State(state): State<SharedState>) -> Json<serde_json::Value
                 None
             }
         });
-        (data.config.pool_name.clone(), cached)
+        (
+            data.config.pool_name.clone(),
+            data.config.gcp_project.clone(),
+            cached,
+        )
     };
 
     // Return cached result if fresh enough
@@ -102,7 +144,9 @@ pub async fn get_vms(State(state): State<SharedState>) -> Json<serde_json::Value
 
     // Run gcloud list in a blocking task to avoid blocking the async runtime
     let current_vms = tokio::task::spawn_blocking(move || {
-        let client = crate::cloud::gcp::GcpClient::new();
+        let client = gcp_project
+            .map(crate::cloud::gcp::GcpClient::with_project)
+            .unwrap_or_default();
         client.list_instances(&pool_name)
     })
     .await;
@@ -219,6 +263,9 @@ pub async fn scale_cluster(
         binary_gcs_url,
         mut machine_type,
         mut spot,
+        public_ip,
+        manage_firewall,
+        worker_service_account,
     ) = {
         let data = state.lock().unwrap();
         (
@@ -231,6 +278,9 @@ pub async fn scale_cluster(
             data.update_fleet_url.clone(),
             data.config.machine_type.clone(),
             data.config.spot,
+            data.config.public_ip,
+            data.config.manage_firewall,
+            data.config.worker_service_account.clone(),
         )
     };
 
@@ -250,8 +300,11 @@ pub async fn scale_cluster(
 
     // Get current worker VMs
     let pool_name_clone = pool_name.clone();
+    let project_for_list = gcp_project.clone();
     let current_vms = tokio::task::spawn_blocking(move || {
-        let client = crate::cloud::gcp::GcpClient::new();
+        let client = project_for_list
+            .map(crate::cloud::gcp::GcpClient::with_project)
+            .unwrap_or_default();
         client.list_instances(&pool_name_clone)
     })
     .await;
@@ -344,6 +397,12 @@ pub async fn scale_cluster(
         if data.config.spot.is_none() {
             data.config.spot = spot;
         }
+        if data.config.public_ip.is_none() {
+            data.config.public_ip = public_ip;
+        }
+        if data.config.manage_firewall.is_none() {
+            data.config.manage_firewall = manage_firewall;
+        }
     }
 
     if target == current_count {
@@ -358,6 +417,7 @@ pub async fn scale_cluster(
     let zone = gcp_zone.unwrap_or_else(|| "us-central1-b".to_string());
     let machine_type = machine_type.unwrap_or_else(|| "n1-standard-4".to_string());
     let spot = spot.unwrap_or(true);
+    let public_ip = public_ip.unwrap_or(true);
 
     if target > current_count {
         // Scale UP: create new workers
@@ -402,21 +462,19 @@ pub async fn scale_cluster(
         let sub = subnet;
         let zone_clone = zone.clone();
 
-        let instance_setups: Vec<crate::cloud::InstanceSetup> = new_indices
-            .iter()
-            .map(|&i| crate::cloud::InstanceSetup {
-                name: format!("{}-worker-{}", pool_name, i),
-                machine_type: machine_type.clone(),
-                zone: zone_clone.clone(),
-                tags: vec![format!("genohype-worker,pool-{},role-worker", pool_name)],
-                startup_script: startup_script.clone(),
-                spot,
-                network: net.clone(),
-                subnet: sub.clone(),
-                project_id: project.clone(),
-                service_account: None,
-            })
-            .collect();
+        let instance_setups = build_worker_instance_setups(
+            &pool_name,
+            &new_indices,
+            &machine_type,
+            &zone_clone,
+            &startup_script,
+            spot,
+            net,
+            sub,
+            public_ip,
+            &project,
+            worker_service_account,
+        );
 
         // Invalidate VM cache so next poll picks up the new worker
         {
@@ -426,7 +484,11 @@ pub async fn scale_cluster(
 
         // Spawn creation in background
         tokio::task::spawn_blocking(move || {
-            let client = crate::cloud::gcp::GcpClient::new();
+            let client = if project.is_empty() {
+                crate::cloud::gcp::GcpClient::new()
+            } else {
+                crate::cloud::gcp::GcpClient::with_project(project)
+            };
             if let Err(e) = client.create_instances(&instance_setups) {
                 eprintln!("Failed to create instances: {}", e);
             }
@@ -484,7 +546,11 @@ pub async fn scale_cluster(
 
         // Spawn deletion in background
         tokio::task::spawn_blocking(move || {
-            let client = crate::cloud::gcp::GcpClient::new();
+            let client = if project.is_empty() {
+                crate::cloud::gcp::GcpClient::new()
+            } else {
+                crate::cloud::gcp::GcpClient::with_project(project.clone())
+            };
             if let Err(e) = client.delete_instances(&names_to_delete, &zone_clone, &project) {
                 eprintln!("Failed to delete instances: {}", e);
             }
@@ -499,5 +565,41 @@ pub async fn scale_cluster(
             previous_workers: current_count,
             target_workers: target,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_worker_instance_setups;
+
+    #[test]
+    fn zero_to_64_workers_preserves_private_identity_configuration() {
+        let indices: Vec<usize> = (0..64).collect();
+        let setups = build_worker_instance_setups(
+            "prototype",
+            &indices,
+            "c4-highcpu-48",
+            "us-central1-a",
+            "startup",
+            true,
+            Some("shared-vpc".into()),
+            Some("private-subnet".into()),
+            false,
+            "project",
+            Some("worker@project.iam.gserviceaccount.com".into()),
+        );
+
+        assert_eq!(setups.len(), 64);
+        assert_eq!(setups.first().unwrap().name, "prototype-worker-0");
+        assert_eq!(setups.last().unwrap().name, "prototype-worker-63");
+        assert!(setups.iter().all(|setup| !setup.public_ip));
+        assert!(setups
+            .iter()
+            .all(|setup| setup.network.as_deref() == Some("shared-vpc")));
+        assert!(setups
+            .iter()
+            .all(|setup| setup.subnet.as_deref() == Some("private-subnet")));
+        assert!(setups.iter().all(|setup| setup.service_account.as_deref()
+            == Some("worker@project.iam.gserviceaccount.com")));
     }
 }

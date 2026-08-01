@@ -14,7 +14,7 @@ pub enum PoolCommands {
         /// If a profile with this name exists in config, its settings are used as defaults
         name: String,
 
-        /// Number of worker VMs to create (default: 4, or from config profile)
+        /// Number of worker VMs to create (default: 0, or from config profile)
         #[arg(long)]
         workers: Option<usize>,
 
@@ -42,6 +42,14 @@ pub enum PoolCommands {
         #[arg(long)]
         subnet: Option<String>,
 
+        /// Assign external IP addresses to VMs (set false for private-only pools)
+        #[arg(long)]
+        public_ip: Option<bool>,
+
+        /// Create the per-pool coordinator firewall rule (set false when infrastructure manages it)
+        #[arg(long)]
+        manage_firewall: Option<bool>,
+
         /// Wait for VMs to be ready (startup script complete)
         #[arg(long)]
         wait: bool,
@@ -50,6 +58,10 @@ pub enum PoolCommands {
         #[arg(long)]
         skip_build: bool,
 
+        /// Path to a custom binary to deploy to workers (CLI overrides the pool profile)
+        #[arg(long)]
+        worker_binary: Option<String>,
+
         /// Create a dedicated coordinator node for distributed processing
         #[arg(long)]
         with_coordinator: bool,
@@ -57,6 +69,10 @@ pub enum PoolCommands {
         /// GCP service account email to attach to worker VMs
         #[arg(long)]
         service_account: Option<String>,
+
+        /// GCP service account email to attach to the coordinator VM
+        #[arg(long)]
+        coordinator_service_account: Option<String>,
     },
 
     /// Submit a job to run on the worker pool
@@ -125,6 +141,14 @@ pub enum PoolCommands {
         /// GCP zone (default: from config or us-central1-a)
         #[arg(long)]
         zone: Option<String>,
+
+        /// Assign external IP addresses to newly created workers
+        #[arg(long)]
+        public_ip: Option<bool>,
+
+        /// Preserve whether Genohype manages the coordinator firewall rule
+        #[arg(long)]
+        manage_firewall: Option<bool>,
 
         /// Path to the Linux-compiled binary (optional)
         #[arg(long)]
@@ -322,6 +346,18 @@ pub enum ServiceCommands {
         /// Subnet name
         #[arg(long)]
         cluster_subnet: Option<String>,
+
+        /// Whether cluster VMs receive external IP addresses
+        #[arg(long)]
+        cluster_public_ip: Option<bool>,
+
+        /// Whether Genohype manages the coordinator firewall rule
+        #[arg(long)]
+        cluster_manage_firewall: Option<bool>,
+
+        /// Service account attached to workers created by coordinator scaling
+        #[arg(long)]
+        cluster_worker_service_account: Option<String>,
     },
 
     /// Start a worker process (connects to coordinator for work)

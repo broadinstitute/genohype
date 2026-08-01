@@ -10,7 +10,7 @@
 //!
 //! The trade-off is requiring `gcloud` to be installed and configured.
 
-use super::{CloudProvider, Instance, PoolConfig};
+use super::{CloudProvider, Instance, InstanceSetup, PoolConfig};
 use crate::{HailError, Result};
 use rayon::prelude::*;
 use std::path::Path;
@@ -34,6 +34,127 @@ impl GcpClient {
         Self {
             project: Some(project),
         }
+    }
+
+    fn add_project_arg(&self, command: &mut Command) {
+        if let Some(project) = &self.project {
+            command.args(["--project", project]);
+        }
+    }
+
+    fn list_instances_command(&self, pool_name: &str) -> Command {
+        let mut command = Command::new("gcloud");
+        command.args([
+            "compute",
+            "instances",
+            "list",
+            "--filter",
+            &format!("tags.items:pool-{}", pool_name),
+            "--format",
+            "json(name,zone,status,networkInterfaces[].networkIP,networkInterfaces[].network,networkInterfaces[].subnetwork,machineType,scheduling.provisioningModel)",
+        ]);
+        self.add_project_arg(&mut command);
+        command
+    }
+
+    fn firewall_create_command(config: &PoolConfig) -> Option<Command> {
+        if !config.with_coordinator || !config.manage_firewall {
+            return None;
+        }
+
+        let mut command = Command::new("gcloud");
+        command.args([
+            "compute",
+            "firewall-rules",
+            "create",
+            &format!("allow-hail-coord-int-{}", config.name),
+            "--network",
+            config.network.as_deref().unwrap_or("default"),
+            "--allow",
+            "tcp:3000",
+            "--source-ranges",
+            "10.0.0.0/8",
+            "--project",
+            &config.project_id,
+            "--quiet",
+        ]);
+        Some(command)
+    }
+
+    fn instance_service_account(config: &PoolConfig, is_coordinator: bool) -> Option<String> {
+        if is_coordinator {
+            config
+                .coordinator_service_account
+                .clone()
+                .or_else(|| config.service_account.clone())
+        } else {
+            config.service_account.clone()
+        }
+    }
+
+    fn instance_create_command(setup: &InstanceSetup) -> Command {
+        let mut command = Command::new("gcloud");
+        command.args([
+            "compute",
+            "instances",
+            "create",
+            &setup.name,
+            "--project",
+            &setup.project_id,
+            "--zone",
+            &setup.zone,
+            "--machine-type",
+            &setup.machine_type,
+            "--image-family",
+            "ubuntu-2204-lts",
+            "--image-project",
+            "ubuntu-os-cloud",
+            "--tags",
+            &setup.tags.join(","),
+            "--metadata",
+            &format!("startup-script={}", setup.startup_script),
+            "--scopes",
+            "cloud-platform",
+        ]);
+        if setup.spot {
+            command.arg("--provisioning-model=SPOT");
+            command.arg("--instance-termination-action=STOP");
+        }
+        if let Some(network) = &setup.network {
+            command.args(["--network", network]);
+        }
+        if let Some(subnet) = &setup.subnet {
+            command.args(["--subnet", subnet]);
+        }
+        if !setup.public_ip {
+            command.arg("--no-address");
+        }
+        if let Some(service_account) = &setup.service_account {
+            command.arg(format!("--service-account={}", service_account));
+        }
+        command
+    }
+
+    fn scp_command(
+        &self,
+        local_path: &str,
+        remote_path: &str,
+        instance: &str,
+        zone: &str,
+    ) -> Command {
+        let mut command = Command::new("gcloud");
+        command.args([
+            "compute",
+            "scp",
+            local_path,
+            &format!("{}:{}", instance, remote_path),
+            "--zone",
+            zone,
+            "--tunnel-through-iap",
+            "--quiet",
+        ]);
+        self.add_project_arg(&mut command);
+        command
     }
 
     /// Check that gcloud CLI is installed and accessible.
@@ -112,19 +233,19 @@ impl GcpClient {
                 )));
             }
 
-            let output = Command::new("gcloud")
-                .args([
-                    "compute",
-                    "instances",
-                    "describe",
-                    instance,
-                    "--zone",
-                    zone,
-                    "--format",
-                    "value(status)",
-                ])
-                .output()
-                .map_err(HailError::Io)?;
+            let mut command = Command::new("gcloud");
+            command.args([
+                "compute",
+                "instances",
+                "describe",
+                instance,
+                "--zone",
+                zone,
+                "--format",
+                "value(status)",
+            ]);
+            self.add_project_arg(&mut command);
+            let output = command.output().map_err(HailError::Io)?;
 
             let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if status == "RUNNING" {
@@ -179,21 +300,34 @@ impl Default for GcpClient {
 }
 
 impl CloudProvider for GcpClient {
+    fn project_id(&self) -> Option<&str> {
+        self.project.as_deref()
+    }
+
     fn create_pool(&self, config: &PoolConfig) -> Result<()> {
         self.check_gcloud_installed()?;
 
         // Generate startup scripts (with optional binary download from GCS)
         // Workers auto-start and connect to coordinator via internal DNS
         let worker_script = super::startup::generate_worker_startup_script(
-            config.binary_gcs_url.as_deref(),
+            config
+                .worker_binary_gcs_url
+                .as_deref()
+                .or(config.binary_gcs_url.as_deref()),
             &config.name,
         );
         // Coordinator auto-starts if binary is provided
         let cluster_cfg = super::startup::CoordinatorClusterConfig {
+            pool_name: Some(&config.name),
+            project: Some(&config.project_id),
+            zone: Some(&config.zone),
             machine_type: Some(&config.machine_type),
             spot: Some(config.spot),
             network: config.network.as_deref(),
             subnet: config.subnet.as_deref(),
+            public_ip: Some(config.public_ip),
+            manage_firewall: Some(config.manage_firewall),
+            worker_service_account: config.service_account.as_deref(),
         };
         let coordinator_script = super::startup::generate_coordinator_startup_script_with_cluster(
             config.wireguard.as_ref(),
@@ -223,86 +357,37 @@ impl CloudProvider for GcpClient {
             ));
         }
 
-        // Auto-create firewall rule for coordinator port if needed
-        if config.with_coordinator {
-            let firewall_name = format!("allow-hail-coord-int-{}", config.name);
-            let network = config.network.as_deref().unwrap_or("default");
-            // Try to create firewall rule (ignore error if it already exists)
-            let _ = Command::new("gcloud")
-                .args([
-                    "compute",
-                    "firewall-rules",
-                    "create",
-                    &firewall_name,
-                    "--network",
-                    network,
-                    "--allow",
-                    "tcp:3000",
-                    "--source-ranges",
-                    "10.0.0.0/8",
-                    "--project",
-                    &config.project_id,
-                    "--quiet",
-                ])
-                .output();
+        // Auto-create firewall rule for coordinator port unless infrastructure manages it.
+        if let Some(mut command) = Self::firewall_create_command(config) {
+            // Preserve legacy best-effort behavior for existing users.
+            let _ = command.output();
         }
 
         // Create instances in parallel using rayon
         let results: Vec<Result<()>> = instance_configs
             .into_par_iter()
             .map(|(instance_name, tags, startup_script)| {
-                let mut cmd = Command::new("gcloud");
-
-                // Use a smaller machine for coordinator (it just routes work)
-                let machine_type = if instance_name.ends_with("-coordinator") {
-                    "e2-standard-2"
-                } else {
-                    &config.machine_type
+                let is_coordinator = instance_name.ends_with("-coordinator");
+                let setup = InstanceSetup {
+                    name: instance_name.clone(),
+                    machine_type: if is_coordinator {
+                        "e2-standard-2".to_string()
+                    } else {
+                        config.machine_type.clone()
+                    },
+                    zone: config.zone.clone(),
+                    tags: vec![tags],
+                    startup_script,
+                    spot: config.spot && !is_coordinator,
+                    network: config.network.clone(),
+                    subnet: config.subnet.clone(),
+                    public_ip: config.public_ip,
+                    project_id: config.project_id.clone(),
+                    service_account: Self::instance_service_account(config, is_coordinator),
                 };
-
-                cmd.args([
-                    "compute",
-                    "instances",
-                    "create",
-                    &instance_name,
-                    "--project",
-                    &config.project_id,
-                    "--zone",
-                    &config.zone,
-                    "--machine-type",
-                    machine_type,
-                    "--image-family",
-                    "ubuntu-2204-lts",
-                    "--image-project",
-                    "ubuntu-os-cloud",
-                    "--tags",
-                    &tags,
-                    "--metadata",
-                    &format!("startup-script={}", startup_script),
-                    "--scopes",
-                    "cloud-platform", // Allow access to GCS and Secret Manager
-                ]);
-
-                // Use Spot for workers if requested, but keep coordinator on standard VM
-                if config.spot && !instance_name.ends_with("-coordinator") {
-                    cmd.arg("--provisioning-model=SPOT");
-                    cmd.arg("--instance-termination-action=STOP");
-                }
-
-                // Network configuration
-                if let Some(ref network) = config.network {
-                    cmd.args(["--network", network]);
-                }
-                if let Some(ref subnet) = config.subnet {
-                    cmd.args(["--subnet", subnet]);
-                }
-
-                // Service account
-                if let Some(ref sa) = config.service_account {
-                    cmd.arg(format!("--service-account={}", sa));
-                }
-
-                let output = cmd.output().map_err(HailError::Io)?;
+                let output = Self::instance_create_command(&setup)
+                    .output()
+                    .map_err(HailError::Io)?;
 
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -325,16 +410,8 @@ impl CloudProvider for GcpClient {
     }
 
     fn list_instances(&self, pool_name: &str) -> Result<Vec<Instance>> {
-        let output = Command::new("gcloud")
-            .args([
-                "compute",
-                "instances",
-                "list",
-                "--filter",
-                &format!("tags.items:pool-{}", pool_name),
-                "--format",
-                "json(name,zone,status,networkInterfaces[].networkIP,networkInterfaces[].network,networkInterfaces[].subnetwork,machineType,scheduling.provisioningModel)",
-            ])
+        let output = self
+            .list_instances_command(pool_name)
             .output()
             .map_err(HailError::Io)?;
 
@@ -363,12 +440,13 @@ impl CloudProvider for GcpClient {
         let instance_names: Vec<&str> = instances.iter().map(|i| i.name.as_str()).collect();
 
         // gcloud supports bulk delete
-        let status = Command::new("gcloud")
+        let mut command = Command::new("gcloud");
+        command
             .args(["compute", "instances", "delete"])
             .args(&instance_names)
-            .args(["--zone", zone, "--quiet"])
-            .status()
-            .map_err(HailError::Io)?;
+            .args(["--zone", zone, "--quiet"]);
+        self.add_project_arg(&mut command);
+        let status = command.status().map_err(HailError::Io)?;
 
         if !status.success() {
             return Err(HailError::Io(std::io::Error::new(
@@ -391,49 +469,9 @@ impl CloudProvider for GcpClient {
         let results: Vec<Result<()>> = instances
             .par_iter()
             .map(|setup| {
-                let mut cmd = Command::new("gcloud");
-
-                cmd.args([
-                    "compute",
-                    "instances",
-                    "create",
-                    &setup.name,
-                    "--project",
-                    &setup.project_id,
-                    "--zone",
-                    &setup.zone,
-                    "--machine-type",
-                    &setup.machine_type,
-                    "--image-family",
-                    "ubuntu-2204-lts",
-                    "--image-project",
-                    "ubuntu-os-cloud",
-                    "--tags",
-                    &setup.tags.join(","),
-                    "--metadata",
-                    &format!("startup-script={}", setup.startup_script),
-                    "--scopes",
-                    "cloud-platform",
-                ]);
-
-                if setup.spot {
-                    cmd.arg("--provisioning-model=SPOT");
-                    cmd.arg("--instance-termination-action=STOP");
-                }
-
-                if let Some(ref network) = setup.network {
-                    cmd.args(["--network", network]);
-                }
-                if let Some(ref subnet) = setup.subnet {
-                    cmd.args(["--subnet", subnet]);
-                }
-
-                // Service account
-                if let Some(ref sa) = setup.service_account {
-                    cmd.arg(format!("--service-account={}", sa));
-                }
-
-                let output = cmd.output().map_err(HailError::Io)?;
+                let output = Self::instance_create_command(setup)
+                    .output()
+                    .map_err(HailError::Io)?;
 
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -477,6 +515,27 @@ impl CloudProvider for GcpClient {
         Ok(())
     }
 
+    fn stop_instances(&self, names: &[String], zone: &str) -> Result<()> {
+        if names.is_empty() {
+            return Ok(());
+        }
+
+        let mut command = Command::new("gcloud");
+        command
+            .args(["compute", "instances", "stop"])
+            .args(names)
+            .args(["--zone", zone, "--quiet"]);
+        self.add_project_arg(&mut command);
+        let status = command.status().map_err(HailError::Io)?;
+        if !status.success() {
+            return Err(HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Failed to stop instances",
+            )));
+        }
+        Ok(())
+    }
+
     fn upload_file(
         &self,
         local_path: &Path,
@@ -491,17 +550,8 @@ impl CloudProvider for GcpClient {
             ))
         })?;
 
-        let status = Command::new("gcloud")
-            .args([
-                "compute",
-                "scp",
-                local_str,
-                &format!("{}:{}", instance, remote_path),
-                "--zone",
-                zone,
-                "--tunnel-through-iap",
-                "--quiet",
-            ])
+        let status = self
+            .scp_command(local_str, remote_path, instance, zone)
             .status()
             .map_err(HailError::Io)?;
 
@@ -528,6 +578,7 @@ impl CloudProvider for GcpClient {
             command,
             "--quiet",
         ]);
+        self.add_project_arg(&mut cmd);
         cmd
     }
 }
@@ -544,6 +595,213 @@ mod tests {
 
         let client = GcpClient::with_project("my-project".to_string());
         assert_eq!(client.project, Some("my-project".to_string()));
+    }
+
+    fn args(command: &Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn assert_project_arg(command: &Command, expected: &str) {
+        let args = args(command);
+        let position = args.iter().position(|arg| arg == "--project").unwrap();
+        assert_eq!(args.get(position + 1).map(String::as_str), Some(expected));
+    }
+
+    #[test]
+    fn configured_project_is_added_to_discovery_ssh_and_scp() {
+        let client = GcpClient::with_project("configured-project".to_string());
+
+        assert_project_arg(&client.list_instances_command("demo"), "configured-project");
+        assert_project_arg(
+            &client.get_ssh_command("demo-coordinator", "us-central1-a", "true"),
+            "configured-project",
+        );
+        assert_project_arg(
+            &client.scp_command(
+                "/tmp/local",
+                "/tmp/remote",
+                "demo-worker-0",
+                "us-central1-a",
+            ),
+            "configured-project",
+        );
+    }
+
+    #[test]
+    fn ambient_project_fallback_does_not_add_an_override() {
+        let client = GcpClient::new();
+        assert!(!args(&client.list_instances_command("demo"))
+            .iter()
+            .any(|arg| arg == "--project"));
+    }
+
+    #[test]
+    fn test_custom_worker_and_stock_coordinator_use_separate_artifacts() {
+        let config = PoolConfig {
+            name: "demo".into(),
+            worker_count: 1,
+            machine_type: "e2-standard-2".into(),
+            zone: "us-central1-a".into(),
+            spot: true,
+            project_id: "project".into(),
+            network: None,
+            subnet: None,
+            public_ip: true,
+            manage_firewall: true,
+            with_coordinator: true,
+            wireguard: None,
+            pool_db_path: None,
+            binary_gcs_url: Some("gs://bucket/stock-coordinator".into()),
+            worker_binary_gcs_url: Some("gs://bucket/custom-worker".into()),
+            service_account: None,
+            coordinator_service_account: None,
+        };
+
+        let worker = super::super::startup::generate_worker_startup_script(
+            config.worker_binary_gcs_url.as_deref(),
+            &config.name,
+        );
+        let coordinator = super::super::startup::generate_coordinator_startup_script(
+            None,
+            config.binary_gcs_url.as_deref(),
+            None,
+        );
+        assert!(worker.contains("gs://bucket/custom-worker"));
+        assert!(!worker.contains("stock-coordinator"));
+        assert!(coordinator.contains("gs://bucket/stock-coordinator"));
+        assert!(!coordinator.contains("custom-worker"));
+    }
+
+    fn pool_config(public_ip: bool, manage_firewall: bool) -> PoolConfig {
+        PoolConfig {
+            name: "demo".into(),
+            worker_count: 1,
+            machine_type: "e2-standard-2".into(),
+            zone: "us-central1-a".into(),
+            spot: false,
+            project_id: "project".into(),
+            network: Some("network".into()),
+            subnet: Some("subnet".into()),
+            public_ip,
+            manage_firewall,
+            with_coordinator: true,
+            wireguard: None,
+            pool_db_path: None,
+            binary_gcs_url: None,
+            worker_binary_gcs_url: None,
+            service_account: None,
+            coordinator_service_account: None,
+        }
+    }
+
+    fn instance_create_args_for(config: &PoolConfig, is_coordinator: bool) -> Vec<String> {
+        let setup = InstanceSetup {
+            name: if is_coordinator {
+                "demo-coordinator".into()
+            } else {
+                "demo-worker-0".into()
+            },
+            machine_type: config.machine_type.clone(),
+            zone: config.zone.clone(),
+            tags: vec![],
+            startup_script: "true".into(),
+            spot: config.spot,
+            network: config.network.clone(),
+            subnet: config.subnet.clone(),
+            public_ip: config.public_ip,
+            project_id: config.project_id.clone(),
+            service_account: GcpClient::instance_service_account(config, is_coordinator),
+        };
+        args(&GcpClient::instance_create_command(&setup))
+    }
+
+    #[test]
+    fn legacy_service_account_is_attached_to_coordinator_and_worker_commands() {
+        let mut config = pool_config(false, false);
+        config.service_account = Some("legacy@project.iam.gserviceaccount.com".into());
+
+        for is_coordinator in [true, false] {
+            assert!(instance_create_args_for(&config, is_coordinator)
+                .iter()
+                .any(|arg| arg == "--service-account=legacy@project.iam.gserviceaccount.com"));
+        }
+    }
+
+    #[test]
+    fn coordinator_and_worker_commands_use_separate_service_accounts() {
+        let mut config = pool_config(false, false);
+        config.service_account = Some("worker@project.iam.gserviceaccount.com".into());
+        config.coordinator_service_account =
+            Some("coordinator@project.iam.gserviceaccount.com".into());
+
+        let worker = instance_create_args_for(&config, false);
+        assert!(worker
+            .iter()
+            .any(|arg| arg == "--service-account=worker@project.iam.gserviceaccount.com"));
+        let coordinator = instance_create_args_for(&config, true);
+        assert!(coordinator
+            .iter()
+            .any(|arg| arg == "--service-account=coordinator@project.iam.gserviceaccount.com"));
+        assert!(!coordinator
+            .iter()
+            .any(|arg| arg == "--service-account=worker@project.iam.gserviceaccount.com"));
+    }
+
+    #[test]
+    fn private_instances_use_no_address_for_create_and_scale_paths() {
+        let config = pool_config(false, false);
+        let setup = InstanceSetup {
+            name: "demo-worker-0".into(),
+            machine_type: config.machine_type.clone(),
+            zone: config.zone.clone(),
+            tags: vec!["genohype-worker".into()],
+            startup_script: "true".into(),
+            spot: false,
+            network: config.network.clone(),
+            subnet: config.subnet.clone(),
+            public_ip: config.public_ip,
+            project_id: config.project_id.clone(),
+            service_account: None,
+        };
+
+        let command_args = args(&GcpClient::instance_create_command(&setup));
+        assert!(command_args.iter().any(|arg| arg == "--no-address"));
+        assert!(command_args
+            .windows(2)
+            .any(|args| args == ["--network", "network"]));
+        assert!(command_args
+            .windows(2)
+            .any(|args| args == ["--subnet", "subnet"]));
+    }
+
+    #[test]
+    fn preconfigured_networking_skips_firewall_command() {
+        assert!(GcpClient::firewall_create_command(&pool_config(false, false)).is_none());
+    }
+
+    #[test]
+    fn legacy_networking_defaults_keep_address_and_firewall_management() {
+        let config = pool_config(true, true);
+        let setup = InstanceSetup {
+            name: "demo-worker-0".into(),
+            machine_type: config.machine_type.clone(),
+            zone: config.zone.clone(),
+            tags: vec![],
+            startup_script: "true".into(),
+            spot: false,
+            network: None,
+            subnet: None,
+            public_ip: config.public_ip,
+            project_id: config.project_id.clone(),
+            service_account: None,
+        };
+        assert!(!args(&GcpClient::instance_create_command(&setup))
+            .iter()
+            .any(|arg| arg == "--no-address"));
+        assert!(GcpClient::firewall_create_command(&config).is_some());
     }
 
     #[test]

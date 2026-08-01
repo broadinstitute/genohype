@@ -137,6 +137,7 @@ pub(crate) fn check_stuck_job(state: &SharedState, timeout_secs: u64) {
         // Reset state
         data.pending_partitions.clear();
         data.processing_partitions.clear();
+        data.custom_assignments.clear();
         data.job_state = JobExecutionState::Standard;
         data.active_tasks.clear();
         // Note: We intentionally keep current_job_id so the dashboard continues
@@ -160,6 +161,8 @@ pub(crate) fn check_timeouts(state: &SharedState, timeout_secs: u64) {
 
     for (part_id, worker, start_time) in timed_out {
         data.processing_partitions.remove(&part_id);
+        data.custom_assignments
+            .retain(|_, assignment| assignment.partition_id != part_id);
 
         // Track the wasted time from this timeout
         let elapsed_secs = now.duration_since(start_time).as_secs_f64();

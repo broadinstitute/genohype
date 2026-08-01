@@ -17,7 +17,82 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Instant;
 
+const WORKER_FRESHNESS_SECS: f64 = 15.0;
+const LOG_TAIL_UNHEALTHY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn worker_is_fresh(worker: &crate::distributed::message::DashboardWorker) -> bool {
+    worker.status != "suspected_dead" && worker.last_seen_secs <= WORKER_FRESHNESS_SECS
+}
+
+fn require_idle_summary(summary_json: &str) -> Result<()> {
+    let summary: crate::distributed::message::DashboardSummary = serde_json::from_str(summary_json)
+        .map_err(|error| {
+            HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Invalid coordinator summary: {error}"),
+            ))
+        })?;
+    if summary.idle {
+        Ok(())
+    } else {
+        Err(HailError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "Coordinator already has a job running. Use --force to supersede.",
+        )))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TailHealth {
+    Healthy,
+    NoWorkers,
+    CoordinatorUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TailFailure {
+    NoWorkers,
+    CoordinatorUnavailable,
+    StreamEnded,
+}
+
+#[derive(Default)]
+struct TailWatchdog {
+    unhealthy_since: Option<Instant>,
+}
+
+impl TailWatchdog {
+    fn observe(&mut self, health: TailHealth, now: Instant) -> Option<TailFailure> {
+        if health == TailHealth::Healthy {
+            self.unhealthy_since = None;
+            return None;
+        }
+
+        let since = self.unhealthy_since.get_or_insert(now);
+        if now.duration_since(*since) < LOG_TAIL_UNHEALTHY_TIMEOUT {
+            return None;
+        }
+
+        Some(match health {
+            TailHealth::NoWorkers => TailFailure::NoWorkers,
+            TailHealth::CoordinatorUnavailable => TailFailure::CoordinatorUnavailable,
+            TailHealth::Healthy => unreachable!(),
+        })
+    }
+}
+
 impl<P: CloudProvider + Sync> PoolManager<P> {
+    fn ensure_coordinator_idle(&self, coordinator: &Instance, zone: &str) -> Result<()> {
+        let summary_json = self
+            .fetch_coordinator_api(coordinator, zone, "/api/dashboard/summary", 3000)
+            .map_err(|error| {
+                HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    format!("Could not verify that the coordinator is idle: {error}"),
+                ))
+            })?;
+        require_idle_summary(&summary_json)
+    }
     /// Start coordinator in idle mode (binary already deployed via startup script or needs deployment).
     pub(crate) fn start_idle_coordinator(
         &self,
@@ -26,6 +101,9 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         _skip_build: bool,
         pool_db_path: Option<&str>,
         binary_deployed_via_startup: bool,
+        worker_binary: Option<&std::path::Path>,
+        worker_deployed_via_startup: bool,
+        pool_config: &crate::cloud::PoolConfig,
     ) -> Result<()> {
         // Get coordinator instance
         let instances = self.provider.list_instances(pool_name)?;
@@ -96,6 +174,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             let backup_arg = pool_db_path
                 .map(|b| format!(" --backup-path {}", b))
                 .unwrap_or_default();
+            let identity_args = self.coordinator_pool_args(pool_config);
             let coord_cmd = format!(
                 "sudo bash -c 'cat > /etc/systemd/system/genohype-coordinator.service << EOF
 [Unit]
@@ -105,7 +184,7 @@ After=network.target
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/local/bin/genohype service start-coordinator --port 3000 --db-path /var/lib/genohype/ops.db{}
+ExecStart=/usr/local/bin/genohype service start-coordinator --port 3000 --db-path /var/lib/genohype/ops.db{}{}
 Restart=always
 RestartSec=3
 StartLimitIntervalSec=0
@@ -114,7 +193,7 @@ StartLimitIntervalSec=0
 WantedBy=multi-user.target
 EOF
 ' && sudo systemctl daemon-reload && sudo systemctl enable --now genohype-coordinator",
-                backup_arg
+                backup_arg, identity_args
             );
 
             let status = self
@@ -148,15 +227,27 @@ EOF
             .collect();
 
         if !workers.is_empty() {
-            if binary_deployed_via_startup {
-                // Workers should already be running from startup script
+            if let Some(custom_worker) = worker_binary {
+                if !worker_deployed_via_startup {
+                    println!("{}", "Deploying custom worker via SCP...".dimmed());
+                    self.deploy_binary(custom_worker, &workers, zone)?;
+                }
+                // Always rewrite, enable, and restart the unit. This also recovers a
+                // service that exited between VM readiness and the first submission.
+                self.start_worker_services(&workers, coord_ip, zone)?;
                 println!(
-                    "{} {} workers started via startup script",
+                    "{} Custom binary deployed and {} worker(s) started",
+                    "OK".green().bold(),
+                    workers.len()
+                );
+            } else if worker_deployed_via_startup {
+                self.start_worker_services(&workers, coord_ip, zone)?;
+                println!(
+                    "{} {} workers verified and restarted",
                     "OK".green().bold(),
                     workers.len()
                 );
             } else {
-                // Fallback: deploy binary and start workers via coordinator
                 println!(
                     "{}",
                     "Deploying binary and starting workers via coordinator...".dimmed()
@@ -386,6 +477,13 @@ EOF
         // Auto-detect distributed mode: use coordinator/worker pattern when coordinator exists
         let use_distributed = coordinator.is_some();
 
+        if worker_binary.is_some() && !use_distributed {
+            return Err(HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Custom workers require a running coordinator",
+            )));
+        }
+
         // Validate we have workers for distributed mode
         if use_distributed && total_workers == 0 {
             return Err(HailError::Io(std::io::Error::new(
@@ -410,10 +508,36 @@ EOF
             }
         );
 
-        // 3. Deploy binary - auto-skip if coordinator is already running (binary was deployed earlier)
-        let should_deploy = if use_distributed {
+        // 3. Deploy binary. A custom worker is independent of the stock
+        // coordinator and must be deployed even when that coordinator is healthy.
+        let coordinator_running = coordinator
+            .as_ref()
+            .map(|coord| self.check_coordinator_status(coord, zone))
+            .unwrap_or(false);
+        // Binary deployment restarts services. Refuse to disrupt an existing job,
+        // and fail closed when its state cannot be verified.
+        if coordinator_running && !force && (force_redeploy || worker_binary.is_some()) {
+            self.ensure_coordinator_idle(coordinator.as_ref().unwrap(), zone)?;
+        }
+        if use_distributed && coordinator_running && !force_redeploy && worker_binary.is_some() {
             let coord = coordinator.as_ref().unwrap();
-            let coord_running = self.check_coordinator_status(coord, zone);
+            let coord_ip = coord.ip().ok_or_else(|| {
+                HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Coordinator {} has no internal IP", coord.name),
+                ))
+            })?;
+            let custom_worker = worker_binary.as_ref().unwrap();
+            println!(
+                "{} Coordinator is healthy; deploying custom worker binary only...",
+                "Setup:".cyan()
+            );
+            self.deploy_binary(custom_worker, &workers, zone)?;
+            self.start_worker_services(&workers, coord_ip, zone)?;
+        }
+
+        let should_deploy = if use_distributed {
+            let coord_running = coordinator_running;
             if coord_running && !force_redeploy {
                 // Coordinator already running = binary already deployed
                 println!(
@@ -443,7 +567,8 @@ EOF
             // Try to stage binary to GCS for fast updates
             let pool_db_path = config.and_then(|c| c.pool_db_path.as_deref());
             let staging_url = if let Some(db_path) = pool_db_path {
-                self.stage_binary_to_gcs(binary, db_path).ok()
+                self.stage_binary_to_gcs(binary, db_path, "genohype-coordinator")
+                    .ok()
             } else {
                 None
             };
@@ -451,7 +576,8 @@ EOF
             // Stage worker binary to GCS separately if it differs from coordinator binary
             let worker_staging_url = if let Some(ref wb) = worker_binary {
                 if let Some(db_path) = pool_db_path {
-                    self.stage_binary_to_gcs(wb, db_path).ok()
+                    self.stage_binary_to_gcs(wb, db_path, "genohype-worker-custom")
+                        .ok()
                 } else {
                     None
                 }
@@ -501,6 +627,7 @@ EOF
                 let backup_arg = pool_db_path
                     .map(|b| format!(" --backup-path {}", b))
                     .unwrap_or_default();
+                let identity_args = self.coordinator_scaling_args(name, zone, config);
                 let coord_cmd = format!(
                     "sudo bash -c 'cat > /etc/systemd/system/genohype-coordinator.service << EOF
 [Unit]
@@ -510,7 +637,7 @@ After=network.target
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/local/bin/genohype service start-coordinator --port 3000 --db-path /var/lib/genohype/ops.db{}
+ExecStart=/usr/local/bin/genohype service start-coordinator --port 3000 --db-path /var/lib/genohype/ops.db{}{}
 Restart=always
 RestartSec=3
 StartLimitIntervalSec=0
@@ -519,7 +646,7 @@ StartLimitIntervalSec=0
 WantedBy=multi-user.target
 EOF
 ' && sudo systemctl daemon-reload && sudo systemctl restart genohype-coordinator",
-                    backup_arg
+                    backup_arg, identity_args
                 );
                 let status = self
                     .provider
@@ -579,6 +706,9 @@ EOF
                             workers.len()
                         );
                     }
+                    // Whether the binary arrived through fleet update or SCP, make
+                    // the unit deterministic and active before accepting a job.
+                    self.start_worker_services(&workers, coord_ip, zone)?;
                 } else {
                     // Same binary for coordinator and workers
                     if let Some(ref gcs_url) = staging_url {
@@ -866,7 +996,7 @@ EOF
     /// 6. Streams coordinator logs for progress monitoring
     pub(crate) fn submit_distributed(
         &self,
-        _pool_name: &str,
+        pool_name: &str,
         zone: &str,
         coordinator: &Instance,
         workers: &[Instance],
@@ -1156,7 +1286,19 @@ EOF
                 coord_ip
             );
 
-            // Check how many workers are already connected (they may have started via startup script)
+            // Do not disrupt an existing job merely to discover that submission
+            // needs --force. Forced replacement intentionally restarts workers.
+            if !force {
+                self.ensure_coordinator_idle(coordinator, zone)?;
+            }
+
+            // Reinstall/enable/restart every unit before submission. The
+            // coordinator registry can look healthy for 30 seconds after a worker
+            // exits, which previously left a release smoke at 0/N indefinitely.
+            self.start_worker_services(workers, coord_ip, zone)?;
+            std::thread::sleep(std::time::Duration::from_secs(3));
+
+            // Only count recent heartbeats; a non-dead status alone can be stale.
             let mut connected_count = 0;
             if let Ok(workers_json) =
                 self.fetch_coordinator_api(coordinator, zone, "/api/dashboard/workers", 3000)
@@ -1165,10 +1307,7 @@ EOF
                     Vec<crate::distributed::message::DashboardWorker>,
                 >(&workers_json)
                 {
-                    connected_count = worker_list
-                        .iter()
-                        .filter(|w| w.status != "suspected_dead")
-                        .count();
+                    connected_count = worker_list.iter().filter(|w| worker_is_fresh(w)).count();
                 }
             }
 
@@ -1277,6 +1416,7 @@ EOF
                 .and_then(|c| c.pool_db_path.as_deref())
                 .map(|b| format!(" --backup-path {}", b))
                 .unwrap_or_default();
+            let identity_args = self.coordinator_scaling_args(pool_name, zone, config);
             let coord_cmd = format!(
                 "sudo bash -c 'cat > /etc/systemd/system/genohype-coordinator.service << EOF
 [Unit]
@@ -1286,7 +1426,7 @@ After=network.target
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/local/bin/genohype service start-coordinator --port 3000 --db-path /var/lib/genohype/ops.db{}
+ExecStart=/usr/local/bin/genohype service start-coordinator --port 3000 --db-path /var/lib/genohype/ops.db{}{}
 Restart=always
 RestartSec=3
 StartLimitIntervalSec=0
@@ -1295,7 +1435,7 @@ StartLimitIntervalSec=0
 WantedBy=multi-user.target
 EOF
 ' && sudo systemctl daemon-reload && sudo systemctl enable --now genohype-coordinator",
-                backup_arg
+                backup_arg, identity_args
             );
 
             let status = self
@@ -1342,10 +1482,7 @@ EOF
                     Vec<crate::distributed::message::DashboardWorker>,
                 >(&workers_json)
                 {
-                    connected_count = worker_list
-                        .iter()
-                        .filter(|w| w.status != "suspected_dead")
-                        .count();
+                    connected_count = worker_list.iter().filter(|w| worker_is_fresh(w)).count();
                 }
             }
 
@@ -1412,7 +1549,7 @@ EOF
         );
 
         log_cmd.stdout(std::process::Stdio::piped());
-        log_cmd.stderr(std::process::Stdio::piped());
+        log_cmd.stderr(std::process::Stdio::null());
 
         let mut child = log_cmd.spawn().map_err(|e| {
             HailError::Io(std::io::Error::new(
@@ -1421,35 +1558,102 @@ EOF
             ))
         })?;
 
-        let job_failed = if let Some(stdout) = child.stdout.take() {
+        let (job_failed, tail_failure) = if let Some(stdout) = child.stdout.take() {
             use std::io::BufRead;
-            let reader = std::io::BufReader::new(stdout);
-            let mut failed = false;
-            for line in reader.lines() {
-                match line {
-                    Ok(line) => {
-                        println!("{}", line);
-                        if line.contains("Job complete. Coordinator returning to idle mode") {
-                            println!();
-                            println!("{} Job complete, exiting log stream.", "OK".green().bold());
-                            break;
-                        }
-                        if line.contains("Job finished with") && line.contains("failed") {
-                            failed = true;
-                        }
+            use std::sync::mpsc::RecvTimeoutError;
+            use std::time::Duration;
+
+            let (line_tx, line_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                for line in std::io::BufReader::new(stdout).lines() {
+                    if line_tx.send(line).is_err() {
+                        break;
                     }
-                    Err(_) => break,
+                }
+            });
+
+            let mut failed = false;
+            let mut complete = false;
+            let mut failure = None;
+            let mut watchdog = TailWatchdog::default();
+            let mut last_health_check = Instant::now() - Duration::from_secs(10);
+
+            while !complete {
+                match line_rx.recv_timeout(Duration::from_secs(1)) {
+                    Ok(Ok(line)) => {
+                        println!("{}", line);
+                        complete =
+                            line.contains("Job complete. Coordinator returning to idle mode");
+                        failed |= line.contains("Job finished with") && line.contains("failed");
+                    }
+                    Ok(Err(_)) | Err(RecvTimeoutError::Disconnected) => {
+                        failure = Some(TailFailure::StreamEnded);
+                        break;
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                }
+
+                if complete {
+                    break;
+                }
+
+                if last_health_check.elapsed() >= Duration::from_secs(5) {
+                    last_health_check = Instant::now();
+                    let health = match self.fetch_coordinator_api(
+                        coordinator,
+                        zone,
+                        "/api/dashboard/workers",
+                        3000,
+                    ) {
+                        Ok(json) => match serde_json::from_str::<
+                            Vec<crate::distributed::message::DashboardWorker>,
+                        >(&json)
+                        {
+                            Ok(worker_list) if worker_list.iter().any(worker_is_fresh) => {
+                                TailHealth::Healthy
+                            }
+                            Ok(_) => TailHealth::NoWorkers,
+                            Err(_) => TailHealth::CoordinatorUnavailable,
+                        },
+                        Err(_) => TailHealth::CoordinatorUnavailable,
+                    };
+
+                    if let Some(reason) = watchdog.observe(health, Instant::now()) {
+                        failure = Some(reason);
+                        break;
+                    }
                 }
             }
-            // Kill the SSH/journalctl process since we're done reading
+
             let _ = child.kill();
             let _ = child.wait();
-            failed
+            if complete {
+                println!();
+                println!("{} Job complete, exiting log stream.", "OK".green().bold());
+                failure = None;
+            }
+            (failed, failure)
         } else {
-            // Fallback: no stdout captured, just wait (shouldn't happen)
+            let _ = child.kill();
             let _ = child.wait();
-            false
+            (false, Some(TailFailure::StreamEnded))
         };
+
+        if let Some(failure) = tail_failure {
+            let message = match failure {
+                TailFailure::NoWorkers => {
+                    "All workers stopped heartbeating for 30 seconds; aborting log tail"
+                }
+                TailFailure::CoordinatorUnavailable => {
+                    "Coordinator monitoring was unavailable for 30 seconds; aborting log tail"
+                }
+                TailFailure::StreamEnded => "Coordinator log stream ended before job completion",
+            };
+            return Err(HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                message,
+            )));
+        }
 
         if job_failed {
             return Err(HailError::Io(std::io::Error::new(
@@ -1472,22 +1676,12 @@ EOF
                 "{}",
                 "Job finished. Stopping pool instances (--auto-stop)...".yellow()
             );
-            let mut stop_cmd = std::process::Command::new("gcloud");
-            stop_cmd.args(["compute", "instances", "stop"]);
+            let mut instance_names = vec![coordinator.name.clone()];
+            instance_names.extend(workers.iter().map(|worker| worker.name.clone()));
 
-            let mut instance_names = vec![coordinator.name.as_str()];
-            for w in workers {
-                instance_names.push(&w.name);
-            }
-
-            stop_cmd.args(&instance_names);
-            stop_cmd.args(["--zone", zone, "--quiet"]);
-
-            match stop_cmd.status() {
-                Ok(s) if s.success() => {
-                    println!("{} Instances stopped.", "OK".green().bold())
-                }
-                _ => eprintln!("{} Failed to stop instances.", "Error:".red()),
+            match self.provider.stop_instances(&instance_names, zone) {
+                Ok(()) => println!("{} Instances stopped.", "OK".green().bold()),
+                Err(_) => eprintln!("{} Failed to stop instances.", "Error:".red()),
             }
         }
 
@@ -1510,7 +1704,9 @@ EOF
                     "sudo bash -c 'cat > /etc/systemd/system/genohype-worker.service << EOF
 [Unit]
 Description=Genohype Worker
-After=network.target
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -1518,12 +1714,11 @@ User=root
 ExecStart=/usr/local/bin/genohype service start-worker --url http://{}:3000 --worker-id {}
 Restart=always
 RestartSec=3
-StartLimitIntervalSec=0
 
 [Install]
 WantedBy=multi-user.target
 EOF
-' && sudo systemctl daemon-reload && sudo systemctl restart genohype-worker",
+' && sudo systemctl daemon-reload && sudo systemctl enable genohype-worker && sudo systemctl restart genohype-worker && sudo systemctl is-active --quiet genohype-worker",
                     coord_ip, worker.name
                 );
 
@@ -1672,5 +1867,101 @@ EOF
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    fn dashboard_worker(
+        status: &str,
+        last_seen_secs: f64,
+    ) -> crate::distributed::message::DashboardWorker {
+        crate::distributed::message::DashboardWorker {
+            worker_id: "worker-0".into(),
+            status: status.into(),
+            current_batch_size: None,
+            max_batch_capacity: None,
+            last_seen_secs,
+            telemetry: None,
+            total_items: 0,
+            tasks_completed: 0,
+            current_task: None,
+            build_version: None,
+            effective_status: None,
+        }
+    }
+
+    #[test]
+    fn stale_registry_entry_is_not_treated_as_connected() {
+        assert!(worker_is_fresh(&dashboard_worker("idle", 1.0)));
+        assert!(!worker_is_fresh(&dashboard_worker("idle", 16.0)));
+        assert!(!worker_is_fresh(&dashboard_worker("suspected_dead", 1.0)));
+    }
+
+    fn summary_json(idle: bool) -> String {
+        serde_json::json!({
+            "progress_percent": 0.0,
+            "total_tasks": 0,
+            "completed_tasks": 0,
+            "processing_tasks": 0,
+            "pending_tasks": 0,
+            "failed_tasks": 0,
+            "total_items": 0,
+            "cluster_items_per_sec": 0.0,
+            "elapsed_secs": 0.0,
+            "eta_secs": null,
+            "is_complete": false,
+            "input_path": "",
+            "job_spec": null,
+            "idle": idle
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn deployment_preflight_requires_verified_idle_coordinator() {
+        assert!(require_idle_summary(&summary_json(true)).is_ok());
+        assert!(require_idle_summary(&summary_json(false))
+            .unwrap_err()
+            .to_string()
+            .contains("already has a job running"));
+        assert!(require_idle_summary("not json").is_err());
+    }
+
+    #[test]
+    fn log_tail_watchdog_bounds_worker_and_api_loss() {
+        use std::time::Duration;
+
+        let start = Instant::now();
+        let mut watchdog = TailWatchdog::default();
+        assert_eq!(
+            watchdog.observe(TailHealth::CoordinatorUnavailable, start),
+            None
+        );
+        assert_eq!(
+            watchdog.observe(
+                TailHealth::CoordinatorUnavailable,
+                start + LOG_TAIL_UNHEALTHY_TIMEOUT
+            ),
+            Some(TailFailure::CoordinatorUnavailable)
+        );
+
+        assert_eq!(
+            watchdog.observe(TailHealth::Healthy, start + Duration::from_secs(31)),
+            None
+        );
+        assert_eq!(
+            watchdog.observe(TailHealth::NoWorkers, start + Duration::from_secs(32)),
+            None
+        );
+        assert_eq!(
+            watchdog.observe(
+                TailHealth::NoWorkers,
+                start + Duration::from_secs(32) + LOG_TAIL_UNHEALTHY_TIMEOUT
+            ),
+            Some(TailFailure::NoWorkers)
+        );
     }
 }

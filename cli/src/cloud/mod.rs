@@ -48,16 +48,24 @@ pub struct PoolConfig {
     pub network: Option<String>,
     /// Subnet name (required for custom networks)
     pub subnet: Option<String>,
+    /// Assign external IP addresses to VMs
+    pub public_ip: bool,
+    /// Create the per-pool coordinator firewall rule
+    pub manage_firewall: bool,
     /// Create a dedicated coordinator node for distributed processing
     pub with_coordinator: bool,
     /// WireGuard configuration for coordinator (optional)
     pub wireguard: Option<WireGuardConfig>,
     /// GCS path for SQLite database backup/restore (e.g., "gs://bucket/pool-ops/dev-pool/ops.db")
     pub pool_db_path: Option<String>,
-    /// GCS URL for pre-staged binary (downloaded by VMs on startup)
+    /// GCS URL for the pre-staged stock coordinator binary.
     pub binary_gcs_url: Option<String>,
-    /// GCP service account email to attach to VMs
+    /// GCS URL for the pre-staged worker binary (custom or stock).
+    pub worker_binary_gcs_url: Option<String>,
+    /// GCP service account email to attach to worker VMs
     pub service_account: Option<String>,
+    /// GCP service account email to attach to the coordinator VM
+    pub coordinator_service_account: Option<String>,
 }
 
 /// Information about a cloud instance.
@@ -133,6 +141,8 @@ pub struct InstanceSetup {
     pub network: Option<String>,
     /// Subnet name
     pub subnet: Option<String>,
+    /// Assign an external IP address to the VM
+    pub public_ip: bool,
     /// GCP project ID
     pub project_id: String,
     /// GCP service account email to attach to the VM
@@ -153,6 +163,10 @@ pub struct ScalingConfig {
     pub network: Option<String>,
     /// Subnet name
     pub subnet: Option<String>,
+    /// Assign external IP addresses to workers
+    pub public_ip: bool,
+    /// Whether Genohype manages the coordinator firewall rule
+    pub manage_firewall: bool,
     /// GCP project ID
     pub project: Option<String>,
     /// Whether the pool has a coordinator
@@ -161,7 +175,7 @@ pub struct ScalingConfig {
     pub pool_db_path: Option<String>,
     /// Path to a custom binary to deploy to workers instead of the coordinator binary
     pub worker_binary: Option<String>,
-    /// GCP service account email to attach to VMs
+    /// GCP service account email to attach to workers created by the coordinator
     pub service_account: Option<String>,
 }
 
@@ -170,6 +184,11 @@ pub struct ScalingConfig {
 /// This trait allows swapping out the underlying cloud provider implementation
 /// (e.g., gcloud CLI wrapper vs native SDK) without changing the orchestration logic.
 pub trait CloudProvider {
+    /// Stable project selected for this provider operation, if explicitly resolved.
+    fn project_id(&self) -> Option<&str> {
+        None
+    }
+
     /// Provision a cluster of worker VMs.
     ///
     /// Creates `config.worker_count` VMs with names `{pool_name}-worker-{i}`.
@@ -190,6 +209,15 @@ pub trait CloudProvider {
     /// Delete specific instances by name.
     /// Used for scaling down worker pools.
     fn delete_instances(&self, names: &[String], zone: &str, project_id: &str) -> Result<()>;
+
+    /// Stop specific instances without deleting them.
+    fn stop_instances(&self, names: &[String], zone: &str) -> Result<()> {
+        let _ = (names, zone);
+        Err(crate::HailError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Stopping instances is not supported by this cloud provider",
+        )))
+    }
 
     /// Upload a file to a specific instance via SCP.
     fn upload_file(

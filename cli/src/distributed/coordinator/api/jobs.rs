@@ -311,6 +311,8 @@ pub(crate) async fn cancel_job(
     // Reset job state
     data.pending_partitions.clear();
     data.processing_partitions.clear();
+    data.custom_assignment_attempts.clear();
+    data.custom_assignments.clear();
     data.job_state = JobExecutionState::Standard;
     data.active_tasks.clear();
     data.last_completed_batch = None;

@@ -49,6 +49,8 @@ pub(crate) fn start_new_job(
     data.processing_partitions.clear();
     data.failed_partitions.clear();
     data.retry_counts.clear();
+    data.custom_assignment_attempts.clear();
+    data.custom_assignments.clear();
     data.total_rows = 0;
     data.job_start_time = Instant::now();
     data.last_progress_time = Instant::now();

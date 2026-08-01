@@ -15,10 +15,63 @@ fn resolve_zone(zone: Option<String>, pool_name: &str, app_config: &config::Conf
         .unwrap_or_else(|| "us-central1-a".to_string())
 }
 
+fn resolve_worker_binary(
+    cli: Option<String>,
+    profile: Option<&config::ResolvedPoolConfig>,
+) -> Option<String> {
+    cli.or_else(|| profile.and_then(|p| p.worker_binary.clone()))
+}
+
+fn resolve_service_accounts(
+    worker: Option<String>,
+    coordinator: Option<String>,
+    profile: Option<&config::ResolvedPoolConfig>,
+) -> (Option<String>, Option<String>) {
+    let worker = worker.or_else(|| profile.and_then(|p| p.service_account.clone()));
+    let coordinator = coordinator
+        .or_else(|| profile.and_then(|p| p.coordinator_service_account.clone()))
+        .or_else(|| worker.clone());
+    (worker, coordinator)
+}
+
+fn command_pool_name_and_project(command: &PoolCommands) -> (&str, Option<&str>) {
+    match command {
+        PoolCommands::Create { name, project, .. } => (name, project.as_deref()),
+        PoolCommands::Submit { name, .. }
+        | PoolCommands::Scale { name, .. }
+        | PoolCommands::Destroy { name, .. }
+        | PoolCommands::List { name }
+        | PoolCommands::Status { name, .. }
+        | PoolCommands::UpdateBinary { name, .. }
+        | PoolCommands::Cancel { name, .. }
+        | PoolCommands::Workers { name, .. }
+        | PoolCommands::Events { name, .. }
+        | PoolCommands::Failures { name, .. }
+        | PoolCommands::Logs { name, .. } => (name, None),
+    }
+}
+
+fn configured_project(
+    cli_project: Option<&str>,
+    pool_name: &str,
+    app_config: &config::Config,
+) -> Option<String> {
+    cli_project
+        .map(String::from)
+        .or_else(|| app_config.get_pool(pool_name).and_then(|p| p.project))
+        .or_else(|| app_config.defaults.project.clone())
+}
+
 /// Run pool management commands
 pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> Result<()> {
-    let client = GcpClient::new();
-    let manager = PoolManager::new(client);
+    // Resolve the project once for the whole command. GcpClient then adds it to
+    // discovery, SSH/SCP, and lifecycle calls so an operation cannot switch to
+    // a different ambient gcloud project after provisioning.
+    let (pool_name, cli_project) = command_pool_name_and_project(&command);
+    let project_id = configured_project(cli_project, pool_name, app_config)
+        .map(Ok)
+        .unwrap_or_else(|| GcpClient::new().get_current_project())?;
+    let manager = PoolManager::new(GcpClient::with_project(project_id.clone()));
 
     match command {
         PoolCommands::Create {
@@ -27,13 +80,17 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
             machine_type,
             zone,
             spot,
-            project,
+            project: _,
             network,
             subnet,
+            public_ip,
+            manage_firewall,
             wait,
             skip_build,
+            worker_binary,
             with_coordinator,
             service_account,
+            coordinator_service_account,
         } => {
             // Try to load pool profile from config (if exists)
             let profile = app_config.get_pool(&name);
@@ -56,13 +113,14 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
             let resolved_subnet = subnet
                 .or_else(|| profile.as_ref().and_then(|p| p.subnet.clone()))
                 .or_else(|| app_config.defaults.subnet.clone());
-
-            // Resolve project ID: CLI > config > gcloud default
-            let project_id = project
-                .or_else(|| profile.as_ref().and_then(|p| p.project.clone()))
-                .or_else(|| app_config.defaults.project.clone())
-                .map(Ok)
-                .unwrap_or_else(|| GcpClient::new().get_current_project())?;
+            let resolved_public_ip = public_ip
+                .or_else(|| profile.as_ref().map(|p| p.public_ip))
+                .or(app_config.defaults.public_ip)
+                .unwrap_or(true);
+            let resolved_manage_firewall = manage_firewall
+                .or_else(|| profile.as_ref().map(|p| p.manage_firewall))
+                .or(app_config.defaults.manage_firewall)
+                .unwrap_or(true);
 
             // Convert WireGuard config from config module to cloud module
             // Resolve env: prefixes (for USB-sourced secrets) at this point
@@ -107,8 +165,14 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
                 );
             }
 
-            let resolved_service_account = service_account
-                .or_else(|| profile.as_ref().and_then(|p| p.service_account.clone()));
+            let (resolved_service_account, resolved_coordinator_service_account) =
+                resolve_service_accounts(
+                    service_account,
+                    coordinator_service_account,
+                    profile.as_ref(),
+                );
+            // Custom worker selection follows the same precedence as other pool settings.
+            let resolved_worker_binary = resolve_worker_binary(worker_binary, profile.as_ref());
 
             let pool_config = PoolConfig {
                 name,
@@ -119,14 +183,18 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
                 project_id,
                 network: resolved_network,
                 subnet: resolved_subnet,
+                public_ip: resolved_public_ip,
+                manage_firewall: resolved_manage_firewall,
                 with_coordinator: resolved_with_coordinator,
                 wireguard,
                 pool_db_path: profile.as_ref().and_then(|p| p.pool_db_path.clone()),
-                binary_gcs_url: None, // Set by create() after staging
+                binary_gcs_url: None,        // Set by create() after staging
+                worker_binary_gcs_url: None, // Set independently by create()
                 service_account: resolved_service_account,
+                coordinator_service_account: resolved_coordinator_service_account,
             };
 
-            manager.create(&pool_config, wait, skip_build)?;
+            manager.create(&pool_config, wait, skip_build, resolved_worker_binary)?;
         }
         PoolCommands::Submit {
             name,
@@ -270,6 +338,8 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
                     spot: p.spot,
                     network: p.network.clone(),
                     subnet: p.subnet.clone(),
+                    public_ip: p.public_ip,
+                    manage_firewall: p.manage_firewall,
                     project: p.project.clone(),
                     with_coordinator: p.with_coordinator,
                     pool_db_path: p.pool_db_path.clone(),
@@ -303,6 +373,8 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
             name,
             workers,
             zone,
+            public_ip,
+            manage_firewall,
             binary,
             worker_binary,
             skip_build,
@@ -323,6 +395,8 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
                 spot: pool_config.spot,
                 network: pool_config.network.clone(),
                 subnet: pool_config.subnet.clone(),
+                public_ip: public_ip.unwrap_or(pool_config.public_ip),
+                manage_firewall: manage_firewall.unwrap_or(pool_config.manage_firewall),
                 project: pool_config.project.clone(),
                 with_coordinator: pool_config.with_coordinator,
                 pool_db_path: pool_config.pool_db_path.clone(),
@@ -370,6 +444,20 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
             let resolved_zone = resolve_zone(zone, &name, app_config);
             let pool_config = app_config.get_pool(&name);
             let pool_db_path = pool_config.as_ref().and_then(|p| p.pool_db_path.clone());
+            let scaling_config = pool_config.as_ref().map(|p| crate::cloud::ScalingConfig {
+                machine_type: p.machine_type.clone(),
+                workers: p.workers,
+                spot: p.spot,
+                network: p.network.clone(),
+                subnet: p.subnet.clone(),
+                public_ip: p.public_ip,
+                manage_firewall: p.manage_firewall,
+                project: p.project.clone(),
+                with_coordinator: p.with_coordinator,
+                pool_db_path: p.pool_db_path.clone(),
+                worker_binary: p.worker_binary.clone(),
+                service_account: p.service_account.clone(),
+            });
             // Resolve worker binary: CLI flag > config profile
             let resolved_worker_binary = worker_binary
                 .or_else(|| pool_config.as_ref().and_then(|p| p.worker_binary.clone()));
@@ -404,6 +492,7 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
                     resolved_worker_binary,
                     skip_build,
                     pool_db_path.as_deref(),
+                    scaling_config.as_ref(),
                 )?;
             }
         }
@@ -430,4 +519,83 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_project_prefers_cli_then_config_and_ignores_ambient() {
+        let config: config::Config = toml::from_str(
+            r#"
+[defaults]
+project = "configured-project"
+[pools.demo]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            configured_project(Some("cli-project"), "demo", &config).as_deref(),
+            Some("cli-project")
+        );
+        assert_eq!(
+            configured_project(None, "demo", &config).as_deref(),
+            Some("configured-project")
+        );
+    }
+
+    #[test]
+    fn custom_worker_resolution_prefers_cli_then_profile() {
+        let config: config::Config = toml::from_str(
+            r#"
+[pools.demo]
+worker_binary = "/profile/worker"
+"#,
+        )
+        .unwrap();
+        let profile = config.get_pool("demo").unwrap();
+
+        assert_eq!(
+            resolve_worker_binary(Some("/cli/worker".into()), Some(&profile)).as_deref(),
+            Some("/cli/worker")
+        );
+        assert_eq!(
+            resolve_worker_binary(None, Some(&profile)).as_deref(),
+            Some("/profile/worker")
+        );
+    }
+
+    #[test]
+    fn create_account_resolution_preserves_legacy_and_separate_identities() {
+        let legacy_config: config::Config = toml::from_str(
+            r#"
+[pools.legacy]
+service_account = "legacy@project.iam.gserviceaccount.com"
+"#,
+        )
+        .unwrap();
+        let legacy = legacy_config.get_pool("legacy").unwrap();
+        let (worker, coordinator) = resolve_service_accounts(None, None, Some(&legacy));
+        assert_eq!(worker, coordinator);
+        assert_eq!(
+            coordinator.as_deref(),
+            Some("legacy@project.iam.gserviceaccount.com")
+        );
+
+        let (worker, coordinator) = resolve_service_accounts(
+            Some("worker@project.iam.gserviceaccount.com".into()),
+            Some("coordinator@project.iam.gserviceaccount.com".into()),
+            Some(&legacy),
+        );
+        assert_eq!(
+            worker.as_deref(),
+            Some("worker@project.iam.gserviceaccount.com")
+        );
+        assert_eq!(
+            coordinator.as_deref(),
+            Some("coordinator@project.iam.gserviceaccount.com")
+        );
+    }
 }

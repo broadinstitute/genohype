@@ -136,18 +136,21 @@ genohype query "./data/gnomad.exomes.v4.1.sites.chrX.vcf.bgz" --interval "chrX:3
 # CLICKHOUSE - Export to ClickHouse database
 # ============================================
 
+# Supply credentials through your environment; do not commit them to this script.
+: "${CLICKHOUSE_URL:?Set CLICKHOUSE_URL to your ClickHouse HTTP URL}"
+
 # Export variants using intervals file (requires --features clickhouse)
 genohype export clickhouse \
   data/variants.ht \
-  "http://default:test@localhost:8123" \
+  "$CLICKHOUSE_URL" \
   demo_variants \
   --intervals-file data/demo_intervals.txt
 
 # Query the exported data
-curl -s "http://default:test@localhost:8123" --data "SELECT locus.1 as contig, locus.2 as position, ref, alt, ancestry_group, allele_frequency FROM demo_variants LIMIT 10 FORMAT Pretty"
+curl -s "$CLICKHOUSE_URL" --data "SELECT locus.1 as contig, locus.2 as position, ref, alt, ancestry_group, allele_frequency FROM demo_variants LIMIT 10 FORMAT Pretty"
 
 # Aggregate by ancestry
-curl -s "http://default:test@localhost:8123" --data "SELECT ancestry_group, count() as variants, round(avg(allele_frequency), 6) as avg_af FROM demo_variants GROUP BY ancestry_group FORMAT Pretty"
+curl -s "$CLICKHOUSE_URL" --data "SELECT ancestry_group, count() as variants, round(avg(allele_frequency), 6) as avg_af FROM demo_variants GROUP BY ancestry_group FORMAT Pretty"
 
 # ============================================
 # BIGQUERY - Export to BigQuery (requires --features bigquery)
