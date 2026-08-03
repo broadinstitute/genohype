@@ -25,7 +25,7 @@ use crate::{HailError, Result};
 use bytes::Bytes;
 use crossbeam_channel::{bounded, Sender};
 use object_store::path::Path as ObjPath;
-use object_store::{ObjectStore, WriteMultipart};
+use object_store::{ObjectStore, PutMode, WriteMultipart};
 use std::io::Write;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -127,6 +127,52 @@ impl CloudWriter {
             start_time.elapsed()
         );
         Ok(size)
+    }
+
+    /// Upload without overwriting an existing object.
+    ///
+    /// A pre-existing object is accepted only when its bytes exactly match this
+    /// writer's buffer. This makes content-addressed lifecycle staging safe to
+    /// retry while detecting a conflicting object at the same immutable URL.
+    pub fn finish_create_only(self) -> Result<usize> {
+        let size = self.buffer.len();
+        let store = self.store;
+        let path = self.path;
+        let data = bytes::Bytes::from(self.buffer);
+
+        IO_RUNTIME
+            .block_on(async move {
+                match store
+                    .put_opts(&path, data.clone().into(), PutMode::Create.into())
+                    .await
+                {
+                    Ok(_) => Ok(size),
+                    Err(object_store::Error::AlreadyExists { .. }) => {
+                        let existing = store.get(&path).await?.bytes().await?;
+                        if existing == data {
+                            Ok(size)
+                        } else {
+                            Err(object_store::Error::Generic {
+                                store: "content-addressed staging",
+                                source: Box::new(std::io::Error::new(
+                                    std::io::ErrorKind::AlreadyExists,
+                                    format!(
+                                        "immutable object {} already exists with different bytes",
+                                        path
+                                    ),
+                                )),
+                            })
+                        }
+                    }
+                    Err(error) => Err(error),
+                }
+            })
+            .map_err(|error| {
+                HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to create immutable cloud object: {error}"),
+                ))
+            })
     }
 
     /// Get the current buffer size (bytes written so far)
@@ -434,5 +480,30 @@ mod tests {
 
         let content = std::fs::read_to_string(path).unwrap();
         assert_eq!(content, "Hello, world!");
+    }
+
+    #[test]
+    fn create_only_writer_deduplicates_identical_bytes() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let path = ObjPath::from("immutable/worker");
+        for _ in 0..2 {
+            let mut writer = CloudWriter::from_store(store.clone(), path.clone());
+            writer.write_all(b"same bytes").unwrap();
+            assert_eq!(writer.finish_create_only().unwrap(), 10);
+        }
+    }
+
+    #[test]
+    fn create_only_writer_rejects_conflicting_bytes() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let path = ObjPath::from("immutable/worker");
+        let mut first = CloudWriter::from_store(store.clone(), path.clone());
+        first.write_all(b"first").unwrap();
+        first.finish_create_only().unwrap();
+
+        let mut conflicting = CloudWriter::from_store(store, path);
+        conflicting.write_all(b"second").unwrap();
+        let error = conflicting.finish_create_only().unwrap_err();
+        assert!(error.to_string().contains("different bytes"));
     }
 }
