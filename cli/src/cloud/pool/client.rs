@@ -40,16 +40,23 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         endpoint: &str,
         port: u16,
     ) -> Result<String> {
-        // Fast path: try local tunnel first (sub-second)
-        let local_url = format!("http://localhost:{}{}", port, endpoint);
-        let mut local_cmd = std::process::Command::new("curl");
-        local_cmd.args(["-s", "--connect-timeout", "1", &local_url]);
-        local_cmd.stdout(std::process::Stdio::piped());
-        local_cmd.stderr(std::process::Stdio::null());
+        #[cfg(test)]
+        let _ = port;
 
-        if let Ok(output) = local_cmd.output() {
-            if output.status.success() && !output.stdout.is_empty() {
-                return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+        // Fast path: try local tunnel first (sub-second). Unit tests skip this
+        // ambient endpoint so recording providers remain hermetic.
+        #[cfg(not(test))]
+        {
+            let local_url = format!("http://localhost:{}{}", port, endpoint);
+            let mut local_cmd = std::process::Command::new("curl");
+            local_cmd.args(["-s", "--connect-timeout", "1", &local_url]);
+            local_cmd.stdout(std::process::Stdio::piped());
+            local_cmd.stderr(std::process::Stdio::null());
+
+            if let Ok(output) = local_cmd.output() {
+                if output.status.success() && !output.stdout.is_empty() {
+                    return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+                }
             }
         }
 
@@ -84,8 +91,8 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         memory_weight_mb: Option<u64>,
         filters: &[String],
         intervals: &[String],
-    ) -> Result<bool> {
-        use crate::distributed::message::{JobConfigRequest, JobConfigResponse};
+    ) -> Result<crate::distributed::message::JobSubmissionAck> {
+        use crate::distributed::message::{JobConfigRequest, JobConfigResponse, JobSubmissionAck};
 
         // Use provided batch_size or fall back to sensible defaults per job type
         // Larger batches let workers parallelize with rayon
@@ -126,90 +133,69 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             ))
         })?;
 
-        // Submit via curl through SSH
-        // Determine submission method based on payload size
-        // 4KB is a safe limit for command line arguments across most systems
-        let curl_cmd = if json_payload.len() < 4096 {
-            format!(
-                "curl -s -X POST -H 'Content-Type: application/json' -d '{}' http://localhost:3000/api/job",
-                json_payload.replace('\'', "'\\''") // Escape single quotes for shell
-            )
-        } else {
-            use std::io::Write;
-            use std::time::{SystemTime, UNIX_EPOCH};
-
-            println!(
-                "{}",
-                "  Payload large, uploading job config file...".dimmed()
-            );
-
-            // Create local temp file
-            let timestamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis();
-            let local_filename = format!("hail_job_{}.json", timestamp);
-            let mut local_path = std::env::temp_dir();
-            local_path.push(&local_filename);
-
-            {
-                let mut file = std::fs::File::create(&local_path).map_err(HailError::Io)?;
-                file.write_all(json_payload.as_bytes())
-                    .map_err(HailError::Io)?;
-            }
-
-            let remote_path = format!("/tmp/{}", local_filename);
-
-            // Upload to coordinator
-            self.provider
-                .upload_file(&local_path, &remote_path, &coordinator.name, zone)?;
-
-            // Clean up local file
-            let _ = std::fs::remove_file(&local_path);
-
-            // Construct curl command using @file syntax
-            // Also remove the remote file after successful submission
-            format!(
-                "curl -s -X POST -H 'Content-Type: application/json' -d @{} http://localhost:3000/api/job && rm {}",
-                remote_path, remote_path
-            )
-        };
-
+        // Stream the request on stdin instead of embedding it in the remote shell
+        // command or uploading a temporary file. Registration-only submit never SCPs.
+        let curl_cmd = "curl -s -X POST -H 'Content-Type: application/json' --data-binary @- http://localhost:3000/api/job";
         let mut cmd = self
             .provider
-            .get_ssh_command(&coordinator.name, zone, &curl_cmd);
+            .get_ssh_command(&coordinator.name, zone, curl_cmd);
+        cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
-        let output = cmd.output().map_err(HailError::Io)?;
+        let mut child = cmd.spawn().map_err(HailError::Io)?;
+        {
+            use std::io::Write;
+            let mut stdin = child.stdin.take().ok_or_else(|| {
+                HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "Failed to open coordinator submission stdin",
+                ))
+            })?;
+            stdin
+                .write_all(json_payload.as_bytes())
+                .map_err(HailError::Io)?;
+        }
+        let output = child.wait_with_output().map_err(HailError::Io)?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            eprintln!("Failed to submit job via API: {}", stderr);
-            return Ok(false);
+            return Err(HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                format!("Failed to submit job via API: {stderr}"),
+            )));
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
+        let response = serde_json::from_str::<JobConfigResponse>(&stdout).map_err(|error| {
+            HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Failed to parse coordinator response: {error} (raw: {stdout})"),
+            ))
+        })?;
+        if !response.acknowledged {
+            return Err(HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                response
+                    .error
+                    .unwrap_or_else(|| "Coordinator rejected job".to_string()),
+            )));
+        }
 
-        // Parse response
-        match serde_json::from_str::<JobConfigResponse>(&stdout) {
-            Ok(response) => {
-                if response.acknowledged {
-                    Ok(true)
-                } else {
-                    if let Some(err) = response.error {
-                        eprintln!("Coordinator rejected job: {}", err);
-                    }
-                    Ok(false)
-                }
+        match response.job_id {
+            Some(job_id) => Ok(JobSubmissionAck::Job { job_id }),
+            None if matches!(
+                job_spec,
+                crate::distributed::message::JobSpec::ManhattanBatch { specs, .. }
+                    if specs.is_empty()
+            ) =>
+            {
+                Ok(JobSubmissionAck::Configuration)
             }
-            Err(e) => {
-                eprintln!(
-                    "Failed to parse coordinator response: {} (raw: {})",
-                    e, stdout
-                );
-                Ok(false)
-            }
+            None => Err(HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Coordinator acknowledged an executable job without an exact job_id",
+            ))),
         }
     }
 

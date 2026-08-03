@@ -2,10 +2,12 @@
 
 mod legacy_runner;
 mod preflight;
+mod readiness;
 
 pub use legacy_runner::WorkerMessage;
 pub use preflight::{list_completed_markers, read_completed_checkpoint};
 
+use self::readiness::require_worker_readiness;
 use super::PoolManager;
 use crate::benchmark::BenchmarkReport;
 use crate::cloud::{CloudProvider, Instance};
@@ -21,7 +23,31 @@ const WORKER_FRESHNESS_SECS: f64 = 15.0;
 const LOG_TAIL_UNHEALTHY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn worker_is_fresh(worker: &crate::distributed::message::DashboardWorker) -> bool {
-    worker.status != "suspected_dead" && worker.last_seen_secs <= WORKER_FRESHNESS_SECS
+    matches!(worker.status.as_str(), "active" | "idle")
+        && worker.last_seen_secs.is_finite()
+        && worker.last_seen_secs >= 0.0
+        && worker.last_seen_secs <= WORKER_FRESHNESS_SECS
+}
+
+fn validate_submit_contract(
+    force_redeploy: bool,
+    worker_binary_path: Option<&str>,
+    detach: bool,
+    output: crate::cli::PoolSubmitOutput,
+) -> Result<()> {
+    if output == crate::cli::PoolSubmitOutput::Json && !detach {
+        return Err(HailError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "--output json requires explicit --detach so stdout remains exactly one JSON acknowledgement object",
+        )));
+    }
+    if force_redeploy && worker_binary_path.is_some() {
+        return Err(HailError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Custom-worker redeployment is not supported by 'pool submit' because submit cannot safely replace the attested artifact. Run 'genohype pool update-binary' with the configured --worker-attestation, verify readiness, then submit without --redeploy-binary.",
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,18 +60,10 @@ fn classify_submission(
     pool_name: &str,
     use_distributed: bool,
     total_workers: usize,
-    has_custom_worker: bool,
-    command: &[String],
+    is_custom_job: bool,
 ) -> Result<SubmissionMode> {
-    if has_custom_worker && !use_distributed {
-        return Err(HailError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "Custom workers require a running coordinator",
-        )));
-    }
-
     if use_distributed && total_workers == 0 {
-        if has_custom_worker && command.first().map(String::as_str) == Some("custom") {
+        if is_custom_job {
             return Ok(SubmissionMode::ZeroWorkerCustom);
         }
         return Err(HailError::Io(std::io::Error::new(
@@ -266,18 +284,28 @@ EOF
 
         if !workers.is_empty() {
             if let Some(custom_worker) = worker_binary {
-                if !worker_deployed_via_startup {
-                    println!("{}", "Deploying custom worker via SCP...".dimmed());
-                    self.deploy_binary(custom_worker, &workers, zone)?;
+                if pool_config.worker_bootstrap.is_some() {
+                    // The fail-closed attested startup path has already verified,
+                    // atomically installed, and enabled the compatible service.
+                    // Rewriting it here would discard deployment identity.
+                    println!(
+                        "{} {} attested custom worker(s) started by VM bootstrap",
+                        "OK".green().bold(),
+                        workers.len()
+                    );
+                } else {
+                    if !worker_deployed_via_startup {
+                        println!("{}", "Deploying custom worker via SCP...".dimmed());
+                        self.deploy_binary(custom_worker, &workers, zone)?;
+                    }
+                    // Preserve the legacy custom-worker recovery behavior.
+                    self.start_worker_services(&workers, coord_ip, zone)?;
+                    println!(
+                        "{} Custom binary deployed and {} worker(s) started",
+                        "OK".green().bold(),
+                        workers.len()
+                    );
                 }
-                // Always rewrite, enable, and restart the unit. This also recovers a
-                // service that exited between VM readiness and the first submission.
-                self.start_worker_services(&workers, coord_ip, zone)?;
-                println!(
-                    "{} Custom binary deployed and {} worker(s) started",
-                    "OK".green().bold(),
-                    workers.len()
-                );
             } else if worker_deployed_via_startup {
                 self.start_worker_services(&workers, coord_ip, zone)?;
                 println!(
@@ -324,6 +352,8 @@ EOF
         auto_stop: bool,
         force_redeploy: bool,
         force: bool,
+        detach: bool,
+        output: crate::cli::PoolSubmitOutput,
         autoscale: bool,
         skip_build: bool,
         batch_size: Option<usize>,
@@ -331,58 +361,52 @@ EOF
         config: Option<&crate::cloud::ScalingConfig>,
         command: &[String],
     ) -> Result<()> {
-        // Determine required features based on command
-        let features: Vec<&str> =
-            if command.len() >= 2 && command[0] == "export" && command[1] == "clickhouse" {
-                vec!["clickhouse"]
-            } else if command.len() >= 2 && command[0] == "ingest" && command[1] == "manhattan" {
-                vec!["clickhouse"] // Ingest manhattan requires clickhouse feature
-            } else {
-                vec![]
-            };
-
-        // Determine if we should build
-        // 1. Explicit skip_build -> skip
-        // 2. We have a bundled binary -> skip (Release mode)
-        // 3. Otherwise -> build (Dev mode)
-        let should_build_base = if skip_build {
-            false
-        } else if self.has_bundled_binary() {
-            println!(
-                "{}",
-                "Found bundled worker binary, skipping build...".dimmed()
-            );
-            false
-        } else {
-            true
-        };
-
-        // Optimize: check if coordinator is already running before building
-        // If coordinator is running and we're not force redeploying or autoscaling,
-        // we can skip the build entirely since binary is already deployed
-        let should_build = if should_build_base && !force_redeploy && !autoscale {
-            // Peek at coordinator status to intelligently skip local build
-            let instances = self.provider.list_instances(name).unwrap_or_default();
-            let coordinator = instances.iter().find(|i| i.name.ends_with("-coordinator"));
-            if let Some(coord) = coordinator {
-                if self.check_coordinator_status(coord, zone) {
-                    println!(
-                        "{}",
-                        "Coordinator already running, skipping build...".dimmed()
-                    );
-                    false
-                } else {
-                    should_build_base
+        let human_output = output == crate::cli::PoolSubmitOutput::Human;
+        macro_rules! println {
+            () => {{
+                if human_output {
+                    std::println!();
                 }
-            } else {
-                should_build_base
-            }
-        } else {
-            should_build_base
-        };
+            }};
+            ($($arg:tt)*) => {{
+                if human_output {
+                    std::println!($($arg)*);
+                }
+            }};
+        }
 
-        // Build binary if redeploying (ensures latest code is used) or if needed
-        if force_redeploy || should_build {
+        // Validate all machine-output and lifecycle authorization contracts
+        // before parsing local inputs, building, discovery, or mutation.
+        validate_submit_contract(
+            force_redeploy,
+            worker_binary_path.as_deref(),
+            detach,
+            output,
+        )?;
+
+        // Validate the command before any explicitly requested lifecycle mutation.
+        // The fully enriched JobSpec is prepared later, after read-only discovery.
+        Self::parse_command_to_job_spec(command)?;
+
+        if detach && (autoscale || auto_stop) {
+            return Err(HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--detach cannot be combined with --autoscale or --auto-stop because those cleanups are client-owned",
+            )));
+        }
+
+        // A normal coordinator-backed submit never builds. Build is authorized
+        // only by an explicit lifecycle option.
+        if (force_redeploy || autoscale) && !skip_build && !self.has_bundled_binary() {
+            let features: Vec<&str> =
+                if command.len() >= 2 && command[0] == "export" && command[1] == "clickhouse" {
+                    vec!["clickhouse"]
+                } else if command.len() >= 2 && command[0] == "ingest" && command[1] == "manhattan"
+                {
+                    vec!["clickhouse"]
+                } else {
+                    vec![]
+                };
             Self::build_linux_binary(&features)?;
         }
 
@@ -432,6 +456,9 @@ EOF
             auto_stop,
             force_redeploy,
             force,
+            detach,
+            output,
+            skip_build,
             batch_size,
             memory_weight_mb,
             config,
@@ -470,34 +497,36 @@ EOF
         auto_stop: bool,
         force_redeploy: bool,
         force: bool,
+        detach: bool,
+        output: crate::cli::PoolSubmitOutput,
+        skip_build: bool,
         batch_size: Option<usize>,
         memory_weight_mb: Option<u64>,
         config: Option<&crate::cloud::ScalingConfig>,
         command: &[String],
     ) -> Result<()> {
-        // 1. Locate the Linux binary (will check if needed after seeing coordinator status)
-        let binary = self.locate_binary(binary_path).ok();
+        let human_output = output == crate::cli::PoolSubmitOutput::Human;
+        macro_rules! println {
+            () => {{
+                if human_output {
+                    std::println!();
+                }
+            }};
+            ($($arg:tt)*) => {{
+                if human_output {
+                    std::println!($($arg)*);
+                }
+            }};
+        }
 
-        // Resolve worker binary (if --worker-binary specified, validate it exists)
-        let worker_binary = if let Some(ref wb_path) = worker_binary_path {
-            let path = std::path::PathBuf::from(wb_path);
-            if !path.exists() {
-                return Err(HailError::Io(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("Worker binary not found at: {}", wb_path),
-                )));
-            }
-            println!(
-                "{} {}",
-                "Worker binary:".cyan(),
-                path.display().to_string().bright_white()
-            );
-            Some(path)
-        } else {
-            None
-        };
+        let (_, parsed_job_spec, _, _) = Self::parse_command_to_job_spec(command)?;
+        let is_custom_job = matches!(
+            parsed_job_spec,
+            crate::distributed::message::JobSpec::Custom { .. }
+        );
+        let has_custom_worker = worker_binary_path.is_some();
 
-        // 2. Get running instances
+        // 1. Get running instances using read-only provider discovery.
         println!("{}", "Fetching instance list...".dimmed());
         let instances = self.provider.list_instances(name)?;
         let running: Vec<_> = instances.into_iter().filter(|i| i.is_running()).collect();
@@ -520,16 +549,18 @@ EOF
         let coordinator = coordinators.into_iter().next();
         let total_workers = workers.len();
 
-        // Auto-detect distributed mode: use coordinator/worker pattern when coordinator exists
+        // Auto-detect distributed mode: use coordinator/worker pattern when coordinator exists.
+        // A configured coordinator-backed pool must never silently fall back to legacy SSH.
         let use_distributed = coordinator.is_some();
+        if !use_distributed && config.map(|value| value.with_coordinator).unwrap_or(false) {
+            return Err(HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Coordinator instance is missing; submit did not create or repair it",
+            )));
+        }
 
-        let submission_mode = classify_submission(
-            name,
-            use_distributed,
-            total_workers,
-            worker_binary.is_some(),
-            command,
-        )?;
+        let submission_mode =
+            classify_submission(name, use_distributed, total_workers, is_custom_job)?;
         let zero_worker_custom = submission_mode == SubmissionMode::ZeroWorkerCustom;
 
         println!(
@@ -543,22 +574,22 @@ EOF
             }
         );
 
-        // 3. Deploy binary. A custom worker is independent of the stock
-        // coordinator and must be deployed even when that coordinator is healthy.
         let coordinator_running = coordinator
             .as_ref()
             .map(|coord| self.check_coordinator_status(coord, zone))
             .unwrap_or(false);
-        // Zero-worker registration is deliberately narrower than deployment:
-        // it requires an already-healthy idle coordinator and cannot supersede,
-        // redeploy, auto-stop, or create compute as a side effect.
+
+        // Coordinator-backed normal submit is registration-only. An unavailable
+        // coordinator fails closed instead of authorizing implicit repair.
+        if use_distributed && !coordinator_running && !force_redeploy {
+            return Err(HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "Coordinator is not healthy; submit did not repair or restart it. Use --redeploy-binary explicitly after verifying lifecycle impact.",
+            )));
+        }
+
+        // Zero-worker custom registration is deliberately narrower than deployment.
         if zero_worker_custom {
-            if !coordinator_running {
-                return Err(HailError::Io(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionRefused,
-                    "Zero-worker custom submission requires a healthy running coordinator",
-                )));
-            }
             if force {
                 return Err(HailError::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -578,80 +609,69 @@ EOF
                 )));
             }
             self.ensure_coordinator_idle(coordinator.as_ref().unwrap(), zone)?;
-        } else if coordinator_running && !force && (force_redeploy || worker_binary.is_some()) {
-            // Binary deployment restarts services. Refuse to disrupt an existing
-            // job, and fail closed when its state cannot be verified.
+        } else if use_distributed && force_redeploy && !force {
+            if !coordinator_running {
+                return Err(HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "Cannot prove the coordinator is idle before --redeploy-binary; retry when healthy or pair with --force",
+                )));
+            }
             self.ensure_coordinator_idle(coordinator.as_ref().unwrap(), zone)?;
         }
-        if use_distributed
-            && coordinator_running
-            && !force_redeploy
-            && worker_binary.is_some()
-            && !workers.is_empty()
-        {
-            let coord = coordinator.as_ref().unwrap();
-            let coord_ip = coord.ip().ok_or_else(|| {
-                HailError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Coordinator {} has no internal IP", coord.name),
-                ))
-            })?;
-            let custom_worker = worker_binary.as_ref().unwrap();
+
+        let should_deploy = !use_distributed || force_redeploy;
+        if !use_distributed {
             println!(
-                "{} Coordinator is healthy; deploying custom worker binary only...",
-                "Setup:".cyan()
+                "{} Coordinator-less legacy submit explicitly deploys binaries and is not lifecycle-free.",
+                "Legacy mode:".yellow().bold()
             );
-            self.deploy_binary(custom_worker, &workers, zone)?;
-            self.start_worker_services(&workers, coord_ip, zone)?;
+            if !skip_build && !self.has_bundled_binary() {
+                let features: Vec<&str> = if (command.len() >= 2
+                    && command[0] == "export"
+                    && command[1] == "clickhouse")
+                    || (command.len() >= 2 && command[0] == "ingest" && command[1] == "manhattan")
+                {
+                    vec!["clickhouse"]
+                } else {
+                    vec![]
+                };
+                Self::build_linux_binary(&features)?;
+            }
         }
 
-        let should_deploy = if use_distributed {
-            let coord_running = coordinator_running;
-            if coord_running && !force_redeploy {
-                // Coordinator already running = binary already deployed
-                println!(
-                    "{} Coordinator already running, skipping binary deployment",
-                    "Note:".cyan()
-                );
-                println!(
-                    "{}",
-                    "      (use --redeploy-binary or 'pool update-binary' to redeploy)".dimmed()
-                );
-                false
+        // Local artifact paths are inspected only after lifecycle deployment was
+        // explicitly authorized (or for the explicit legacy compatibility path).
+        let binary = if should_deploy {
+            Some(self.locate_binary(binary_path)?)
+        } else {
+            None
+        };
+        let worker_binary = if should_deploy {
+            if let Some(ref wb_path) = worker_binary_path {
+                let path = std::path::PathBuf::from(wb_path);
+                if !path.exists() {
+                    return Err(HailError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("Worker binary not found at: {}", wb_path),
+                    )));
+                }
+                Some(path)
             } else {
-                true // Deploy if coordinator not running, or if force_redeploy
+                None
             }
         } else {
-            true // Non-distributed always deploys
+            None
         };
 
         if should_deploy {
-            let binary = binary.as_ref().ok_or_else(|| {
-                HailError::Io(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "Linux binary not found. Build with: cargo linux --release",
-                ))
-            })?;
+            let binary = binary.as_ref().expect("deployment path resolves binary");
 
             // Try to stage binary to GCS for fast updates
             let pool_db_path = config.and_then(|c| c.pool_db_path.as_deref());
             let staging_url = if let Some(db_path) = pool_db_path {
-                self.stage_binary_to_gcs(binary, db_path, "genohype-coordinator")
-                    .ok()
+                Some(self.stage_binary_to_gcs(binary, db_path, "genohype-coordinator")?)
             } else {
                 None
-            };
-
-            // Stage worker binary to GCS separately if it differs from coordinator binary
-            let worker_staging_url = if let Some(ref wb) = worker_binary {
-                if let Some(db_path) = pool_db_path {
-                    self.stage_binary_to_gcs(wb, db_path, "genohype-worker-custom")
-                        .ok()
-                } else {
-                    None
-                }
-            } else {
-                staging_url.clone() // Same binary for both
             };
 
             if use_distributed {
@@ -665,11 +685,18 @@ EOF
 
                 // Stop any existing coordinator first
                 println!("{}", "Stopping existing coordinator...".dimmed());
-                let stop_cmd = "sudo systemctl stop genohype-coordinator 2>/dev/null || true";
-                let _ = self
+                let stop_cmd = "sudo systemctl stop genohype-coordinator";
+                let stop_status = self
                     .provider
                     .get_ssh_command(&coord.name, zone, stop_cmd)
-                    .status();
+                    .status()
+                    .map_err(HailError::Io)?;
+                if !stop_status.success() {
+                    return Err(HailError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "Failed to stop the coordinator before explicit redeployment",
+                    )));
+                }
                 std::thread::sleep(std::time::Duration::from_secs(1));
 
                 // Deploy coordinator binary (always the stock genohype binary)
@@ -679,10 +706,17 @@ EOF
                         "gsutil cp {} /tmp/genohype && chmod +x /tmp/genohype && sudo mv /tmp/genohype /usr/local/bin/genohype",
                         gcs_url
                     );
-                    self.provider
+                    let status = self
+                        .provider
                         .get_ssh_command(&coord.name, zone, &update_coord_cmd)
                         .status()
                         .map_err(HailError::Io)?;
+                    if !status.success() {
+                        return Err(HailError::Io(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "Failed to install the explicitly redeployed coordinator binary",
+                        )));
+                    }
                 } else {
                     println!("{}", "Deploying coordinator binary via SCP...".dimmed());
                     self.deploy_binary(binary, &[coord.clone()], zone)?;
@@ -739,74 +773,48 @@ EOF
                     )));
                 }
 
-                // Deploy worker binary (custom binary if specified, otherwise same as coordinator)
+                // Custom-worker redeploy is rejected by validate_submit_contract
+                // before any artifact access or mutation. The remaining shared
+                // redeploy path is therefore stock-only.
                 if worker_binary.is_some() {
-                    // Custom worker binary: deploy separately to workers
-                    let wb = worker_binary.as_ref().unwrap();
-                    if let Some(ref gcs_url) = worker_staging_url {
-                        println!(
-                            "{} Deploying custom worker binary to {} workers via GCS...",
-                            "API:".cyan(),
-                            workers.len()
-                        );
-                        let req = serde_json::json!({ "gcs_url": gcs_url });
-                        let curl_cmd = format!(
-                            "curl -s -X POST -H 'Content-Type: application/json' -d '{}' http://localhost:3000/api/update-fleet",
-                            req.to_string()
-                        );
-                        let _ = self
-                            .provider
-                            .get_ssh_command(&coord.name, zone, &curl_cmd)
-                            .status();
-                        println!(
-                            "{} Custom worker binary update triggered.",
-                            "OK".green().bold()
-                        );
-                    } else {
-                        // Fallback: SCP the custom worker binary directly to workers
-                        println!(
-                            "{}",
-                            "Deploying custom worker binary to workers via SCP...".dimmed()
-                        );
-                        self.deploy_binary(wb, &workers, zone)?;
-                        println!(
-                            "{} Custom worker binary deployed to {} workers.",
-                            "OK".green().bold(),
-                            workers.len()
-                        );
+                    return Err(HailError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Custom-worker redeploy must use 'genohype pool update-binary'",
+                    )));
+                }
+                if let Some(ref gcs_url) = staging_url {
+                    println!(
+                        "{} Instructing workers to self-update via GCS...",
+                        "API:".cyan()
+                    );
+                    let req = serde_json::json!({ "gcs_url": gcs_url });
+                    let curl_cmd = format!(
+                        "curl --fail-with-body --show-error --silent -X POST -H 'Content-Type: application/json' -d '{}' http://localhost:3000/api/update-fleet",
+                        req
+                    );
+                    let status = self
+                        .provider
+                        .get_ssh_command(&coord.name, zone, &curl_cmd)
+                        .status()
+                        .map_err(HailError::Io)?;
+                    if !status.success() {
+                        return Err(HailError::Io(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "Coordinator rejected the stock worker fleet update",
+                        )));
                     }
-                    // Whether the binary arrived through fleet update or SCP, make
-                    // the unit deterministic and active before accepting a job.
-                    self.start_worker_services(&workers, coord_ip, zone)?;
+                    println!(
+                        "{} Binary update triggered for workers.",
+                        "OK".green().bold()
+                    );
                 } else {
-                    // Same binary for coordinator and workers
-                    if let Some(ref gcs_url) = staging_url {
-                        println!(
-                            "{} Instructing workers to self-update via GCS...",
-                            "API:".cyan()
-                        );
-                        let req = serde_json::json!({ "gcs_url": gcs_url });
-                        let curl_cmd = format!(
-                            "curl -s -X POST -H 'Content-Type: application/json' -d '{}' http://localhost:3000/api/update-fleet",
-                            req.to_string()
-                        );
-                        let _ = self
-                            .provider
-                            .get_ssh_command(&coord.name, zone, &curl_cmd)
-                            .status();
-                        println!(
-                            "{} Binary update triggered for workers.",
-                            "OK".green().bold()
-                        );
-                    } else {
-                        println!("{}", "Workers pulling binary from coordinator...".dimmed());
-                        self.propagate_binary_from_coordinator(coord_ip, &workers, zone)?;
-                        println!(
-                            "{} Binary propagated to {} workers.",
-                            "OK".green().bold(),
-                            workers.len()
-                        );
-                    }
+                    println!("{}", "Workers pulling binary from coordinator...".dimmed());
+                    self.propagate_binary_from_coordinator(coord_ip, &workers, zone)?;
+                    println!(
+                        "{} Binary propagated to {} workers.",
+                        "OK".green().bold(),
+                        workers.len()
+                    );
                 }
             } else {
                 // Non-distributed mode
@@ -824,6 +832,20 @@ EOF
             }
         }
 
+        // Redeployment explicitly authorizes service repair. Keep that mutation
+        // inside the opt-in path; normal submit never reaches this block.
+        if use_distributed && force_redeploy && !workers.is_empty() {
+            let coord = coordinator.as_ref().expect("distributed coordinator");
+            let coord_ip = coord.ip().ok_or_else(|| {
+                HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Coordinator {} has no internal IP", coord.name),
+                ))
+            })?;
+            self.start_worker_services(&workers, coord_ip, zone)?;
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
+
         // 4. Branch based on mode - use coordinator/worker pattern when coordinator exists
         if use_distributed {
             return self.submit_distributed(
@@ -834,6 +856,9 @@ EOF
                 command,
                 auto_stop,
                 force,
+                detach,
+                output,
+                has_custom_worker,
                 batch_size,
                 memory_weight_mb,
                 config,
@@ -1056,13 +1081,9 @@ EOF
 
     /// Submit a distributed job using the coordinator/worker pattern.
     ///
-    /// This method:
-    /// 1. Parses the command to extract input/output paths and job type
-    /// 2. Calculates total partitions from the input table
-    /// 3. Checks if coordinator is already running (idle mode), submits via API
-    /// 4. Or starts the coordinator service on the coordinator VM (legacy)
-    /// 5. Starts worker services on all worker VMs
-    /// 6. Streams coordinator logs for progress monitoring
+    /// This method parses and enriches the job, verifies the already-running
+    /// coordinator and exact fresh worker registry without mutation, submits via
+    /// the API, prints the durable acknowledgement, and optionally monitors it.
     pub(crate) fn submit_distributed(
         &self,
         pool_name: &str,
@@ -1072,11 +1093,28 @@ EOF
         command: &[String],
         auto_stop: bool,
         force: bool,
+        detach: bool,
+        output: crate::cli::PoolSubmitOutput,
+        has_custom_worker: bool,
         batch_size: Option<usize>,
         memory_weight_mb: Option<u64>,
         config: Option<&crate::cloud::ScalingConfig>,
     ) -> Result<()> {
         use genohype_core::query::QueryEngine;
+
+        let human_output = output == crate::cli::PoolSubmitOutput::Human;
+        macro_rules! println {
+            () => {{
+                if human_output {
+                    std::println!();
+                }
+            }};
+            ($($arg:tt)*) => {{
+                if human_output {
+                    std::println!($($arg)*);
+                }
+            }};
+        }
 
         println!("{}", "Preparing distributed job...".dimmed());
 
@@ -1344,266 +1382,141 @@ EOF
             ))
         })?;
 
-        // Check if coordinator is already running (started in idle mode during pool create)
-        let coordinator_already_running = self.check_coordinator_status(coordinator, zone);
+        if !self.check_coordinator_status(coordinator, zone) {
+            return Err(HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "Coordinator became unavailable before registration; no repair was attempted",
+            )));
+        }
+        println!(
+            "{} Healthy coordinator on {} ({})",
+            "Found".green(),
+            coordinator.name.cyan(),
+            coord_ip
+        );
 
-        if coordinator_already_running {
-            println!(
-                "{} Coordinator already running on {} ({})",
-                "Found".green(),
-                coordinator.name.cyan(),
-                coord_ip
-            );
-
-            // Do not disrupt an existing job merely to discover that submission
-            // needs --force. Forced replacement intentionally restarts workers.
-            if !force {
-                self.ensure_coordinator_idle(coordinator, zone)?;
-            }
-
-            // Reinstall/enable/restart every unit before submission. The
-            // coordinator registry can look healthy for 30 seconds after a worker
-            // exits, which previously left a release smoke at 0/N indefinitely.
-            self.start_worker_services(workers, coord_ip, zone)?;
-            std::thread::sleep(std::time::Duration::from_secs(3));
-
-            // Only count recent heartbeats; a non-dead status alone can be stale.
-            let mut connected_count = 0;
-            if let Ok(workers_json) =
-                self.fetch_coordinator_api(coordinator, zone, "/api/dashboard/workers", 3000)
-            {
-                if let Ok(worker_list) = serde_json::from_str::<
-                    Vec<crate::distributed::message::DashboardWorker>,
-                >(&workers_json)
-                {
-                    connected_count = worker_list.iter().filter(|w| worker_is_fresh(w)).count();
-                }
-            }
-
-            if connected_count < workers.len() {
-                // Some workers are not connected - start missing ones via SSH
-                println!(
-                    "{} {}/{} workers connected. Starting missing workers via SSH...",
-                    "Warning:".yellow(),
-                    connected_count,
-                    workers.len()
-                );
-                self.start_worker_services(workers, coord_ip, zone)?;
-
-                // Give workers a moment to connect to coordinator
-                println!("{}", "Waiting for workers to connect...".dimmed());
-                std::thread::sleep(std::time::Duration::from_secs(3));
-            } else {
-                println!(
-                    "{} {}/{} workers already connected",
-                    "OK".green(),
-                    connected_count,
-                    workers.len()
-                );
-            }
-
-            // For ClickHouse export jobs, create the target table before submitting
-            // Workers will INSERT into this table, so it must exist first
-            #[cfg(feature = "clickhouse")]
-            if let crate::distributed::message::JobSpec::ExportClickhouse {
-                ref clickhouse_url,
-                ref table_name,
-            } = job_spec
-            {
-                use genohype_core::export::clickhouse::{generate_create_table, ClickHouseClient};
-                use genohype_core::query::QueryEngine;
-
-                println!(
-                    "{} Creating ClickHouse table '{}'...",
-                    "Setup:".cyan(),
-                    table_name.bright_white()
-                );
-
-                // Read schema from the input Hail table
-                let engine = QueryEngine::open_path(&input_path)?;
-                let row_type = engine.row_type();
-                let key_fields = engine.key_fields();
-
-                // Generate CREATE TABLE IF NOT EXISTS DDL
-                let ddl = generate_create_table(table_name, row_type, key_fields).map_err(|e| {
-                    HailError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Failed to generate ClickHouse DDL: {}", e),
-                    ))
-                })?;
-
-                // Execute DDL on ClickHouse
-                let client = ClickHouseClient::new(clickhouse_url);
-                client.execute(&ddl).map_err(|e| {
-                    HailError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Failed to create ClickHouse table: {}", e),
-                    ))
-                })?;
-
-                println!("  {} Table '{}' ready", "OK".green(), table_name);
-            }
-
-            // Submit job via API
-            println!("{}", "Submitting job via API...".dimmed());
-            if !self.submit_job_via_api(
-                coordinator,
-                zone,
-                &input_path,
-                &job_spec,
-                total_partitions,
-                force,
-                batch_size,
-                memory_weight_mb,
-                &filters,
-                &intervals,
-            )? {
-                return Err(HailError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Failed to submit job to coordinator via API",
-                )));
-            }
-            println!("{} Job submitted via API", "OK".green().bold());
-        } else {
-            // Start coordinator in idle/API mode (no pre-configured job)
-            println!(
-                "Starting coordinator on {} ({})...",
-                coordinator.name.cyan(),
-                coord_ip
-            );
-
-            // First ensure port is free
-            let cleanup_cmd = "fuser -k 3000/tcp 2>/dev/null; true";
-            let _ = self
-                .provider
-                .get_ssh_command(&coordinator.name, zone, cleanup_cmd)
-                .status();
-            std::thread::sleep(std::time::Duration::from_millis(500));
-
-            // Start coordinator service in idle mode (accepts jobs via API)
-            let backup_arg = config
-                .and_then(|c| c.pool_db_path.as_deref())
-                .map(|b| format!(" --backup-path {}", b))
-                .unwrap_or_default();
-            let identity_args = self.coordinator_scaling_args(pool_name, zone, config);
-            let coord_cmd = format!(
-                "sudo bash -c 'cat > /etc/systemd/system/genohype-coordinator.service << EOF
-[Unit]
-Description=Genohype Coordinator
-After=network.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=/usr/local/bin/genohype service start-coordinator --port 3000 --db-path /var/lib/genohype/ops.db{}{}
-Restart=always
-RestartSec=3
-StartLimitIntervalSec=0
-
-[Install]
-WantedBy=multi-user.target
-EOF
-' && sudo systemctl daemon-reload && sudo systemctl enable --now genohype-coordinator",
-                backup_arg, identity_args
-            );
-
-            let status = self
-                .provider
-                .get_ssh_command(&coordinator.name, zone, &coord_cmd)
-                .status()
-                .map_err(HailError::Io)?;
-
-            if !status.success() {
-                return Err(HailError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Failed to start coordinator service",
-                )));
-            }
-
-            // Give coordinator a moment to bind its port
-            std::thread::sleep(std::time::Duration::from_secs(2));
-
-            // Verify coordinator started successfully
-            if !self.check_coordinator_status(coordinator, zone) {
-                // Show log to help debug
-                let log_cmd = "journalctl -u genohype-coordinator -n 50 --no-pager 2>/dev/null || echo '(no log available)'";
-                if let Ok(output) = self
-                    .provider
-                    .get_ssh_command(&coordinator.name, zone, log_cmd)
-                    .output()
-                {
-                    let log_content = String::from_utf8_lossy(&output.stdout);
-                    eprintln!("\n{}", "Coordinator log:".red().bold());
-                    eprintln!("{}", log_content);
-                }
-                return Err(HailError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Coordinator failed to start. See log above.",
-                )));
-            }
-
-            // Check if any workers are already connected (may have started from startup script)
-            let mut connected_count = 0;
-            if let Ok(workers_json) =
-                self.fetch_coordinator_api(coordinator, zone, "/api/dashboard/workers", 3000)
-            {
-                if let Ok(worker_list) = serde_json::from_str::<
-                    Vec<crate::distributed::message::DashboardWorker>,
-                >(&workers_json)
-                {
-                    connected_count = worker_list.iter().filter(|w| worker_is_fresh(w)).count();
-                }
-            }
-
-            if connected_count < workers.len() {
-                // Start missing workers via SSH
-                println!(
-                    "Starting {} worker(s) ({} already connected)...",
-                    workers.len().to_string().bright_white(),
-                    connected_count
-                );
-                self.start_worker_services(workers, coord_ip, zone)?;
-
-                // Give workers a moment to connect to coordinator
-                println!("{}", "Waiting for workers to connect...".dimmed());
-                std::thread::sleep(std::time::Duration::from_secs(3));
-            } else {
-                println!(
-                    "{} {}/{} workers already connected",
-                    "OK".green(),
-                    connected_count,
-                    workers.len()
-                );
-            }
-
-            // Submit job via API (same as the "coordinator already running" path)
-            println!("{}", "Submitting job via API...".dimmed());
-            if !self.submit_job_via_api(
-                coordinator,
-                zone,
-                &input_path,
-                &job_spec,
-                total_partitions,
-                force,
-                batch_size,
-                memory_weight_mb,
-                &filters,
-                &intervals,
-            )? {
-                return Err(HailError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Failed to submit job to coordinator via API",
-                )));
-            }
-            println!("{} Job submitted via API", "OK".green().bold());
+        if !force {
+            self.ensure_coordinator_idle(coordinator, zone)?;
         }
 
-        println!();
-        println!("{} Distributed job submitted!", "OK".green().bold());
-        println!("  {} {}", "Coordinator:".cyan(), coordinator.name);
-        println!("  {} {}", "Workers:".cyan(), workers.len());
-        println!("  {} {}", "Total partitions:".cyan(), total_partitions);
-        println!();
+        let workers_json =
+            self.fetch_coordinator_api(coordinator, zone, "/api/dashboard/workers", 3000)?;
+        let registrations: Vec<crate::distributed::message::DashboardWorker> =
+            serde_json::from_str(&workers_json).map_err(|error| {
+                HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Invalid coordinator worker registry: {error}"),
+                ))
+            })?;
+        let expected_names: Vec<_> = workers.iter().map(|worker| worker.name.clone()).collect();
+        // Avoid inspecting, hashing, staging, or building a mutable operator-local
+        // worker binary. Stock workers must match the coordinator build. Custom
+        // workers bind to the configured build-produced attestation identity.
+        //
+        // Durable-state limitation: the expected custom identity is not yet
+        // persisted by the pool/coordinator. Until it is, normal submit relies on
+        // the configured operator-local sidecar path remaining available and
+        // trusted; absence is therefore a fail-closed readiness error.
+        let expected_build = if !has_custom_worker {
+            let summary_json =
+                self.fetch_coordinator_api(coordinator, zone, "/api/dashboard/summary", 3000)?;
+            let summary: crate::distributed::message::DashboardSummary =
+                serde_json::from_str(&summary_json).map_err(|error| {
+                    HailError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("Invalid coordinator summary: {error}"),
+                    ))
+                })?;
+            Some(summary.build_version.ok_or_else(|| {
+                HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Coordinator did not report its build identity",
+                ))
+            })?)
+        } else {
+            let attestation_path = config
+                .and_then(|config| config.worker_attestation.as_deref())
+                .ok_or_else(|| {
+                    HailError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Custom-worker submit requires worker_attestation in the pool profile to bind readiness to the intended build. This read-only check does not hash, stage, or build the local binary.",
+                    ))
+                })?;
+            let attestation = crate::cloud::attestation::read_worker_attestation_intent(
+                std::path::Path::new(attestation_path),
+            )?;
+            Some(attestation.build_version)
+        };
+        require_worker_readiness(&expected_names, &registrations, expected_build.as_deref())?;
+        println!(
+            "{} {}/{} exact managed workers have fresh, healthy build identities",
+            "OK".green(),
+            registrations
+                .iter()
+                .filter(|worker| expected_names.contains(&worker.worker_id))
+                .count(),
+            workers.len()
+        );
+
+        println!("{}", "Submitting job via API...".dimmed());
+        let acknowledgement = self.submit_job_via_api(
+            coordinator,
+            zone,
+            &input_path,
+            &job_spec,
+            total_partitions,
+            force,
+            batch_size,
+            memory_weight_mb,
+            &filters,
+            &intervals,
+        )?;
+
+        let job_id = match acknowledgement {
+            crate::distributed::message::JobSubmissionAck::Job { job_id } => {
+                match output {
+                    crate::cli::PoolSubmitOutput::Human => {
+                        println!();
+                        println!("{} Submission acknowledged", "OK".green().bold());
+                        println!("  {} {}", "Job ID:".cyan(), job_id.bright_white().bold());
+                        println!("  {} {}", "Coordinator:".cyan(), coordinator.name);
+                        println!("  {} {}", "Workers:".cyan(), workers.len());
+                        println!("  {} {}", "Total partitions:".cyan(), total_partitions);
+                        println!();
+                    }
+                    crate::cli::PoolSubmitOutput::Json => std::println!(
+                        "{}",
+                        serde_json::json!({
+                            "acknowledged": true,
+                            "job_id": job_id,
+                            "pool": pool_name,
+                            "coordinator": coordinator.name,
+                            "workers": workers.len(),
+                            "total_partitions": total_partitions,
+                        })
+                    ),
+                }
+                job_id
+            }
+            crate::distributed::message::JobSubmissionAck::Configuration => {
+                match output {
+                    crate::cli::PoolSubmitOutput::Human => println!(
+                        "{} Idle catalog configuration acknowledged (no executable job)",
+                        "OK".green().bold()
+                    ),
+                    crate::cli::PoolSubmitOutput::Json => std::println!(
+                        "{}",
+                        serde_json::json!({
+                            "acknowledged": true,
+                            "job_id": null,
+                            "pool": pool_name,
+                            "configuration_only": true,
+                        })
+                    ),
+                }
+                return Ok(());
+            }
+        };
         if workers.is_empty() {
             println!(
                 "{}",
@@ -1612,9 +1525,20 @@ EOF
             );
             return Ok(());
         }
+        if detach {
+            if output == crate::cli::PoolSubmitOutput::Human {
+                println!(
+                    "Detached after durable acknowledgement. Remote job {} continues running.",
+                    job_id
+                );
+                println!("Monitor with: genohype pool status {}", pool_name);
+            }
+            return Ok(());
+        }
         println!(
             "{}",
-            "Streaming coordinator logs (will exit on job completion)...".dimmed()
+            "Streaming coordinator logs (interrupting monitoring does not cancel the remote job)..."
+                .dimmed()
         );
         println!();
 
@@ -1728,7 +1652,7 @@ EOF
             };
             return Err(HailError::Io(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
-                message,
+                format!("{message}; remote job {job_id} continues running and was not cancelled"),
             )));
         }
 
@@ -1756,10 +1680,8 @@ EOF
             let mut instance_names = vec![coordinator.name.clone()];
             instance_names.extend(workers.iter().map(|worker| worker.name.clone()));
 
-            match self.provider.stop_instances(&instance_names, zone) {
-                Ok(()) => println!("{} Instances stopped.", "OK".green().bold()),
-                Err(_) => eprintln!("{} Failed to stop instances.", "Error:".red()),
-            }
+            self.provider.stop_instances(&instance_names, zone)?;
+            println!("{} Instances stopped.", "OK".green().bold());
         }
 
         Ok(())
@@ -1951,6 +1873,10 @@ EOF
 mod lifecycle_tests {
     use super::*;
 
+    const TEST_REVISION: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const TEST_BUILD: &str =
+        "fixture/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/x86_64-linux-release";
+
     fn dashboard_worker(
         status: &str,
         last_seen_secs: f64,
@@ -1965,28 +1891,24 @@ mod lifecycle_tests {
             total_items: 0,
             tasks_completed: 0,
             current_task: None,
-            build_version: None,
+            build_version: Some(TEST_BUILD.into()),
             effective_status: None,
         }
     }
 
     #[test]
-    fn zero_worker_mode_is_only_for_custom_jobs_with_a_custom_worker() {
-        let custom = vec!["custom".to_string(), "--tasks".to_string(), "1".to_string()];
+    fn zero_worker_mode_is_based_on_custom_job_not_binary_path_intent() {
         assert_eq!(
-            classify_submission("pool", true, 0, true, &custom).unwrap(),
+            classify_submission("pool", true, 0, true).unwrap(),
             SubmissionMode::ZeroWorkerCustom
         );
-
-        let stock = vec!["summary".to_string(), "input.ht".to_string()];
-        assert!(classify_submission("pool", true, 0, true, &stock).is_err());
-        assert!(classify_submission("pool", true, 0, false, &custom).is_err());
-        assert!(classify_submission("pool", false, 0, true, &custom)
-            .unwrap_err()
-            .to_string()
-            .contains("running coordinator"));
+        assert!(classify_submission("pool", true, 0, false).is_err());
         assert_eq!(
-            classify_submission("pool", true, 1, true, &custom).unwrap(),
+            classify_submission("pool", true, 1, true).unwrap(),
+            SubmissionMode::Standard
+        );
+        assert_eq!(
+            classify_submission("pool", false, 0, true).unwrap(),
             SubmissionMode::Standard
         );
     }
@@ -2013,7 +1935,8 @@ mod lifecycle_tests {
             "is_complete": false,
             "input_path": "",
             "job_spec": null,
-            "idle": idle
+            "idle": idle,
+            "build_version": TEST_BUILD
         })
         .to_string()
     }
@@ -2026,6 +1949,227 @@ mod lifecycle_tests {
             .to_string()
             .contains("already has a job running"));
         assert!(require_idle_summary("not json").is_err());
+    }
+
+    #[test]
+    fn healthy_detached_submits_never_issue_lifecycle_operations() {
+        use crate::cloud::{CloudProvider, Instance, InstanceSetup, NetworkInterface, PoolConfig};
+        use std::path::Path;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct Calls {
+            ssh: Vec<String>,
+            uploads: usize,
+            creates: usize,
+            deletes: usize,
+            stops: usize,
+        }
+
+        #[derive(Clone)]
+        struct RecordingProvider(Arc<Mutex<Calls>>);
+
+        impl CloudProvider for RecordingProvider {
+            fn create_pool(&self, _: &PoolConfig) -> Result<()> {
+                self.0.lock().unwrap().creates += 1;
+                Ok(())
+            }
+
+            fn list_instances(&self, _: &str) -> Result<Vec<Instance>> {
+                let instance = |name: &str, ip: &str| Instance {
+                    name: name.into(),
+                    zone: "us-central1-a".into(),
+                    network_interfaces: vec![NetworkInterface {
+                        network_ip: ip.into(),
+                        network: None,
+                        subnetwork: None,
+                    }],
+                    status: "RUNNING".into(),
+                    machine_type: None,
+                    scheduling: None,
+                };
+                Ok(vec![
+                    instance("pool-coordinator", "10.0.0.1"),
+                    instance("pool-worker-0", "10.0.0.2"),
+                ])
+            }
+
+            fn destroy_pool(&self, _: &str, _: &str) -> Result<()> {
+                self.0.lock().unwrap().deletes += 1;
+                Ok(())
+            }
+
+            fn create_instances(&self, _: &[InstanceSetup]) -> Result<()> {
+                self.0.lock().unwrap().creates += 1;
+                Ok(())
+            }
+
+            fn delete_instances(&self, _: &[String], _: &str, _: &str) -> Result<()> {
+                self.0.lock().unwrap().deletes += 1;
+                Ok(())
+            }
+
+            fn stop_instances(&self, _: &[String], _: &str) -> Result<()> {
+                self.0.lock().unwrap().stops += 1;
+                Ok(())
+            }
+
+            fn upload_file(&self, _: &Path, _: &str, _: &str, _: &str) -> Result<()> {
+                self.0.lock().unwrap().uploads += 1;
+                Ok(())
+            }
+
+            fn get_ssh_command(&self, _: &str, _: &str, command: &str) -> std::process::Command {
+                self.0.lock().unwrap().ssh.push(command.to_string());
+                let response = if command.contains("/api/dashboard/summary") {
+                    summary_json(true)
+                } else if command.contains("/api/dashboard/workers") {
+                    let mut worker = dashboard_worker("idle", 1.0);
+                    worker.worker_id = "pool-worker-0".into();
+                    serde_json::to_string(&vec![worker]).unwrap()
+                } else if command.contains("/api/job") {
+                    r#"{"acknowledged":true,"job_id":"job-exact","error":null}"#.into()
+                } else {
+                    r#"{"pending_tasks":0,"completed_tasks":0}"#.into()
+                };
+                let quoted = response.replace('\'', "'\\''");
+                let script = if command.contains("/api/job") {
+                    format!("cat >/dev/null; printf '%s' '{quoted}'")
+                } else {
+                    format!("printf '%s' '{quoted}'")
+                };
+                let mut process = std::process::Command::new("sh");
+                process.args(["-c", &script]);
+                process
+            }
+        }
+
+        let cases = [
+            (
+                vec!["custom".into(), "--tasks".into(), "1".into()],
+                false,
+                Some("/profile/path/that/does-not-exist".to_string()),
+            ),
+            (
+                vec![
+                    "stress".into(),
+                    "--tasks".into(),
+                    "1".into(),
+                    "--cpu-secs".into(),
+                    "0".into(),
+                ],
+                false,
+                None,
+            ),
+            (
+                vec![
+                    "stress".into(),
+                    "--tasks".into(),
+                    "1".into(),
+                    "--cpu-secs".into(),
+                    "0".into(),
+                ],
+                true,
+                None,
+            ),
+        ];
+
+        for (command, force, worker_binary) in cases {
+            let mut sidecar = tempfile::NamedTempFile::new().unwrap();
+            serde_json::to_writer(
+                &mut sidecar,
+                &crate::cloud::attestation::WorkerArtifactAttestation {
+                    schema_version: 1,
+                    sha256: "b".repeat(64),
+                    size: 1,
+                    revision: TEST_REVISION.into(),
+                    build_identity: TEST_BUILD.into(),
+                    build_version: TEST_BUILD.into(),
+                    platform: "linux".into(),
+                    arch: "x86_64".into(),
+                },
+            )
+            .unwrap();
+            let config = worker_binary
+                .as_ref()
+                .map(|worker_binary| crate::cloud::ScalingConfig {
+                    machine_type: "e2-standard-2".into(),
+                    workers: 1,
+                    spot: false,
+                    network: None,
+                    subnet: None,
+                    public_ip: false,
+                    manage_firewall: false,
+                    project: Some("project".into()),
+                    with_coordinator: true,
+                    pool_db_path: Some("gs://bucket/pool/ops.db".into()),
+                    worker_binary: Some(worker_binary.clone()),
+                    worker_attestation: Some(sidecar.path().to_string_lossy().into_owned()),
+                    service_account: None,
+                });
+            let calls = Arc::new(Mutex::new(Calls::default()));
+            let manager = PoolManager::new(RecordingProvider(calls.clone()));
+            manager
+                .submit(
+                    "pool",
+                    "us-central1-a",
+                    None,
+                    worker_binary,
+                    false,
+                    false,
+                    force,
+                    true,
+                    crate::cli::PoolSubmitOutput::Human,
+                    false,
+                    true,
+                    None,
+                    None,
+                    config.as_ref(),
+                    &command,
+                )
+                .unwrap();
+
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.uploads, 0);
+            assert_eq!(calls.creates, 0);
+            assert_eq!(calls.deletes, 0);
+            assert_eq!(calls.stops, 0);
+            let ssh = calls.ssh.join("\n");
+            for forbidden in [
+                "systemctl",
+                "fuser",
+                "update-fleet",
+                "gsutil cp",
+                "/etc/systemd/system",
+            ] {
+                assert!(!ssh.contains(forbidden), "forbidden {forbidden}: {ssh}");
+            }
+        }
+    }
+
+    #[test]
+    fn machine_json_requires_explicit_detach() {
+        let error =
+            validate_submit_contract(false, None, false, crate::cli::PoolSubmitOutput::Json)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("requires explicit --detach"), "{error}");
+        assert!(
+            validate_submit_contract(false, None, true, crate::cli::PoolSubmitOutput::Json).is_ok()
+        );
+    }
+
+    #[test]
+    fn custom_submit_redeploy_fails_closed_before_artifact_access() {
+        let error = validate_submit_contract(
+            true,
+            Some("/does/not/need/to/exist"),
+            true,
+            crate::cli::PoolSubmitOutput::Human,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("pool update-binary"), "{error}");
     }
 
     #[test]

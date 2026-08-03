@@ -13,8 +13,59 @@
 use super::{CloudProvider, Instance, InstanceSetup, PoolConfig};
 use crate::{HailError, Result};
 use rayon::prelude::*;
-use std::path::Path;
-use std::process::Command;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+struct PrivateStartupScript {
+    path: PathBuf,
+}
+
+impl PrivateStartupScript {
+    fn create(contents: &str) -> Result<Self> {
+        let path = std::env::temp_dir().join(format!(
+            "genohype-startup-{}-{}.sh",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        // Construct the guard before writing so write/sync failures also clean
+        // up the create-new, mode-0600 file.
+        let script = Self { path };
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&script.path)
+            .map_err(HailError::Io)?;
+        file.write_all(contents.as_bytes()).map_err(HailError::Io)?;
+        file.sync_all().map_err(HailError::Io)?;
+        Ok(script)
+    }
+}
+
+impl Drop for PrivateStartupScript {
+    fn drop(&mut self) {
+        // Best-effort cleanup is appropriate in Drop. The file is mode 0600
+        // and its unpredictable, create-new name prevents reuse.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// A gcloud instance-create command and the private startup-script file it
+/// references. Keeping both in one value makes it impossible for the file to be
+/// deleted before gcloud has finished reading it.
+struct PreparedInstanceCreateCommand {
+    command: Command,
+    startup_script: PrivateStartupScript,
+}
+
+impl PreparedInstanceCreateCommand {
+    fn output(mut self) -> std::io::Result<Output> {
+        self.command.output()
+    }
+}
 
 /// GCP client using the gcloud CLI.
 pub struct GcpClient {
@@ -92,7 +143,9 @@ impl GcpClient {
         }
     }
 
-    fn instance_create_command(setup: &InstanceSetup) -> Command {
+    fn instance_create_command(setup: &InstanceSetup) -> Result<PreparedInstanceCreateCommand> {
+        let startup_script = PrivateStartupScript::create(&setup.startup_script)?;
+
         let mut command = Command::new("gcloud");
         command.args([
             "compute",
@@ -112,7 +165,11 @@ impl GcpClient {
             "--tags",
             &setup.tags.join(","),
             "--metadata",
-            &format!("startup-script={}", setup.startup_script),
+            "enable-oslogin=TRUE",
+            &format!(
+                "--metadata-from-file=startup-script={}",
+                startup_script.path.display()
+            ),
             "--scopes",
             "cloud-platform",
         ]);
@@ -132,7 +189,10 @@ impl GcpClient {
         if let Some(service_account) = &setup.service_account {
             command.arg(format!("--service-account={}", service_account));
         }
-        command
+        Ok(PreparedInstanceCreateCommand {
+            command,
+            startup_script,
+        })
     }
 
     fn scp_command(
@@ -309,13 +369,17 @@ impl CloudProvider for GcpClient {
 
         // Generate startup scripts (with optional binary download from GCS)
         // Workers auto-start and connect to coordinator via internal DNS
-        let worker_script = super::startup::generate_worker_startup_script(
-            config
-                .worker_binary_gcs_url
-                .as_deref()
-                .or(config.binary_gcs_url.as_deref()),
-            &config.name,
-        );
+        let worker_script = if let Some(bootstrap) = &config.worker_bootstrap {
+            super::startup::generate_attested_worker_startup_script(bootstrap, &config.name)?
+        } else {
+            super::startup::generate_worker_startup_script(
+                config
+                    .worker_binary_gcs_url
+                    .as_deref()
+                    .or(config.binary_gcs_url.as_deref()),
+                &config.name,
+            )
+        };
         // Coordinator auto-starts if binary is provided
         let cluster_cfg = super::startup::CoordinatorClusterConfig {
             pool_name: Some(&config.name),
@@ -385,7 +449,7 @@ impl CloudProvider for GcpClient {
                     project_id: config.project_id.clone(),
                     service_account: Self::instance_service_account(config, is_coordinator),
                 };
-                let output = Self::instance_create_command(&setup)
+                let output = Self::instance_create_command(&setup)?
                     .output()
                     .map_err(HailError::Io)?;
 
@@ -469,7 +533,7 @@ impl CloudProvider for GcpClient {
         let results: Vec<Result<()>> = instances
             .par_iter()
             .map(|setup| {
-                let output = Self::instance_create_command(setup)
+                let output = Self::instance_create_command(setup)?
                     .output()
                     .map_err(HailError::Io)?;
 
@@ -656,6 +720,7 @@ mod tests {
             pool_db_path: None,
             binary_gcs_url: Some("gs://bucket/stock-coordinator".into()),
             worker_binary_gcs_url: Some("gs://bucket/custom-worker".into()),
+            worker_bootstrap: None,
             service_account: None,
             coordinator_service_account: None,
         };
@@ -692,12 +757,16 @@ mod tests {
             pool_db_path: None,
             binary_gcs_url: None,
             worker_binary_gcs_url: None,
+            worker_bootstrap: None,
             service_account: None,
             coordinator_service_account: None,
         }
     }
 
-    fn instance_create_args_for(config: &PoolConfig, is_coordinator: bool) -> Vec<String> {
+    fn instance_create_for(
+        config: &PoolConfig,
+        is_coordinator: bool,
+    ) -> PreparedInstanceCreateCommand {
         let setup = InstanceSetup {
             name: if is_coordinator {
                 "demo-coordinator".into()
@@ -715,7 +784,81 @@ mod tests {
             project_id: config.project_id.clone(),
             service_account: GcpClient::instance_service_account(config, is_coordinator),
         };
-        args(&GcpClient::instance_create_command(&setup))
+        GcpClient::instance_create_command(&setup).unwrap()
+    }
+
+    fn instance_create_args_for(config: &PoolConfig, is_coordinator: bool) -> Vec<String> {
+        let prepared = instance_create_for(config, is_coordinator);
+        args(&prepared.command)
+    }
+
+    #[test]
+    fn created_instances_enable_os_login() {
+        let config = pool_config(false, false);
+        let args = instance_create_args_for(&config, false);
+        assert!(args
+            .windows(2)
+            .any(|pair| { pair[0] == "--metadata" && pair[1] == "enable-oslogin=TRUE" }));
+    }
+
+    #[test]
+    fn startup_script_uses_private_file_not_inline_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = "#!/bin/bash\necho one,two\nprintf '%s' '{\"a\":1,\"b\":2}'\n";
+        let mut config = pool_config(false, false);
+        config.network = None;
+        config.subnet = None;
+        let setup = InstanceSetup {
+            name: "demo-worker-0".into(),
+            machine_type: config.machine_type,
+            zone: config.zone,
+            tags: vec!["genohype-worker".into()],
+            startup_script: script.into(),
+            spot: false,
+            network: None,
+            subnet: None,
+            public_ip: false,
+            project_id: config.project_id,
+            service_account: None,
+        };
+
+        let prepared = GcpClient::instance_create_command(&setup).unwrap();
+        let path = prepared.startup_script.path.clone();
+        let command_args = args(&prepared.command);
+        assert!(command_args
+            .iter()
+            .any(|arg| arg == &format!("--metadata-from-file=startup-script={}", path.display())));
+        assert!(!command_args.iter().any(|arg| arg.contains(script)));
+        assert!(!command_args
+            .windows(2)
+            .any(|pair| pair[0] == "--metadata" && pair[1].starts_with("startup-script=")));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), script);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(prepared);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn startup_script_file_is_cleaned_after_process_success_and_spawn_failure() {
+        let config = pool_config(false, false);
+        let mut successful = instance_create_for(&config, false);
+        let success_path = successful.startup_script.path.clone();
+        successful.command = Command::new("true");
+        assert!(successful.output().unwrap().status.success());
+        assert!(!success_path.exists());
+
+        let mut failed = instance_create_for(&config, false);
+        let failure_path = failed.startup_script.path.clone();
+        failed.command = Command::new(format!(
+            "/definitely-missing-genohype-test-command-{}",
+            uuid::Uuid::new_v4()
+        ));
+        assert!(failed.output().is_err());
+        assert!(!failure_path.exists());
     }
 
     #[test]
@@ -767,7 +910,8 @@ mod tests {
             service_account: None,
         };
 
-        let command_args = args(&GcpClient::instance_create_command(&setup));
+        let prepared = GcpClient::instance_create_command(&setup).unwrap();
+        let command_args = args(&prepared.command);
         assert!(command_args.iter().any(|arg| arg == "--no-address"));
         assert!(command_args
             .windows(2)
@@ -798,7 +942,8 @@ mod tests {
             project_id: config.project_id.clone(),
             service_account: None,
         };
-        assert!(!args(&GcpClient::instance_create_command(&setup))
+        let prepared = GcpClient::instance_create_command(&setup).unwrap();
+        assert!(!args(&prepared.command)
             .iter()
             .any(|arg| arg == "--no-address"));
         assert!(GcpClient::firewall_create_command(&config).is_some());

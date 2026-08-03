@@ -26,7 +26,7 @@ pub(crate) fn start_new_job(
     memory_weight_mb: Option<u64>,
     filters: Vec<String>,
     intervals: Vec<String>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     // Enrich specs if it's a batch job
     if let JobSpec::ManhattanBatch { ref mut specs, .. } = job_spec {
         super::batch_init::enrich_specs(specs);
@@ -111,13 +111,10 @@ pub(crate) fn start_new_job(
     };
 
     if let Err(e) = data.metrics_db.insert_job(&job_record) {
-        if matches!(job_spec, JobSpec::Custom { .. }) {
-            data.current_job_id = None;
-            return Err(format!(
-                "custom jobs require durable coordinator state; failed to persist job: {e}"
-            ));
-        }
-        eprintln!("Warning: failed to persist job to DB: {}", e);
+        data.current_job_id = None;
+        return Err(format!(
+            "jobs require durable coordinator state; failed to persist job: {e}"
+        ));
     }
 
     // Mark as no longer idle
@@ -178,7 +175,7 @@ pub(crate) fn start_new_job(
         }
     }
 
-    Ok(())
+    Ok(job_id)
 }
 
 /// Appends new phenotypes dynamically to an already-running Batch job.

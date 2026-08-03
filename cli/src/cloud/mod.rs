@@ -3,6 +3,7 @@
 //! This module provides traits and implementations for managing cloud VMs
 //! for distributed genohype workloads.
 
+pub mod attestation;
 pub mod gcp;
 pub mod pool;
 pub mod startup;
@@ -62,6 +63,8 @@ pub struct PoolConfig {
     pub binary_gcs_url: Option<String>,
     /// GCS URL for the pre-staged worker binary (custom or stock).
     pub worker_binary_gcs_url: Option<String>,
+    /// Verified custom-worker bootstrap metadata, when the attested path is used.
+    pub worker_bootstrap: Option<attestation::ExpectedWorkerBootstrap>,
     /// GCP service account email to attach to worker VMs
     pub service_account: Option<String>,
     /// GCP service account email to attach to the coordinator VM
@@ -175,6 +178,8 @@ pub struct ScalingConfig {
     pub pool_db_path: Option<String>,
     /// Path to a custom binary to deploy to workers instead of the coordinator binary
     pub worker_binary: Option<String>,
+    /// Path to the custom worker's build-produced attestation sidecar
+    pub worker_attestation: Option<String>,
     /// GCP service account email to attach to workers created by the coordinator
     pub service_account: Option<String>,
 }
@@ -217,6 +222,18 @@ pub trait CloudProvider {
             std::io::ErrorKind::Unsupported,
             "Stopping instances is not supported by this cloud provider",
         )))
+    }
+
+    /// Stage a validated custom worker at its immutable pool-scoped URL.
+    ///
+    /// Providers may override this for recording tests or alternate object-store
+    /// transports. The default uses create-only object-store semantics.
+    fn stage_worker_artifact(
+        &self,
+        artifact: &attestation::ValidatedWorkerArtifact,
+        pool_db_path: &str,
+    ) -> Result<attestation::StagedWorkerArtifact> {
+        attestation::stage_validated_worker_artifact(artifact, pool_db_path)
     }
 
     /// Upload a file to a specific instance via SCP.

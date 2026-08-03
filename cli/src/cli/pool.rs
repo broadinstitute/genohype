@@ -1,6 +1,16 @@
 //! Pool and service command argument definitions.
 
-use clap::Subcommand;
+use clap::{Subcommand, ValueEnum};
+
+/// Output format for the durable pool submission acknowledgement.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum PoolSubmitOutput {
+    /// Human-readable acknowledgement.
+    #[default]
+    Human,
+    /// Exactly one JSON acknowledgement object on stdout (requires --detach).
+    Json,
+}
 
 /// Subcommands for managing distributed worker pools.
 #[derive(Subcommand)]
@@ -62,6 +72,10 @@ pub enum PoolCommands {
         #[arg(long)]
         worker_binary: Option<String>,
 
+        /// Build-produced JSON attestation for the resolved custom worker binary
+        #[arg(long)]
+        worker_attestation: Option<String>,
+
         /// Create a dedicated coordinator node for distributed processing
         #[arg(long)]
         with_coordinator: bool,
@@ -88,11 +102,11 @@ pub enum PoolCommands {
         #[arg(long)]
         cluster: Option<String>,
 
-        /// Path to the Linux-compiled binary (defaults to target/x86_64-unknown-linux-gnu/release/genohype)
+        /// Linux binary used only by explicit redeploy/autoscale or coordinator-less legacy submit
         #[arg(long)]
         binary: Option<String>,
 
-        /// Path to a custom binary to deploy to workers (workers get this instead of the coordinator binary)
+        /// Custom worker artifact intent; deployment requires an explicit lifecycle option
         #[arg(long)]
         worker_binary: Option<String>,
 
@@ -100,7 +114,7 @@ pub enum PoolCommands {
         #[arg(long)]
         auto_stop: bool,
 
-        /// Force binary redeployment even if coordinator is already running
+        /// Explicitly authorize binary deployment and service restart before registration
         #[arg(long)]
         redeploy_binary: bool,
 
@@ -111,6 +125,17 @@ pub enum PoolCommands {
         /// Force submission even if a job is already running (supersedes it)
         #[arg(long)]
         force: bool,
+
+        /// Return after the coordinator durably acknowledges the job.
+        /// Required with `--output json`; stopping local monitoring never cancels
+        /// an acknowledged remote job.
+        #[arg(long)]
+        detach: bool,
+
+        /// Format for the durable submission acknowledgement. JSON requires
+        /// `--detach` and writes exactly one object to stdout.
+        #[arg(long, value_enum, default_value_t = PoolSubmitOutput::Human)]
+        output: PoolSubmitOutput,
 
         /// Skip automatic Linux binary build (use existing binary)
         #[arg(long)]
@@ -157,6 +182,10 @@ pub enum PoolCommands {
         /// Path to a custom binary to deploy to workers (workers get this instead of the coordinator binary)
         #[arg(long)]
         worker_binary: Option<String>,
+
+        /// Build-produced JSON attestation for the resolved custom worker binary
+        #[arg(long)]
+        worker_attestation: Option<String>,
 
         /// Skip automatic Linux binary build (use existing binary)
         #[arg(long)]
@@ -223,6 +252,10 @@ pub enum PoolCommands {
         /// Path to a custom binary to deploy to workers (workers get this instead of the coordinator binary)
         #[arg(long)]
         worker_binary: Option<String>,
+
+        /// Build-produced JSON attestation for the resolved custom worker binary
+        #[arg(long)]
+        worker_attestation: Option<String>,
 
         /// Skip automatic Linux binary build (use existing binary)
         #[arg(long)]

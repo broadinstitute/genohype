@@ -9,6 +9,27 @@ use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 
 impl<P: CloudProvider + Sync> PoolManager<P> {
+    /// Stage already-validated custom-worker bytes at their content-addressed URL.
+    ///
+    /// The caller invokes this once per operation; every new VM receives the
+    /// same immutable artifact identity and pulls it directly from GCS.
+    pub(crate) fn stage_attested_worker_to_gcs(
+        &self,
+        artifact: &crate::cloud::attestation::ValidatedWorkerArtifact,
+        pool_db_path: &str,
+    ) -> Result<crate::cloud::attestation::StagedWorkerArtifact> {
+        let staging_url = crate::cloud::attestation::content_addressed_worker_url(
+            pool_db_path,
+            &artifact.attestation,
+        )?;
+        println!(
+            "{} Staging attested worker to {}...",
+            "Setup:".cyan(),
+            staging_url.dimmed()
+        );
+        self.provider.stage_worker_artifact(artifact, pool_db_path)
+    }
+
     /// Stage the genohype binary to GCS for fast worker pulls.
     pub(crate) fn stage_binary_to_gcs(
         &self,
@@ -64,6 +85,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         zone: &str,
         binary_path: Option<String>,
         worker_binary_path: Option<String>,
+        worker_attestation_path: Option<String>,
         skip_build: bool,
         pool_db_path: Option<&str>,
         config: Option<&crate::cloud::ScalingConfig>,
@@ -114,6 +136,26 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         } else {
             None
         };
+        if worker_attestation_path.is_some() && worker_binary.is_none() {
+            return Err(HailError::InvalidFormat(
+                "--worker-attestation requires a resolved custom worker binary".into(),
+            ));
+        }
+        let attested_worker = match (&worker_binary, worker_attestation_path.as_deref()) {
+            (Some(worker), Some(sidecar)) => {
+                Some(crate::cloud::attestation::validate_worker_artifact(
+                    worker,
+                    std::path::Path::new(sidecar),
+                )?)
+            }
+            _ => None,
+        };
+        if worker_binary.is_some() && attested_worker.is_none() {
+            println!(
+                "{} Unattested custom-worker update is legacy compatibility",
+                "Warning:".yellow()
+            );
+        }
 
         // Get running instances
         println!("{}", "Fetching instance list...".dimmed());
@@ -174,8 +216,15 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         // Stage worker binary to GCS separately if it differs from coordinator binary
         let worker_staging_url = if let Some(ref wb) = worker_binary {
             if let Some(ref db_path) = pool_db_path {
-                self.stage_binary_to_gcs(wb, db_path, "genohype-worker-custom")
-                    .ok()
+                if let Some(ref artifact) = attested_worker {
+                    Some(
+                        self.stage_attested_worker_to_gcs(artifact, db_path)?
+                            .gcs_url,
+                    )
+                } else {
+                    self.stage_binary_to_gcs(wb, db_path, "genohype-worker-custom")
+                        .ok()
+                }
             } else {
                 None
             }
@@ -365,6 +414,7 @@ EOF
         &self,
         binary_path: Option<String>,
         worker_binary_path: Option<String>,
+        worker_attestation_path: Option<String>,
         skip_build: bool,
         pool_db_path: Option<&str>,
         port: u16,
@@ -395,7 +445,36 @@ EOF
             binary.display().to_string().bright_white()
         );
 
-        // Stage to GCS
+        if worker_attestation_path.is_some() && worker_binary_path.is_none() {
+            return Err(HailError::InvalidFormat(
+                "--worker-attestation requires a resolved custom worker binary".into(),
+            ));
+        }
+        let worker_binary = worker_binary_path
+            .as_ref()
+            .map(PathBuf::from)
+            .map(|path| {
+                if path.is_file() {
+                    Ok(path)
+                } else {
+                    Err(HailError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("Worker binary not found at: {}", path.display()),
+                    )))
+                }
+            })
+            .transpose()?;
+        let attested_worker = match (&worker_binary, worker_attestation_path.as_deref()) {
+            (Some(worker), Some(sidecar)) => {
+                Some(crate::cloud::attestation::validate_worker_artifact(
+                    worker,
+                    std::path::Path::new(sidecar),
+                )?)
+            }
+            _ => None,
+        };
+
+        // Stage to GCS only after all local custom artifact checks pass.
         let pool_db_path = pool_db_path.ok_or_else(|| {
             HailError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -405,21 +484,19 @@ EOF
 
         let gcs_url = self.stage_binary_to_gcs(&binary, pool_db_path, "genohype-coordinator")?;
 
-        // Stage worker binary separately if specified
-        let worker_gcs_url = if let Some(ref wb_path) = worker_binary_path {
-            let wb = PathBuf::from(wb_path);
-            if !wb.exists() {
-                return Err(HailError::Io(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("Worker binary not found at: {}", wb_path),
-                )));
-            }
+        // Stage worker binary separately if specified.
+        let worker_gcs_url = if let Some(ref worker) = worker_binary {
             println!(
                 "{} {}",
                 "Worker binary:".cyan(),
-                wb.display().to_string().bright_white()
+                worker.display().to_string().bright_white()
             );
-            self.stage_binary_to_gcs(&wb, pool_db_path, "genohype-worker-custom")?
+            if let Some(ref artifact) = attested_worker {
+                self.stage_attested_worker_to_gcs(artifact, pool_db_path)?
+                    .gcs_url
+            } else {
+                self.stage_binary_to_gcs(worker, pool_db_path, "genohype-worker-custom")?
+            }
         } else {
             gcs_url.clone()
         };

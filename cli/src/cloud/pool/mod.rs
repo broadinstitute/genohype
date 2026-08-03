@@ -168,6 +168,7 @@ mod tests {
             with_coordinator: true,
             pool_db_path: None,
             worker_binary: None,
+            worker_attestation: None,
             service_account: Some("worker@project.iam.gserviceaccount.com".into()),
         };
         let args = PoolManager::new(ProjectProvider).coordinator_scaling_args(

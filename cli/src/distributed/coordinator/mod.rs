@@ -2052,6 +2052,7 @@ mod lease_coordinator_tests {
         let job_id = {
             let data = state.lock().unwrap();
             let job_id = data.current_job_id.clone().expect("registered job id");
+            assert_eq!(accepted.job_id.as_deref(), Some(job_id.as_str()));
             assert!(!data.idle);
             assert!(data.worker_registry.is_empty());
             assert_eq!(

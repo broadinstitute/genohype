@@ -89,6 +89,7 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
             wait,
             skip_build,
             worker_binary,
+            worker_attestation,
             with_coordinator,
             service_account,
             coordinator_service_account,
@@ -174,6 +175,11 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
                 );
             // Custom worker selection follows the same precedence as other pool settings.
             let resolved_worker_binary = resolve_worker_binary(worker_binary, profile.as_ref());
+            let resolved_worker_attestation = worker_attestation.or_else(|| {
+                profile
+                    .as_ref()
+                    .and_then(|profile| profile.worker_attestation.clone())
+            });
 
             let pool_config = PoolConfig {
                 name,
@@ -191,11 +197,18 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
                 pool_db_path: profile.as_ref().and_then(|p| p.pool_db_path.clone()),
                 binary_gcs_url: None,        // Set by create() after staging
                 worker_binary_gcs_url: None, // Set independently by create()
+                worker_bootstrap: None,
                 service_account: resolved_service_account,
                 coordinator_service_account: resolved_coordinator_service_account,
             };
 
-            manager.create(&pool_config, wait, skip_build, resolved_worker_binary)?;
+            manager.create(
+                &pool_config,
+                wait,
+                skip_build,
+                resolved_worker_binary,
+                resolved_worker_attestation,
+            )?;
         }
         PoolCommands::Submit {
             name,
@@ -206,6 +219,8 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
             auto_stop,
             redeploy_binary,
             force,
+            detach,
+            output,
             autoscale,
             skip_build,
             batch_size,
@@ -312,17 +327,19 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
                             // Replace config path in the command vector to point to the new temp file
                             command[config_idx + 1] = temp_path.to_string_lossy().to_string();
 
-                            println!(
-                                "{} Using cluster '{}' ({})",
-                                "Cluster:".green().bold(),
-                                cluster_name.cyan(),
-                                cluster_conf.clickhouse_url
-                            );
-                            println!(
-                                "{} {}",
-                                "Output:".green().bold(),
-                                new_output_dir.bright_white()
-                            );
+                            if output == crate::cli::PoolSubmitOutput::Human {
+                                println!(
+                                    "{} Using cluster '{}' ({})",
+                                    "Cluster:".green().bold(),
+                                    cluster_name.cyan(),
+                                    cluster_conf.clickhouse_url
+                                );
+                                println!(
+                                    "{} {}",
+                                    "Output:".green().bold(),
+                                    new_output_dir.bright_white()
+                                );
+                            }
                         }
                     }
                 }
@@ -345,6 +362,7 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
                     with_coordinator: p.with_coordinator,
                     pool_db_path: p.pool_db_path.clone(),
                     worker_binary: p.worker_binary.clone(),
+                    worker_attestation: p.worker_attestation.clone(),
                     service_account: p.service_account.clone(),
                 });
             // Resolve worker binary: CLI flag > config profile
@@ -362,6 +380,8 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
                 auto_stop,
                 redeploy_binary,
                 force,
+                detach,
+                output,
                 autoscale,
                 skip_build,
                 batch_size,
@@ -378,6 +398,7 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
             manage_firewall,
             binary,
             worker_binary,
+            worker_attestation,
             skip_build,
         } => {
             let pool_config = app_config.get_pool(&name).ok_or_else(|| {
@@ -390,7 +411,7 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
                 ))
             })?;
 
-            let scaling_config = crate::cloud::ScalingConfig {
+            let mut scaling_config = crate::cloud::ScalingConfig {
                 machine_type: pool_config.machine_type.clone(),
                 workers: pool_config.workers,
                 spot: pool_config.spot,
@@ -402,12 +423,15 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
                 with_coordinator: pool_config.with_coordinator,
                 pool_db_path: pool_config.pool_db_path.clone(),
                 worker_binary: pool_config.worker_binary.clone(),
+                worker_attestation: pool_config.worker_attestation.clone(),
                 service_account: pool_config.service_account.clone(),
             };
 
             let resolved_zone = resolve_zone(zone, &name, app_config);
-            // Resolve worker binary: CLI flag > config profile
+            // Resolve custom artifact values: CLI flags > config profile.
             let resolved_worker_binary = worker_binary.or(scaling_config.worker_binary.clone());
+            scaling_config.worker_attestation =
+                worker_attestation.or_else(|| scaling_config.worker_attestation.clone());
             manager.scale(
                 &name,
                 workers,
@@ -442,6 +466,7 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
             zone,
             binary,
             worker_binary,
+            worker_attestation,
             skip_build,
             via_api,
             port,
@@ -461,11 +486,17 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
                 with_coordinator: p.with_coordinator,
                 pool_db_path: p.pool_db_path.clone(),
                 worker_binary: p.worker_binary.clone(),
+                worker_attestation: p.worker_attestation.clone(),
                 service_account: p.service_account.clone(),
             });
             // Resolve worker binary: CLI flag > config profile
             let resolved_worker_binary = worker_binary
                 .or_else(|| pool_config.as_ref().and_then(|p| p.worker_binary.clone()));
+            let resolved_worker_attestation = worker_attestation.or_else(|| {
+                pool_config
+                    .as_ref()
+                    .and_then(|profile| profile.worker_attestation.clone())
+            });
             // CLI flag overrides config, config defaults to false
             let use_api = via_api
                 || pool_config
@@ -485,6 +516,7 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
                 manager.update_binary_via_api(
                     binary,
                     resolved_worker_binary,
+                    resolved_worker_attestation,
                     skip_build,
                     pool_db_path.as_deref(),
                     api_port,
@@ -495,6 +527,7 @@ pub fn run_pool_command(command: PoolCommands, app_config: &config::Config) -> R
                     &resolved_zone,
                     binary,
                     resolved_worker_binary,
+                    resolved_worker_attestation,
                     skip_build,
                     pool_db_path.as_deref(),
                     scaling_config.as_ref(),
@@ -557,6 +590,7 @@ project = "configured-project"
             r#"
 [pools.demo]
 worker_binary = "/profile/worker"
+worker_attestation = "/profile/worker.attestation.json"
 "#,
         )
         .unwrap();
@@ -569,6 +603,10 @@ worker_binary = "/profile/worker"
         assert_eq!(
             resolve_worker_binary(None, Some(&profile)).as_deref(),
             Some("/profile/worker")
+        );
+        assert_eq!(
+            profile.worker_attestation.as_deref(),
+            Some("/profile/worker.attestation.json")
         );
     }
 

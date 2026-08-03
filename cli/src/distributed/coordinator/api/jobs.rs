@@ -79,12 +79,14 @@ pub(crate) async fn submit_job(
             Ok(Err(e)) => {
                 return axum::Json(JobConfigResponse {
                     acknowledged: false,
+                    job_id: None,
                     error: Some(e),
                 });
             }
             Err(e) => {
                 return axum::Json(JobConfigResponse {
                     acknowledged: false,
+                    job_id: None,
                     error: Some(format!("Task panicked: {}", e)),
                 });
             }
@@ -106,12 +108,14 @@ pub(crate) async fn submit_job(
     if active_workers == 0 && !zero_worker_custom {
         return axum::Json(JobConfigResponse {
             acknowledged: false,
+            job_id: None,
             error: Some("No active workers connected. Scale up workers first.".to_string()),
         });
     }
     if zero_worker_custom && req.force {
         return axum::Json(JobConfigResponse {
             acknowledged: false,
+            job_id: None,
             error: Some("Zero-worker custom submission does not allow --force".to_string()),
         });
     }
@@ -121,6 +125,7 @@ pub(crate) async fn submit_job(
         if !req.force {
             return axum::Json(JobConfigResponse {
                 acknowledged: false,
+                job_id: None,
                 error: Some(
                     "Coordinator already has a job running. Use --force to supersede.".to_string(),
                 ),
@@ -137,6 +142,7 @@ pub(crate) async fn submit_job(
     if req.total_tasks == 0 && !is_batch_job && !is_ingest_job {
         return axum::Json(JobConfigResponse {
             acknowledged: false,
+            job_id: None,
             error: Some("total_tasks must be greater than 0".to_string()),
         });
     }
@@ -149,6 +155,7 @@ pub(crate) async fn submit_job(
     if req.input_path.is_empty() && needs_input_path {
         return axum::Json(JobConfigResponse {
             acknowledged: false,
+            job_id: None,
             error: Some("input_path is required".to_string()),
         });
     }
@@ -187,13 +194,15 @@ pub(crate) async fn submit_job(
             println!("Received idle batch request. Catalog is loading in background...");
             return axum::Json(JobConfigResponse {
                 acknowledged: true,
+                job_id: None,
                 error: None,
             });
         }
     }
 
-    // Use the central job service to reset queues, persist to DB, and build states
-    if let Err(e) = services::start_new_job(
+    // Use the central job service to reset queues, durably persist, and return
+    // the exact ID created by the authoritative state transition.
+    let job_id = match services::start_new_job(
         &mut data,
         req.job_spec.clone(),
         req.input_path.clone(),
@@ -203,11 +212,15 @@ pub(crate) async fn submit_job(
         req.filters.clone(),
         req.intervals.clone(),
     ) {
-        return axum::Json(JobConfigResponse {
-            acknowledged: false,
-            error: Some(e),
-        });
-    }
+        Ok(job_id) => job_id,
+        Err(e) => {
+            return axum::Json(JobConfigResponse {
+                acknowledged: false,
+                job_id: None,
+                error: Some(e),
+            });
+        }
+    };
 
     // Handle IngestManhattan jobs (discover phenotypes and queue ingestion tasks)
     // We do this after start_new_job because it requires blocking I/O scanning GCS.
@@ -230,6 +243,7 @@ pub(crate) async fn submit_job(
             if let Err(e) = services::init_clickhouse_tables(clickhouse_url, init_strategy) {
                 return axum::Json(JobConfigResponse {
                     acknowledged: false,
+                    job_id: None,
                     error: Some(e),
                 });
             }
@@ -250,6 +264,7 @@ pub(crate) async fn submit_job(
             Err(e) => {
                 return axum::Json(JobConfigResponse {
                     acknowledged: false,
+                    job_id: None,
                     error: Some(format!("Failed to discover phenotypes: {}", e)),
                 });
             }
@@ -285,6 +300,7 @@ pub(crate) async fn submit_job(
 
     axum::Json(JobConfigResponse {
         acknowledged: true,
+        job_id: Some(job_id),
         error: None,
     })
 }

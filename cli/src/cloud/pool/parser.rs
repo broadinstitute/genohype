@@ -1291,7 +1291,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                     format!("Manifest file '{}' contains an empty array", path),
                 )));
             }
-            println!(
+            eprintln!(
                 "  {} {} tasks from manifest '{}'",
                 "Loaded".green(),
                 entries.len().to_string().bright_white(),

@@ -1053,9 +1053,21 @@ pub struct JobConfigRequest {
 pub struct JobConfigResponse {
     /// Whether the job was accepted
     pub acknowledged: bool,
+    /// Exact durable coordinator job ID. Present for accepted executable jobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
     /// Error message if job was rejected
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// Typed acknowledgement retained by clients after coordinator registration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobSubmissionAck {
+    /// An executable job was durably registered under this exact ID.
+    Job { job_id: String },
+    /// Non-executable coordinator configuration (for example an idle catalog) was accepted.
+    Configuration,
 }
 
 /// Request to cancel the current job.

@@ -3,7 +3,160 @@
 //! This module generates the bash script that runs on VM boot to install
 //! dependencies required by the genohype binary.
 
+use super::attestation::ExpectedWorkerBootstrap;
 use super::WireGuardConfig;
+use crate::{HailError, Result};
+
+fn invalid_bootstrap(message: impl Into<String>) -> HailError {
+    HailError::InvalidFormat(format!("invalid worker bootstrap: {}", message.into()))
+}
+
+/// Generate an integrity-bound custom-worker startup script.
+///
+/// The Ubuntu image is not assumed to contain `gsutil` or `gcloud`; the script
+/// installs the Google Cloud CLI from Google's apt repository before using the
+/// VM service account to download the private GCS object.
+pub fn generate_attested_worker_startup_script(
+    bootstrap: &ExpectedWorkerBootstrap,
+    pool_name: &str,
+) -> Result<String> {
+    let staged = &bootstrap.artifact;
+    let attestation = &staged.attestation;
+    let safe_pool = !pool_name.is_empty()
+        && pool_name.len() <= 63
+        && pool_name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    if !safe_pool {
+        return Err(invalid_bootstrap(
+            "pool name must contain only lowercase letters, digits, and hyphens",
+        ));
+    }
+    if !staged.gcs_url.starts_with("gs://")
+        || !staged.gcs_url.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'/' | b'.' | b'_' | b'-')
+        })
+    {
+        return Err(invalid_bootstrap("artifact URL must be a safe gs:// URL"));
+    }
+    if bootstrap.deployment_id.is_empty()
+        || !bootstrap
+            .deployment_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err(invalid_bootstrap(
+            "deployment ID contains unsafe characters",
+        ));
+    }
+
+    let marker = serde_json::json!({
+        "schema_version": 1,
+        "deployment_id": bootstrap.deployment_id,
+        "artifact_url": staged.gcs_url,
+        "sha256": attestation.sha256,
+        "size": attestation.size,
+        "revision": attestation.revision,
+        "build_identity": attestation.build_identity,
+        "build_version": attestation.build_version,
+        "platform": attestation.platform,
+        "arch": attestation.arch,
+        "service_active": true,
+    });
+
+    Ok(format!(
+        r#"#!/bin/bash
+set -euo pipefail
+
+readonly ARTIFACT_URL='{url}'
+readonly EXPECTED_SHA256='{sha}'
+readonly EXPECTED_SIZE='{size}'
+readonly DEPLOYMENT_ID='{deployment}'
+readonly INSTALL_PATH='/usr/local/bin/genohype'
+readonly TEMP_PATH="${{INSTALL_PATH}}.${{DEPLOYMENT_ID}}.tmp"
+readonly METADATA_PATH="/var/lib/genohype/deployments/${{DEPLOYMENT_ID}}.json"
+trap 'rm -f "$TEMP_PATH" /var/lib/genohype/bootstrap-ready.json.tmp' EXIT
+
+apt-get update -qq
+apt-get install -y -qq libssl-dev ca-certificates curl gnupg apt-transport-https
+if ! command -v gcloud >/dev/null 2>&1; then
+  curl -fsSL --retry 5 https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+    | gpg --dearmor --yes -o /usr/share/keyrings/cloud.google.gpg
+  echo 'deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main' \
+    > /etc/apt/sources.list.d/google-cloud-sdk.list
+  apt-get update -qq
+  apt-get install -y -qq google-cloud-cli
+fi
+
+mkdir -p /usr/local/bin /var/lib/genohype/deployments
+rm -f "$TEMP_PATH" /tmp/genohype-ready /var/lib/genohype/bootstrap-ready.json
+for attempt in 1 2 3 4 5 6 7 8; do
+  if gcloud storage cp "$ARTIFACT_URL" "$TEMP_PATH"; then
+    break
+  fi
+  rm -f "$TEMP_PATH"
+  if [ "$attempt" = 8 ]; then
+    echo 'custom worker download failed after 8 attempts' >&2
+    exit 1
+  fi
+  sleep $((attempt * 3))
+done
+
+[ "$(stat -c %s "$TEMP_PATH")" = "$EXPECTED_SIZE" ]
+printf '%s  %s\n' "$EXPECTED_SHA256" "$TEMP_PATH" | sha256sum --check --strict -
+chmod 0755 "$TEMP_PATH"
+chown root:root "$TEMP_PATH"
+mv -f "$TEMP_PATH" "$INSTALL_PATH"
+
+WORKER_ID=$(curl -fsS 'http://metadata.google.internal/computeMetadata/v1/instance/name' \
+  -H 'Metadata-Flavor: Google')
+cat > /etc/systemd/system/genohype-worker.service << SVCEOF
+[Unit]
+Description=Genohype Attested Custom Worker
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+Environment=GENOHYPE_WORKER_DEPLOYMENT_ID={deployment}
+Environment=GENOHYPE_WORKER_ARTIFACT_SHA256={sha}
+Environment=GENOHYPE_WORKER_BUILD_IDENTITY={build_identity}
+Environment=GENOHYPE_WORKER_REVISION={revision}
+ExecStart=/usr/local/bin/genohype service start-worker --url http://{pool}-coordinator:3000 --worker-id $WORKER_ID
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+systemctl daemon-reload
+systemctl enable --now genohype-worker
+systemctl is-active --quiet genohype-worker
+
+# The generation-scoped deployment record is create-only and read-only.
+set -o noclobber
+cat > "$METADATA_PATH" << 'MARKEREOF'
+{marker}
+MARKEREOF
+set +o noclobber
+chmod 0444 "$METADATA_PATH"
+cp "$METADATA_PATH" /var/lib/genohype/bootstrap-ready.json.tmp
+mv -f /var/lib/genohype/bootstrap-ready.json.tmp /var/lib/genohype/bootstrap-ready.json
+ln -sfn /var/lib/genohype/bootstrap-ready.json /tmp/genohype-ready
+trap - EXIT
+"#,
+        url = staged.gcs_url,
+        sha = attestation.sha256,
+        size = attestation.size,
+        deployment = bootstrap.deployment_id,
+        build_identity = attestation.build_identity,
+        revision = attestation.revision,
+        pool = pool_name,
+        marker = marker,
+    ))
+}
 
 /// Generate the startup script for worker VMs.
 ///
@@ -185,9 +338,18 @@ pub fn generate_coordinator_startup_script_with_cluster(
 
         format!(
             r#"
-# Download binary from GCS (pre-staged)
+# Download binary from GCS (pre-staged). Minimal GCE images do not
+# consistently include gsutil/google-cloud-cli, so install it fail-closed.
+if ! command -v gcloud >/dev/null 2>&1; then
+  curl -fsSL --retry 5 https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+    | gpg --dearmor --yes -o /usr/share/keyrings/cloud.google.gpg
+  echo 'deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main' \
+    > /etc/apt/sources.list.d/google-cloud-sdk.list
+  apt-get update -qq
+  apt-get install -y -qq google-cloud-cli
+fi
 echo "Downloading binary from GCS..."
-gsutil cp {} /tmp/genohype
+gcloud storage cp {} /tmp/genohype
 chmod +x /tmp/genohype
 mv /tmp/genohype /usr/local/bin/genohype
 echo "Binary installed at /usr/local/bin/genohype"
@@ -295,7 +457,7 @@ resolve_secret() {{
 
 # Install dependencies required for the Rust binary
 apt-get update -qq
-apt-get install -y -qq libssl-dev ca-certificates curl
+apt-get install -y -qq libssl-dev ca-certificates curl gnupg apt-transport-https
 {}
 
 # Create directory for the binary
@@ -358,6 +520,54 @@ mod tests {
         assert!(script.contains("Restart=always"));
         assert!(script.contains("systemctl daemon-reload"));
         assert!(script.contains("systemctl enable --now genohype-worker"));
+    }
+
+    #[test]
+    fn attested_startup_verifies_before_atomic_install_and_marks_ready_last() {
+        use crate::cloud::attestation::{
+            ExpectedWorkerBootstrap, StagedWorkerArtifact, WorkerArtifactAttestation,
+        };
+        let revision = "a".repeat(40);
+        let bootstrap = ExpectedWorkerBootstrap {
+            artifact: StagedWorkerArtifact {
+                gcs_url: format!(
+                    "gs://bucket/pool/bin/custom-workers/{}/{}//genohype-worker",
+                    revision,
+                    "b".repeat(64)
+                ),
+                attestation: WorkerArtifactAttestation {
+                    schema_version: 1,
+                    sha256: "b".repeat(64),
+                    size: 123,
+                    revision: revision.clone(),
+                    build_identity: format!("e2e:{revision}:fixture-a"),
+                    build_version: format!("e2e:{revision}:fixture-a"),
+                    platform: "linux".into(),
+                    arch: "x86_64".into(),
+                },
+            },
+            deployment_id: "deployment-1".into(),
+        };
+        let script = generate_attested_worker_startup_script(&bootstrap, "testpool").unwrap();
+        assert!(script.contains("apt-get install -y -qq google-cloud-cli"));
+        assert!(script.contains("gcloud storage cp \"$ARTIFACT_URL\" \"$TEMP_PATH\""));
+        let verify = script.find("sha256sum --check --strict").unwrap();
+        let install = script
+            .find("mv -f \"$TEMP_PATH\" \"$INSTALL_PATH\"")
+            .unwrap();
+        let active = script
+            .find("systemctl is-active --quiet genohype-worker")
+            .unwrap();
+        let marker = script
+            .find("mv -f /var/lib/genohype/bootstrap-ready.json.tmp")
+            .unwrap();
+        assert!(verify < install && install < active && active < marker);
+        assert!(script.contains("\"deployment_id\":\"deployment-1\""));
+        assert!(script.contains("/var/lib/genohype/deployments/${DEPLOYMENT_ID}.json"));
+        assert!(script.contains("chmod 0444 \"$METADATA_PATH\""));
+        assert!(script.contains("Environment=GENOHYPE_WORKER_DEPLOYMENT_ID=deployment-1"));
+        assert!(script.contains("\"arch\":\"x86_64\""));
+        assert!(!script.contains("touch /tmp/genohype-ready"));
     }
 
     #[test]
@@ -438,7 +648,8 @@ mod tests {
         );
 
         // Check binary download and auto-start
-        assert!(script.contains("gsutil cp gs://bucket/path/genohype"));
+        assert!(script.contains("gcloud storage cp gs://bucket/path/genohype"));
+        assert!(script.contains("apt-get install -y -qq google-cloud-cli"));
         assert!(script.contains("start-coordinator"));
         assert!(script.contains("--port 3000"));
         assert!(script.contains("--backup-path gs://bucket/backup/ops.db"));

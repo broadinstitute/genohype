@@ -152,6 +152,10 @@ pub struct PoolProfile {
     pub update_api_port: Option<u16>,
     /// Path to a custom binary to deploy to workers instead of the coordinator binary
     pub worker_binary: Option<String>,
+    /// Path to the custom worker's build-produced attestation sidecar.
+    /// Until expected custom identity is persisted as pool state, lifecycle-free
+    /// submit reads identity intent from this path without reading the binary.
+    pub worker_attestation: Option<String>,
     /// GCP service account email to attach to worker VMs
     pub service_account: Option<String>,
     /// GCP service account email to attach to the coordinator VM
@@ -470,6 +474,7 @@ impl Config {
                 update_via_api: profile.update_via_api.unwrap_or(false),
                 update_api_port: profile.update_api_port.unwrap_or(3000),
                 worker_binary: profile.worker_binary.clone(),
+                worker_attestation: profile.worker_attestation.clone(),
                 service_account: profile.service_account.clone(),
                 coordinator_service_account: profile.coordinator_service_account.clone(),
             }
@@ -574,6 +579,9 @@ pub struct ResolvedPoolConfig {
     pub update_api_port: u16,
     /// Path to a custom binary to deploy to workers instead of the coordinator binary
     pub worker_binary: Option<String>,
+    /// Path to the custom worker's build-produced attestation sidecar.
+    /// This remains the readiness identity source until pool state persists it.
+    pub worker_attestation: Option<String>,
     /// GCP service account email to attach to worker VMs
     pub service_account: Option<String>,
     /// GCP service account email to attach to the coordinator VM
