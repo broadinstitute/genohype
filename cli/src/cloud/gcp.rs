@@ -93,6 +93,25 @@ impl GcpClient {
         }
     }
 
+    fn startup_status_command(&self, instance_id: &str, zone: &str) -> Command {
+        let mut command = Command::new("gcloud");
+        command.args([
+            "compute",
+            "instances",
+            "get-guest-attributes",
+            instance_id,
+            "--zone",
+            zone,
+            "--query-path",
+            "genohype/startup",
+            "--format",
+            "value(value)",
+            "--quiet",
+        ]);
+        self.add_project_arg(&mut command);
+        command
+    }
+
     fn list_instances_command(&self, pool_name: &str) -> Command {
         let mut command = Command::new("gcloud");
         command.args([
@@ -102,7 +121,7 @@ impl GcpClient {
             "--filter",
             &format!("tags.items:pool-{}", pool_name),
             "--format",
-            "json(name,zone,status,networkInterfaces[].networkIP,networkInterfaces[].network,networkInterfaces[].subnetwork,machineType,scheduling.provisioningModel)",
+            "json(id,name,zone,status,networkInterfaces[].networkIP,networkInterfaces[].network,networkInterfaces[].subnetwork,machineType,scheduling.provisioningModel)",
         ]);
         self.add_project_arg(&mut command);
         command
@@ -165,7 +184,7 @@ impl GcpClient {
             "--tags",
             &setup.tags.join(","),
             "--metadata",
-            "enable-oslogin=TRUE",
+            "enable-oslogin=TRUE,enable-guest-attributes=TRUE",
             &format!(
                 "--metadata-from-file=startup-script={}",
                 startup_script.path.display()
@@ -313,42 +332,6 @@ impl GcpClient {
             }
 
             std::thread::sleep(std::time::Duration::from_secs(2));
-        }
-    }
-
-    /// Wait for the startup script to complete (marker file exists).
-    #[allow(dead_code)]
-    pub fn wait_for_startup_complete(
-        &self,
-        instance: &str,
-        zone: &str,
-        timeout_secs: u64,
-    ) -> Result<()> {
-        let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(timeout_secs);
-
-        loop {
-            if start.elapsed() > timeout {
-                return Err(HailError::Io(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!(
-                        "Timeout waiting for startup script on instance {}",
-                        instance
-                    ),
-                )));
-            }
-
-            // Check if the ready marker file exists
-            let mut cmd = self.get_ssh_command(instance, zone, "test -f /tmp/genohype-ready");
-            let status = cmd.status();
-
-            if let Ok(s) = status {
-                if s.success() {
-                    return Ok(());
-                }
-            }
-
-            std::thread::sleep(std::time::Duration::from_secs(3));
         }
     }
 }
@@ -645,6 +628,39 @@ impl CloudProvider for GcpClient {
         self.add_project_arg(&mut cmd);
         cmd
     }
+
+    fn get_startup_status(&self, instance: &Instance, zone: &str) -> Result<Option<String>> {
+        if instance.id.is_empty() {
+            return Err(HailError::InvalidFormat(format!(
+                "instance {} has no immutable GCE ID",
+                instance.name
+            )));
+        }
+        let output = self
+            .startup_status_command(&instance.id, zone)
+            .output()
+            .map_err(HailError::Io)?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("not found")
+                || stderr.contains("No guest attributes")
+                || stderr.contains("does not have guest attributes")
+            {
+                return Ok(None);
+            }
+            return Err(HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "failed to read startup status for {} (ID {}): {}",
+                    instance.name,
+                    instance.id,
+                    stderr.trim()
+                ),
+            )));
+        }
+        let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Ok((!value.is_empty()).then_some(value))
+    }
 }
 
 #[cfg(test)]
@@ -793,12 +809,34 @@ mod tests {
     }
 
     #[test]
-    fn created_instances_enable_os_login() {
+    fn created_instances_enable_os_login_and_guest_attributes() {
         let config = pool_config(false, false);
         let args = instance_create_args_for(&config, false);
+        let metadata = args
+            .windows(2)
+            .find(|pair| pair[0] == "--metadata")
+            .map(|pair| pair[1].as_str())
+            .unwrap();
+        assert!(metadata
+            .split(',')
+            .any(|item| item == "enable-oslogin=TRUE"));
+        assert!(metadata
+            .split(',')
+            .any(|item| item == "enable-guest-attributes=TRUE"));
+    }
+
+    #[test]
+    fn startup_status_query_addresses_immutable_instance_id() {
+        let client = GcpClient::with_project("configured-project".into());
+        let command = client.startup_status_command("3079297992975262580", "us-east1-b");
+        let args = args(&command);
         assert!(args
             .windows(2)
-            .any(|pair| { pair[0] == "--metadata" && pair[1] == "enable-oslogin=TRUE" }));
+            .any(|pair| { pair[0] == "get-guest-attributes" && pair[1] == "3079297992975262580" }));
+        assert!(args
+            .windows(2)
+            .any(|pair| { pair[0] == "--query-path" && pair[1] == "genohype/startup" }));
+        assert_project_arg(&command, "configured-project");
     }
 
     #[test]
@@ -952,6 +990,7 @@ mod tests {
     #[test]
     fn test_instance_helpers() {
         let instance = Instance {
+            id: "123456789".to_string(),
             name: "test-worker-0".to_string(),
             zone: "us-central1-a".to_string(),
             network_interfaces: vec![NetworkInterface {

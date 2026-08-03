@@ -74,6 +74,9 @@ pub struct PoolConfig {
 /// Information about a cloud instance.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Instance {
+    /// Immutable provider instance generation ID.
+    #[serde(default)]
+    pub id: String,
     /// Instance name
     pub name: String,
     /// Zone where instance is located
@@ -250,6 +253,42 @@ pub trait CloudProvider {
     /// The caller is responsible for spawning and managing I/O.
     /// This allows streaming stdout/stderr for real-time progress.
     fn get_ssh_command(&self, instance: &str, zone: &str, command: &str) -> Command;
+
+    /// Get an SSH command for a startup/readiness probe.
+    ///
+    /// Providers may need different host-key handling while a deleted instance
+    /// name is being reused. The default preserves normal SSH behavior.
+    fn get_startup_probe_command(&self, instance: &str, zone: &str, command: &str) -> Command {
+        self.get_ssh_command(instance, zone, command)
+    }
+
+    /// Read the generation-scoped startup status published by a guest.
+    ///
+    /// The default keeps alternate/test providers working through SSH. Cloud
+    /// providers should override this with a control-plane transport that can
+    /// address the immutable instance generation directly.
+    fn get_startup_status(&self, instance: &Instance, zone: &str) -> Result<Option<String>> {
+        let command = "test -f /tmp/genohype-ready && curl -fsS -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/id";
+        let output = self
+            .get_startup_probe_command(&instance.name, zone, command)
+            .output()
+            .map_err(crate::HailError::Io)?;
+        if output.status.success() {
+            let instance_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            Ok(Some(
+                serde_json::json!({
+                    "status": "ready",
+                    "instance_id": instance_id,
+                    "deployment_id": null,
+                    "sha256": null,
+                    "service_active": false,
+                })
+                .to_string(),
+            ))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 /// Progress update message sent from worker to coordinator.

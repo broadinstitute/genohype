@@ -11,6 +11,32 @@ fn invalid_bootstrap(message: impl Into<String>) -> HailError {
     HailError::InvalidFormat(format!("invalid worker bootstrap: {}", message.into()))
 }
 
+fn publish_startup_ready_script(
+    deployment_id: Option<&str>,
+    sha256: Option<&str>,
+    service_active: bool,
+) -> String {
+    let deployment_id = serde_json::to_string(&deployment_id).expect("string JSON");
+    let sha256 = serde_json::to_string(&sha256).expect("string JSON");
+    format!(
+        r#"INSTANCE_ID=$(curl -fsS -H 'Metadata-Flavor: Google' \
+  http://metadata.google.internal/computeMetadata/v1/instance/id)
+READY_STATUS=$(printf '{{"status":"ready","instance_id":"%s","deployment_id":{deployment_id},"sha256":{sha256},"service_active":{service_active}}}' "$INSTANCE_ID")
+for attempt in 1 2 3 4 5; do
+  if curl -fsS -X PUT -H 'Metadata-Flavor: Google' --data-binary "$READY_STATUS" \
+    http://metadata.google.internal/computeMetadata/v1/instance/guest-attributes/genohype/startup; then
+    break
+  fi
+  if [ "$attempt" = 5 ]; then
+    echo 'failed to publish generation-scoped startup status' >&2
+    exit 1
+  fi
+  sleep $((attempt * 2))
+done
+"#
+    )
+}
+
 /// Generate an integrity-bound custom-worker startup script.
 ///
 /// The Ubuntu image is not assumed to contain `gsutil` or `gcloud`; the script
@@ -145,7 +171,7 @@ chmod 0444 "$METADATA_PATH"
 cp "$METADATA_PATH" /var/lib/genohype/bootstrap-ready.json.tmp
 mv -f /var/lib/genohype/bootstrap-ready.json.tmp /var/lib/genohype/bootstrap-ready.json
 ln -sfn /var/lib/genohype/bootstrap-ready.json /tmp/genohype-ready
-trap - EXIT
+{publish_ready}trap - EXIT
 "#,
         url = staged.gcs_url,
         sha = attestation.sha256,
@@ -155,6 +181,11 @@ trap - EXIT
         revision = attestation.revision,
         pool = pool_name,
         marker = marker,
+        publish_ready = publish_startup_ready_script(
+            Some(&bootstrap.deployment_id),
+            Some(&attestation.sha256),
+            true,
+        ),
     ))
 }
 
@@ -244,10 +275,11 @@ chmod 777 /var/lib/genohype
 {}
 # Create a marker file to indicate VM is ready
 touch /tmp/genohype-ready
-
+{}
 echo "=== Worker VM initialized ==="
 "#,
-        binary_download
+        binary_download,
+        publish_startup_ready_script(None, None, false),
     )
 }
 
@@ -470,10 +502,12 @@ chmod 777 /var/lib/genohype
 
 # Create a marker file to indicate VM is ready
 touch /tmp/genohype-ready
-
+{}
 echo "=== Coordinator VM initialized ==="
 "#,
-        wg_install, binary_download
+        wg_install,
+        binary_download,
+        publish_startup_ready_script(None, None, false),
     )
 }
 
@@ -506,6 +540,9 @@ mod tests {
         assert!(script.contains("ca-certificates"));
         assert!(script.contains("/usr/local/bin"));
         assert!(script.contains("genohype-ready"));
+        assert!(script.contains("instance/guest-attributes/genohype/startup"));
+        assert!(script.contains("\"instance_id\":\"%s\""));
+        assert!(script.contains("\"deployment_id\":null"));
     }
 
     #[test]
@@ -561,11 +598,16 @@ mod tests {
         let marker = script
             .find("mv -f /var/lib/genohype/bootstrap-ready.json.tmp")
             .unwrap();
-        assert!(verify < install && install < active && active < marker);
+        let published = script
+            .find("instance/guest-attributes/genohype/startup")
+            .unwrap();
+        assert!(verify < install && install < active && active < marker && marker < published);
         assert!(script.contains("\"deployment_id\":\"deployment-1\""));
         assert!(script.contains("/var/lib/genohype/deployments/${DEPLOYMENT_ID}.json"));
         assert!(script.contains("chmod 0444 \"$METADATA_PATH\""));
         assert!(script.contains("Environment=GENOHYPE_WORKER_DEPLOYMENT_ID=deployment-1"));
+        assert!(script.contains("\"deployment_id\":\"deployment-1\""));
+        assert!(script.contains(&format!("\"sha256\":\"{}\"", "b".repeat(64))));
         assert!(script.contains("\"arch\":\"x86_64\""));
         assert!(!script.contains("touch /tmp/genohype-ready"));
     }

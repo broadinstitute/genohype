@@ -1977,6 +1977,7 @@ mod lifecycle_tests {
 
             fn list_instances(&self, _: &str) -> Result<Vec<Instance>> {
                 let instance = |name: &str, ip: &str| Instance {
+                    id: format!("id-{name}"),
                     name: name.into(),
                     zone: "us-central1-a".into(),
                     network_interfaces: vec![NetworkInterface {

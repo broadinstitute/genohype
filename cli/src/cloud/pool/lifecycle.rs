@@ -9,6 +9,34 @@ use owo_colors::OwoColorize;
 
 const ATTESTED_WORKER_FRESHNESS_SECS: f64 = 15.0;
 
+#[derive(Debug, serde::Deserialize)]
+struct GuestStartupStatus {
+    status: String,
+    instance_id: String,
+    deployment_id: Option<String>,
+    sha256: Option<String>,
+    service_active: bool,
+}
+
+fn startup_status_is_ready(
+    instance: &Instance,
+    value: &str,
+    bootstrap: Option<&crate::cloud::attestation::ExpectedWorkerBootstrap>,
+) -> std::result::Result<bool, String> {
+    let status: GuestStartupStatus =
+        serde_json::from_str(value).map_err(|error| format!("invalid startup status: {error}"))?;
+    if status.status != "ready" || status.instance_id != instance.id {
+        return Ok(false);
+    }
+    if let Some(bootstrap) = bootstrap {
+        Ok(status.service_active
+            && status.deployment_id.as_deref() == Some(bootstrap.deployment_id.as_str())
+            && status.sha256.as_deref() == Some(bootstrap.artifact.attestation.sha256.as_str()))
+    } else {
+        Ok(status.deployment_id.is_none() && status.sha256.is_none())
+    }
+}
+
 fn attested_dashboard_worker_is_ready(
     worker: &crate::distributed::message::DashboardWorker,
     expected_build_version: &str,
@@ -165,7 +193,12 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
 
         if should_wait {
             println!("{}", "Waiting for VMs to be ready...".dimmed());
-            self.wait_for_pool_ready(&config.name, &config.zone, 300)?;
+            self.wait_for_pool_ready(
+                &config.name,
+                &config.zone,
+                config.worker_bootstrap.as_ref(),
+                300,
+            )?;
             println!("{} All workers are ready.", "OK".green().bold());
         } else {
             println!("   Workers will be ready in ~60 seconds (or use --wait)");
@@ -236,53 +269,71 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         &self,
         pool_name: &str,
         zone: &str,
+        worker_bootstrap: Option<&crate::cloud::attestation::ExpectedWorkerBootstrap>,
         timeout_secs: u64,
     ) -> Result<()> {
         use std::time::{Duration, Instant};
 
         let start = Instant::now();
         let timeout = Duration::from_secs(timeout_secs);
-
-        // Get list of instances
         let instances = self.provider.list_instances(pool_name)?;
         if instances.is_empty() {
             return Ok(());
         }
+        if let Some(instance) = instances.iter().find(|instance| instance.id.is_empty()) {
+            return Err(HailError::InvalidFormat(format!(
+                "instance {} has no immutable generation ID",
+                instance.name
+            )));
+        }
 
         let total = instances.len();
         let mut ready_count = 0;
-
+        let mut last_diagnostic = "no guest startup status published".to_string();
         println!("   Waiting for {} instances...", total);
 
         while ready_count < total {
             if start.elapsed() > timeout {
                 return Err(crate::HailError::Io(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
-                    format!("Timeout waiting for pool '{}' to be ready", pool_name),
+                    format!(
+                        "Timeout waiting for pool '{}' startup status: {}",
+                        pool_name, last_diagnostic
+                    ),
                 )));
             }
 
             ready_count = 0;
-            for inst in &instances {
-                // Check if the ready marker file exists
-                let mut cmd = self.provider.get_ssh_command(
-                    &inst.name,
-                    zone,
-                    "test -f /tmp/genohype-ready && echo ready",
-                );
-                cmd.stdout(std::process::Stdio::piped());
-                cmd.stderr(std::process::Stdio::null());
-
-                if let Ok(output) = cmd.output() {
-                    if output.status.success() {
-                        let stdout = String::from_utf8_lossy(&output.stdout);
-                        if stdout.contains("ready") {
-                            ready_count += 1;
-                        }
-                    }
+            let mut diagnostics = Vec::new();
+            for instance in &instances {
+                let expected = instance
+                    .name
+                    .contains("-worker-")
+                    .then_some(worker_bootstrap)
+                    .flatten();
+                match self.provider.get_startup_status(instance, zone) {
+                    Ok(Some(value)) => match startup_status_is_ready(instance, &value, expected) {
+                        Ok(true) => ready_count += 1,
+                        Ok(false) => diagnostics.push(format!(
+                            "{} (ID {}) published non-matching status {}",
+                            instance.name, instance.id, value
+                        )),
+                        Err(error) => diagnostics
+                            .push(format!("{} (ID {}): {}", instance.name, instance.id, error)),
+                    },
+                    Ok(None) => diagnostics.push(format!(
+                        "{} (ID {}) has no startup status",
+                        instance.name, instance.id
+                    )),
+                    Err(error) => diagnostics.push(format!(
+                        "{} (ID {}) status query failed: {}",
+                        instance.name, instance.id, error
+                    )),
                 }
             }
-
+            if !diagnostics.is_empty() {
+                last_diagnostic = diagnostics.join("; ");
+            }
             println!("   {}/{} ready", ready_count, total);
 
             if ready_count < total {
@@ -596,18 +647,42 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             self.provider.create_instances(&new_instances)?;
             println!("{} Created {} new instances.", "OK".green().bold(), to_add);
 
-            // Wait for readiness
-            println!("{}", "Waiting for new instances to be ready...".dimmed());
-            for inst in &new_instances {
-                self.wait_for_startup_complete(&inst.name, zone, 300)?;
+            // Discover the immutable generations created for these names before
+            // accepting any completion signal. Name and internal IP can both be
+            // reused immediately after deletion.
+            let updated_instances = self.provider.list_instances(name)?;
+            let new_worker_instances: Vec<Instance> = new_instances
+                .iter()
+                .map(|requested| {
+                    updated_instances
+                        .iter()
+                        .find(|instance| instance.name == requested.name)
+                        .cloned()
+                        .ok_or_else(|| {
+                            HailError::Io(std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                format!(
+                                    "new instance {} was not visible after creation",
+                                    requested.name
+                                ),
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if let Some(instance) = new_worker_instances
+                .iter()
+                .find(|instance| instance.id.is_empty())
+            {
+                return Err(HailError::InvalidFormat(format!(
+                    "new instance {} has no immutable generation ID",
+                    instance.name
+                )));
             }
 
-            // Get updated instance list to get IPs
-            let updated_instances = self.provider.list_instances(name)?;
-            let new_worker_instances: Vec<Instance> = updated_instances
-                .into_iter()
-                .filter(|i| new_instances.iter().any(|n| n.name == i.name))
-                .collect();
+            println!("{}", "Waiting for new instances to be ready...".dimmed());
+            for instance in &new_worker_instances {
+                self.wait_for_startup_complete(instance, zone, worker_bootstrap.as_ref(), 300)?;
+            }
 
             // Attested workers are fully installed by their startup scripts.
             // The successful path performs no per-worker SCP or service rewrite.
@@ -764,37 +839,14 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                             .map(String::as_str)
                             .collect();
                         if missing.is_empty() {
-                            let mut inactive = Vec::new();
-                            for worker_name in expected_names {
-                                let command = format!(
-                                    "sudo systemctl is-active --quiet genohype-worker && sudo grep -F '\"deployment_id\":\"{}\"' /var/lib/genohype/deployments/{}.json >/dev/null && sudo grep -F '\"sha256\":\"{}\"' /var/lib/genohype/deployments/{}.json >/dev/null",
-                                    bootstrap.deployment_id,
-                                    bootstrap.deployment_id,
-                                    bootstrap.artifact.attestation.sha256,
-                                    bootstrap.deployment_id,
-                                );
-                                let active = self
-                                    .provider
-                                    .get_ssh_command(worker_name, zone, &command)
-                                    .status()
-                                    .map(|status| status.success())
-                                    .unwrap_or(false);
-                                if !active {
-                                    inactive.push(worker_name.as_str());
-                                }
-                            }
-                            if inactive.is_empty() {
-                                println!(
-                                    "{} Exact attested worker generation is active ({})",
-                                    "OK".green().bold(),
-                                    bootstrap.deployment_id
-                                );
-                                return Ok(());
-                            }
-                            last_diagnostic = format!(
-                                "services or deployment metadata not active on {:?}",
-                                inactive
+                            // The numeric-ID startup record already proved the
+                            // exact deployment, artifact SHA, and active service.
+                            println!(
+                                "{} Exact attested worker generation is active ({})",
+                                "OK".green().bold(),
+                                bootstrap.deployment_id
                             );
+                            return Ok(());
                         } else {
                             last_diagnostic = format!(
                                 "missing fresh post-create build_version {:?} for {:?}",
@@ -811,46 +863,53 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         }
     }
 
-    /// Wait for startup script to complete on a specific instance.
+    /// Wait for generation-scoped startup completion on a specific instance.
     pub(crate) fn wait_for_startup_complete(
         &self,
-        instance_name: &str,
+        instance: &Instance,
         zone: &str,
+        bootstrap: Option<&crate::cloud::attestation::ExpectedWorkerBootstrap>,
         timeout_secs: u64,
     ) -> Result<()> {
         use std::time::{Duration, Instant};
 
+        if instance.id.is_empty() {
+            return Err(HailError::InvalidFormat(format!(
+                "instance {} has no immutable generation ID",
+                instance.name
+            )));
+        }
         let start = Instant::now();
         let timeout = Duration::from_secs(timeout_secs);
+        let mut last_diagnostic = "no guest startup status published".to_string();
 
         loop {
             if start.elapsed() > timeout {
                 return Err(HailError::Io(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     format!(
-                        "Timeout waiting for startup script on instance {}",
-                        instance_name
+                        "Timeout waiting for startup status on instance {} (ID {}): {}",
+                        instance.name, instance.id, last_diagnostic
                     ),
                 )));
             }
 
-            // Check if the ready marker file exists
-            let mut cmd = self.provider.get_ssh_command(
-                instance_name,
-                zone,
-                "test -f /tmp/genohype-ready && echo ready",
-            );
-            cmd.stdout(std::process::Stdio::piped());
-            cmd.stderr(std::process::Stdio::null());
-
-            if let Ok(output) = cmd.output() {
-                if output.status.success() {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    if stdout.contains("ready") {
-                        println!("  {} {}", "Ready:".dimmed(), instance_name.cyan());
+            match self.provider.get_startup_status(instance, zone) {
+                Ok(Some(value)) => match startup_status_is_ready(instance, &value, bootstrap) {
+                    Ok(true) => {
+                        println!(
+                            "  {} {} (ID {})",
+                            "Ready:".dimmed(),
+                            instance.name.cyan(),
+                            instance.id
+                        );
                         return Ok(());
                     }
-                }
+                    Ok(false) => last_diagnostic = format!("non-matching startup status {value}"),
+                    Err(error) => last_diagnostic = error,
+                },
+                Ok(None) => last_diagnostic = "no guest startup status published".to_string(),
+                Err(error) => last_diagnostic = error.to_string(),
             }
 
             std::thread::sleep(Duration::from_secs(5));
@@ -906,6 +965,7 @@ mod tests {
 
     fn worker(name: &str, status: &str) -> Instance {
         Instance {
+            id: format!("id-{name}"),
             name: name.into(),
             zone: "us-central1-a".into(),
             network_interfaces: vec![NetworkInterface {
@@ -1002,6 +1062,59 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn same_name_startup_status_rejects_old_instance_and_deployment_generations() {
+        let (_, _, attestation) = write_attested_fixture();
+        let bootstrap = crate::cloud::attestation::ExpectedWorkerBootstrap {
+            artifact: crate::cloud::attestation::StagedWorkerArtifact {
+                gcs_url: "gs://bucket/fresh-worker".into(),
+                attestation,
+            },
+            deployment_id: "fresh-generation".into(),
+        };
+        let mut replacement = worker("demo-worker-0", "RUNNING");
+        replacement.id = "222".into();
+
+        let old_instance = serde_json::json!({
+            "status": "ready",
+            "instance_id": "111",
+            "deployment_id": "stale-generation",
+            "sha256": bootstrap.artifact.attestation.sha256,
+            "service_active": true,
+        });
+        assert!(!startup_status_is_ready(
+            &replacement,
+            &old_instance.to_string(),
+            Some(&bootstrap),
+        )
+        .unwrap());
+
+        let old_deployment = serde_json::json!({
+            "status": "ready",
+            "instance_id": "222",
+            "deployment_id": "stale-generation",
+            "sha256": bootstrap.artifact.attestation.sha256,
+            "service_active": true,
+        });
+        assert!(!startup_status_is_ready(
+            &replacement,
+            &old_deployment.to_string(),
+            Some(&bootstrap),
+        )
+        .unwrap());
+
+        let fresh = serde_json::json!({
+            "status": "ready",
+            "instance_id": "222",
+            "deployment_id": "fresh-generation",
+            "sha256": bootstrap.artifact.attestation.sha256,
+            "service_active": true,
+        });
+        assert!(
+            startup_status_is_ready(&replacement, &fresh.to_string(), Some(&bootstrap),).unwrap()
+        );
+    }
+
     #[derive(Clone)]
     struct CustomScaleProvider {
         list_calls: Arc<std::sync::atomic::AtomicUsize>,
@@ -1062,14 +1175,41 @@ mod tests {
                 )
             } else if command.contains("/status") {
                 r#"{"pending_tasks":0}"#.to_string()
-            } else if command.contains("test -f /tmp/genohype-ready") {
-                "ready".to_string()
             } else {
                 String::new()
             };
             let mut shell = std::process::Command::new("sh");
             shell.args(["-c", &format!("printf '%s' '{}'", output)]);
             shell
+        }
+        fn get_startup_status(&self, instance: &Instance, _: &str) -> Result<Option<String>> {
+            let setups = self.setups.lock().unwrap();
+            let script = setups
+                .iter()
+                .find(|setup| setup.name == instance.name)
+                .map(|setup| setup.startup_script.as_str())
+                .ok_or_else(|| HailError::InvalidFormat("missing recorded setup".into()))?;
+            let extract = |prefix: &str| {
+                script
+                    .lines()
+                    .find_map(|line| line.strip_prefix(prefix))
+                    .and_then(|value| value.strip_suffix('\''))
+                    .map(str::to_string)
+            };
+            let deployment_id = extract("readonly DEPLOYMENT_ID='")
+                .ok_or_else(|| HailError::InvalidFormat("missing deployment ID".into()))?;
+            let sha256 = extract("readonly EXPECTED_SHA256='")
+                .ok_or_else(|| HailError::InvalidFormat("missing artifact SHA".into()))?;
+            Ok(Some(
+                serde_json::json!({
+                    "status": "ready",
+                    "instance_id": instance.id,
+                    "deployment_id": deployment_id,
+                    "sha256": sha256,
+                    "service_active": true,
+                })
+                .to_string(),
+            ))
         }
     }
 
@@ -1184,6 +1324,7 @@ mod tests {
         let commands = ssh_commands.lock().unwrap().join("\n");
         assert!(!commands.contains("systemctl restart genohype-worker"));
         assert!(!commands.contains("cat > /etc/systemd/system/genohype-worker"));
+        assert!(!commands.contains("/var/lib/genohype/deployments/"));
     }
 
     #[test]

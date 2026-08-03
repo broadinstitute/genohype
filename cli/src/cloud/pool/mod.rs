@@ -218,6 +218,7 @@ mod tests {
         let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let manager = PoolManager::new(RecordingProvider(commands.clone()));
         let worker = Instance {
+            id: "worker-id".into(),
             name: "demo-worker-0".into(),
             zone: "us-central1-a".into(),
             network_interfaces: vec![],
