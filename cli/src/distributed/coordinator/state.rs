@@ -67,6 +67,8 @@ pub struct CoordinatorConfig {
     pub timeout_secs: u64,
     /// Timeout for stuck jobs making no progress (seconds)
     pub stuck_timeout_secs: u64,
+    /// Maximum number of automatic retries after a failed assignment
+    pub max_retries: usize,
     /// Filter conditions (where clauses)
     pub filters: Vec<String>,
     /// Interval filters
@@ -110,6 +112,7 @@ impl Default for CoordinatorConfig {
             batch_size: 1, // Default to 1 partition per request for fine-grained retry
             timeout_secs: 600, // 10 minutes
             stuck_timeout_secs: 600, // 10 minutes for stuck job detection
+            max_retries: 3,
             filters: Vec::new(),
             intervals: Vec::new(),
             memory_weight_mb: None,
@@ -578,6 +581,38 @@ impl CoordinatorData {
             .as_millis() as u64
     }
 
+    /// Clear the in-memory and durable fence for a preempted custom assignment.
+    pub(crate) fn clear_custom_assignment_for_partition(
+        &mut self,
+        partition_id: usize,
+    ) -> Result<(), String> {
+        let assignment = self
+            .custom_assignments
+            .iter()
+            .find(|(_, assignment)| assignment.partition_id == partition_id)
+            .map(|(task_id, assignment)| (task_id.clone(), assignment.clone()));
+        let Some((task_id, assignment)) = assignment else {
+            return Ok(());
+        };
+
+        let result = if let Some(job_id) = self.current_job_id.as_deref() {
+            self.metrics_db.clear_current_custom_assignment(
+                job_id,
+                &task_id,
+                assignment.assignment_attempt,
+                &assignment.lease_token,
+            )
+        } else {
+            Err(format!(
+                "custom task {task_id} has an assignment but no current job"
+            ))
+        };
+        // In-memory authority must be revoked even if the durable audit fence
+        // cannot be cleared; stale reports remain rejected by lease validation.
+        self.custom_assignments.remove(&task_id);
+        result
+    }
+
     /// Requeue all tasks assigned to a worker that is suspected dead.
     pub(crate) fn requeue_worker_tasks(&mut self, dead_worker_id: &str) {
         let now_ms = CoordinatorData::now_ms();
@@ -594,23 +629,27 @@ impl CoordinatorData {
 
         for part_id in lost_parts {
             self.processing_partitions.remove(&part_id);
-            self.custom_assignments
-                .retain(|_, assignment| assignment.partition_id != part_id);
+            if let Err(error) = self.clear_custom_assignment_for_partition(part_id) {
+                eprintln!(
+                    "Warning: failed to clear preempted custom assignment for partition {}: {}",
+                    part_id, error
+                );
+            }
             let retry_count = {
                 let retries = self.retry_counts.entry(part_id).or_insert(0);
                 *retries += 1;
                 *retries
             };
-            if retry_count > 3 {
+            if retry_count > self.config.max_retries {
                 println!(
-                    "Partition {} exceeded max retries (worker {} dead). Marking as failed.",
-                    part_id, dead_worker_id
+                    "Partition {} reached retry limit {} (worker {} dead). Marking as failed.",
+                    part_id, self.config.max_retries, dead_worker_id
                 );
                 self.failed_partitions.insert(part_id);
             } else {
                 println!(
-                    "Worker {} died. Requeuing partition {} (retry {}/3)",
-                    dead_worker_id, part_id, retry_count
+                    "Worker {} died. Requeuing partition {} (retry {}/{})",
+                    dead_worker_id, part_id, retry_count, self.config.max_retries
                 );
                 self.pending_partitions.push_front(part_id);
 
@@ -621,8 +660,8 @@ impl CoordinatorData {
                     worker_id: Some(dead_worker_id.to_string()),
                     phenotype_id: None,
                     details: format!(
-                        "Task {} requeued after worker death (retry {}/3)",
-                        part_id, retry_count
+                        "Task {} requeued after worker death (retry {}/{})",
+                        part_id, retry_count, self.config.max_retries
                     ),
                 });
             }

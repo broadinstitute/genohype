@@ -366,6 +366,14 @@ pub enum ServiceCommands {
         #[arg(long, default_value = "600")]
         timeout: u64,
 
+        /// Timeout in seconds before failing a job with no completed work
+        #[arg(long, default_value = "600")]
+        stuck_timeout: u64,
+
+        /// Maximum automatic retries after an assignment fails
+        #[arg(long, default_value = "3")]
+        max_retries: usize,
+
         /// Pool name for cluster management (e.g., "heavy")
         #[arg(long)]
         pool_name: Option<String>,
@@ -427,3 +435,52 @@ pub enum ServiceCommands {
 /// This allows the CLI to use the same enum as the library code.
 #[cfg(feature = "clickhouse")]
 pub use crate::distributed::message::InitStrategy;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::{Cli, Commands};
+    use clap::Parser;
+
+    fn coordinator_policy(args: &[&str]) -> (u64, u64, usize) {
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command {
+            Commands::Service {
+                command:
+                    ServiceCommands::StartCoordinator {
+                        timeout,
+                        stuck_timeout,
+                        max_retries,
+                        ..
+                    },
+            } => (timeout, stuck_timeout, max_retries),
+            _ => panic!("expected start-coordinator command"),
+        }
+    }
+
+    #[test]
+    fn coordinator_timeout_and_retry_policy_defaults_remain_unchanged() {
+        assert_eq!(
+            coordinator_policy(&["genohype", "service", "start-coordinator"]),
+            (600, 600, 3)
+        );
+    }
+
+    #[test]
+    fn coordinator_accepts_long_timeout_and_zero_retry_policy() {
+        assert_eq!(
+            coordinator_policy(&[
+                "genohype",
+                "service",
+                "start-coordinator",
+                "--timeout",
+                "3600",
+                "--stuck-timeout",
+                "3600",
+                "--max-retries",
+                "0",
+            ]),
+            (3600, 3600, 0)
+        );
+    }
+}

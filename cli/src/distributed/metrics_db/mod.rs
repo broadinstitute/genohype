@@ -991,6 +991,34 @@ impl MetricsDb {
         tx.commit().map_err(|error| error.to_string())
     }
 
+    /// Remove one exact live durable assignment fence after coordinator preemption.
+    pub(crate) fn clear_current_custom_assignment(
+        &self,
+        job_id: &str,
+        task_id: &str,
+        assignment_attempt: u64,
+        lease_token: &str,
+    ) -> Result<(), String> {
+        let assignment_attempt = i64::try_from(assignment_attempt)
+            .map_err(|_| "assignment attempt exceeds SQLite INTEGER".to_string())?;
+        let lease_identity_sha256 = lease_identity(lease_token);
+        let conn = self.conn.lock().unwrap();
+        let deleted = conn
+            .execute(
+                "DELETE FROM current_custom_assignments
+                 WHERE job_id = ?1 AND task_id = ?2
+                   AND assignment_attempt = ?3 AND lease_identity_sha256 = ?4",
+                params![job_id, task_id, assignment_attempt, lease_identity_sha256],
+            )
+            .map_err(|error| error.to_string())?;
+        if deleted != 1 {
+            return Err(format!(
+                "expected one current assignment for {job_id}/{task_id}, deleted {deleted}"
+            ));
+        }
+        Ok(())
+    }
+
     /// Remove live durable assignment fences for a terminal or superseded job.
     pub(crate) fn clear_current_custom_assignments(&self, job_id: &str) -> SqliteResult<()> {
         let conn = self.conn.lock().unwrap();

@@ -81,6 +81,8 @@ pub async fn start_coordinator(config: CoordinatorConfig) -> Result<()> {
         config.total_tasks,
         config.batch_size,
         config.timeout_secs,
+        config.stuck_timeout_secs,
+        config.max_retries,
         config.pool_name,
         config.gcp_project,
         config.gcp_zone,
@@ -93,6 +95,15 @@ pub async fn start_coordinator(config: CoordinatorConfig) -> Result<()> {
         config.worker_service_account,
     )
     .await
+}
+
+fn terminal_job_status(failed_tasks: usize, max_retries: usize) -> &'static str {
+    if failed_tasks > 0 && max_retries == 0 {
+        "failed"
+    } else {
+        // Preserve the existing terminal status for ordinary/default-policy jobs.
+        "completed"
+    }
 }
 
 fn restore_and_reconcile_database<F>(
@@ -160,6 +171,8 @@ pub async fn run_coordinator(
     total_tasks: usize,
     batch_size: usize,
     timeout_secs: u64,
+    stuck_timeout_secs: u64,
+    max_retries: usize,
     pool_name: Option<String>,
     gcp_project: Option<String>,
     gcp_zone: Option<String>,
@@ -209,7 +222,9 @@ pub async fn run_coordinator(
         }
     }
     println!("  Batch size: {}", batch_size);
-    println!("  Timeout: {}s", timeout_secs);
+    println!("  Assignment timeout: {}s", timeout_secs);
+    println!("  Stuck timeout: {}s", stuck_timeout_secs);
+    println!("  Max retries: {}", max_retries);
 
     // Try to restore from backup path if configured. Any successfully copied
     // database is reconciled before the server or its receipt endpoints exist.
@@ -285,7 +300,8 @@ pub async fn run_coordinator(
             total_tasks,
             batch_size,
             timeout_secs,
-            stuck_timeout_secs: 600, // Default 10 minutes
+            stuck_timeout_secs,
+            max_retries,
             filters: Vec::new(),
             intervals: Vec::new(),
             memory_weight_mb: None,
@@ -392,7 +408,7 @@ pub async fn run_coordinator(
 
         loop {
             tokio::time::sleep(Duration::from_secs(30)).await;
-            check_timeouts(&monitor_state, timeout_secs);
+            check_timeouts(&monitor_state);
             check_worker_liveness(&monitor_state);
             check_cpu_status_consistency(&monitor_state);
 
@@ -402,11 +418,7 @@ pub async fn run_coordinator(
             last_events_count = current_events;
 
             // Check for stuck jobs (R3)
-            let stuck_timeout = {
-                let data = monitor_state.lock().unwrap();
-                data.config.stuck_timeout_secs
-            };
-            check_stuck_job(&monitor_state, stuck_timeout);
+            check_stuck_job(&monitor_state);
 
             // Print periodic status
             // For batch/Manhattan jobs, use their state; otherwise use standard counters
@@ -643,9 +655,10 @@ pub async fn run_coordinator(
                         // Build a summary for persistence
                         let summary = build_dashboard_summary(&data);
                         let summary_json = serde_json::to_string(&summary).ok();
+                        let terminal_status = terminal_job_status(failed, max_retries);
                         if let Err(e) = data.metrics_db.update_job_status(
                             job_id,
-                            "completed",
+                            terminal_status,
                             Some(end_time_ms),
                             summary_json.as_deref(),
                         ) {
@@ -1320,7 +1333,7 @@ async fn complete_work(
             wasted_duration_ms,
         });
 
-        // Log event as warning (will be retried) - individual REQUEUED events show retry status
+        // Log the failed batch; per-task events below record retry or terminal failure.
         data.log_event(JobEvent {
             timestamp_ms: now_ms,
             event_type: "warning".to_string(),
@@ -1356,6 +1369,7 @@ async fn complete_work(
         }
 
         // Process requeues in reverse order to preserve original queue ordering
+        let max_retries = data.config.max_retries;
         for &part_id in parts_to_requeue.iter().rev() {
             // Use same retry logic as timeouts
             let retry_count = {
@@ -1364,10 +1378,10 @@ async fn complete_work(
                 *retries
             };
 
-            if retry_count > 3 {
+            if retry_count > max_retries {
                 println!(
-                    "Partition {} exceeded max retries ({}), marking as permanently failed",
-                    part_id, retry_count
+                    "Partition {} reached retry limit {}, marking as permanently failed",
+                    part_id, max_retries
                 );
                 data.failed_partitions.insert(part_id);
 
@@ -1378,14 +1392,14 @@ async fn complete_work(
                     worker_id: None,
                     phenotype_id: None,
                     details: format!(
-                        "Task {} permanently failed after {} retries",
-                        part_id, retry_count
+                        "Task {} permanently failed with retry limit {}",
+                        part_id, max_retries
                     ),
                 });
             } else {
                 println!(
-                    "Re-queuing partition {} for retry ({}/3)",
-                    part_id, retry_count
+                    "Re-queuing partition {} for retry ({}/{})",
+                    part_id, retry_count, max_retries
                 );
                 data.pending_partitions.push_front(part_id);
 
@@ -1396,8 +1410,8 @@ async fn complete_work(
                     worker_id: None,
                     phenotype_id: None,
                     details: format!(
-                        "Task {} requeued after failure (retry {}/3)",
-                        part_id, retry_count
+                        "Task {} requeued after failure (retry {}/{})",
+                        part_id, retry_count, max_retries
                     ),
                 });
             }
@@ -2569,16 +2583,175 @@ mod lease_coordinator_tests {
         );
     }
 
+    #[test]
+    fn zero_retry_failed_jobs_are_terminally_failed_without_changing_default_status() {
+        assert_eq!(terminal_job_status(1, 0), "failed");
+        assert_eq!(terminal_job_status(0, 0), "completed");
+        assert_eq!(terminal_job_status(1, 3), "completed");
+    }
+
+    #[tokio::test]
+    async fn configured_long_timeouts_do_not_use_the_legacy_600_second_cutoff() {
+        let state = test_state(1);
+        {
+            let mut data = state.lock().unwrap();
+            data.config.timeout_secs = 3600;
+            data.config.stuck_timeout_secs = 3600;
+            data.config.max_retries = 0;
+        }
+        assign(&state, "worker-a").await;
+        {
+            let mut data = state.lock().unwrap();
+            data.processing_partitions.get_mut(&0).unwrap().1 =
+                Instant::now() - Duration::from_secs(601);
+            data.last_progress_time = Instant::now() - Duration::from_secs(601);
+        }
+
+        check_timeouts(&state);
+        check_stuck_job(&state);
+        {
+            let data = state.lock().unwrap();
+            assert!(!data.idle);
+            assert_eq!(data.processing_partitions.len(), 1);
+            assert!(data.pending_partitions.is_empty());
+            assert!(data.failed_partitions.is_empty());
+            assert_eq!(
+                data.metrics_db
+                    .current_custom_assignment_count("job-1")
+                    .unwrap(),
+                1
+            );
+        }
+
+        state.lock().unwrap().last_progress_time = Instant::now() - Duration::from_secs(3601);
+        check_stuck_job(&state);
+        let data = state.lock().unwrap();
+        assert!(data.idle);
+        assert!(data.processing_partitions.is_empty());
+        assert!(data.pending_partitions.is_empty());
+        assert!(data.custom_assignments.is_empty());
+        assert_eq!(
+            data.metrics_db
+                .current_custom_assignment_count("job-1")
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            data.metrics_db
+                .get_custom_receipts("job-1")
+                .unwrap()
+                .job_status
+                .as_deref(),
+            Some("failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_retries_makes_first_timeout_terminal_without_requeue() {
+        let state = test_state(1);
+        state.lock().unwrap().config.timeout_secs = 3600;
+        state.lock().unwrap().config.max_retries = 0;
+        assign(&state, "worker-timeout").await;
+        state
+            .lock()
+            .unwrap()
+            .processing_partitions
+            .get_mut(&0)
+            .unwrap()
+            .1 = Instant::now() - Duration::from_secs(3601);
+
+        check_timeouts(&state);
+
+        let data = state.lock().unwrap();
+        assert!(data.pending_partitions.is_empty());
+        assert!(data.processing_partitions.is_empty());
+        assert_eq!(data.failed_partitions, HashSet::from([0]));
+        assert_eq!(data.retry_counts.get(&0), Some(&1));
+        assert_eq!(data.custom_assignment_attempts.get("custom_0"), Some(&1));
+        assert!(data.custom_assignments.is_empty());
+        assert_eq!(
+            data.metrics_db
+                .current_custom_assignment_count("job-1")
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_retries_makes_first_worker_error_terminal_without_requeue() {
+        let state = test_state(1);
+        state.lock().unwrap().config.max_retries = 0;
+        let (task_id, session, lease) = assign(&state, "worker-error").await;
+
+        let response = complete_work(
+            axum::extract::State(state.clone()),
+            axum::Json(completion(
+                "worker-error",
+                &task_id,
+                &session,
+                lease,
+                Some("coverage failed"),
+            )),
+        )
+        .await;
+
+        assert!(response.0.acknowledged);
+        let data = state.lock().unwrap();
+        assert!(data.pending_partitions.is_empty());
+        assert!(data.processing_partitions.is_empty());
+        assert_eq!(data.failed_partitions, HashSet::from([0]));
+        assert_eq!(data.custom_assignment_attempts.get("custom_0"), Some(&1));
+        assert!(data.custom_assignments.is_empty());
+        let receipts = data.metrics_db.get_custom_receipts("job-1").unwrap();
+        assert_eq!(receipts.failed_attempt_count, 1);
+        assert_eq!(receipts.terminal_receipt_count, 1);
+    }
+
+    #[tokio::test]
+    async fn zero_retries_makes_suspected_death_terminal_without_requeue() {
+        let state = test_state(1);
+        state.lock().unwrap().config.max_retries = 0;
+        assign(&state, "worker-dead").await;
+        state
+            .lock()
+            .unwrap()
+            .worker_registry
+            .get_mut("worker-dead")
+            .unwrap()
+            .last_seen =
+            Instant::now() - Duration::from_secs(state::WORKER_SUSPECT_TIMEOUT_SECS + 1);
+
+        check_worker_liveness(&state);
+
+        let data = state.lock().unwrap();
+        assert_eq!(
+            data.worker_registry.get("worker-dead").unwrap().status,
+            WorkerStatus::SuspectedDead
+        );
+        assert!(data.pending_partitions.is_empty());
+        assert!(data.processing_partitions.is_empty());
+        assert_eq!(data.failed_partitions, HashSet::from([0]));
+        assert_eq!(data.custom_assignment_attempts.get("custom_0"), Some(&1));
+        assert!(data.custom_assignments.is_empty());
+        assert_eq!(
+            data.metrics_db
+                .current_custom_assignment_count("job-1")
+                .unwrap(),
+            0
+        );
+    }
+
     #[tokio::test]
     async fn stale_completion_after_timeout_and_reassignment_mutates_no_state() {
         let state = test_state(1);
         let (task_id, session, stale_lease) = assign(&state, "worker-old").await;
         {
             let mut data = state.lock().unwrap();
+            data.config.timeout_secs = 1;
             data.processing_partitions.get_mut(&0).unwrap().1 =
                 Instant::now() - Duration::from_secs(10);
         }
-        check_timeouts(&state, 1);
+        check_timeouts(&state);
         let (_, _, fresh_lease) = assign(&state, "worker-new").await;
         assert_eq!(
             fresh_lease.assignment_attempt,
@@ -2727,10 +2900,11 @@ mod lease_coordinator_tests {
 
         {
             let mut data = state.lock().unwrap();
+            data.config.timeout_secs = 1;
             data.processing_partitions.get_mut(&0).unwrap().1 =
                 Instant::now() - Duration::from_secs(10);
         }
-        check_timeouts(&state, 1);
+        check_timeouts(&state);
         let _ = assign(&state, "worker-b").await;
         assert_rejected_heartbeat_unchanged(&state, heartbeat("worker-a", Some(&session), lease))
             .await;
@@ -2945,10 +3119,11 @@ mod lease_coordinator_tests {
         let (_, _, third) = assign(&state, "worker-3").await;
         {
             let mut data = state.lock().unwrap();
+            data.config.timeout_secs = 1;
             data.processing_partitions.get_mut(&0).unwrap().1 =
                 Instant::now() - Duration::from_secs(10);
         }
-        check_timeouts(&state, 1);
+        check_timeouts(&state);
         assert!(state.lock().unwrap().custom_assignments.is_empty());
         let (_, _, fourth) = assign(&state, "worker-4").await;
 

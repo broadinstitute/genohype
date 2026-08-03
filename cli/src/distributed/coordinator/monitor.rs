@@ -77,9 +77,10 @@ pub(crate) async fn backup_db(metrics_db: &MetricsDb, db_path: &str, backup_path
     success
 }
 
-/// Check if the job is stuck (no progress for N minutes) and auto-cancel if needed.
-pub(crate) fn check_stuck_job(state: &SharedState, timeout_secs: u64) {
+/// Check if the job is stuck (no progress for the configured timeout) and auto-cancel.
+pub(crate) fn check_stuck_job(state: &SharedState) {
     let mut data = state.lock().unwrap();
+    let timeout_secs = data.config.stuck_timeout_secs;
 
     // Only check if job is running
     if data.idle {
@@ -149,11 +150,12 @@ pub(crate) fn check_stuck_job(state: &SharedState, timeout_secs: u64) {
     }
 }
 
-/// Check for timed-out work and reschedule.
-pub(crate) fn check_timeouts(state: &SharedState, timeout_secs: u64) {
+/// Check for timed-out work and reschedule according to the configured retry limit.
+pub(crate) fn check_timeouts(state: &SharedState) {
     let mut data = state.lock().unwrap();
     let now = Instant::now();
-    let timeout = Duration::from_secs(timeout_secs);
+    let timeout = Duration::from_secs(data.config.timeout_secs);
+    let max_retries = data.config.max_retries;
 
     let mut timed_out = Vec::new();
     for (part_id, (worker, start_time)) in &data.processing_partitions {
@@ -164,8 +166,12 @@ pub(crate) fn check_timeouts(state: &SharedState, timeout_secs: u64) {
 
     for (part_id, worker, start_time) in timed_out {
         data.processing_partitions.remove(&part_id);
-        data.custom_assignments
-            .retain(|_, assignment| assignment.partition_id != part_id);
+        if let Err(error) = data.clear_custom_assignment_for_partition(part_id) {
+            eprintln!(
+                "Warning: failed to clear timed-out custom assignment for partition {}: {}",
+                part_id, error
+            );
+        }
 
         // Track the wasted time from this timeout
         let elapsed_secs = now.duration_since(start_time).as_secs_f64();
@@ -174,16 +180,16 @@ pub(crate) fn check_timeouts(state: &SharedState, timeout_secs: u64) {
         let retries = data.retry_counts.entry(part_id).or_insert(0);
         *retries += 1;
 
-        if *retries > 3 {
+        if *retries > max_retries {
             println!(
-                "Partition {} exceeded max retries (worker: {}). Marking as failed. (wasted {:.1}s)",
-                part_id, worker, elapsed_secs
+                "Partition {} reached retry limit {} (worker: {}). Marking as failed. (wasted {:.1}s)",
+                part_id, max_retries, worker, elapsed_secs
             );
             data.failed_partitions.insert(part_id);
         } else {
             println!(
-                "Partition {} timed out (worker: {}), rescheduling (retry {}) (wasted {:.1}s)",
-                part_id, worker, retries, elapsed_secs
+                "Partition {} timed out (worker: {}), rescheduling (retry {}/{}) (wasted {:.1}s)",
+                part_id, worker, retries, max_retries, elapsed_secs
             );
             data.pending_partitions.push_front(part_id);
         }
