@@ -1,0 +1,13 @@
+[package]
+name = "genohype-e2e-custom-worker"
+version = "0.1.0"
+edition = "2021"
+publish = false
+build = "build.rs"
+
+[dependencies]
+anyhow = "1.0"
+genohype-pool = { path = "../../../../../pool" }
+serde_json = "1.0"
+sha2 = "0.10"
+tokio = { version = "1.35", features = ["macros", "rt-multi-thread", "time"] }

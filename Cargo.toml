@@ -1,5 +1,11 @@
 [workspace]
-members = ["core", "cli", "pool", "mcp"]
+members = [
+    "core",
+    "cli",
+    "pool",
+    "mcp",
+    "scripts/e2e/gcp/fixtures/custom-worker",
+]
 resolver = "2"
 
 [workspace.dependencies]

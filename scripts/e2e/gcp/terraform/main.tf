@@ -8,33 +8,55 @@ locals {
     purpose = "genohype-e2e"
     run_id  = var.run_id
   }
-  service_account_roles = toset([
-    "roles/compute.admin",
+  driver_project_roles = toset([
+    "roles/compute.instanceAdmin.v1",
     "roles/compute.osAdminLogin",
     "roles/iap.tunnelResourceAccessor",
     "roles/serviceusage.serviceUsageConsumer",
   ])
 }
 
-resource "google_service_account" "e2e" {
-  account_id   = substr(local.prefix, 0, 30)
-  display_name = "Disposable Genohype E2E ${var.run_id}"
+resource "google_service_account" "driver_orchestrator" {
+  account_id   = "ghd-${var.run_id}"
+  display_name = "Genohype E2E driver ${var.run_id}"
+}
+
+resource "google_service_account" "coordinator_runtime" {
+  account_id   = "ghc-${var.run_id}"
+  display_name = "Genohype E2E coordinator ${var.run_id}"
+}
+
+resource "google_service_account" "worker_runtime" {
+  account_id   = "ghw-${var.run_id}"
+  display_name = "Genohype E2E worker ${var.run_id}"
 }
 
 # Additive members only: never replace an existing project IAM binding/policy.
-resource "google_project_iam_member" "e2e" {
-  for_each = local.service_account_roles
+resource "google_project_iam_member" "driver" {
+  for_each = local.driver_project_roles
   project  = var.project_id
   role     = each.value
-  member   = "serviceAccount:${google_service_account.e2e.email}"
+  member   = "serviceAccount:${google_service_account.driver_orchestrator.email}"
 }
 
-# Scope actAs to the disposable account itself instead of granting it access to
-# every service account in the project.
-resource "google_service_account_iam_member" "self_use" {
-  service_account_id = google_service_account.e2e.name
+resource "google_project_iam_member" "coordinator_viewer" {
+  project = var.project_id
+  role    = "roles/compute.viewer"
+  member  = "serviceAccount:${google_service_account.coordinator_runtime.email}"
+}
+
+# The driver can attach only the two disposable runtime identities, never an
+# arbitrary account in the target project.
+resource "google_service_account_iam_member" "driver_uses_coordinator" {
+  service_account_id = google_service_account.coordinator_runtime.name
   role               = "roles/iam.serviceAccountUser"
-  member             = "serviceAccount:${google_service_account.e2e.email}"
+  member             = "serviceAccount:${google_service_account.driver_orchestrator.email}"
+}
+
+resource "google_service_account_iam_member" "driver_uses_worker" {
+  service_account_id = google_service_account.worker_runtime.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${google_service_account.driver_orchestrator.email}"
 }
 
 resource "google_compute_network" "e2e" {
@@ -49,6 +71,14 @@ resource "google_compute_subnetwork" "e2e" {
   network                  = google_compute_network.e2e.id
   ip_cidr_range            = "10.252.0.0/24"
   private_ip_google_access = true
+}
+
+resource "google_compute_subnetwork_iam_member" "driver_network_user" {
+  project    = var.project_id
+  region     = var.region
+  subnetwork = google_compute_subnetwork.e2e.name
+  role       = "roles/compute.networkUser"
+  member     = "serviceAccount:${google_service_account.driver_orchestrator.email}"
 }
 
 resource "google_compute_router" "e2e" {
@@ -119,10 +149,28 @@ resource "google_storage_bucket" "e2e" {
   }
 }
 
-resource "google_storage_bucket_iam_member" "e2e_objects" {
+resource "google_storage_bucket_iam_member" "driver_objects" {
   bucket = google_storage_bucket.e2e.name
   role   = "roles/storage.objectAdmin"
-  member = "serviceAccount:${google_service_account.e2e.email}"
+  member = "serviceAccount:${google_service_account.driver_orchestrator.email}"
+}
+
+resource "google_storage_bucket_iam_member" "coordinator_objects" {
+  bucket = google_storage_bucket.e2e.name
+  role   = "roles/storage.objectUser"
+  member = "serviceAccount:${google_service_account.coordinator_runtime.email}"
+}
+
+resource "google_storage_bucket_iam_member" "worker_read" {
+  bucket = google_storage_bucket.e2e.name
+  role   = "roles/storage.objectViewer"
+  member = "serviceAccount:${google_service_account.worker_runtime.email}"
+}
+
+resource "google_storage_bucket_iam_member" "worker_create" {
+  bucket = google_storage_bucket.e2e.name
+  role   = "roles/storage.objectCreator"
+  member = "serviceAccount:${google_service_account.worker_runtime.email}"
 }
 
 resource "google_compute_instance" "driver" {
@@ -140,15 +188,13 @@ resource "google_compute_instance" "driver" {
     }
   }
 
+  # The driver is private. Cloud NAT supplies egress and IAP supplies inbound SSH.
   network_interface {
     subnetwork = google_compute_subnetwork.e2e.id
-    # Outbound internet is needed to install system packages. Inbound SSH is
-    # still restricted to IAP by the only TCP/22 firewall rule in this VPC.
-    access_config {}
   }
 
   service_account {
-    email  = google_service_account.e2e.email
+    email  = google_service_account.driver_orchestrator.email
     scopes = ["cloud-platform"]
   }
 
@@ -157,8 +203,11 @@ resource "google_compute_instance" "driver" {
   }
 
   depends_on = [
-    google_project_iam_member.e2e,
-    google_service_account_iam_member.self_use,
-    google_storage_bucket_iam_member.e2e_objects,
+    google_compute_router_nat.e2e,
+    google_project_iam_member.driver,
+    google_compute_subnetwork_iam_member.driver_network_user,
+    google_service_account_iam_member.driver_uses_coordinator,
+    google_service_account_iam_member.driver_uses_worker,
+    google_storage_bucket_iam_member.driver_objects,
   ]
 }

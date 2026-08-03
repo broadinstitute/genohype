@@ -1857,6 +1857,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "genohype-e2e-custom-worker"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "genohype-pool",
+ "serde_json",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
 name = "genohype-mcp"
 version = "0.1.0"
 dependencies = [

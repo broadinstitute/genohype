@@ -1,0 +1,7 @@
+[
+  {
+    "kind": "sleep_ms",
+    "label": "bounded lifecycle sleep",
+    "milliseconds": 5000
+  }
+]

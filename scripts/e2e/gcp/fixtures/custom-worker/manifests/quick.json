@@ -1,0 +1,13 @@
+[
+  {
+    "kind": "echo",
+    "value": {
+      "message": "genohype-e2e",
+      "ordinal": 1
+    }
+  },
+  {
+    "input": "genohype-e2e",
+    "kind": "sha256"
+  }
+]
