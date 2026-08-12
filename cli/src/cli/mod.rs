@@ -3,6 +3,7 @@
 pub mod cluster;
 pub mod export;
 pub mod manhattan;
+pub mod manifest;
 pub mod misc;
 pub mod pool;
 pub mod shared;
@@ -15,6 +16,7 @@ pub mod annotate;
 pub use cluster::*;
 pub use export::*;
 pub use manhattan::*;
+pub use manifest::*;
 pub use misc::*;
 pub use pool::*;
 pub use shared::*;
@@ -86,6 +88,12 @@ pub enum Commands {
     Schema {
         #[command(subcommand)]
         command: SchemaSubcommands,
+    },
+
+    /// Create and inspect immutable source manifests
+    Manifest {
+        #[command(subcommand)]
+        command: ManifestCommands,
     },
 
     /// Generate Manhattan plots (PNG + JSON sidecar)

@@ -25,6 +25,7 @@
 //! This enables processing 12TB datasets without local staging.
 
 pub mod adapter;
+pub mod inventory;
 pub mod manifest;
 pub mod resolver;
 pub mod writer;
@@ -36,6 +37,12 @@ pub use adapter::{
     get_reader_with_snapshot, is_cloud_path, join_path, range_read, range_read_with_snapshot,
     read_single_block, set_prefetch_depth, BoxedReader, CloudReader, MmapReader,
     PrefetchingCloudReader,
+};
+pub use inventory::{
+    inventory_hail_table, inventory_hail_table_path, IgnoredCounts, InventoryAccess,
+    InventoryOptions, InventoryResult, InventoryRole, LocalInventoryBackend, ObservedListing,
+    ObservedObject, RelativeObjectPath, SourceInventoryBackend, DEFAULT_MAX_OBJECTS,
+    MAX_METADATA_BYTES,
 };
 pub use manifest::{SourceManifest, SourceObject, SourceSnapshot, SOURCE_MANIFEST_SCHEMA_VERSION};
 pub use resolver::{

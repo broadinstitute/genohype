@@ -51,6 +51,7 @@ use commands::info::show_info;
 #[cfg(feature = "clickhouse")]
 use commands::ingest::run_ingest_command;
 use commands::manhattan::{run_loci, run_locus, run_manhattan, run_manhattan_batch};
+use commands::manifest::run_manifest_command;
 use commands::pool::run_pool_command;
 use commands::query::run_query;
 #[cfg(feature = "validation")]
@@ -114,6 +115,7 @@ fn main() -> Result<()> {
             #[cfg(feature = "bigquery")]
             ExportCommands::Bigquery(args) => run_export_bigquery(args)?,
         },
+        Commands::Manifest { command } => run_manifest_command(command)?,
         Commands::Manhattan(args) => run_manhattan(args)?,
         Commands::ManhattanBatch(args) => run_manhattan_batch(args)?,
         Commands::Loci(args) => run_loci(args)?,

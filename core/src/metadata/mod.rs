@@ -10,4 +10,5 @@ pub mod cache;
 mod structures;
 
 pub use cache::{CacheOptions, MetadataCache};
+pub(crate) use structures::parse_metadata_at;
 pub use structures::*;

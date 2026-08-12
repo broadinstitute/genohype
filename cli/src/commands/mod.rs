@@ -7,6 +7,7 @@ pub mod info;
 #[cfg(feature = "clickhouse")]
 pub mod ingest;
 pub mod manhattan;
+pub mod manifest;
 pub mod pool;
 pub mod query;
 #[cfg(feature = "validation")]
