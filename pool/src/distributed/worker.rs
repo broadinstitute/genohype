@@ -198,6 +198,8 @@ pub async fn run_worker(
                                         worker_id: worker_id.clone(),
                                         telemetry: metrics.snapshot(10.0),
                                         build_version: build_version.clone(),
+                                        build_identity: None,
+                                        binary_sha256: None,
                                         session_id: heartbeat_session_id.clone(),
                                         assignments: heartbeat_assignments.clone(),
                                     };

@@ -42,7 +42,10 @@ use crate::distributed::message::{
     TaskDescriptor, WorkRequest, WorkResponse, CUSTOM_WORKER_PROTOCOL_VERSION,
     SAFE_EXPORT_WORKER_PROTOCOL_VERSION,
 };
-use crate::distributed::metrics_db::{CustomCompletionOutcome, DurableCustomAssignment, MetricsDb};
+use crate::distributed::metrics_db::{
+    CustomCompletionOutcome, DurableCustomAssignment, DurableSafeExportAssignment, MetricsDb,
+    SafePublicationClaimOutcome,
+};
 use crate::Result;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
@@ -147,11 +150,11 @@ where
     let restored = MetricsDb::open(db_path)
         .map_err(|error| format!("failed to open restored metrics database: {error}"))?;
     let reconciled = restored
-        .reconcile_restored_custom_jobs(CoordinatorData::now_ms())
+        .reconcile_restored_fenced_jobs(CoordinatorData::now_ms())
         .map_err(|error| format!("failed to reconcile restored custom jobs: {error}"))?;
     if reconciled > 0 {
         eprintln!(
-            "  Marked {reconciled} restored running custom job(s) failed and fenced assignments"
+            "  Marked {reconciled} restored running fenced job(s) failed and cleared assignments"
         );
     }
     Ok(true)
@@ -362,6 +365,8 @@ pub async fn run_coordinator(
         retry_counts: HashMap::new(),
         custom_assignment_attempts: HashMap::new(),
         custom_assignments: HashMap::new(),
+        safe_export_assignment_attempts: HashMap::new(),
+        safe_export_assignments: HashMap::new(),
         failed_partitions: HashSet::new(),
         worker_registry: HashMap::new(),
         job_start_time: Instant::now(),
@@ -725,6 +730,8 @@ pub async fn run_coordinator(
                     data.retry_counts.clear();
                     data.custom_assignment_attempts.clear();
                     data.custom_assignments.clear();
+                    data.safe_export_assignment_attempts.clear();
+                    data.safe_export_assignments.clear();
                     data.job_state = JobExecutionState::Standard;
                     data.active_tasks.clear();
                     data.aggregated_results.clear();
@@ -885,11 +892,14 @@ async fn get_work(
                         .to_string(),
             });
         }
-        // Stage 4b deliberately does not expose a lease until the parallel
-        // durable safe-assignment fence lands in Stage 4c/5a.
+        // Keep the public execution gate fail-closed until the follow-up commit
+        // installs cloud publication plus atomic accepted-receipt authority.
+        // The typed assignment/claim machinery below is complete but must not
+        // expose a job that can stage bytes without reaching an authoritative
+        // terminal receipt.
         return axum::Json(WorkResponse::Incompatible {
             required_protocol_version: SAFE_EXPORT_WORKER_PROTOCOL_VERSION,
-            message: "safe-export execution is fenced off until durable coordinator publication support is installed".to_string(),
+            message: "safe-export durable assignment fencing is installed; immutable publication and accepted-receipt commit are not yet installed".to_string(),
         });
     }
 
@@ -969,23 +979,31 @@ async fn get_work(
             .get(&req.worker_id)
             .and_then(|w| w.hardware.as_ref());
 
-        let max_batch_size = determine_batch_size(
-            data.config.batch_size,
-            worker_hw,
-            &data.config.job_spec,
-            data.config.memory_weight_mb,
-        );
-        // Respect learned capacity ceiling if it exists
+        let safe_export = matches!(data.config.job_spec, Some(JobSpec::SafeExport(_)));
+        let max_batch_size = if safe_export {
+            1
+        } else {
+            determine_batch_size(
+                data.config.batch_size,
+                worker_hw,
+                &data.config.job_spec,
+                data.config.memory_weight_mb,
+            )
+        };
+        // Safe export never participates in AIMD or learned batch capacity.
         let worker_cap = data
             .worker_registry
             .get(&req.worker_id)
             .and_then(|w| w.max_batch_capacity);
         let effective_max = worker_cap.unwrap_or(max_batch_size).min(max_batch_size);
-        let batch_size = data
-            .worker_registry
-            .get(&req.worker_id)
-            .and_then(|w| w.current_batch_size)
-            .unwrap_or_else(|| (effective_max / 10).max(2).min(effective_max));
+        let batch_size = if safe_export {
+            1
+        } else {
+            data.worker_registry
+                .get(&req.worker_id)
+                .and_then(|w| w.current_batch_size)
+                .unwrap_or_else(|| (effective_max / 10).max(2).min(effective_max))
+        };
 
         while partitions.len() < batch_size {
             if let Some(next_id) = data.pending_partitions.pop_front() {
@@ -1021,16 +1039,71 @@ async fn get_work(
         let all_tasks = job_spec.generate_tasks(&input_path, total_tasks);
         let mut tasks: Vec<TaskDescriptor> = partitions
             .iter()
-            .map(|&i| {
-                // Try to find by index first (most common case), then by ID
+            .filter_map(|&i| {
+                // Safe export must never fabricate a legacy fallback descriptor.
                 all_tasks
                     .iter()
                     .find(|t| t.index == Some(i))
                     .cloned()
                     .or_else(|| all_tasks.iter().find(|t| t.id == i.to_string()).cloned())
-                    .unwrap_or_else(|| TaskDescriptor::partition(i, total_tasks))
+                    .or_else(|| (!safe_export).then(|| TaskDescriptor::partition(i, total_tasks)))
             })
             .collect();
+        if tasks.len() != partitions.len() {
+            for partition_id in partitions.into_iter().rev() {
+                data.processing_partitions.remove(&partition_id);
+                data.pending_partitions.push_front(partition_id);
+            }
+            return axum::Json(WorkResponse::Wait);
+        }
+
+        if let JobSpec::SafeExport(ref spec) = job_spec {
+            let task = &mut tasks[0];
+            let lease = data.issue_safe_export_assignment(
+                &task.id,
+                partitions[0],
+                &req.worker_id,
+                req.build_version.as_deref().expect("safe build checked"),
+                req.build_identity
+                    .as_deref()
+                    .expect("safe build identity checked"),
+                req.binary_sha256.as_deref().expect("safe binary checked"),
+            );
+            task.assignment_attempt = Some(lease.assignment_attempt);
+            task.lease_token = Some(lease.lease_token);
+            let Some(job_id) = data.current_job_id.clone() else {
+                data.processing_partitions.remove(&partitions[0]);
+                data.safe_export_assignments.remove(&task.id);
+                data.pending_partitions.push_front(partitions[0]);
+                return axum::Json(WorkResponse::Wait);
+            };
+            let durable = DurableSafeExportAssignment {
+                export_id: &spec.export_id,
+                task_id: &task.id,
+                partition_id: partitions[0],
+                assignment_attempt: task.assignment_attempt.expect("safe attempt"),
+                lease_token: task.lease_token.as_deref().expect("safe lease"),
+                worker_id: &req.worker_id,
+                worker_git_commit: req.build_version.as_deref().expect("safe build checked"),
+                worker_build_identity: req
+                    .build_identity
+                    .as_deref()
+                    .expect("safe identity checked"),
+                worker_binary_sha256: req.binary_sha256.as_deref().expect("safe binary checked"),
+            };
+            if let Err(error) = data.metrics_db.persist_safe_export_assignment(
+                &job_id,
+                &data.session_id,
+                &durable,
+                CoordinatorData::now_ms(),
+            ) {
+                eprintln!("Rejected unsafe safe-export assignment dispatch: {error}");
+                data.processing_partitions.remove(&partitions[0]);
+                data.safe_export_assignments.remove(&task.id);
+                data.pending_partitions.push_front(partitions[0]);
+                return axum::Json(WorkResponse::Wait);
+            }
+        }
 
         // Custom tasks are side-effecting and may outlive a timeout or Spot
         // preemption. Fence each assignment independently so a late worker can
@@ -1164,6 +1237,158 @@ async fn complete_work(
                 acknowledged: false,
             });
         }
+    }
+
+    let safe_spec = match data.config.job_spec.clone() {
+        Some(JobSpec::SafeExport(spec)) => Some(spec),
+        _ => None,
+    };
+    if let Some(spec) = safe_spec {
+        // Safe completions must never fall through to generic in-memory
+        // accounting. Stage 4c validates the complete fence/report contract;
+        // publication and receipt commit are the only path that may eventually
+        // acknowledge it.
+        if data
+            .validate_safe_export_assignments(
+                req.session_id.as_deref(),
+                &req.worker_id,
+                &req.tasks,
+                &req.assignments,
+            )
+            .is_err()
+        {
+            return axum::Json(CompleteResponse {
+                acknowledged: false,
+            });
+        }
+        let task_id = &req.tasks[0];
+        let assignment = data
+            .safe_export_assignments
+            .get(task_id)
+            .expect("validated safe-export assignment")
+            .clone();
+        if assignment.worker_git_commit != spec.expected_worker.git_commit
+            || assignment.worker_build_identity != spec.expected_worker.build_identity
+            || assignment.worker_binary_sha256 != spec.expected_worker.binary_sha256
+        {
+            return axum::Json(CompleteResponse {
+                acknowledged: false,
+            });
+        }
+        let Some(job_id) = data.current_job_id.clone() else {
+            return axum::Json(CompleteResponse {
+                acknowledged: false,
+            });
+        };
+        let durable = DurableSafeExportAssignment {
+            export_id: &spec.export_id,
+            task_id,
+            partition_id: assignment.partition_id,
+            assignment_attempt: assignment.assignment_attempt,
+            lease_token: &assignment.lease_token,
+            worker_id: &assignment.worker_id,
+            worker_git_commit: &assignment.worker_git_commit,
+            worker_build_identity: &assignment.worker_build_identity,
+            worker_binary_sha256: &assignment.worker_binary_sha256,
+        };
+        if let Some(error) = req.error.as_deref() {
+            if req.result_json.is_some()
+                || data
+                    .metrics_db
+                    .fail_safe_export_assignment(&job_id, &data.session_id, &durable, error, now_ms)
+                    .is_err()
+            {
+                return axum::Json(CompleteResponse {
+                    acknowledged: false,
+                });
+            }
+            data.safe_export_assignments.remove(task_id);
+            data.processing_partitions.remove(&assignment.partition_id);
+            let retry = data
+                .retry_counts
+                .entry(assignment.partition_id)
+                .or_insert(0);
+            *retry += 1;
+            if *retry > data.config.max_retries {
+                data.failed_partitions.insert(assignment.partition_id);
+            } else {
+                data.pending_partitions.push_front(assignment.partition_id);
+            }
+            return axum::Json(CompleteResponse { acknowledged: true });
+        }
+        if req.result_json.is_none() {
+            return axum::Json(CompleteResponse {
+                acknowledged: false,
+            });
+        }
+        let Some(report) = serde_json::to_vec(req.result_json.as_ref().unwrap())
+            .ok()
+            .and_then(|json| genohype_core::release::ExportPartReport::from_json(&json).ok())
+        else {
+            return axum::Json(CompleteResponse {
+                acknowledged: false,
+            });
+        };
+        let Some(task) = spec
+            .sealed_part_tasks()
+            .ok()
+            .and_then(|tasks| tasks.into_iter().find(|task| task.task_id == *task_id))
+        else {
+            return axum::Json(CompleteResponse {
+                acknowledged: false,
+            });
+        };
+        let Ok(lease_hash) = genohype_core::io::lease_identity_sha256(&assignment.lease_token)
+        else {
+            return axum::Json(CompleteResponse {
+                acknowledged: false,
+            });
+        };
+        if report
+            .validate_against(
+                &spec,
+                &task,
+                &req.worker_id,
+                assignment.assignment_attempt,
+                &lease_hash,
+            )
+            .is_err()
+        {
+            return axum::Json(CompleteResponse {
+                acknowledged: false,
+            });
+        }
+        let Ok(report_json) = serde_json::to_string(&report) else {
+            return axum::Json(CompleteResponse {
+                acknowledged: false,
+            });
+        };
+        match data.metrics_db.begin_safe_export_publication(
+            &job_id,
+            &data.session_id,
+            &durable,
+            &report_json,
+            now_ms,
+        ) {
+            Ok(SafePublicationClaimOutcome::Claimed | SafePublicationClaimOutcome::Duplicate) => {
+                if let Some(current) = data.safe_export_assignments.get_mut(task_id) {
+                    current.state = state::SafeExportAssignmentState::Publishing;
+                }
+            }
+            Err(error) => {
+                eprintln!("Rejected safe-export publication claim: {error}");
+                return axum::Json(CompleteResponse {
+                    acknowledged: false,
+                });
+            }
+        }
+        eprintln!(
+            "Safe-export report {} is durably claimed for publication; cloud publication is not installed",
+            task_id
+        );
+        return axum::Json(CompleteResponse {
+            acknowledged: false,
+        });
     }
 
     let is_custom_job = matches!(data.config.job_spec, Some(JobSpec::Custom { .. }));
@@ -1836,6 +2061,43 @@ async fn handle_heartbeat(
 ) -> axum::Json<HeartbeatResponse> {
     let mut data = state.lock().unwrap();
 
+    if matches!(data.config.job_spec, Some(JobSpec::SafeExport(_))) {
+        let mut expected_tasks: Vec<String> = data
+            .safe_export_assignments
+            .iter()
+            .filter(|(_, assignment)| assignment.worker_id == req.worker_id)
+            .map(|(task_id, _)| task_id.clone())
+            .collect();
+        expected_tasks.sort();
+        if !expected_tasks.is_empty() || !req.assignments.is_empty() {
+            let build_matches = expected_tasks.iter().all(|task_id| {
+                data.safe_export_assignments
+                    .get(task_id)
+                    .is_some_and(|assignment| {
+                        req.build_version.as_deref() == Some(assignment.worker_git_commit.as_str())
+                            && req.build_identity.as_deref()
+                                == Some(assignment.worker_build_identity.as_str())
+                            && req.binary_sha256.as_deref()
+                                == Some(assignment.worker_binary_sha256.as_str())
+                    })
+            });
+            if !build_matches
+                || data
+                    .validate_safe_export_assignments(
+                        req.session_id.as_deref(),
+                        &req.worker_id,
+                        &expected_tasks,
+                        &req.assignments,
+                    )
+                    .is_err()
+            {
+                return axum::Json(HeartbeatResponse {
+                    acknowledged: false,
+                });
+            }
+        }
+    }
+
     if matches!(data.config.job_spec, Some(JobSpec::Custom { .. })) {
         let mut expected_tasks: Vec<String> = data
             .custom_assignments
@@ -1992,6 +2254,8 @@ mod lease_coordinator_tests {
             retry_counts: HashMap::new(),
             custom_assignment_attempts: HashMap::new(),
             custom_assignments: HashMap::new(),
+            safe_export_assignment_attempts: HashMap::new(),
+            safe_export_assignments: HashMap::new(),
             failed_partitions: HashSet::new(),
             worker_registry: HashMap::new(),
             job_start_time: Instant::now(),
@@ -2976,6 +3240,8 @@ mod lease_coordinator_tests {
             worker_id: worker_id.to_string(),
             telemetry,
             build_version: Some("rejected-build".to_string()),
+            build_identity: None,
+            binary_sha256: None,
             session_id: session_id.map(str::to_string),
             assignments: vec![lease],
         }

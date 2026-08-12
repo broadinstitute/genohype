@@ -26,9 +26,28 @@ pub(crate) struct DurableCustomAssignment<'a> {
     pub lease_token: &'a str,
 }
 
+/// One safe-export assignment persisted before its lease capability is exposed.
+pub(crate) struct DurableSafeExportAssignment<'a> {
+    pub export_id: &'a str,
+    pub task_id: &'a str,
+    pub partition_id: usize,
+    pub assignment_attempt: u64,
+    pub lease_token: &'a str,
+    pub worker_id: &'a str,
+    pub worker_git_commit: &'a str,
+    pub worker_build_identity: &'a str,
+    pub worker_binary_sha256: &'a str,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CustomCompletionOutcome {
     Stored,
+    Duplicate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SafePublicationClaimOutcome {
+    Claimed,
     Duplicate,
 }
 
@@ -228,6 +247,123 @@ impl MetricsDb {
             BEFORE DELETE ON custom_task_receipts
             BEGIN
                 SELECT RAISE(ABORT, 'custom task receipts are immutable');
+            END;
+
+            -- Safe export has a parallel typed authority boundary. It must
+            -- never reuse the arbitrary custom-task report tables.
+            CREATE TABLE IF NOT EXISTS safe_export_runs (
+                job_id TEXT PRIMARY KEY,
+                export_id TEXT NOT NULL,
+                expected_part_count INTEGER NOT NULL CHECK (expected_part_count >= 0),
+                imported_part_count INTEGER NOT NULL DEFAULT 0 CHECK (imported_part_count >= 0),
+                completed_part_count INTEGER NOT NULL DEFAULT 0 CHECK (completed_part_count >= 0),
+                phase TEXT NOT NULL CHECK (phase IN ('running', 'finalizing', 'completed', 'failed', 'cancelled', 'superseded')),
+                release_uri TEXT,
+                release_version TEXT,
+                release_etag TEXT,
+                release_size INTEGER,
+                release_sha256 TEXT,
+                success_uri TEXT,
+                success_version TEXT,
+                success_etag TEXT,
+                success_size INTEGER,
+                success_sha256 TEXT,
+                created_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_safe_export_runs_export
+                ON safe_export_runs(export_id, job_id);
+
+            CREATE TABLE IF NOT EXISTS current_safe_export_assignments (
+                job_id TEXT NOT NULL,
+                export_id TEXT NOT NULL,
+                coordinator_session_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                partition_id INTEGER NOT NULL CHECK (partition_id >= 0),
+                assignment_attempt INTEGER NOT NULL CHECK (assignment_attempt > 0),
+                lease_identity_sha256 TEXT NOT NULL,
+                worker_id TEXT NOT NULL,
+                worker_git_commit TEXT NOT NULL,
+                worker_build_identity TEXT NOT NULL,
+                worker_binary_sha256 TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('assigned', 'publishing')),
+                report_json TEXT,
+                report_sha256 TEXT,
+                assigned_at_ms INTEGER NOT NULL,
+                publishing_at_ms INTEGER,
+                PRIMARY KEY (job_id, task_id),
+                CHECK ((state = 'assigned' AND report_json IS NULL AND report_sha256 IS NULL AND publishing_at_ms IS NULL)
+                    OR (state = 'publishing' AND report_json IS NOT NULL AND report_sha256 IS NOT NULL AND publishing_at_ms IS NOT NULL))
+            );
+
+            CREATE TABLE IF NOT EXISTS safe_export_attempt_receipts (
+                job_id TEXT NOT NULL,
+                export_id TEXT NOT NULL,
+                coordinator_session_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                partition_id INTEGER NOT NULL CHECK (partition_id >= 0),
+                assignment_attempt INTEGER NOT NULL CHECK (assignment_attempt > 0),
+                lease_identity_sha256 TEXT NOT NULL,
+                worker_id TEXT NOT NULL,
+                worker_git_commit TEXT NOT NULL,
+                worker_build_identity TEXT NOT NULL,
+                worker_binary_sha256 TEXT NOT NULL,
+                terminal_status TEXT NOT NULL CHECK (terminal_status IN ('accepted', 'failed')),
+                report_json TEXT,
+                report_sha256 TEXT,
+                error TEXT,
+                accepted_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (job_id, task_id, assignment_attempt),
+                CHECK ((terminal_status = 'accepted' AND report_json IS NOT NULL AND report_sha256 IS NOT NULL AND error IS NULL)
+                    OR (terminal_status = 'failed' AND error IS NOT NULL))
+            );
+            CREATE INDEX IF NOT EXISTS idx_safe_export_attempts_job
+                ON safe_export_attempt_receipts(job_id, task_id, assignment_attempt);
+            CREATE TRIGGER IF NOT EXISTS safe_export_attempt_receipts_immutable_update
+            BEFORE UPDATE ON safe_export_attempt_receipts
+            BEGIN
+                SELECT RAISE(ABORT, 'safe export attempt receipts are immutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS safe_export_attempt_receipts_immutable_delete
+            BEFORE DELETE ON safe_export_attempt_receipts
+            BEGIN
+                SELECT RAISE(ABORT, 'safe export attempt receipts are immutable');
+            END;
+
+            CREATE TABLE IF NOT EXISTS safe_export_part_receipts (
+                export_id TEXT NOT NULL,
+                partition_id INTEGER NOT NULL CHECK (partition_id >= 0),
+                task_id TEXT NOT NULL,
+                first_job_id TEXT NOT NULL,
+                first_assignment_attempt INTEGER NOT NULL CHECK (first_assignment_attempt > 0),
+                receipt_json TEXT NOT NULL,
+                receipt_sha256 TEXT NOT NULL,
+                receipt_uri TEXT NOT NULL,
+                receipt_version TEXT NOT NULL,
+                receipt_etag TEXT NOT NULL,
+                receipt_size INTEGER NOT NULL CHECK (receipt_size >= 0),
+                receipt_object_sha256 TEXT NOT NULL,
+                output_uri TEXT NOT NULL,
+                output_version TEXT NOT NULL,
+                output_etag TEXT NOT NULL,
+                output_size INTEGER NOT NULL CHECK (output_size >= 0),
+                output_sha256 TEXT NOT NULL,
+                row_count INTEGER NOT NULL CHECK (row_count >= 0),
+                row_group_count INTEGER NOT NULL CHECK (row_group_count >= 0),
+                schema_fingerprint_sha256 TEXT NOT NULL,
+                decoded_rows_sha256 TEXT NOT NULL,
+                accepted_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (export_id, partition_id),
+                UNIQUE (export_id, task_id)
+            );
+            CREATE TRIGGER IF NOT EXISTS safe_export_part_receipts_immutable_update
+            BEFORE UPDATE ON safe_export_part_receipts
+            BEGIN
+                SELECT RAISE(ABORT, 'safe export part receipts are immutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS safe_export_part_receipts_immutable_delete
+            BEFORE DELETE ON safe_export_part_receipts
+            BEGIN
+                SELECT RAISE(ABORT, 'safe export part receipts are immutable');
             END;
             "#,
         )?;
@@ -589,14 +725,18 @@ impl MetricsDb {
             let required_tables: i64 = snapshot
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master
-                     WHERE type = 'table' AND name IN ('jobs', 'current_custom_assignments', 'custom_task_receipts')",
+                     WHERE type = 'table' AND name IN (
+                         'jobs', 'current_custom_assignments', 'custom_task_receipts',
+                         'safe_export_runs', 'current_safe_export_assignments',
+                         'safe_export_attempt_receipts', 'safe_export_part_receipts'
+                     )",
                     [],
                     |row| row.get(0),
                 )
                 .map_err(|error| format!("failed to verify backup schema: {error}"))?;
-            if required_tables != 3 {
+            if required_tables != 7 {
                 return Err(format!(
-                    "backup snapshot is missing receipt-authority tables ({required_tables}/3 present)"
+                    "backup snapshot is missing receipt-authority tables ({required_tables}/7 present)"
                 ));
             }
             Ok(())
@@ -605,6 +745,383 @@ impl MetricsDb {
             let _ = std::fs::remove_file(snapshot_path);
             return Err(error);
         }
+        Ok(())
+    }
+
+    /// Register the durable run authority after the generic job row exists.
+    pub(crate) fn register_safe_export_run(
+        &self,
+        job_id: &str,
+        export_id: &str,
+        expected_part_count: usize,
+        created_at_ms: u64,
+    ) -> Result<(), String> {
+        let expected = i64::try_from(expected_part_count)
+            .map_err(|_| "safe-export part count exceeds SQLite INTEGER".to_string())?;
+        let created = i64::try_from(created_at_ms)
+            .map_err(|_| "safe-export run timestamp exceeds SQLite INTEGER".to_string())?;
+        let conn = self.conn.lock().unwrap();
+        let status: Option<String> = conn
+            .query_row(
+                "SELECT status FROM jobs WHERE job_id = ?1",
+                [job_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if status.as_deref() != Some("running") {
+            return Err(format!("safe-export job {job_id} is not durably running"));
+        }
+        conn.execute(
+            "INSERT INTO safe_export_runs (
+                 job_id, export_id, expected_part_count, imported_part_count,
+                 completed_part_count, phase, created_at_ms
+             ) VALUES (?1, ?2, ?3, 0, 0, 'running', ?4)",
+            params![job_id, export_id, expected, created],
+        )
+        .map_err(|error| format!("failed to register safe-export run: {error}"))?;
+        Ok(())
+    }
+
+    /// Persist exactly one safe assignment before exposing its raw lease token.
+    pub(crate) fn persist_safe_export_assignment(
+        &self,
+        job_id: &str,
+        coordinator_session_id: &str,
+        assignment: &DurableSafeExportAssignment<'_>,
+        assigned_at_ms: u64,
+    ) -> Result<(), String> {
+        if assignment.assignment_attempt == 0 {
+            return Err("safe-export assignment attempt must be nonzero".to_string());
+        }
+        let partition_id = i64::try_from(assignment.partition_id)
+            .map_err(|_| "partition ID exceeds SQLite INTEGER".to_string())?;
+        let attempt = i64::try_from(assignment.assignment_attempt)
+            .map_err(|_| "assignment attempt exceeds SQLite INTEGER".to_string())?;
+        let assigned_at = i64::try_from(assigned_at_ms)
+            .map_err(|_| "assignment timestamp exceeds SQLite INTEGER".to_string())?;
+        let lease_hash = genohype_core::io::lease_identity_sha256(assignment.lease_token)
+            .map_err(|error| format!("invalid safe-export lease: {error}"))?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let authority: Option<(String, String)> = tx
+            .query_row(
+                "SELECT jobs.status, safe_export_runs.phase
+                 FROM jobs JOIN safe_export_runs USING (job_id)
+                 WHERE jobs.job_id = ?1 AND safe_export_runs.export_id = ?2",
+                params![job_id, assignment.export_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if authority
+            .as_ref()
+            .map(|(job, run)| (job.as_str(), run.as_str()))
+            != Some(("running", "running"))
+        {
+            return Err(format!(
+                "safe-export run {job_id}/{} is not durably running",
+                assignment.export_id
+            ));
+        }
+        let accepted: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM safe_export_part_receipts
+                 WHERE export_id = ?1 AND partition_id = ?2",
+                params![assignment.export_id, partition_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if accepted != 0 {
+            return Err(format!(
+                "safe-export partition {} already has authority",
+                assignment.partition_id
+            ));
+        }
+        let prior_attempt: Option<i64> = tx
+            .query_row(
+                "SELECT MAX(assignment_attempt) FROM (
+                     SELECT assignment_attempt FROM safe_export_attempt_receipts
+                     WHERE job_id = ?1 AND task_id = ?2
+                     UNION ALL
+                     SELECT assignment_attempt FROM current_safe_export_assignments
+                     WHERE job_id = ?1 AND task_id = ?2
+                 )",
+                params![job_id, assignment.task_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if prior_attempt.is_some_and(|prior| attempt <= prior) {
+            return Err(format!(
+                "safe-export attempt {} for {} is not newer than durable attempt {:?}",
+                assignment.assignment_attempt, assignment.task_id, prior_attempt
+            ));
+        }
+        tx.execute(
+            "INSERT INTO current_safe_export_assignments (
+                 job_id, export_id, coordinator_session_id, task_id, partition_id,
+                 assignment_attempt, lease_identity_sha256, worker_id,
+                 worker_git_commit, worker_build_identity, worker_binary_sha256,
+                 state, assigned_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'assigned', ?12)",
+            params![
+                job_id,
+                assignment.export_id,
+                coordinator_session_id,
+                assignment.task_id,
+                partition_id,
+                attempt,
+                lease_hash,
+                assignment.worker_id,
+                assignment.worker_git_commit,
+                assignment.worker_build_identity,
+                assignment.worker_binary_sha256,
+                assigned_at,
+            ],
+        )
+        .map_err(|error| format!("failed to persist safe-export assignment: {error}"))?;
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    /// Append one immutable failed attempt and consume its exact assignment.
+    pub(crate) fn fail_safe_export_assignment(
+        &self,
+        job_id: &str,
+        coordinator_session_id: &str,
+        assignment: &DurableSafeExportAssignment<'_>,
+        error: &str,
+        accepted_at_ms: u64,
+    ) -> Result<(), String> {
+        if error.is_empty() {
+            return Err("safe-export failure must include an error".to_string());
+        }
+        if error.contains(assignment.lease_token) {
+            return Err("safe-export failure contains the raw lease capability".to_string());
+        }
+        let partition_id = i64::try_from(assignment.partition_id)
+            .map_err(|_| "partition ID exceeds SQLite INTEGER".to_string())?;
+        let attempt = i64::try_from(assignment.assignment_attempt)
+            .map_err(|_| "assignment attempt exceeds SQLite INTEGER".to_string())?;
+        let accepted_at = i64::try_from(accepted_at_ms)
+            .map_err(|_| "failure timestamp exceeds SQLite INTEGER".to_string())?;
+        let lease_hash = genohype_core::io::lease_identity_sha256(assignment.lease_token)
+            .map_err(|failure| format!("invalid safe-export lease: {failure}"))?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|failure| failure.to_string())?;
+        let authority: Option<(String, String)> = tx
+            .query_row(
+                "SELECT jobs.status, safe_export_runs.phase
+                 FROM jobs JOIN safe_export_runs USING (job_id)
+                 WHERE jobs.job_id = ?1 AND safe_export_runs.export_id = ?2",
+                params![job_id, assignment.export_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|failure| failure.to_string())?;
+        if authority
+            .as_ref()
+            .map(|(job, run)| (job.as_str(), run.as_str()))
+            != Some(("running", "running"))
+        {
+            return Err("safe-export run is not durably running".to_string());
+        }
+        let inserted = tx
+            .execute(
+                "INSERT INTO safe_export_attempt_receipts (
+                     job_id, export_id, coordinator_session_id, task_id, partition_id,
+                     assignment_attempt, lease_identity_sha256, worker_id,
+                     worker_git_commit, worker_build_identity, worker_binary_sha256,
+                     terminal_status, report_json, report_sha256, error, accepted_at_ms
+                 )
+                 SELECT job_id, export_id, coordinator_session_id, task_id, partition_id,
+                        assignment_attempt, lease_identity_sha256, worker_id,
+                        worker_git_commit, worker_build_identity, worker_binary_sha256,
+                        'failed', NULL, NULL, ?12, ?13
+                 FROM current_safe_export_assignments
+                 WHERE job_id = ?1 AND export_id = ?2 AND coordinator_session_id = ?3
+                   AND task_id = ?4 AND partition_id = ?5 AND assignment_attempt = ?6
+                   AND lease_identity_sha256 = ?7 AND worker_id = ?8
+                   AND worker_git_commit = ?9 AND worker_build_identity = ?10
+                   AND worker_binary_sha256 = ?11 AND state = 'assigned'",
+                params![
+                    job_id,
+                    assignment.export_id,
+                    coordinator_session_id,
+                    assignment.task_id,
+                    partition_id,
+                    attempt,
+                    lease_hash,
+                    assignment.worker_id,
+                    assignment.worker_git_commit,
+                    assignment.worker_build_identity,
+                    assignment.worker_binary_sha256,
+                    error,
+                    accepted_at,
+                ],
+            )
+            .map_err(|failure| format!("failed to append safe-export failure: {failure}"))?;
+        if inserted != 1 {
+            return Err("no exact assigned safe-export fence to fail".to_string());
+        }
+        let removed = tx
+            .execute(
+                "DELETE FROM current_safe_export_assignments
+                 WHERE job_id = ?1 AND task_id = ?2 AND assignment_attempt = ?3
+                   AND lease_identity_sha256 = ?4 AND state = 'assigned'",
+                params![job_id, assignment.task_id, attempt, lease_hash],
+            )
+            .map_err(|failure| failure.to_string())?;
+        if removed != 1 {
+            return Err("safe-export assignment changed during failure commit".to_string());
+        }
+        tx.commit().map_err(|failure| failure.to_string())
+    }
+
+    /// Atomically claim an exact current assignment for cloud publication.
+    /// Exact report redelivery is idempotent; changed bytes or identity fail.
+    pub(crate) fn begin_safe_export_publication(
+        &self,
+        job_id: &str,
+        coordinator_session_id: &str,
+        assignment: &DurableSafeExportAssignment<'_>,
+        report_json: &str,
+        publishing_at_ms: u64,
+    ) -> Result<SafePublicationClaimOutcome, String> {
+        let attempt = i64::try_from(assignment.assignment_attempt)
+            .map_err(|_| "assignment attempt exceeds SQLite INTEGER".to_string())?;
+        let publishing_at = i64::try_from(publishing_at_ms)
+            .map_err(|_| "publishing timestamp exceeds SQLite INTEGER".to_string())?;
+        let lease_hash = genohype_core::io::lease_identity_sha256(assignment.lease_token)
+            .map_err(|error| format!("invalid safe-export lease: {error}"))?;
+        let report_sha256 = sha256_hex(
+            b"genohype/safe-export-worker-report/v1",
+            report_json.as_bytes(),
+        );
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let authority: Option<(String, String)> = tx
+            .query_row(
+                "SELECT jobs.status, safe_export_runs.phase
+                 FROM jobs JOIN safe_export_runs USING (job_id)
+                 WHERE jobs.job_id = ?1 AND safe_export_runs.export_id = ?2",
+                params![job_id, assignment.export_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if authority
+            .as_ref()
+            .map(|(job, run)| (job.as_str(), run.as_str()))
+            != Some(("running", "running"))
+        {
+            return Err("safe-export run is not durably running".to_string());
+        }
+        let current: Option<(String, Option<String>, Option<String>)> = tx
+            .query_row(
+                "SELECT state, report_json, report_sha256
+                 FROM current_safe_export_assignments
+                 WHERE job_id = ?1 AND export_id = ?2 AND coordinator_session_id = ?3
+                   AND task_id = ?4 AND partition_id = ?5 AND assignment_attempt = ?6
+                   AND lease_identity_sha256 = ?7 AND worker_id = ?8
+                   AND worker_git_commit = ?9 AND worker_build_identity = ?10
+                   AND worker_binary_sha256 = ?11",
+                params![
+                    job_id,
+                    assignment.export_id,
+                    coordinator_session_id,
+                    assignment.task_id,
+                    i64::try_from(assignment.partition_id)
+                        .map_err(|_| "partition ID exceeds SQLite INTEGER".to_string())?,
+                    attempt,
+                    lease_hash,
+                    assignment.worker_id,
+                    assignment.worker_git_commit,
+                    assignment.worker_build_identity,
+                    assignment.worker_binary_sha256,
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        match current {
+            Some((state, prior_json, prior_sha)) if state == "publishing" => {
+                if prior_json.as_deref() == Some(report_json)
+                    && prior_sha.as_deref() == Some(report_sha256.as_str())
+                {
+                    return Ok(SafePublicationClaimOutcome::Duplicate);
+                }
+                return Err("conflicting report for publishing safe-export assignment".to_string());
+            }
+            Some((state, _, _)) if state == "assigned" => {}
+            _ => return Err("no exact assigned safe-export fence to publish".to_string()),
+        }
+        let updated = tx
+            .execute(
+                "UPDATE current_safe_export_assignments
+                 SET state = 'publishing', report_json = ?12,
+                     report_sha256 = ?13, publishing_at_ms = ?14
+                 WHERE job_id = ?1 AND export_id = ?2 AND coordinator_session_id = ?3
+                   AND task_id = ?4 AND partition_id = ?5 AND assignment_attempt = ?6
+                   AND lease_identity_sha256 = ?7 AND worker_id = ?8
+                   AND worker_git_commit = ?9 AND worker_build_identity = ?10
+                   AND worker_binary_sha256 = ?11 AND state = 'assigned'",
+                params![
+                    job_id,
+                    assignment.export_id,
+                    coordinator_session_id,
+                    assignment.task_id,
+                    i64::try_from(assignment.partition_id)
+                        .map_err(|_| "partition ID exceeds SQLite INTEGER".to_string())?,
+                    attempt,
+                    lease_hash,
+                    assignment.worker_id,
+                    assignment.worker_git_commit,
+                    assignment.worker_build_identity,
+                    assignment.worker_binary_sha256,
+                    report_json,
+                    report_sha256,
+                    publishing_at,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if updated != 1 {
+            return Err("safe-export assignment changed while claiming publication".to_string());
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(SafePublicationClaimOutcome::Claimed)
+    }
+
+    /// Clear one assigned safe-export fence during timeout/preemption. A
+    /// publishing claim is deliberately non-requeueable and is left intact.
+    pub(crate) fn clear_assigned_safe_export_assignment(
+        &self,
+        job_id: &str,
+        task_id: &str,
+        assignment_attempt: u64,
+        lease_token: &str,
+    ) -> Result<bool, String> {
+        let attempt = i64::try_from(assignment_attempt)
+            .map_err(|_| "assignment attempt exceeds SQLite INTEGER".to_string())?;
+        let lease_hash = genohype_core::io::lease_identity_sha256(lease_token)
+            .map_err(|error| format!("invalid safe-export lease: {error}"))?;
+        let conn = self.conn.lock().unwrap();
+        let removed = conn
+            .execute(
+                "DELETE FROM current_safe_export_assignments
+                 WHERE job_id = ?1 AND task_id = ?2 AND assignment_attempt = ?3
+                   AND lease_identity_sha256 = ?4 AND state = 'assigned'",
+                params![job_id, task_id, attempt, lease_hash],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(removed == 1)
+    }
+
+    pub(crate) fn clear_current_safe_export_assignments(&self, job_id: &str) -> SqliteResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM current_safe_export_assignments WHERE job_id = ?1",
+            [job_id],
+        )?;
         Ok(())
     }
 
@@ -893,14 +1410,14 @@ impl MetricsDb {
         Ok(CustomCompletionOutcome::Stored)
     }
 
-    /// Fail closed any custom jobs that were running in a restored backup.
-    /// Restored receipts remain immutable audit records, but cannot authorize
-    /// completion, and every restored assignment fence is removed atomically.
-    pub(crate) fn reconcile_restored_custom_jobs(&self, end_time_ms: u64) -> Result<usize, String> {
+    /// Fail closed any custom or safe-export job running in a restored backup.
+    /// Restored receipts remain immutable audit records, but cannot revive an
+    /// old coordinator session or assignment fence.
+    pub(crate) fn reconcile_restored_fenced_jobs(&self, end_time_ms: u64) -> Result<usize, String> {
         let end_time_ms = i64::try_from(end_time_ms)
             .map_err(|_| "restore reconciliation timestamp exceeds SQLite INTEGER".to_string())?;
         let summary = serde_json::json!({
-            "error": "Custom job interrupted by coordinator startup after database backup restore; restored receipts are not completion authority"
+            "error": "Fenced job interrupted by coordinator startup after database backup restore; restored receipts are not completion authority"
         })
         .to_string();
         let mut conn = self.conn.lock().unwrap();
@@ -923,20 +1440,25 @@ impl MetricsDb {
             rows.collect::<SqliteResult<Vec<_>>>()
                 .map_err(|error| error.to_string())?
         };
-        let custom_job_ids: Vec<String> = running_jobs
+        let fenced_job_ids: Vec<(String, bool)> = running_jobs
             .into_iter()
             .filter_map(|(job_id, job_type, job_spec_json)| {
-                let is_custom_type =
-                    matches!(job_type.as_deref(), Some("custom" | "custom payload"));
-                let is_custom_spec = job_spec_json
+                let decoded = job_spec_json
                     .as_deref()
-                    .and_then(|json| serde_json::from_str::<JobSpec>(json).ok())
-                    .is_some_and(|spec| matches!(spec, JobSpec::Custom { .. }));
-                (is_custom_type || is_custom_spec).then_some(job_id)
+                    .and_then(|json| serde_json::from_str::<JobSpec>(json).ok());
+                let is_custom = matches!(job_type.as_deref(), Some("custom" | "custom payload"))
+                    || decoded
+                        .as_ref()
+                        .is_some_and(|spec| matches!(spec, JobSpec::Custom { .. }));
+                let is_safe = job_type.as_deref() == Some("safe export parquet")
+                    || decoded
+                        .as_ref()
+                        .is_some_and(|spec| matches!(spec, JobSpec::SafeExport(_)));
+                (is_custom || is_safe).then_some((job_id, is_safe))
             })
             .collect();
 
-        for job_id in &custom_job_ids {
+        for (job_id, is_safe) in &fenced_job_ids {
             let updated = tx
                 .execute(
                     "UPDATE jobs SET status = 'failed', end_time_ms = ?2,
@@ -945,11 +1467,11 @@ impl MetricsDb {
                     params![job_id, end_time_ms, summary],
                 )
                 .map_err(|error| {
-                    format!("failed to terminalize restored custom job {job_id}: {error}")
+                    format!("failed to terminalize restored fenced job {job_id}: {error}")
                 })?;
             if updated != 1 {
                 return Err(format!(
-                    "restored custom job {job_id} changed during reconciliation"
+                    "restored fenced job {job_id} changed during reconciliation"
                 ));
             }
             tx.execute(
@@ -957,9 +1479,26 @@ impl MetricsDb {
                 [job_id],
             )
             .map_err(|error| format!("failed to fence restored custom job {job_id}: {error}"))?;
+            tx.execute(
+                "DELETE FROM current_safe_export_assignments WHERE job_id = ?1",
+                [job_id],
+            )
+            .map_err(|error| {
+                format!("failed to fence restored safe-export job {job_id}: {error}")
+            })?;
+            if *is_safe {
+                tx.execute(
+                    "UPDATE safe_export_runs SET phase = 'failed'
+                     WHERE job_id = ?1 AND phase IN ('running', 'finalizing')",
+                    [job_id],
+                )
+                .map_err(|error| {
+                    format!("failed to terminalize safe-export run {job_id}: {error}")
+                })?;
+            }
         }
         tx.commit().map_err(|error| error.to_string())?;
-        Ok(custom_job_ids.len())
+        Ok(fenced_job_ids.len())
     }
 
     /// Atomically cancel a running custom job and remove every durable current
@@ -1611,6 +2150,293 @@ mod tests {
                 lease_token: lease_token.to_string(),
             }],
         }
+    }
+
+    fn insert_safe_run(db: &MetricsDb, job_id: &str, export_id: &str, total_tasks: usize) {
+        db.insert_job(&JobRecord {
+            job_id: job_id.to_string(),
+            status: "running".to_string(),
+            start_time_ms: 1,
+            end_time_ms: None,
+            job_spec_json: None,
+            input_path: "gs://bucket/input.ht".to_string(),
+            total_tasks,
+            job_type: Some("safe export parquet".to_string()),
+        })
+        .unwrap();
+        db.register_safe_export_run(job_id, export_id, total_tasks, 1)
+            .unwrap();
+    }
+
+    #[test]
+    fn safe_export_assignment_is_parallel_hashed_and_persisted_before_dispatch() {
+        let db = MetricsDb::in_memory().unwrap();
+        let export_id = "a".repeat(64);
+        let binary = "b".repeat(64);
+        insert_safe_run(&db, "safe-job", &export_id, 2);
+        let raw_lease = "raw-capability-must-not-be-persisted";
+        db.persist_safe_export_assignment(
+            "safe-job",
+            "session-1",
+            &DurableSafeExportAssignment {
+                export_id: &export_id,
+                task_id: "part-00000000",
+                partition_id: 0,
+                assignment_attempt: 1,
+                lease_token: raw_lease,
+                worker_id: "worker-1",
+                worker_git_commit: "commit-1",
+                worker_build_identity: "build-1",
+                worker_binary_sha256: &binary,
+            },
+            2,
+        )
+        .unwrap();
+
+        let conn = db.conn.lock().unwrap();
+        let row: (String, String, String, String, String) = conn
+            .query_row(
+                "SELECT lease_identity_sha256, worker_git_commit,
+                        worker_build_identity, worker_binary_sha256, state
+                 FROM current_safe_export_assignments
+                 WHERE job_id = 'safe-job' AND task_id = 'part-00000000'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            row.0,
+            genohype_core::io::lease_identity_sha256(raw_lease).unwrap()
+        );
+        assert_ne!(row.0, raw_lease);
+        assert_eq!(
+            (&row.1, &row.2, &row.3, &row.4),
+            (
+                &"commit-1".into(),
+                &"build-1".into(),
+                &binary,
+                &"assigned".into()
+            )
+        );
+        let dump: String = conn
+            .query_row(
+                "SELECT group_concat(value, '') FROM (
+                     SELECT job_id AS value FROM current_safe_export_assignments
+                     UNION ALL SELECT lease_identity_sha256 FROM current_safe_export_assignments
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!dump.contains(raw_lease));
+        drop(conn);
+
+        assert!(db
+            .persist_safe_export_assignment(
+                "safe-job",
+                "session-1",
+                &DurableSafeExportAssignment {
+                    export_id: &export_id,
+                    task_id: "part-00000000",
+                    partition_id: 0,
+                    assignment_attempt: 1,
+                    lease_token: "another",
+                    worker_id: "worker-2",
+                    worker_git_commit: "commit-1",
+                    worker_build_identity: "build-1",
+                    worker_binary_sha256: &binary,
+                },
+                3,
+            )
+            .is_err());
+        assert!(db
+            .persist_safe_export_assignment(
+                "safe-job",
+                "session-1",
+                &DurableSafeExportAssignment {
+                    export_id: &export_id,
+                    task_id: "part-overflow",
+                    partition_id: usize::MAX,
+                    assignment_attempt: 1,
+                    lease_token: "lease",
+                    worker_id: "worker-1",
+                    worker_git_commit: "commit-1",
+                    worker_build_identity: "build-1",
+                    worker_binary_sha256: &binary,
+                },
+                3,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn safe_export_restore_fails_old_session_and_clears_live_fence() {
+        let db = MetricsDb::in_memory().unwrap();
+        let export_id = "a".repeat(64);
+        let binary = "b".repeat(64);
+        insert_safe_run(&db, "safe-job", &export_id, 1);
+        db.persist_safe_export_assignment(
+            "safe-job",
+            "old-session",
+            &DurableSafeExportAssignment {
+                export_id: &export_id,
+                task_id: "part-00000000",
+                partition_id: 0,
+                assignment_attempt: 1,
+                lease_token: "old-lease",
+                worker_id: "worker-1",
+                worker_git_commit: "commit-1",
+                worker_build_identity: "build-1",
+                worker_binary_sha256: &binary,
+            },
+            2,
+        )
+        .unwrap();
+        assert_eq!(db.reconcile_restored_fenced_jobs(3).unwrap(), 1);
+        let conn = db.conn.lock().unwrap();
+        let authority: (String, String, i64) = conn
+            .query_row(
+                "SELECT jobs.status, safe_export_runs.phase,
+                        (SELECT COUNT(*) FROM current_safe_export_assignments)
+                 FROM jobs JOIN safe_export_runs USING (job_id)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(authority, ("failed".into(), "failed".into(), 0));
+    }
+
+    #[test]
+    fn safe_export_failure_atomically_appends_attempt_and_consumes_assignment() {
+        let db = MetricsDb::in_memory().unwrap();
+        let export_id = "a".repeat(64);
+        let binary = "b".repeat(64);
+        let assignment = DurableSafeExportAssignment {
+            export_id: &export_id,
+            task_id: "part-00000000",
+            partition_id: 0,
+            assignment_attempt: 1,
+            lease_token: "raw-lease",
+            worker_id: "worker-1",
+            worker_git_commit: "commit-1",
+            worker_build_identity: "build-1",
+            worker_binary_sha256: &binary,
+        };
+        insert_safe_run(&db, "safe-job", &export_id, 1);
+        db.persist_safe_export_assignment("safe-job", "session-1", &assignment, 2)
+            .unwrap();
+        db.fail_safe_export_assignment("safe-job", "session-1", &assignment, "worker failure", 3)
+            .unwrap();
+        let conn = db.conn.lock().unwrap();
+        let current: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM current_safe_export_assignments",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let failed: (String, String) = conn
+            .query_row(
+                "SELECT terminal_status, error FROM safe_export_attempt_receipts",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(current, 0);
+        assert_eq!(failed, ("failed".into(), "worker failure".into()));
+    }
+
+    #[test]
+    fn safe_export_publication_claim_is_exact_idempotent_and_non_requeueable() {
+        let db = MetricsDb::in_memory().unwrap();
+        let export_id = "a".repeat(64);
+        let binary = "b".repeat(64);
+        let assignment = DurableSafeExportAssignment {
+            export_id: &export_id,
+            task_id: "part-00000000",
+            partition_id: 0,
+            assignment_attempt: 1,
+            lease_token: "raw-lease",
+            worker_id: "worker-1",
+            worker_git_commit: "commit-1",
+            worker_build_identity: "build-1",
+            worker_binary_sha256: &binary,
+        };
+        insert_safe_run(&db, "safe-job", &export_id, 1);
+        db.persist_safe_export_assignment("safe-job", "session-1", &assignment, 2)
+            .unwrap();
+        assert_eq!(
+            db.begin_safe_export_publication(
+                "safe-job",
+                "session-1",
+                &assignment,
+                "{\"report\":1}",
+                3,
+            )
+            .unwrap(),
+            SafePublicationClaimOutcome::Claimed
+        );
+        assert!(!db
+            .clear_assigned_safe_export_assignment("safe-job", "part-00000000", 1, "raw-lease")
+            .unwrap());
+        assert_eq!(
+            db.begin_safe_export_publication(
+                "safe-job",
+                "session-1",
+                &assignment,
+                "{\"report\":1}",
+                4,
+            )
+            .unwrap(),
+            SafePublicationClaimOutcome::Duplicate
+        );
+        assert!(db
+            .begin_safe_export_publication(
+                "safe-job",
+                "session-1",
+                &assignment,
+                "{\"report\":2}",
+                4,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn safe_export_evidence_tables_are_immutable() {
+        let db = MetricsDb::in_memory().unwrap();
+        let conn = db.conn.lock().unwrap();
+        conn.execute_batch(
+            "INSERT INTO safe_export_attempt_receipts VALUES (
+                 'job','export','session','task',0,1,'lease','worker','commit','build','binary',
+                 'failed',NULL,NULL,'failure',1);
+             INSERT INTO safe_export_part_receipts VALUES (
+                 'export',0,'task','job',1,'{}','digest','gs://b/r','1','etag',2,'rdigest',
+                 'gs://b/o','2','etag2',3,'odigest',4,1,'schema','rows',5);",
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "UPDATE safe_export_attempt_receipts SET error='changed'",
+                []
+            )
+            .is_err());
+        assert!(conn
+            .execute("DELETE FROM safe_export_attempt_receipts", [])
+            .is_err());
+        assert!(conn
+            .execute("UPDATE safe_export_part_receipts SET row_count=9", [])
+            .is_err());
+        assert!(conn
+            .execute("DELETE FROM safe_export_part_receipts", [])
+            .is_err());
     }
 
     #[test]

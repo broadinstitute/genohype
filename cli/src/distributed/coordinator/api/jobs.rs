@@ -376,6 +376,12 @@ pub(crate) async fn cancel_job(
         if let Err(error) = data.metrics_db.clear_current_custom_assignments(job_id) {
             eprintln!("Warning: failed to clear cancelled custom assignments: {error}");
         }
+        if let Err(error) = data
+            .metrics_db
+            .clear_current_safe_export_assignments(job_id)
+        {
+            eprintln!("Warning: failed to clear cancelled safe-export assignments: {error}");
+        }
     }
 
     // Reset job state only after the durable custom cancellation commits.
@@ -384,6 +390,8 @@ pub(crate) async fn cancel_job(
     data.processing_partitions.clear();
     data.custom_assignment_attempts.clear();
     data.custom_assignments.clear();
+    data.safe_export_assignment_attempts.clear();
+    data.safe_export_assignments.clear();
     data.job_state = JobExecutionState::Standard;
     data.active_tasks.clear();
     data.last_completed_batch = None;

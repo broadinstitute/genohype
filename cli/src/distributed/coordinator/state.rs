@@ -325,6 +325,26 @@ pub(crate) struct CustomAssignment {
     pub(crate) lease_token: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SafeExportAssignmentState {
+    Assigned,
+    Publishing,
+}
+
+/// Parallel, typed safe-export assignment authority. The raw lease exists only
+/// in process memory and on the worker wire; SQLite stores its digest.
+#[derive(Clone)]
+pub(crate) struct SafeExportAssignment {
+    pub(crate) partition_id: usize,
+    pub(crate) worker_id: String,
+    pub(crate) worker_git_commit: String,
+    pub(crate) worker_build_identity: String,
+    pub(crate) worker_binary_sha256: String,
+    pub(crate) assignment_attempt: u64,
+    pub(crate) lease_token: String,
+    pub(crate) state: SafeExportAssignmentState,
+}
+
 /// Internal state of the coordinator.
 pub(crate) struct CoordinatorData {
     /// Partitions waiting to be assigned
@@ -349,6 +369,10 @@ pub(crate) struct CoordinatorData {
     pub(crate) custom_assignment_attempts: HashMap<String, u64>,
     /// Current fenced custom assignments, keyed by stable task ID.
     pub(crate) custom_assignments: HashMap<String, CustomAssignment>,
+    /// Last coordinator-issued attempt number for each safe-export part.
+    pub(crate) safe_export_assignment_attempts: HashMap<String, u64>,
+    /// Current typed safe-export assignments, keyed by stable part ID.
+    pub(crate) safe_export_assignments: HashMap<String, SafeExportAssignment>,
     /// Partitions that permanently failed (exceeded max retries)
     pub(crate) failed_partitions: HashSet<usize>,
     /// Registry of all known workers and their telemetry
@@ -469,7 +493,88 @@ fn validate_custom_assignment_report(
     Ok(())
 }
 
+fn validate_safe_export_assignment_report(
+    current_session_id: &str,
+    report_session_id: Option<&str>,
+    assignments: &HashMap<String, SafeExportAssignment>,
+    worker_id: &str,
+    task_ids: &[String],
+    leases: &[crate::distributed::message::AssignmentLease],
+) -> Result<(), String> {
+    if report_session_id != Some(current_session_id) || task_ids.len() != 1 || leases.len() != 1 {
+        return Err("safe export requires the exact session and one task/lease".to_string());
+    }
+    let task_id = &task_ids[0];
+    let lease = &leases[0];
+    let current = assignments
+        .get(task_id)
+        .ok_or_else(|| format!("safe-export task {task_id} has no current assignment"))?;
+    if lease.task_id != *task_id
+        || current.worker_id != worker_id
+        || current.assignment_attempt != lease.assignment_attempt
+        || current.lease_token != lease.lease_token
+    {
+        return Err(format!(
+            "stale or wrong-owner safe-export lease for {task_id}"
+        ));
+    }
+    Ok(())
+}
+
 impl CoordinatorData {
+    /// Allocate and remember a fresh identity for a safe-export assignment.
+    pub(crate) fn issue_safe_export_assignment(
+        &mut self,
+        task_id: &str,
+        partition_id: usize,
+        worker_id: &str,
+        worker_git_commit: &str,
+        worker_build_identity: &str,
+        worker_binary_sha256: &str,
+    ) -> crate::distributed::message::AssignmentLease {
+        let attempt = self
+            .safe_export_assignment_attempts
+            .entry(task_id.to_string())
+            .or_insert(0);
+        *attempt += 1;
+        let lease = crate::distributed::message::AssignmentLease {
+            task_id: task_id.to_string(),
+            assignment_attempt: *attempt,
+            lease_token: uuid::Uuid::new_v4().to_string(),
+        };
+        self.safe_export_assignments.insert(
+            task_id.to_string(),
+            SafeExportAssignment {
+                partition_id,
+                worker_id: worker_id.to_string(),
+                worker_git_commit: worker_git_commit.to_string(),
+                worker_build_identity: worker_build_identity.to_string(),
+                worker_binary_sha256: worker_binary_sha256.to_string(),
+                assignment_attempt: lease.assignment_attempt,
+                lease_token: lease.lease_token.clone(),
+                state: SafeExportAssignmentState::Assigned,
+            },
+        );
+        lease
+    }
+
+    pub(crate) fn validate_safe_export_assignments(
+        &self,
+        session_id: Option<&str>,
+        worker_id: &str,
+        task_ids: &[String],
+        leases: &[crate::distributed::message::AssignmentLease],
+    ) -> Result<(), String> {
+        validate_safe_export_assignment_report(
+            &self.session_id,
+            session_id,
+            &self.safe_export_assignments,
+            worker_id,
+            task_ids,
+            leases,
+        )
+    }
+
     /// Allocate and remember a fresh identity for a custom task assignment.
     pub(crate) fn issue_custom_assignment(
         &mut self,
@@ -581,6 +686,42 @@ impl CoordinatorData {
             .as_millis() as u64
     }
 
+    /// Clear an assigned safe-export fence for timeout/preemption. Publishing
+    /// assignments are not removed or requeued by liveness paths.
+    pub(crate) fn clear_safe_export_assignment_for_partition(
+        &mut self,
+        partition_id: usize,
+    ) -> Result<bool, String> {
+        let assignment = self
+            .safe_export_assignments
+            .iter()
+            .find(|(_, assignment)| assignment.partition_id == partition_id)
+            .map(|(task_id, assignment)| (task_id.clone(), assignment.clone()));
+        let Some((task_id, assignment)) = assignment else {
+            return Ok(true);
+        };
+        if assignment.state == SafeExportAssignmentState::Publishing {
+            return Ok(false);
+        }
+        let job_id = self
+            .current_job_id
+            .as_deref()
+            .ok_or_else(|| format!("safe-export task {task_id} has no current job"))?;
+        let removed = self.metrics_db.clear_assigned_safe_export_assignment(
+            job_id,
+            &task_id,
+            assignment.assignment_attempt,
+            &assignment.lease_token,
+        )?;
+        if !removed {
+            return Err(format!(
+                "safe-export assignment {job_id}/{task_id} changed durably"
+            ));
+        }
+        self.safe_export_assignments.remove(&task_id);
+        Ok(true)
+    }
+
     /// Clear the in-memory and durable fence for a preempted custom assignment.
     pub(crate) fn clear_custom_assignment_for_partition(
         &mut self,
@@ -628,6 +769,17 @@ impl CoordinatorData {
         lost_parts.sort_by(|a, b| b.cmp(a));
 
         for part_id in lost_parts {
+            match self.clear_safe_export_assignment_for_partition(part_id) {
+                Ok(false) => continue, // publication owns the non-requeueable claim
+                Ok(true) => {}
+                Err(error) => {
+                    eprintln!(
+                        "Warning: failed to clear preempted safe-export assignment for partition {}: {}",
+                        part_id, error
+                    );
+                    continue;
+                }
+            }
             self.processing_partitions.remove(&part_id);
             if let Err(error) = self.clear_custom_assignment_for_partition(part_id) {
                 eprintln!(
@@ -807,6 +959,60 @@ impl CoordinatorData {
 #[cfg(test)]
 mod lease_tests {
     use super::*;
+
+    #[test]
+    fn safe_export_fence_rejects_wrong_session_owner_attempt_and_token() {
+        let task_id = "part-00000000".to_string();
+        let mut assignments = HashMap::new();
+        assignments.insert(
+            task_id.clone(),
+            SafeExportAssignment {
+                partition_id: 0,
+                worker_id: "worker-a".into(),
+                worker_git_commit: "commit".into(),
+                worker_build_identity: "build".into(),
+                worker_binary_sha256: "b".repeat(64),
+                assignment_attempt: 2,
+                lease_token: "lease-2".into(),
+                state: SafeExportAssignmentState::Assigned,
+            },
+        );
+        let exact = crate::distributed::message::AssignmentLease {
+            task_id: task_id.clone(),
+            assignment_attempt: 2,
+            lease_token: "lease-2".into(),
+        };
+        assert!(validate_safe_export_assignment_report(
+            "session-2",
+            Some("session-2"),
+            &assignments,
+            "worker-a",
+            std::slice::from_ref(&task_id),
+            std::slice::from_ref(&exact),
+        )
+        .is_ok());
+        for (session, worker, attempt, token) in [
+            ("session-1", "worker-a", 2, "lease-2"),
+            ("session-2", "worker-b", 2, "lease-2"),
+            ("session-2", "worker-a", 1, "lease-2"),
+            ("session-2", "worker-a", 2, "wrong-token"),
+        ] {
+            let lease = crate::distributed::message::AssignmentLease {
+                task_id: task_id.clone(),
+                assignment_attempt: attempt,
+                lease_token: token.into(),
+            };
+            assert!(validate_safe_export_assignment_report(
+                "session-2",
+                Some(session),
+                &assignments,
+                worker,
+                std::slice::from_ref(&task_id),
+                &[lease],
+            )
+            .is_err());
+        }
+    }
 
     #[test]
     fn preemption_requeue_issues_monotonic_fresh_identity_and_fences_stale_completion() {

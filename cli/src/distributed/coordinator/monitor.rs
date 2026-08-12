@@ -136,12 +136,22 @@ pub(crate) fn check_stuck_job(state: &SharedState) {
             if let Err(e) = data.metrics_db.clear_current_custom_assignments(job_id) {
                 eprintln!("Warning: failed to clear failed custom assignments: {}", e);
             }
+            if let Err(e) = data
+                .metrics_db
+                .clear_current_safe_export_assignments(job_id)
+            {
+                eprintln!(
+                    "Warning: failed to clear failed safe-export assignments: {}",
+                    e
+                );
+            }
         }
 
         // Reset state
         data.pending_partitions.clear();
         data.processing_partitions.clear();
         data.custom_assignments.clear();
+        data.safe_export_assignments.clear();
         data.job_state = JobExecutionState::Standard;
         data.active_tasks.clear();
         // Note: We intentionally keep current_job_id so the dashboard continues
@@ -165,6 +175,17 @@ pub(crate) fn check_timeouts(state: &SharedState) {
     }
 
     for (part_id, worker, start_time) in timed_out {
+        match data.clear_safe_export_assignment_for_partition(part_id) {
+            Ok(false) => continue, // publishing is a durable non-requeueable claim
+            Ok(true) => {}
+            Err(error) => {
+                eprintln!(
+                    "Warning: failed to clear timed-out safe-export assignment for partition {}: {}",
+                    part_id, error
+                );
+                continue;
+            }
+        }
         data.processing_partitions.remove(&part_id);
         if let Err(error) = data.clear_custom_assignment_for_partition(part_id) {
             eprintln!(

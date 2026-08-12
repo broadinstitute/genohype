@@ -428,6 +428,12 @@ pub struct HeartbeatRequest {
     /// Git commit hash of the worker binary
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_version: Option<String>,
+    /// Stable worker build identity; absent on legacy/custom handlers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_identity: Option<String>,
+    /// SHA-256 of the exact running worker executable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_sha256: Option<String>,
     /// Coordinator session that issued the active assignments.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
@@ -558,6 +564,8 @@ mod lease_protocol_tests {
             "telemetry": TelemetrySnapshot::empty()
         }))
         .unwrap();
+        assert_eq!(heartbeat.build_identity, None);
+        assert_eq!(heartbeat.binary_sha256, None);
         assert_eq!(heartbeat.session_id, None);
         assert!(heartbeat.assignments.is_empty());
 

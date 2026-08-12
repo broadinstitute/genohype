@@ -98,6 +98,8 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
         client.clone(),
         config.coordinator_url.clone(),
         config.worker_id.clone(),
+        build_identity.clone(),
+        binary_sha256.clone(),
         telemetry_state.clone(),
     );
 

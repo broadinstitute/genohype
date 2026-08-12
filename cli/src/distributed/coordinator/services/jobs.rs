@@ -69,6 +69,14 @@ pub(crate) fn start_new_job(
                 }
                 eprintln!("Warning: failed to clear superseded assignments: {error}");
             }
+            if let Err(error) = data
+                .metrics_db
+                .clear_current_safe_export_assignments(prior_job_id)
+            {
+                return Err(format!(
+                    "failed to clear superseded safe-export assignments: {error}"
+                ));
+            }
         }
     }
 
@@ -91,6 +99,8 @@ pub(crate) fn start_new_job(
     data.retry_counts.clear();
     data.custom_assignment_attempts.clear();
     data.custom_assignments.clear();
+    data.safe_export_assignment_attempts.clear();
+    data.safe_export_assignments.clear();
     data.total_rows = 0;
     data.job_start_time = Instant::now();
     data.last_progress_time = Instant::now();
@@ -127,6 +137,25 @@ pub(crate) fn start_new_job(
         return Err(format!(
             "jobs require durable coordinator state; failed to persist job: {e}"
         ));
+    }
+    if let JobSpec::SafeExport(spec) = &job_spec {
+        if let Err(error) = data.metrics_db.register_safe_export_run(
+            &job_id,
+            &spec.export_id,
+            total_tasks,
+            job_record.start_time_ms,
+        ) {
+            let _ = data.metrics_db.update_job_status(
+                &job_id,
+                "failed",
+                Some(CoordinatorData::now_ms()),
+                Some(&format!("{{\"error\":{}}}", serde_json::json!(error))),
+            );
+            data.current_job_id = None;
+            return Err(format!(
+                "failed to register durable safe-export run: {error}"
+            ));
+        }
     }
 
     // Mark as no longer idle

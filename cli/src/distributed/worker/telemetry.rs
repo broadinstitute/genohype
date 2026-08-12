@@ -195,6 +195,8 @@ pub fn spawn_telemetry_loop(
     client: reqwest::Client,
     coordinator_url: String,
     worker_id: String,
+    build_identity: String,
+    binary_sha256: String,
     state: Arc<TelemetryState>,
 ) -> tokio::task::JoinHandle<()> {
     let heartbeat_url = format!("{}/heartbeat", coordinator_url);
@@ -397,6 +399,8 @@ pub fn spawn_telemetry_loop(
                 worker_id: worker_id.clone(),
                 telemetry: snapshot,
                 build_version: Some(env!("GIT_HASH").to_string()),
+                build_identity: Some(build_identity.clone()),
+                binary_sha256: Some(binary_sha256.clone()),
                 session_id,
                 assignments,
             };
