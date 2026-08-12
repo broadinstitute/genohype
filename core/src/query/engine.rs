@@ -106,6 +106,42 @@ impl QueryEngine {
         }
     }
 
+    /// Open a Hail table under an already validated immutable source snapshot.
+    /// Non-Hail sources are rejected so callers cannot accidentally bypass the
+    /// manifest through a compatibility reader.
+    #[instrument(skip_all, fields(path = table_path, snapshot = snapshot.digest_sha256()))]
+    pub fn open_path_with_snapshot(
+        table_path: &str,
+        snapshot: crate::io::SourceSnapshot,
+    ) -> Result<Self> {
+        if table_path.ends_with(".vcf")
+            || table_path.ends_with(".vcf.gz")
+            || table_path.ends_with(".vcf.bgz")
+            || table_path.ends_with(".bed.gz")
+            || table_path.ends_with(".bed.bgz")
+        {
+            return Err(crate::HailError::InvalidFormat(
+                "source snapshots currently require a Hail table".to_string(),
+            ));
+        }
+        let hail_source = HailTableSource::open_with_snapshot(table_path, None, Some(snapshot))?;
+        Ok(QueryEngine {
+            source: Box::new(hail_source.clone()),
+            hail_source: Some(hail_source),
+        })
+    }
+
+    /// Load and digest-check a canonical manifest before opening any table object.
+    pub fn open_path_with_manifest(
+        table_path: &str,
+        manifest_path: &str,
+        expected_manifest_sha256: &str,
+    ) -> Result<Self> {
+        let snapshot =
+            crate::io::SourceSnapshot::load_and_verify(manifest_path, expected_manifest_sha256)?;
+        Self::open_path_with_snapshot(table_path, snapshot)
+    }
+
     /// Open a data source with optional metadata caching.
     ///
     /// For Hail tables, metadata files are cached on the local filesystem

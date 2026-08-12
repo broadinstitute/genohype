@@ -16,8 +16,9 @@
 use crate::{HailError, Result};
 use futures::StreamExt;
 use object_store::path::Path as ObjPath;
-use object_store::ObjectStore;
+use object_store::{GetOptions, GetRange, ObjectMeta, ObjectStore};
 use once_cell::sync::Lazy;
+use sha2::Digest;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -25,6 +26,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
 use tracing::{debug, trace};
+
+use super::{ResolvedObject, SourceObject, SourceSnapshot};
 
 /// Default chunk size for cloud reads (8MB) - used by non-prefetching reader
 const DEFAULT_CHUNK_SIZE: usize = 8 * 1024 * 1024;
@@ -82,33 +85,149 @@ pub(crate) static IO_RUNTIME: Lazy<Runtime> =
 static GCS_CLIENT_CACHE: Lazy<Mutex<HashMap<String, Arc<dyn ObjectStore>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+#[derive(Clone)]
+struct CloudObjectContext {
+    canonical_store_id: String,
+    canonical_uri: String,
+    expected: Option<SourceObject>,
+    /// Identity observed by the opening HEAD, used only to isolate legacy cache entries.
+    observed_version: Option<String>,
+    observed_etag: Option<String>,
+}
+
+impl CloudObjectContext {
+    fn from_resolved(resolved: &ResolvedObject, meta: &ObjectMeta) -> Self {
+        Self {
+            canonical_store_id: resolved.canonical_store_id.clone(),
+            canonical_uri: resolved.canonical_uri.clone(),
+            expected: resolved.expected.clone(),
+            observed_version: meta.version.clone(),
+            observed_etag: meta.e_tag.clone(),
+        }
+    }
+
+    fn cache_key(&self, offset: u64, len: usize) -> String {
+        let version = self
+            .expected
+            .as_ref()
+            .map(|identity| identity.version.as_str())
+            .or(self.observed_version.as_deref())
+            .unwrap_or("<absent>");
+        let etag = self
+            .expected
+            .as_ref()
+            .map(|identity| identity.etag.as_str())
+            .or(self.observed_etag.as_deref())
+            .unwrap_or("<absent>");
+        format!(
+            "{}|{}|{}|{}|{}|{}",
+            self.canonical_store_id, self.canonical_uri, version, etag, offset, len
+        )
+    }
+}
+
+fn pinned_options(
+    expected: Option<&SourceObject>,
+    range: Option<std::ops::Range<usize>>,
+    head: bool,
+) -> GetOptions {
+    GetOptions {
+        version: expected.map(|identity| identity.version.clone()),
+        if_match: expected.map(|identity| identity.etag.clone()),
+        range: range.map(GetRange::Bounded),
+        head,
+        ..Default::default()
+    }
+}
+
+fn verify_object_meta(uri: &str, expected: &SourceObject, meta: &ObjectMeta) -> Result<()> {
+    if meta.version.as_deref() != Some(expected.version.as_str()) {
+        return Err(HailError::InvalidFormat(format!(
+            "source object version mismatch for {uri}: expected {}, got {:?}",
+            expected.version, meta.version
+        )));
+    }
+    if meta.e_tag.as_deref() != Some(expected.etag.as_str()) {
+        return Err(HailError::InvalidFormat(format!(
+            "source object ETag mismatch for {uri}: expected {}, got {:?}",
+            expected.etag, meta.e_tag
+        )));
+    }
+    if meta.size as u64 != expected.size {
+        return Err(HailError::InvalidFormat(format!(
+            "source object size mismatch for {uri}: expected {}, got {}",
+            expected.size, meta.size
+        )));
+    }
+    Ok(())
+}
+
+async fn head_resolved(resolved: &ResolvedObject) -> Result<ObjectMeta> {
+    let result = resolved
+        .store
+        .get_opts(
+            &resolved.path,
+            pinned_options(resolved.expected.as_ref(), None, true),
+        )
+        .await?;
+    if let Some(expected) = &resolved.expected {
+        verify_object_meta(&resolved.canonical_uri, expected, &result.meta)?;
+    }
+    Ok(result.meta)
+}
+
 /// Fetch a byte range with app-level retries for transient mid-stream failures.
-///
-/// object_store's built-in RetryConfig does NOT retry body-decode failures that
-/// occur mid-stream (e.g. "error decoding response body"). This helper wraps
-/// `get_range` and retries such transient errors with exponential backoff.
+/// Every snapshot request carries both version and If-Match, then verifies the
+/// identity returned with the body before exposing bytes to a decoder.
 async fn get_range_retrying(
     store: &Arc<dyn ObjectStore>,
     path: &ObjPath,
+    context: &CloudObjectContext,
     range: std::ops::Range<usize>,
-) -> object_store::Result<bytes::Bytes> {
+) -> Result<bytes::Bytes> {
     const MAX_ATTEMPTS: u32 = 6;
     let mut backoff = std::time::Duration::from_millis(500);
     let mut attempt = 0;
     loop {
-        match store.get_range(path, range.clone()).await {
-            Ok(b) => return Ok(b),
-            Err(e) => {
+        let request = store
+            .get_opts(
+                path,
+                pinned_options(context.expected.as_ref(), Some(range.clone()), false),
+            )
+            .await;
+        match request {
+            Ok(result) => {
+                if let Some(expected) = &context.expected {
+                    verify_object_meta(&context.canonical_uri, expected, &result.meta)?;
+                }
+                if result.range != range {
+                    return Err(HailError::InvalidFormat(format!(
+                        "source object range mismatch for {}: expected {:?}, got {:?}",
+                        context.canonical_uri, range, result.range
+                    )));
+                }
+                let bytes = result.bytes().await?;
+                if bytes.len() != range.len() {
+                    return Err(HailError::InvalidFormat(format!(
+                        "source object short range for {}: expected {} bytes, got {}",
+                        context.canonical_uri,
+                        range.len(),
+                        bytes.len()
+                    )));
+                }
+                return Ok(bytes);
+            }
+            Err(error) => {
                 attempt += 1;
-                let m = e.to_string();
-                let transient = m.contains("error decoding response body")
-                    || m.contains("decoding response")
-                    || m.contains("connection")
-                    || m.contains("timed out")
-                    || m.contains("broken pipe")
-                    || m.contains("reset");
+                let message = error.to_string();
+                let transient = message.contains("error decoding response body")
+                    || message.contains("decoding response")
+                    || message.contains("connection")
+                    || message.contains("timed out")
+                    || message.contains("broken pipe")
+                    || message.contains("reset");
                 if attempt >= MAX_ATTEMPTS || !transient {
-                    return Err(e);
+                    return Err(error.into());
                 }
                 tokio::time::sleep(backoff).await;
                 backoff = std::cmp::min(backoff * 2, std::time::Duration::from_secs(30));
@@ -194,11 +313,13 @@ pub struct CloudReader {
     buffer_start: u64,
     file_size: u64,
     chunk_size: usize,
+    context: CloudObjectContext,
 }
 
 impl CloudReader {
     /// Create a new CloudReader for the given store and path
     pub fn new(store: Arc<dyn ObjectStore>, path: ObjPath, file_size: u64) -> Self {
+        let canonical_uri = path.to_string();
         CloudReader {
             store,
             path,
@@ -207,7 +328,25 @@ impl CloudReader {
             buffer_start: 0,
             file_size,
             chunk_size: DEFAULT_CHUNK_SIZE,
+            context: CloudObjectContext {
+                canonical_store_id: "<direct-store>".to_string(),
+                canonical_uri,
+                expected: None,
+                observed_version: None,
+                observed_etag: None,
+            },
         }
+    }
+
+    fn new_resolved(
+        store: Arc<dyn ObjectStore>,
+        path: ObjPath,
+        file_size: u64,
+        context: CloudObjectContext,
+    ) -> Self {
+        let mut reader = Self::new(store, path, file_size);
+        reader.context = context;
+        reader
     }
 
     /// Set the chunk size for reads
@@ -234,10 +373,11 @@ impl CloudReader {
         let range = start as usize..end as usize;
         let store = self.store.clone();
         let path = self.path.clone();
+        let context = self.context.clone();
 
         let start_time = std::time::Instant::now();
         let bytes = IO_RUNTIME
-            .block_on(async { get_range_retrying(&store, &path, range).await })
+            .block_on(async { get_range_retrying(&store, &path, &context, range).await })
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
         trace!("CloudReader: fetch completed in {:?}", start_time.elapsed());
@@ -343,6 +483,7 @@ pub struct PrefetchingCloudReader {
     /// Store and path for seek operations
     store: Arc<dyn ObjectStore>,
     path: ObjPath,
+    context: CloudObjectContext,
     /// Dropped to signal prefetch task to stop via channel closure
     _cancel_tx: Option<tokio::sync::mpsc::Sender<()>>,
 }
@@ -352,7 +493,29 @@ impl PrefetchingCloudReader {
     ///
     /// Immediately starts a background task to fetch data from the given offset.
     pub fn new(store: Arc<dyn ObjectStore>, path: ObjPath, file_size: u64) -> Self {
-        let (rx, cancel_tx) = Self::start_prefetch(store.clone(), path.clone(), 0, file_size);
+        let canonical_uri = path.to_string();
+        Self::new_resolved(
+            store,
+            path,
+            file_size,
+            CloudObjectContext {
+                canonical_store_id: "<direct-store>".to_string(),
+                canonical_uri,
+                expected: None,
+                observed_version: None,
+                observed_etag: None,
+            },
+        )
+    }
+
+    fn new_resolved(
+        store: Arc<dyn ObjectStore>,
+        path: ObjPath,
+        file_size: u64,
+        context: CloudObjectContext,
+    ) -> Self {
+        let (rx, cancel_tx) =
+            Self::start_prefetch(store.clone(), path.clone(), context.clone(), 0, file_size);
 
         PrefetchingCloudReader {
             rx,
@@ -362,6 +525,7 @@ impl PrefetchingCloudReader {
             file_size,
             store,
             path,
+            context,
             _cancel_tx: Some(cancel_tx),
         }
     }
@@ -374,6 +538,7 @@ impl PrefetchingCloudReader {
     fn start_prefetch(
         store: Arc<dyn ObjectStore>,
         path: ObjPath,
+        context: CloudObjectContext,
         start_offset: u64,
         file_size: u64,
     ) -> (
@@ -391,6 +556,7 @@ impl PrefetchingCloudReader {
 
             let store_ref = &store;
             let path_ref = &path;
+            let context_ref = &context;
 
             let mut fetch_stream = futures::stream::iter(0..chunk_count)
                 .map(|i| {
@@ -400,8 +566,9 @@ impl PrefetchingCloudReader {
                     let range = offset as usize..(offset as usize + len);
                     let store = store_ref.clone();
                     let path = path_ref.clone();
+                    let context = context_ref.clone();
                     async move {
-                        let cache_key = format!("{}|{}|{}", path.as_ref(), offset, len);
+                        let cache_key = context.cache_key(offset, len);
                         // Check chunk cache first
                         if let Some(cached) = CHUNK_CACHE.get(&cache_key).await {
                             trace!(
@@ -417,7 +584,7 @@ impl PrefetchingCloudReader {
                             offset + len as u64
                         );
                         let start_time = std::time::Instant::now();
-                        let result = get_range_retrying(&store, &path, range).await;
+                        let result = get_range_retrying(&store, &path, &context, range).await;
                         trace!(
                             "PrefetchingCloudReader: fetch completed in {:?}",
                             start_time.elapsed()
@@ -528,6 +695,7 @@ impl Seek for PrefetchingCloudReader {
             let (rx, cancel_tx) = Self::start_prefetch(
                 self.store.clone(),
                 self.path.clone(),
+                self.context.clone(),
                 new_position,
                 self.file_size,
             );
@@ -630,15 +798,27 @@ pub type BoxedReader = Box<dyn ReadSeek + Send + Sync>;
 /// falling back to standard file I/O if mmap fails.
 #[tracing::instrument(skip_all, fields(path))]
 pub fn get_reader(path: &str) -> Result<BoxedReader> {
+    get_reader_with_snapshot(path, None)
+}
+
+/// Create a reader bound to an explicit immutable source snapshot.
+/// Every path opened in snapshot mode must have exactly one manifest entry.
+pub fn get_reader_with_snapshot(
+    path: &str,
+    snapshot: Option<&SourceSnapshot>,
+) -> Result<BoxedReader> {
     if path.starts_with("gs://")
         || path.starts_with("s3://")
         || path.starts_with("http://")
         || path.starts_with("https://")
     {
-        create_cloud_reader(path)
+        create_cloud_reader(path, snapshot)
     } else {
+        if let Some(snapshot) = snapshot {
+            verify_local_object(path, snapshot.object(path)?)?;
+        }
         // Local file - try mmap first for optimal NVMe performance
-        let file = File::open(path).map_err(|e| HailError::Io(e))?;
+        let file = File::open(path).map_err(HailError::Io)?;
 
         // Try memory mapping for zero-copy access
         match MmapReader::new(&file) {
@@ -666,24 +846,69 @@ pub fn get_reader(path: &str) -> Result<BoxedReader> {
 /// Uses `PrefetchingCloudReader` which spawns a background task to fetch
 /// data ahead of the read position, hiding network latency.
 #[tracing::instrument(skip_all, fields(url = url_str))]
-fn create_cloud_reader(url_str: &str) -> Result<BoxedReader> {
-    let (store, path) = crate::io::resolve_url(url_str)?;
+fn create_cloud_reader(url_str: &str, snapshot: Option<&SourceSnapshot>) -> Result<BoxedReader> {
+    let resolved = crate::io::resolve_object(url_str, snapshot)?;
+    // A snapshot HEAD is itself version- and ETag-conditioned. Legacy HEADs
+    // provide the identity component used to isolate shared cache entries.
+    let meta = IO_RUNTIME.block_on(head_resolved(&resolved))?;
+    let file_size = resolved
+        .expected
+        .as_ref()
+        .map(|identity| identity.size)
+        .unwrap_or(meta.size as u64);
+    let context = CloudObjectContext::from_resolved(&resolved, &meta);
 
-    // Get the file size via HEAD request
-    let file_size = IO_RUNTIME
-        .block_on(async { store.head(&path).await })
-        .map_err(|e| HailError::InvalidFormat(format!("Failed to get file metadata: {}", e)))?
-        .size as u64;
-
-    // Use PrefetchingCloudReader for latency-hiding streaming
     trace!(
-        "Creating PrefetchingCloudReader for {} ({} bytes)",
+        "Creating PrefetchingCloudReader for {} ({} bytes, pinned={})",
         url_str,
-        file_size
+        file_size,
+        resolved.expected.is_some()
     );
-    Ok(Box::new(PrefetchingCloudReader::new(
-        store, path, file_size,
+    Ok(Box::new(PrefetchingCloudReader::new_resolved(
+        resolved.store,
+        resolved.path,
+        file_size,
+        context,
     )))
+}
+
+fn verify_local_object(path: &str, expected: &SourceObject) -> Result<()> {
+    let metadata = std::fs::metadata(path)?;
+    if metadata.len() != expected.size {
+        return Err(HailError::InvalidFormat(format!(
+            "source object size mismatch for {path}: expected {}, got {}",
+            expected.size,
+            metadata.len()
+        )));
+    }
+    let expected_sha256 = expected.sha256.as_ref().ok_or_else(|| {
+        HailError::InvalidFormat(format!(
+            "local snapshot object requires SHA-256 for byte verification: {path}"
+        ))
+    })?;
+    let mut file = File::open(path)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let actual = {
+        let digest = hasher.finalize();
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    if &actual != expected_sha256 {
+        return Err(HailError::InvalidFormat(format!(
+            "source object SHA-256 mismatch for {path}: expected {expected_sha256}, got {actual}"
+        )));
+    }
+    Ok(())
 }
 
 /// Join a base path with a child path, handling both local and cloud paths correctly
@@ -730,9 +955,21 @@ pub fn is_cloud_path(path: &str) -> bool {
 /// # Returns
 /// A vector containing the requested bytes
 pub fn range_read(path: &str, offset: u64, length: usize) -> Result<Vec<u8>> {
+    range_read_with_snapshot(path, offset, length, None)
+}
+
+pub fn range_read_with_snapshot(
+    path: &str,
+    offset: u64,
+    length: usize,
+    snapshot: Option<&SourceSnapshot>,
+) -> Result<Vec<u8>> {
     if is_cloud_path(path) {
-        range_read_cloud(path, offset, length)
+        range_read_cloud(path, offset, length, snapshot)
     } else {
+        if let Some(snapshot) = snapshot {
+            verify_local_object(path, snapshot.object(path)?)?;
+        }
         range_read_local(path, offset, length)
     }
 }
@@ -752,19 +989,19 @@ fn range_read_local(path: &str, offset: u64, length: usize) -> Result<Vec<u8>> {
 }
 
 /// Read a byte range from a cloud storage URL
-fn range_read_cloud(url_str: &str, offset: u64, length: usize) -> Result<Vec<u8>> {
-    let (store, path) = crate::io::resolve_url(url_str)?;
-
+fn range_read_cloud(
+    url_str: &str,
+    offset: u64,
+    length: usize,
+    snapshot: Option<&SourceSnapshot>,
+) -> Result<Vec<u8>> {
+    let resolved = crate::io::resolve_object(url_str, snapshot)?;
+    let meta = IO_RUNTIME.block_on(head_resolved(&resolved))?;
+    let context = CloudObjectContext::from_resolved(&resolved, &meta);
     let range = offset as usize..(offset as usize + length);
-    let bytes = IO_RUNTIME
-        .block_on(async { get_range_retrying(&store, &path, range).await })
-        .map_err(|e| {
-            HailError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                e.to_string(),
-            ))
-        })?;
-
+    let bytes = IO_RUNTIME.block_on(async {
+        get_range_retrying(&resolved.store, &resolved.path, &context, range).await
+    })?;
     Ok(bytes.to_vec())
 }
 
@@ -802,28 +1039,236 @@ pub fn read_single_block(path: &str, file_offset: u64) -> Result<Vec<u8>> {
 /// # Returns
 /// The size of the file in bytes
 pub fn get_file_size(path: &str) -> Result<u64> {
+    get_file_size_with_snapshot(path, None)
+}
+
+pub fn get_file_size_with_snapshot(path: &str, snapshot: Option<&SourceSnapshot>) -> Result<u64> {
     if is_cloud_path(path) {
-        let (store, obj_path) = crate::io::resolve_url(path)?;
-
-        let meta = IO_RUNTIME
-            .block_on(async { store.head(&obj_path).await })
-            .map_err(|e| {
-                HailError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
-
-        Ok(meta.size as u64)
+        let resolved = crate::io::resolve_object(path, snapshot)?;
+        let meta = IO_RUNTIME.block_on(head_resolved(&resolved))?;
+        Ok(resolved
+            .expected
+            .as_ref()
+            .map(|identity| identity.size)
+            .unwrap_or(meta.size as u64))
     } else {
-        let metadata = std::fs::metadata(path)?;
-        Ok(metadata.len())
+        if let Some(snapshot) = snapshot {
+            let expected = snapshot.object(path)?;
+            verify_local_object(path, expected)?;
+            Ok(expected.size)
+        } else {
+            Ok(std::fs::metadata(path)?.len())
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::stream::BoxStream;
+    use object_store::memory::InMemory;
+    use object_store::{
+        ListResult, MultipartUpload, PutMultipartOpts, PutOptions, PutPayload, PutResult,
+    };
+
+    #[derive(Debug)]
+    struct VersionedStore {
+        inner: InMemory,
+        version: String,
+    }
+
+    impl std::fmt::Display for VersionedStore {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "versioned-memory({})", self.version)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for VersionedStore {
+        async fn put_opts(
+            &self,
+            location: &ObjPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjPath,
+            opts: PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjPath,
+            mut options: GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            if let Some(requested) = options.version.take() {
+                if requested != self.version {
+                    return Err(object_store::Error::Precondition {
+                        path: location.to_string(),
+                        source: format!("version {} does not match {}", requested, self.version)
+                            .into(),
+                    });
+                }
+            }
+            let mut result = self.inner.get_opts(location, options).await?;
+            result.meta.version = Some(self.version.clone());
+            Ok(result)
+        }
+
+        async fn delete(&self, location: &ObjPath) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &ObjPath, to: &ObjPath) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &ObjPath,
+            to: &ObjPath,
+        ) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    fn versioned_object(
+        uri: &str,
+        store_id: &str,
+        version: &str,
+        data: &[u8],
+    ) -> (Arc<dyn ObjectStore>, ObjPath, CloudObjectContext) {
+        let store = Arc::new(VersionedStore {
+            inner: InMemory::new(),
+            version: version.to_string(),
+        });
+        let path = ObjPath::from("same/path");
+        let put = IO_RUNTIME
+            .block_on(store.put(&path, bytes::Bytes::copy_from_slice(data).into()))
+            .unwrap();
+        let expected = SourceObject {
+            uri: uri.to_string(),
+            version: version.to_string(),
+            etag: put.e_tag.unwrap(),
+            size: data.len() as u64,
+            crc32c: Some("test-crc32c".to_string()),
+            sha256: None,
+        };
+        let context = CloudObjectContext {
+            canonical_store_id: store_id.to_string(),
+            canonical_uri: uri.to_string(),
+            expected: Some(expected),
+            observed_version: None,
+            observed_etag: None,
+        };
+        (store, path, context)
+    }
+
+    #[test]
+    fn pinned_prefetch_range_seek_and_cache_isolation() {
+        let unique = uuid::Uuid::new_v4();
+        let uri_a = format!("gs://bucket-a/{unique}");
+        let uri_b = format!("gs://bucket-b/{unique}");
+        let (store_a, path_a, context_a) =
+            versioned_object(&uri_a, "gs://bucket-a", "generation-1", b"abcdefghij");
+        let (store_b, path_b, context_b) =
+            versioned_object(&uri_b, "gs://bucket-b", "generation-1", b"0123456789");
+
+        let mut a = PrefetchingCloudReader::new_resolved(store_a, path_a, 10, context_a.clone());
+        let mut first = [0; 4];
+        a.read_exact(&mut first).unwrap();
+        assert_eq!(&first, b"abcd");
+        a.seek(SeekFrom::Start(6)).unwrap();
+        let mut tail = Vec::new();
+        a.read_to_end(&mut tail).unwrap();
+        assert_eq!(&tail, b"ghij");
+
+        // Same object path/version/ETag in another store must not reuse A's bytes.
+        let mut b = PrefetchingCloudReader::new_resolved(store_b, path_b, 10, context_b);
+        let mut all = Vec::new();
+        b.read_to_end(&mut all).unwrap();
+        assert_eq!(&all, b"0123456789");
+
+        assert_ne!(
+            context_a.cache_key(0, 10),
+            CloudObjectContext {
+                canonical_store_id: "gs://bucket-b".to_string(),
+                canonical_uri: uri_a,
+                expected: context_a.expected.clone(),
+                observed_version: None,
+                observed_etag: None,
+            }
+            .cache_key(0, 10)
+        );
+    }
+
+    #[test]
+    fn pinned_reads_fail_on_wrong_or_absent_identity_and_missing_object() {
+        let uri = format!("gs://bucket/{}", uuid::Uuid::new_v4());
+        let (store, path, context) =
+            versioned_object(&uri, "gs://bucket", "generation-7", b"payload");
+
+        let mut wrong_version = context.clone();
+        wrong_version.expected.as_mut().unwrap().version = "generation-8".to_string();
+        let error = IO_RUNTIME
+            .block_on(get_range_retrying(&store, &path, &wrong_version, 0..7))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("version"), "{error}");
+
+        let mut wrong_etag = context.clone();
+        wrong_etag.expected.as_mut().unwrap().etag = "wrong-etag".to_string();
+        let error = IO_RUNTIME
+            .block_on(get_range_retrying(&store, &path, &wrong_etag, 0..7))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("precondition") || error.contains("ETag"),
+            "{error}"
+        );
+
+        let meta = IO_RUNTIME.block_on(store.head(&path)).unwrap();
+        let mut wrong_size = context.expected.clone().unwrap();
+        wrong_size.size += 1;
+        assert!(verify_object_meta(&uri, &wrong_size, &meta)
+            .unwrap_err()
+            .to_string()
+            .contains("size mismatch"));
+
+        let mut absent_version = meta.clone();
+        absent_version.version = None;
+        assert!(
+            verify_object_meta(&uri, context.expected.as_ref().unwrap(), &absent_version)
+                .unwrap_err()
+                .to_string()
+                .contains("version mismatch")
+        );
+
+        let missing = ObjPath::from("missing");
+        assert!(IO_RUNTIME
+            .block_on(get_range_retrying(&store, &missing, &context, 0..1))
+            .is_err());
+    }
 
     #[test]
     fn test_join_path_local() {

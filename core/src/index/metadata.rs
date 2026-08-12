@@ -68,7 +68,14 @@ impl IndexMetadata {
     /// - `http://` or `https://` - HTTP(S) URLs
     /// - Local file path - Regular file system access
     pub fn from_path(path: &str) -> Result<Self> {
-        let mut reader = crate::io::get_reader(path)?;
+        Self::from_path_with_snapshot(path, None)
+    }
+
+    pub fn from_path_with_snapshot(
+        path: &str,
+        snapshot: Option<&crate::io::SourceSnapshot>,
+    ) -> Result<Self> {
+        let mut reader = crate::io::get_reader_with_snapshot(path, snapshot)?;
         let mut data = Vec::new();
         reader.read_to_end(&mut data)?;
 

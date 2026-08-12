@@ -88,7 +88,14 @@ impl BlockMap {
     /// This replaces the old `build_from_cloud_path` which made N sequential HTTP
     /// range requests (one per block header), causing massive latency on remote files.
     pub fn build_from_path(path: &str) -> Result<Self> {
-        let reader = crate::io::get_reader(path)?;
+        Self::build_from_path_with_snapshot(path, None)
+    }
+
+    pub fn build_from_path_with_snapshot(
+        path: &str,
+        snapshot: Option<&crate::io::SourceSnapshot>,
+    ) -> Result<Self> {
+        let reader = crate::io::get_reader_with_snapshot(path, snapshot)?;
         Self::build_from_reader(reader)
     }
 

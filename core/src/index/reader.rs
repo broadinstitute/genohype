@@ -48,9 +48,17 @@ impl IndexReader {
     ///
     /// This loads all index nodes into memory for fast lookups.
     pub fn new_from_path(index_dir: &str, spec: &IndexSpec) -> Result<Self> {
+        Self::new_from_path_with_snapshot(index_dir, spec, None)
+    }
+
+    pub fn new_from_path_with_snapshot(
+        index_dir: &str,
+        spec: &IndexSpec,
+        snapshot: Option<&crate::io::SourceSnapshot>,
+    ) -> Result<Self> {
         // Read index metadata
         let metadata_path = join_path(index_dir, "metadata.json.gz");
-        let metadata = IndexMetadata::from_path(&metadata_path)?;
+        let metadata = IndexMetadata::from_path_with_snapshot(&metadata_path, snapshot)?;
 
         // Parse the EType for leaf nodes
         let leaf_type = ETypeParser::parse(&spec.leaf_codec.e_type)?;
@@ -59,8 +67,13 @@ impl IndexReader {
         let internal_type = ETypeParser::parse(&spec.internal_node_codec.e_type)?;
 
         // Load all nodes from the index file into cache
-        let node_cache =
-            Self::load_all_nodes_from_path(index_dir, &metadata, &leaf_type, &internal_type)?;
+        let node_cache = Self::load_all_nodes_from_path(
+            index_dir,
+            &metadata,
+            &leaf_type,
+            &internal_type,
+            snapshot,
+        )?;
 
         Ok(IndexReader {
             _index_dir: index_dir.to_string(),
@@ -82,6 +95,19 @@ impl IndexReader {
         cache: Option<&MetadataCache>,
         cache_opts: Option<&CacheOptions>,
     ) -> Result<Self> {
+        Self::new_from_path_cached_with_snapshot(index_dir, spec, cache, cache_opts, None)
+    }
+
+    pub fn new_from_path_cached_with_snapshot(
+        index_dir: &str,
+        spec: &IndexSpec,
+        cache: Option<&MetadataCache>,
+        cache_opts: Option<&CacheOptions>,
+        snapshot: Option<&crate::io::SourceSnapshot>,
+    ) -> Result<Self> {
+        if snapshot.is_some() {
+            return Self::new_from_path_with_snapshot(index_dir, spec, snapshot);
+        }
         let cache_opts_default = CacheOptions::default();
         let opts = cache_opts.unwrap_or(&cache_opts_default);
 
@@ -168,9 +194,10 @@ impl IndexReader {
         metadata: &IndexMetadata,
         leaf_type: &EncodedType,
         internal_type: &EncodedType,
+        snapshot: Option<&crate::io::SourceSnapshot>,
     ) -> Result<HashMap<u64, IndexNode>> {
         let index_file_path = join_path(index_dir, &metadata.index_path);
-        let mut reader = crate::io::get_reader(&index_file_path)?;
+        let mut reader = crate::io::get_reader_with_snapshot(&index_file_path, snapshot)?;
 
         // Read the entire file into memory first (index files are small)
         let mut data = Vec::new();

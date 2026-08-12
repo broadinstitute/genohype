@@ -222,8 +222,15 @@ impl TableMetadata {
     /// - `http://` or `https://` - HTTP(S) URLs
     /// - Local file path - Regular file system access
     pub fn from_path(path: &str) -> Result<Self> {
+        Self::from_path_with_snapshot(path, None)
+    }
+
+    pub fn from_path_with_snapshot(
+        path: &str,
+        snapshot: Option<&crate::io::SourceSnapshot>,
+    ) -> Result<Self> {
         let start = std::time::Instant::now();
-        let mut reader = crate::io::get_reader(path)?;
+        let mut reader = crate::io::get_reader_with_snapshot(path, snapshot)?;
         let mut data = Vec::new();
         reader.read_to_end(&mut data)?;
         debug!(
@@ -245,6 +252,19 @@ impl TableMetadata {
         cache: Option<&super::cache::MetadataCache>,
         opts: Option<&super::cache::CacheOptions>,
     ) -> Result<Self> {
+        Self::from_path_cached_with_snapshot(path, table_url, cache, opts, None)
+    }
+
+    pub fn from_path_cached_with_snapshot(
+        path: &str,
+        table_url: &str,
+        cache: Option<&super::cache::MetadataCache>,
+        opts: Option<&super::cache::CacheOptions>,
+        snapshot: Option<&crate::io::SourceSnapshot>,
+    ) -> Result<Self> {
+        if snapshot.is_some() {
+            return Self::from_path_with_snapshot(path, snapshot);
+        }
         match (cache, opts) {
             (Some(c), Some(o)) if o.enabled && crate::io::is_cloud_path(path) => {
                 let data = c.get_or_fetch(table_url, "table_metadata.json.gz", o, || {
@@ -309,8 +329,15 @@ impl RVDComponentSpec {
     /// - `http://` or `https://` - HTTP(S) URLs
     /// - Local file path - Regular file system access
     pub fn from_path(path: &str) -> Result<Self> {
+        Self::from_path_with_snapshot(path, None)
+    }
+
+    pub fn from_path_with_snapshot(
+        path: &str,
+        snapshot: Option<&crate::io::SourceSnapshot>,
+    ) -> Result<Self> {
         let start = std::time::Instant::now();
-        let mut reader = crate::io::get_reader(path)?;
+        let mut reader = crate::io::get_reader_with_snapshot(path, snapshot)?;
         let mut data = Vec::new();
         reader.read_to_end(&mut data)?;
         debug!(
@@ -335,6 +362,19 @@ impl RVDComponentSpec {
         cache: Option<&super::cache::MetadataCache>,
         opts: Option<&super::cache::CacheOptions>,
     ) -> Result<Self> {
+        Self::from_path_cached_with_snapshot(path, table_url, cache, opts, None)
+    }
+
+    pub fn from_path_cached_with_snapshot(
+        path: &str,
+        table_url: &str,
+        cache: Option<&super::cache::MetadataCache>,
+        opts: Option<&super::cache::CacheOptions>,
+        snapshot: Option<&crate::io::SourceSnapshot>,
+    ) -> Result<Self> {
+        if snapshot.is_some() {
+            return Self::from_path_with_snapshot(path, snapshot);
+        }
         match (cache, opts) {
             (Some(c), Some(o)) if o.enabled && crate::io::is_cloud_path(path) => {
                 let data = c.get_or_fetch(table_url, "rows_metadata.json.gz", o, || {

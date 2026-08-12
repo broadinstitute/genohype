@@ -4,6 +4,7 @@
 //! and creating the appropriate ObjectStore instances. This eliminates code duplication
 //! across `adapter.rs` and `writer.rs`.
 
+use crate::io::{SourceObject, SourceSnapshot};
 use crate::{HailError, Result};
 use object_store::path::Path as ObjPath;
 use object_store::ObjectStore;
@@ -12,6 +13,42 @@ use url::Url;
 
 /// Result of resolving a cloud URL: an ObjectStore and the path within it.
 pub type ResolvedStore = (Arc<dyn ObjectStore>, ObjPath);
+
+/// A resolved cloud object plus an optional manifest-pinned identity.
+#[derive(Clone)]
+pub struct ResolvedObject {
+    pub store: Arc<dyn ObjectStore>,
+    pub path: ObjPath,
+    /// Scheme and authority used to isolate stores in shared caches.
+    pub canonical_store_id: String,
+    /// Complete canonical URI used to isolate identically named objects.
+    pub canonical_uri: String,
+    pub expected: Option<SourceObject>,
+}
+
+/// Resolve a cloud URL and bind it to the explicit snapshot when supplied.
+pub fn resolve_object(url_str: &str, snapshot: Option<&SourceSnapshot>) -> Result<ResolvedObject> {
+    let url =
+        Url::parse(url_str).map_err(|e| HailError::InvalidFormat(format!("Invalid URL: {e}")))?;
+    let canonical_store_id = match url.host_str() {
+        Some(host) => match url.port() {
+            Some(port) => format!("{}://{host}:{port}", url.scheme()),
+            None => format!("{}://{host}", url.scheme()),
+        },
+        None => format!("{}://", url.scheme()),
+    };
+    let expected = snapshot
+        .map(|snapshot| snapshot.object(url_str).cloned())
+        .transpose()?;
+    let (store, path) = resolve_url(url_str)?;
+    Ok(ResolvedObject {
+        store,
+        path,
+        canonical_store_id,
+        canonical_uri: url_str.to_string(),
+        expected,
+    })
+}
 
 /// Resolve a cloud URL string into an ObjectStore and path.
 ///

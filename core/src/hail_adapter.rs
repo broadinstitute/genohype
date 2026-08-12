@@ -32,6 +32,7 @@ pub struct SortedPartitionIterator {
     row_type: EncodedType,
     buffer_spec: BufferSpec,
     ranges: Vec<KeyRange>,
+    snapshot: Option<crate::io::SourceSnapshot>,
 }
 
 impl SortedPartitionIterator {
@@ -42,6 +43,7 @@ impl SortedPartitionIterator {
         row_type: EncodedType,
         buffer_spec: BufferSpec,
         ranges: Vec<KeyRange>,
+        snapshot: Option<crate::io::SourceSnapshot>,
     ) -> Self {
         Self {
             partition_indices,
@@ -52,6 +54,7 @@ impl SortedPartitionIterator {
             row_type,
             buffer_spec,
             ranges,
+            snapshot,
         }
     }
 
@@ -60,7 +63,8 @@ impl SortedPartitionIterator {
         let parts_path = join_path(&self.rows_path, "parts");
         let part_path = join_path(&parts_path, part_file);
 
-        let buffer = BufferBuilder::from_path(&part_path)?.build_from_spec(&self.buffer_spec)?;
+        let reader = crate::io::get_reader_with_snapshot(&part_path, self.snapshot.as_ref())?;
+        let buffer = BufferBuilder::from_reader(reader).build_from_spec(&self.buffer_spec)?;
         Ok(PartitionStream::new(
             buffer,
             self.row_type.clone(),
@@ -136,6 +140,8 @@ pub struct HailTableSource {
     metadata_cache: Option<Arc<MetadataCache>>,
     /// Cache options
     cache_opts: Option<CacheOptions>,
+    /// Explicit immutable source context. Never process-global.
+    source_snapshot: Option<crate::io::SourceSnapshot>,
 }
 
 impl HailTableSource {
@@ -152,22 +158,40 @@ impl HailTableSource {
     /// When `cache_opts` is provided, metadata files are cached on the local
     /// filesystem to avoid re-downloading on every CLI invocation.
     pub fn open(table_path: &str, cache_opts: Option<CacheOptions>) -> Result<Self> {
-        let _span = info_span!("HailTableSource::open", table_path).entered();
+        Self::open_with_snapshot(table_path, cache_opts, None)
+    }
+
+    pub fn open_with_snapshot(
+        table_path: &str,
+        cache_opts: Option<CacheOptions>,
+        source_snapshot: Option<crate::io::SourceSnapshot>,
+    ) -> Result<Self> {
+        let _span = info_span!(
+            "HailTableSource::open",
+            table_path,
+            snapshot = source_snapshot.is_some()
+        )
+        .entered();
 
         let table_path = table_path.trim_end_matches('/').to_string();
         let rows_path = join_path(&table_path, "rows");
 
         // Set up cache if options provided
-        let cache = cache_opts.as_ref().and_then(|_| MetadataCache::new());
+        let cache = if source_snapshot.is_some() {
+            None
+        } else {
+            cache_opts.as_ref().and_then(|_| MetadataCache::new())
+        };
 
         // Load RVD metadata
         let metadata_path = join_path(&rows_path, "metadata.json.gz");
         debug!("Loading RVD metadata from {}", metadata_path);
-        let rvd_spec = RVDComponentSpec::from_path_cached(
+        let rvd_spec = RVDComponentSpec::from_path_cached_with_snapshot(
             &metadata_path,
             &table_path,
             cache.as_ref(),
             cache_opts.as_ref(),
+            source_snapshot.as_ref(),
         )?;
         debug!(
             "RVD metadata loaded: {} partitions, {} range bounds",
@@ -181,11 +205,12 @@ impl HailTableSource {
         // Load top-level metadata for partition counts and version info
         let top_metadata_path = join_path(&table_path, "metadata.json.gz");
         debug!("Loading table metadata from {}", top_metadata_path);
-        let table_metadata = Some(TableMetadata::from_path_cached(
+        let table_metadata = Some(TableMetadata::from_path_cached_with_snapshot(
             &top_metadata_path,
             &table_path,
             cache.as_ref(),
             cache_opts.as_ref(),
+            source_snapshot.as_ref(),
         )?);
         let partition_counts = table_metadata.as_ref().and_then(|m| m.partition_counts());
         debug!(
@@ -208,6 +233,7 @@ impl HailTableSource {
             table_metadata,
             metadata_cache: cache.map(Arc::new),
             cache_opts,
+            source_snapshot,
         })
     }
 
@@ -238,7 +264,7 @@ impl HailTableSource {
             })
             .unwrap_or("globals");
         let path = join_path(&join_path(&self.table_path, rel_path), "metadata.json.gz");
-        RVDComponentSpec::from_path(&path)
+        RVDComponentSpec::from_path_with_snapshot(&path, self.source_snapshot.as_ref())
     }
 
     /// Codec that prevents row data decoding, if metadata inspection is the
@@ -333,11 +359,12 @@ impl HailTableSource {
         let index_base = join_path(&self.table_path, index_rel_path);
         let index_path = join_path(&index_base, &index_dir_name);
 
-        let reader = Arc::new(IndexReader::new_from_path_cached(
+        let reader = Arc::new(IndexReader::new_from_path_cached_with_snapshot(
             &index_path,
             index_spec,
             self.metadata_cache.as_deref(),
             self.cache_opts.as_ref(),
+            self.source_snapshot.as_ref(),
         )?);
         cache.insert(partition_idx, reader.clone());
         Ok(reader)
@@ -351,7 +378,10 @@ impl HailTableSource {
         }
 
         let part_path = self.get_partition_path(partition_idx);
-        let block_map = Arc::new(BlockMap::build_from_path(&part_path)?);
+        let block_map = Arc::new(BlockMap::build_from_path_with_snapshot(
+            &part_path,
+            self.source_snapshot.as_ref(),
+        )?);
         cache.insert(partition_idx, block_map.clone());
         Ok(block_map)
     }
@@ -373,7 +403,8 @@ impl HailTableSource {
 
         // Use the full buffer stack so rows spanning block boundaries are handled.
         // Seek to the compressed block, then skip local_offset decompressed bytes.
-        let mut reader = crate::io::get_reader(&part_path)?;
+        let mut reader =
+            crate::io::get_reader_with_snapshot(&part_path, self.source_snapshot.as_ref())?;
         use std::io::Seek;
         reader.seek(std::io::SeekFrom::Start(file_offset))?;
         let mut buffer = BufferBuilder::from_reader(reader)
@@ -413,7 +444,9 @@ impl HailTableSource {
         let parts_path = join_path(&self.rows_path, "parts");
         let part_path = join_path(&parts_path, part_file);
 
-        let buffer = BufferBuilder::from_path(&part_path)?
+        let reader =
+            crate::io::get_reader_with_snapshot(&part_path, self.source_snapshot.as_ref())?;
+        let buffer = BufferBuilder::from_reader(reader)
             .build_from_spec(&self.rvd_spec.codec_spec.buffer_spec)?;
 
         Ok(PartitionStream::with_intervals(
@@ -488,12 +521,27 @@ impl DataSource for HailTableSource {
     }
 
     fn globals(&self) -> Result<EncodedValue> {
-        // Load globals from {table_path}/globals/
-        let globals_path = join_path(&self.table_path, "globals");
+        // Load globals from the metadata-declared component path.
+        let globals_rel_path = self
+            .table_metadata
+            .as_ref()
+            .and_then(|metadata| {
+                metadata
+                    .extra
+                    .get("components")?
+                    .get("globals")?
+                    .get("rel_path")?
+                    .as_str()
+            })
+            .unwrap_or("globals");
+        let globals_path = join_path(&self.table_path, globals_rel_path);
         let globals_metadata_path = join_path(&globals_path, "metadata.json.gz");
 
         // Load globals metadata
-        let globals_spec = RVDComponentSpec::from_path(&globals_metadata_path)?;
+        let globals_spec = RVDComponentSpec::from_path_with_snapshot(
+            &globals_metadata_path,
+            self.source_snapshot.as_ref(),
+        )?;
         if let Some(codec) = globals_spec
             .codec_spec
             .buffer_spec
@@ -515,7 +563,9 @@ impl DataSource for HailTableSource {
         let part_path = join_path(&parts_path, &globals_spec.part_files[0]);
 
         // Build buffer and decode
-        let mut buffer = BufferBuilder::from_path(&part_path)?
+        let reader =
+            crate::io::get_reader_with_snapshot(&part_path, self.source_snapshot.as_ref())?;
+        let mut buffer = BufferBuilder::from_reader(reader)
             .build_from_spec(&globals_spec.codec_spec.buffer_spec)?;
 
         // Hail partition streams always start with a row-present byte per row,
@@ -541,6 +591,12 @@ impl DataSource for HailTableSource {
         // Fast path: use partition counts from top-level metadata (no extra I/O)
         if let Some(counts) = &self.partition_counts {
             return Some(counts.iter().sum());
+        }
+
+        // An infallible Option-returning API cannot safely represent snapshot
+        // identity failures, so never attempt index reads here in snapshot mode.
+        if self.source_snapshot.is_some() {
+            return None;
         }
 
         // Fallback: fetch each partition's index metadata (slow for remote tables)
@@ -616,11 +672,20 @@ impl DataSource for HailTableSource {
         let key_fields = self.rvd_spec.key.clone();
         let metadata_cache = self.metadata_cache.clone();
         let cache_opts = self.cache_opts.clone();
+        let source_snapshot = self.source_snapshot.clone();
 
         // Pre-compute seek key from intervals (if available)
         let seek_key = intervals
             .as_ref()
             .and_then(|ivl| build_seek_key_from_intervals(ivl, &key_fields));
+
+        // Identity failures in snapshot index reads must never be converted to
+        // a silent full-scan fallback.
+        if source_snapshot.is_some() && has_index && seek_key.is_some() {
+            for &partition_idx in &matching_partitions {
+                self.get_index_reader(partition_idx)?;
+            }
+        }
 
         let num_partitions = matching_partitions.len();
 
@@ -647,11 +712,12 @@ impl DataSource for HailTableSource {
                 let index_rel_path = spec.rel_path.trim_start_matches("../");
                 let index_base = join_path(&table_path, index_rel_path);
                 let index_path = join_path(&index_base, &index_dir_name);
-                let reader = Arc::new(IndexReader::new_from_path_cached(
+                let reader = Arc::new(IndexReader::new_from_path_cached_with_snapshot(
                     &index_path,
                     spec,
                     metadata_cache.as_deref(),
                     cache_opts.as_ref(),
+                    source_snapshot.as_ref(),
                 )?);
                 let mut cache = index_readers.lock().unwrap();
                 cache.insert(partition_idx, reader.clone());
@@ -667,7 +733,10 @@ impl DataSource for HailTableSource {
                             return Ok(map.clone());
                         }
                     }
-                    let map = Arc::new(BlockMap::build_from_path(part_path)?);
+                    let map = Arc::new(BlockMap::build_from_path_with_snapshot(
+                        part_path,
+                        source_snapshot.as_ref(),
+                    )?);
                     let mut cache = block_maps.lock().unwrap();
                     cache.insert(partition_idx, map.clone());
                     Ok(map)
@@ -717,7 +786,10 @@ impl DataSource for HailTableSource {
                             Some((file_offset, local_offset)) => {
                                 // Seeked path: open reader at the target block
                                 (|| -> crate::Result<_> {
-                                    let mut reader = crate::io::get_reader(&part_path)?;
+                                    let mut reader = crate::io::get_reader_with_snapshot(
+                                        &part_path,
+                                        source_snapshot.as_ref(),
+                                    )?;
                                     use std::io::Seek;
                                     reader.seek(std::io::SeekFrom::Start(file_offset))?;
                                     let buffer = BufferBuilder::from_reader(reader)
@@ -726,9 +798,14 @@ impl DataSource for HailTableSource {
                                 })()
                             }
                             None => {
-                                // Fallback: full scan from offset 0
-                                BufferBuilder::from_path(&part_path).and_then(|builder| {
-                                    builder
+                                // Fallback: full scan from offset 0 under the
+                                // same explicit source identity.
+                                crate::io::get_reader_with_snapshot(
+                                    &part_path,
+                                    source_snapshot.as_ref(),
+                                )
+                                .and_then(|reader| {
+                                    BufferBuilder::from_reader(reader)
                                         .build_from_spec(&row_buffer_spec)
                                         .map(|buffer| (buffer, 0usize))
                                 })
@@ -814,10 +891,17 @@ impl DataSource for HailTableSource {
         let key_fields = self.rvd_spec.key.clone();
         let metadata_cache = self.metadata_cache.clone();
         let cache_opts = self.cache_opts.clone();
+        let source_snapshot = self.source_snapshot.clone();
 
         let seek_key = intervals
             .as_ref()
             .and_then(|ivl| build_seek_key_from_intervals(ivl, &key_fields));
+
+        if source_snapshot.is_some() && has_index && seek_key.is_some() {
+            for &partition_idx in &matching_partitions {
+                self.get_index_reader(partition_idx)?;
+            }
+        }
 
         let num_partitions = matching_partitions.len();
 
@@ -842,11 +926,12 @@ impl DataSource for HailTableSource {
                 let index_rel_path = spec.rel_path.trim_start_matches("../");
                 let index_base = join_path(&table_path, index_rel_path);
                 let index_path = join_path(&index_base, &index_dir_name);
-                let reader = Arc::new(IndexReader::new_from_path_cached(
+                let reader = Arc::new(IndexReader::new_from_path_cached_with_snapshot(
                     &index_path,
                     spec,
                     metadata_cache.as_deref(),
                     cache_opts.as_ref(),
+                    source_snapshot.as_ref(),
                 )?);
                 let mut cache = index_readers.lock().unwrap();
                 cache.insert(partition_idx, reader.clone());
@@ -893,15 +978,22 @@ impl DataSource for HailTableSource {
                         let _open_span = info_span!("partition_open", partition = idx).entered();
                         match seek_result {
                             Some((file_offset, local_offset)) => (|| -> crate::Result<_> {
-                                let mut reader = crate::io::get_reader(&part_path)?;
+                                let mut reader = crate::io::get_reader_with_snapshot(
+                                    &part_path,
+                                    source_snapshot.as_ref(),
+                                )?;
                                 use std::io::Seek;
                                 reader.seek(std::io::SeekFrom::Start(file_offset))?;
                                 let buffer = BufferBuilder::from_reader(reader)
                                     .build_from_spec(&row_buffer_spec)?;
                                 Ok((buffer, local_offset))
                             })(),
-                            None => BufferBuilder::from_path(&part_path).and_then(|builder| {
-                                builder
+                            None => crate::io::get_reader_with_snapshot(
+                                &part_path,
+                                source_snapshot.as_ref(),
+                            )
+                            .and_then(|reader| {
+                                BufferBuilder::from_reader(reader)
                                     .build_from_spec(&row_buffer_spec)
                                     .map(|buffer| (buffer, 0usize))
                             }),
@@ -968,6 +1060,7 @@ impl DataSource for HailTableSource {
             row_type,
             buffer_spec,
             ranges,
+            self.source_snapshot.clone(),
         );
 
         Ok(Box::new(iter))
@@ -1075,6 +1168,39 @@ mod tests {
         }
     }
 
+    fn snapshot_for_tree(root: &std::path::Path) -> crate::io::SourceSnapshot {
+        use sha2::{Digest, Sha256};
+
+        fn collect(path: &std::path::Path, objects: &mut Vec<crate::io::SourceObject>) {
+            for entry in std::fs::read_dir(path).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    collect(&entry.path(), objects);
+                } else {
+                    let bytes = std::fs::read(entry.path()).unwrap();
+                    let sha256: String = Sha256::digest(&bytes)
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect();
+                    objects.push(crate::io::SourceObject {
+                        uri: entry.path().to_string_lossy().to_string(),
+                        version: "local-fixture-v1".to_string(),
+                        etag: sha256.clone(),
+                        size: bytes.len() as u64,
+                        crc32c: None,
+                        sha256: Some(sha256),
+                    });
+                }
+            }
+        }
+
+        let mut objects = Vec::new();
+        collect(root, &mut objects);
+        let manifest = crate::io::SourceManifest::new(objects).unwrap();
+        let digest = manifest.digest_sha256().unwrap();
+        crate::io::SourceSnapshot::new(manifest, &digest).unwrap()
+    }
+
     #[test]
     fn malformed_existing_top_metadata_fails_with_object_and_field_path() {
         let temp = tempfile::tempdir().unwrap();
@@ -1100,6 +1226,97 @@ mod tests {
         };
         assert!(error.contains("metadata.json.gz"), "{error}");
         assert!(error.contains("hail_version"), "{error}");
+    }
+
+    #[test]
+    fn snapshot_pins_metadata_globals_rows_indexes_and_all_scan_builders() {
+        use crate::projection::FieldPath;
+
+        let temp = tempfile::tempdir().unwrap();
+        let table = temp.path().join("snapshot.ht");
+        copy_tree(std::path::Path::new("tests/fixtures/tiny-keyed.ht"), &table);
+        let snapshot = snapshot_for_tree(&table);
+        let source = HailTableSource::open_with_snapshot(
+            table.to_str().unwrap(),
+            Some(CacheOptions::default()),
+            Some(snapshot.clone()),
+        )
+        .unwrap();
+
+        assert!(source.globals_rvd_spec().is_ok());
+        assert!(source.globals().is_ok());
+        assert_eq!(source.scan_partition_stream(0, &[]).unwrap().count(), 2);
+        assert_eq!(source.query_stream(&[]).unwrap().count(), 2);
+        let projection = Arc::new(ProjectionTree::from_fields(&[
+            FieldPath::parse("gene_id").unwrap()
+        ]));
+        assert_eq!(
+            source
+                .query_stream_with_projection(&[], None, Some(projection))
+                .unwrap()
+                .count(),
+            2
+        );
+        assert_eq!(source.query_stream_sorted(&[]).unwrap().count(), 2);
+        let key = EncodedValue::Struct(vec![
+            (
+                "gene_id".to_string(),
+                EncodedValue::Binary(b"ENSG00000066468".to_vec()),
+            ),
+            ("chrom".to_string(), EncodedValue::Binary(b"10".to_vec())),
+            ("start".to_string(), EncodedValue::Int32(121478332)),
+        ]);
+        assert!(source.lookup(&key).unwrap().is_some());
+
+        // Mutation after open is caught at the next object boundary, before decode.
+        let part = table.join("rows/parts/part-0");
+        let mut bytes = std::fs::read(&part).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        std::fs::write(&part, bytes).unwrap();
+        let error = match source.scan_partition_stream(0, &[]) {
+            Ok(_) => panic!("mutated snapshot partition unexpectedly opened"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("SHA-256 mismatch"), "{error}");
+    }
+
+    #[test]
+    fn snapshot_fails_on_missing_or_wrong_sized_metadata_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let table = temp.path().join("snapshot.ht");
+        copy_tree(std::path::Path::new("tests/fixtures/tiny-keyed.ht"), &table);
+        let snapshot = snapshot_for_tree(&table);
+        let mut missing_manifest = snapshot.manifest().clone();
+        missing_manifest
+            .objects
+            .retain(|object| !object.uri.ends_with("/rows/metadata.json.gz"));
+        let digest = missing_manifest.digest_sha256().unwrap();
+        let missing = crate::io::SourceSnapshot::new(missing_manifest, &digest).unwrap();
+        let error =
+            match HailTableSource::open_with_snapshot(table.to_str().unwrap(), None, Some(missing))
+            {
+                Ok(_) => panic!("missing metadata identity unexpectedly opened"),
+                Err(error) => error.to_string(),
+            };
+        assert!(error.contains("no object identity"), "{error}");
+
+        let mut wrong_manifest = snapshot.manifest().clone();
+        let top_metadata = table.join("metadata.json.gz").to_string_lossy().to_string();
+        wrong_manifest
+            .objects
+            .iter_mut()
+            .find(|object| object.uri == top_metadata)
+            .unwrap()
+            .size += 1;
+        let digest = wrong_manifest.digest_sha256().unwrap();
+        let wrong = crate::io::SourceSnapshot::new(wrong_manifest, &digest).unwrap();
+        let error =
+            match HailTableSource::open_with_snapshot(table.to_str().unwrap(), None, Some(wrong)) {
+                Ok(_) => panic!("wrong metadata size unexpectedly opened"),
+                Err(error) => error.to_string(),
+            };
+        assert!(error.contains("size mismatch"), "{error}");
     }
 
     #[test]

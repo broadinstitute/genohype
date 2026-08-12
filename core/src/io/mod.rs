@@ -25,15 +25,20 @@
 //! This enables processing 12TB datasets without local staging.
 
 pub mod adapter;
+pub mod manifest;
 pub mod resolver;
 pub mod writer;
 
 #[cfg(feature = "gcp")]
 pub use adapter::get_gcs_client;
 pub use adapter::{
-    get_file_size, get_prefetch_depth, get_reader, is_cloud_path, join_path, range_read,
+    get_file_size, get_file_size_with_snapshot, get_prefetch_depth, get_reader,
+    get_reader_with_snapshot, is_cloud_path, join_path, range_read, range_read_with_snapshot,
     read_single_block, set_prefetch_depth, BoxedReader, CloudReader, MmapReader,
     PrefetchingCloudReader,
 };
-pub use resolver::{resolve_url, resolve_url_for_write, ResolvedStore};
+pub use manifest::{SourceManifest, SourceObject, SourceSnapshot, SOURCE_MANIFEST_SCHEMA_VERSION};
+pub use resolver::{
+    resolve_object, resolve_url, resolve_url_for_write, ResolvedObject, ResolvedStore,
+};
 pub use writer::{CloudWriter, OutputWriter, StreamingCloudWriter};
