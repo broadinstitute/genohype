@@ -1,5 +1,6 @@
 //! Index metadata structures
 
+use crate::metadata::parse_metadata_at;
 use crate::Result;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
@@ -38,7 +39,7 @@ pub struct IndexMetadata {
 impl IndexMetadata {
     /// Parse index metadata from JSON bytes
     pub fn from_json(data: &[u8]) -> Result<Self> {
-        Ok(serde_json::from_slice(data)?)
+        parse_metadata_at(data, "in-memory index metadata")
     }
 
     /// Parse index metadata from gzipped JSON
@@ -46,17 +47,17 @@ impl IndexMetadata {
         let mut decoder = flate2::read::GzDecoder::new(data);
         let mut json_data = Vec::new();
         decoder.read_to_end(&mut json_data)?;
-        Self::from_json(&json_data)
+        parse_metadata_at(&json_data, "in-memory index metadata")
     }
 
     /// Load index metadata from a local file path
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let mut file = File::open(path)?;
+        let mut file = File::open(&path)?;
         let mut data = Vec::new();
         file.read_to_end(&mut data)?;
 
-        // Try gzipped first, fall back to plain JSON
-        Self::from_gzipped_json(&data).or_else(|_| Self::from_json(&data))
+        let source = path.as_ref().to_string_lossy();
+        parse_metadata_at(&data, &source)
     }
 
     /// Load index metadata from a path string (local or cloud URL)
@@ -71,8 +72,7 @@ impl IndexMetadata {
         let mut data = Vec::new();
         reader.read_to_end(&mut data)?;
 
-        // Try gzipped first, fall back to plain JSON
-        Self::from_gzipped_json(&data).or_else(|_| Self::from_json(&data))
+        parse_metadata_at(&data, path)
     }
 }
 

@@ -199,9 +199,51 @@ pub fn show_info(
         }
         println!();
 
-        // Codec information
-        println!("{}", "Row Codec:".green());
+        // Codec information. Keep Hail's logical and physical type strings
+        // distinct; Arrow conversion is only a physical representation.
+        println!("{}", "Row Logical Type (_vType):".green());
         println!("{}", format_schema_clean(&rvd_spec.codec_spec.v_type));
+        println!("{}", "Row Physical Type (_eType):".green());
+        println!("{}", rvd_spec.codec_spec.e_type);
+        println!("{}", "Row Buffer Stack:".green());
+        println!(
+            "{}",
+            serde_json::to_string(&rvd_spec.codec_spec.buffer_spec)?
+        );
+        if let Some(codec) = rvd_spec.codec_spec.buffer_spec.unsupported_decode_codec() {
+            println!(
+                "{} {}",
+                "Row decoding:".green(),
+                format!("Unsupported ({codec}); metadata inspection only").yellow()
+            );
+        } else {
+            println!("{} {}", "Row decoding:".green(), "Supported".bright_green());
+        }
+        println!();
+    }
+
+    if let Some(globals_spec) = engine.globals_rvd_spec()? {
+        println!("{}", "Globals Logical Type (_vType):".green());
+        println!("{}", format_schema_clean(&globals_spec.codec_spec.v_type));
+        println!("{}", "Globals Physical Type (_eType):".green());
+        println!("{}", globals_spec.codec_spec.e_type);
+        if let Some(codec) = globals_spec
+            .codec_spec
+            .buffer_spec
+            .unsupported_decode_codec()
+        {
+            println!(
+                "{} {}",
+                "Globals decoding:".green(),
+                format!("Unsupported ({codec}); metadata inspection only").yellow()
+            );
+        } else {
+            println!(
+                "{} {}",
+                "Globals decoding:".green(),
+                "Supported".bright_green()
+            );
+        }
     }
 
     Ok(())
@@ -240,6 +282,7 @@ fn show_info_json(table_path: &str, count: bool, cache_opts: Option<CacheOptions
     if let Some(metadata) = engine.table_metadata() {
         info["file_version"] = serde_json::json!(metadata.file_version);
         info["hail_version"] = serde_json::json!(metadata.hail_version);
+        info["references_rel_path"] = serde_json::json!(metadata.references_rel_path);
     }
 
     // Only compute total_rows if fast or --count requested
@@ -258,6 +301,25 @@ fn show_info_json(table_path: &str, count: bool, cache_opts: Option<CacheOptions
         }
 
         info["schema"] = serde_json::json!(format_schema_clean(&rvd_spec.codec_spec.v_type));
+        info["row_codec"] = serde_json::json!({
+            "physical_type": rvd_spec.codec_spec.e_type,
+            "logical_type": rvd_spec.codec_spec.v_type,
+            "buffer_spec": rvd_spec.codec_spec.buffer_spec,
+            "metadata_inspection_supported": true,
+            "data_decode_supported": rvd_spec.codec_spec.buffer_spec.data_decode_supported(),
+            "unsupported_codec": rvd_spec.codec_spec.buffer_spec.unsupported_decode_codec(),
+        });
+    }
+
+    if let Some(globals_spec) = engine.globals_rvd_spec()? {
+        info["globals_codec"] = serde_json::json!({
+            "physical_type": globals_spec.codec_spec.e_type,
+            "logical_type": globals_spec.codec_spec.v_type,
+            "buffer_spec": globals_spec.codec_spec.buffer_spec,
+            "metadata_inspection_supported": true,
+            "data_decode_supported": globals_spec.codec_spec.buffer_spec.data_decode_supported(),
+            "unsupported_codec": globals_spec.codec_spec.buffer_spec.unsupported_decode_codec(),
+        });
     }
 
     println!("{}", serde_json::to_string_pretty(&info)?);

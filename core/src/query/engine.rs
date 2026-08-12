@@ -179,6 +179,14 @@ impl QueryEngine {
         self.hail_source.as_ref().and_then(|h| h.table_metadata())
     }
 
+    /// Load globals component metadata without decoding its data.
+    pub fn globals_rvd_spec(&self) -> crate::Result<Option<RVDComponentSpec>> {
+        self.hail_source
+            .as_ref()
+            .map(|hail| hail.globals_rvd_spec())
+            .transpose()
+    }
+
     /// Check if total_rows() is available without an expensive scan
     pub fn has_fast_row_count(&self) -> bool {
         self.hail_source

@@ -178,13 +178,12 @@ impl HailTableSource {
         // Load top-level metadata for partition counts and version info
         let top_metadata_path = join_path(&table_path, "metadata.json.gz");
         debug!("Loading table metadata from {}", top_metadata_path);
-        let table_metadata = TableMetadata::from_path_cached(
+        let table_metadata = Some(TableMetadata::from_path_cached(
             &top_metadata_path,
             &table_path,
             cache.as_ref(),
             cache_opts.as_ref(),
-        )
-        .ok();
+        )?);
         let partition_counts = table_metadata.as_ref().and_then(|m| m.partition_counts());
         debug!(
             "Partition counts from metadata: {}",
@@ -219,6 +218,42 @@ impl HailTableSource {
     /// Get the top-level table metadata (version info, references path)
     pub fn table_metadata(&self) -> Option<&TableMetadata> {
         self.table_metadata.as_ref()
+    }
+
+    /// Load the globals component metadata without reading globals data.
+    pub fn globals_rvd_spec(&self) -> Result<RVDComponentSpec> {
+        let rel_path = self
+            .table_metadata
+            .as_ref()
+            .and_then(|metadata| {
+                metadata
+                    .extra
+                    .get("components")?
+                    .get("globals")?
+                    .get("rel_path")?
+                    .as_str()
+            })
+            .unwrap_or("globals");
+        let path = join_path(&join_path(&self.table_path, rel_path), "metadata.json.gz");
+        RVDComponentSpec::from_path(&path)
+    }
+
+    /// Codec that prevents row data decoding, if metadata inspection is the
+    /// only supported capability for this table.
+    pub fn unsupported_row_decode_codec(&self) -> Option<&'static str> {
+        self.rvd_spec
+            .codec_spec
+            .buffer_spec
+            .unsupported_decode_codec()
+    }
+
+    fn ensure_row_decode_supported(&self, operation: &str) -> Result<()> {
+        if let Some(codec) = self.unsupported_row_decode_codec() {
+            return Err(HailError::Codec(format!(
+                "{operation} is not supported for rows encoded with {codec}; metadata-only inspection is supported"
+            )));
+        }
+        Ok(())
     }
 
     /// Check if partition counts are available without scanning index files
@@ -445,6 +480,15 @@ impl DataSource for HailTableSource {
 
         // Load globals metadata
         let globals_spec = RVDComponentSpec::from_path(&globals_metadata_path)?;
+        if let Some(codec) = globals_spec
+            .codec_spec
+            .buffer_spec
+            .unsupported_decode_codec()
+        {
+            return Err(HailError::Codec(format!(
+                "globals decoding is not supported for data encoded with {codec}; metadata-only inspection is supported"
+            )));
+        }
 
         // Parse the globals type from the codec spec
         let globals_type = ETypeParser::parse(&globals_spec.codec_spec.e_type)?;
@@ -514,6 +558,7 @@ impl DataSource for HailTableSource {
         partition_idx: usize,
         ranges: &[KeyRange],
     ) -> Result<Box<dyn Iterator<Item = Result<EncodedValue>> + Send>> {
+        self.ensure_row_decode_supported("row scanning")?;
         let stream = self.create_partition_stream(partition_idx, ranges)?;
         Ok(Box::new(stream))
     }
@@ -524,6 +569,7 @@ impl DataSource for HailTableSource {
         ranges: &[KeyRange],
         intervals: Option<Arc<IntervalList>>,
     ) -> Result<Box<dyn Iterator<Item = Result<EncodedValue>> + Send>> {
+        self.ensure_row_decode_supported("row querying")?;
         let matching_partitions = filter_partitions_with_intervals(
             &self.rvd_spec.range_bounds,
             ranges,
@@ -719,6 +765,7 @@ impl DataSource for HailTableSource {
         intervals: Option<Arc<IntervalList>>,
         decode_projection: Option<Arc<ProjectionTree>>,
     ) -> Result<Box<dyn Iterator<Item = Result<EncodedValue>> + Send>> {
+        self.ensure_row_decode_supported("projected row querying")?;
         let matching_partitions = filter_partitions_with_intervals(
             &self.rvd_spec.range_bounds,
             ranges,
@@ -871,6 +918,7 @@ impl DataSource for HailTableSource {
         &self,
         ranges: &[KeyRange],
     ) -> Result<Box<dyn Iterator<Item = Result<EncodedValue>> + Send>> {
+        self.ensure_row_decode_supported("sorted row querying")?;
         // Sequential iteration through partitions in sorted order
         let matching_partitions = filter_partitions(&self.rvd_spec.range_bounds, ranges);
 
@@ -899,6 +947,7 @@ impl DataSource for HailTableSource {
 
     #[instrument(skip_all)]
     fn lookup(&self, key: &EncodedValue) -> Result<Option<EncodedValue>> {
+        self.ensure_row_decode_supported("row lookup")?;
         // For point lookups, skip partition pruning if there's only one partition
         let matching_partitions = if self.rvd_spec.part_files.len() == 1 {
             vec![0]
@@ -925,5 +974,87 @@ impl DataSource for HailTableSource {
         }
 
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    fn rewrite_fixture_rows_as_lz4hc(output: &std::path::Path) {
+        let mut decoder = flate2::read::GzDecoder::new(
+            std::fs::File::open("tests/fixtures/tiny-keyed.ht/rows/metadata.json.gz").unwrap(),
+        );
+        let mut json = Vec::new();
+        decoder.read_to_end(&mut json).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        let codec = &mut value["_codecSpec"]["_bufferSpec"]["child"]["child"];
+        codec["name"] = serde_json::json!("LZ4HCBlockBufferSpec");
+        codec["blockSize"] = serde_json::json!(32768);
+
+        let mut encoder = flate2::write::GzEncoder::new(
+            std::fs::File::create(output).unwrap(),
+            flate2::Compression::default(),
+        );
+        encoder
+            .write_all(&serde_json::to_vec(&value).unwrap())
+            .unwrap();
+        encoder.finish().unwrap();
+    }
+
+    #[test]
+    fn malformed_existing_top_metadata_fails_with_object_and_field_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let table = temp.path().join("malformed-top.ht");
+        std::fs::create_dir_all(table.join("rows")).unwrap();
+        std::fs::copy(
+            "tests/fixtures/tiny-keyed.ht/rows/metadata.json.gz",
+            table.join("rows/metadata.json.gz"),
+        )
+        .unwrap();
+        std::fs::write(
+            table.join("metadata.json.gz"),
+            br#"{
+                "file_version": 67328,
+                "references_rel_path": "references"
+            }"#,
+        )
+        .unwrap();
+
+        let error = match HailTableSource::new(table.to_str().unwrap()) {
+            Ok(_) => panic!("malformed top metadata unexpectedly opened"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("metadata.json.gz"), "{error}");
+        assert!(error.contains("hail_version"), "{error}");
+    }
+
+    #[test]
+    fn lz4hc_metadata_opens_but_row_decode_fails_before_reading_parts() {
+        let temp = tempfile::tempdir().unwrap();
+        let table = temp.path().join("historical.ht");
+        std::fs::create_dir_all(table.join("rows")).unwrap();
+        std::fs::copy(
+            "tests/fixtures/tiny-keyed.ht/metadata.json.gz",
+            table.join("metadata.json.gz"),
+        )
+        .unwrap();
+        rewrite_fixture_rows_as_lz4hc(&table.join("rows/metadata.json.gz"));
+
+        let source = HailTableSource::new(table.to_str().unwrap()).unwrap();
+        assert_eq!(
+            source.unsupported_row_decode_codec(),
+            Some("LZ4HCBlockBufferSpec")
+        );
+        assert_eq!(source.table_metadata().unwrap().file_version, 67328);
+        assert_eq!(source.key_fields(), ["gene_id", "chrom", "start"]);
+
+        let error = match source.scan_partition_stream(0, &[]) {
+            Ok(_) => panic!("LZ4HC row scan unexpectedly opened"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("LZ4HCBlockBufferSpec"), "{error}");
+        assert!(error.contains("metadata-only inspection"), "{error}");
     }
 }
