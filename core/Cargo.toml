@@ -7,7 +7,7 @@ license = "MIT"
 
 [features]
 default = ["gcp", "validation"]
-gcp = ["object_store/gcp"]
+gcp = ["object_store/gcp", "dep:google-cloud-storage"]
 aws = ["object_store/aws"]
 http = ["object_store/http"]
 validation = ["dep:jsonschema"]
@@ -17,7 +17,7 @@ vep = ["dep:fastvep-core", "dep:fastvep-io", "dep:fastvep-annotate", "dep:fastve
 clickhouse = ["export", "dep:reqwest"]
 elasticsearch = ["export", "dep:reqwest"]
 postgres = ["export", "dep:sqlx"]
-bigquery = ["export", "dep:google-cloud-bigquery", "dep:google-cloud-storage"]
+bigquery = ["export", "dep:google-cloud-bigquery", "gcp"]
 
 [dependencies]
 # Compression

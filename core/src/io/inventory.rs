@@ -1,12 +1,24 @@
 //! Bounded, read-only inventory of the exact objects needed to read a Hail table.
 //!
-//! The inventory engine is provider-neutral. This first implementation includes a
-//! content-addressed local backend; cloud roots fail explicitly rather than using
-//! an incomplete provider identity.
+//! The inventory engine is provider-neutral. Local files use content-addressed
+//! identities; GCS joins JSON-list generation/checksum identity to a
+//! generation-selected `object_store` HEAD and pins all planning metadata reads.
 
 use crate::index::IndexMetadata;
 use crate::metadata::{parse_metadata_at, RVDComponentSpec, TableMetadata};
 use crate::{HailError, Result};
+#[cfg(feature = "gcp")]
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+#[cfg(feature = "gcp")]
+use google_cloud_storage::client::{Client as GoogleStorageClient, ClientConfig};
+#[cfg(feature = "gcp")]
+use google_cloud_storage::http::objects::list::{ListObjectsRequest, ListObjectsResponse};
+#[cfg(feature = "gcp")]
+use google_cloud_storage::http::objects::Object as GoogleObject;
+#[cfg(feature = "gcp")]
+use object_store::path::Path as ObjectStorePath;
+#[cfg(feature = "gcp")]
+use object_store::{GetOptions, ObjectMeta, ObjectStore};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
@@ -80,6 +92,9 @@ pub struct ObservedObject {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ObservedListing {
     pub objects: BTreeMap<RelativeObjectPath, ObservedObject>,
+    /// Provider directory markers are ignored before relative-path normalization,
+    /// because `prefix/` and `prefix` must not alias in the object map.
+    pub directory_markers: usize,
 }
 
 impl ObservedListing {
@@ -291,15 +306,17 @@ pub fn inventory_hail_table<B: SourceInventoryBackend>(
     })
 }
 
-/// Dispatch inventory by root scheme. Cloud inventory is deliberately unsupported
-/// until its listing generation/CRC32C can be joined safely to generation-selected HEAD.
+/// Dispatch inventory by root scheme.
 pub fn inventory_hail_table_path(
     root: &str,
     options: &InventoryOptions,
 ) -> Result<InventoryResult> {
     if root.starts_with("gs://") {
         #[cfg(feature = "gcp")]
-        return invalid("GCS source-manifest inventory is not yet implemented safely");
+        {
+            let mut backend = GcsInventoryBackend::new(root)?;
+            return inventory_hail_table(&mut backend, options);
+        }
         #[cfg(not(feature = "gcp"))]
         return invalid("GCS source-manifest inventory requires the 'gcp' feature");
     }
@@ -465,7 +482,10 @@ fn reconcile(
         .map(|path| path.as_str().to_string())
         .collect();
     let mut unexpected = Vec::new();
-    let mut ignored = IgnoredCounts::default();
+    let mut ignored = IgnoredCounts {
+        directory_markers: listing.directory_markers,
+        ..IgnoredCounts::default()
+    };
 
     for (path, observed) in &listing.objects {
         if observed.directory_marker {
@@ -698,6 +718,448 @@ fn is_hadoop_checksum(path: &RelativeObjectPath) -> bool {
 
 fn invalid<T>(message: impl Into<String>) -> Result<T> {
     Err(HailError::InvalidFormat(message.into()))
+}
+
+#[cfg(feature = "gcp")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GcsListedObject {
+    name: String,
+    generation: String,
+    size: u64,
+    crc32c: String,
+    json_etag: String,
+}
+
+#[cfg(feature = "gcp")]
+fn parse_gcs_root(root: &str) -> Result<(String, String, String)> {
+    if root.chars().any(char::is_whitespace) || root.contains('%') || root.contains('\\') {
+        return invalid("GCS inventory root contains an unsafe object-name encoding");
+    }
+    let raw_after_scheme = root
+        .strip_prefix("gs://")
+        .ok_or_else(|| HailError::InvalidFormat("GCS inventory root must use gs://".to_string()))?;
+    let raw_prefix = raw_after_scheme
+        .split_once('/')
+        .map(|(_, path)| path)
+        .unwrap_or("")
+        .trim_end_matches('/');
+    if raw_prefix.is_empty()
+        || !raw_prefix.is_ascii()
+        || raw_prefix.contains("//")
+        || raw_prefix
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..")
+    {
+        return invalid("GCS inventory root must contain a safe, nonempty object prefix");
+    }
+    let parsed = url::Url::parse(root).map_err(|error| {
+        HailError::InvalidFormat(format!("invalid GCS inventory root: {error}"))
+    })?;
+    if parsed.scheme() != "gs"
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.port().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return invalid("GCS inventory root must be gs://bucket/nonempty-prefix without credentials, port, query, or fragment");
+    }
+    let bucket = parsed
+        .host_str()
+        .filter(|bucket| !bucket.is_empty())
+        .ok_or_else(|| {
+            HailError::InvalidFormat("GCS inventory root is missing a bucket".to_string())
+        })?
+        .to_string();
+    let path = parsed.path();
+    if !path.starts_with('/') || path.starts_with("//") {
+        return invalid("GCS inventory root has an unsafe prefix");
+    }
+    let prefix = path[1..].trim_end_matches('/');
+    if prefix != raw_prefix {
+        return invalid("GCS inventory root has a non-canonical object-name encoding");
+    }
+    let canonical = format!("gs://{bucket}/{prefix}");
+    Ok((bucket, prefix.to_string(), canonical))
+}
+
+#[cfg(feature = "gcp")]
+fn convert_gcs_object(
+    object: &GoogleObject,
+    bucket: &str,
+    prefix_boundary: &str,
+) -> Result<(Option<RelativeObjectPath>, GcsListedObject, bool)> {
+    if !object.bucket.is_empty() && object.bucket != bucket {
+        return invalid(format!(
+            "GCS JSON listing returned object from unexpected bucket: {}",
+            object.bucket
+        ));
+    }
+    let relative_text = object.name.strip_prefix(prefix_boundary).ok_or_else(|| {
+        HailError::InvalidFormat(format!(
+            "GCS JSON listing returned object outside requested prefix boundary: {}",
+            object.name
+        ))
+    })?;
+    if object.generation <= 0 {
+        return invalid(format!(
+            "GCS object has missing or non-positive generation: {}",
+            object.name
+        ));
+    }
+    let size = u64::try_from(object.size).map_err(|_| {
+        HailError::InvalidFormat(format!("GCS object has negative size: {}", object.name))
+    })?;
+    let crc32c = object.crc32c.as_deref().ok_or_else(|| {
+        HailError::InvalidFormat(format!("GCS object is missing CRC32C: {}", object.name))
+    })?;
+    let decoded = BASE64_STANDARD.decode(crc32c).map_err(|error| {
+        HailError::InvalidFormat(format!(
+            "GCS object has invalid standard-base64 CRC32C {}: {error}",
+            object.name
+        ))
+    })?;
+    if decoded.len() != 4 {
+        return invalid(format!(
+            "GCS object CRC32C must decode to exactly 4 bytes: {}",
+            object.name
+        ));
+    }
+    let canonical_crc32c = BASE64_STANDARD.encode(decoded);
+    if canonical_crc32c != crc32c {
+        return invalid(format!(
+            "GCS object has a non-canonical standard-base64 CRC32C: {}",
+            object.name
+        ));
+    }
+    let crc32c = canonical_crc32c;
+    if object.etag.trim().is_empty() {
+        return invalid(format!(
+            "GCS JSON listing object has an empty ETag: {}",
+            object.name
+        ));
+    }
+    let listed = GcsListedObject {
+        name: object.name.clone(),
+        generation: object.generation.to_string(),
+        size,
+        crc32c,
+        json_etag: object.etag.clone(),
+    };
+
+    let directory_marker = object.name.ends_with('/') && size == 0;
+    if directory_marker {
+        return Ok((None, listed, true));
+    }
+    if relative_text.is_empty()
+        || !relative_text.is_ascii()
+        || relative_text.ends_with('/')
+        || relative_text.contains("//")
+        || relative_text.contains('%')
+        || relative_text.contains('\\')
+        || relative_text.contains('?')
+        || relative_text.contains('#')
+        || relative_text
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..")
+    {
+        return invalid(format!(
+            "GCS listing contains an unsafe object name: {}",
+            object.name
+        ));
+    }
+    let relative = RelativeObjectPath::new(relative_text)?;
+    if relative.as_str() != relative_text {
+        return invalid(format!(
+            "GCS listing contains a non-canonical object name: {}",
+            object.name
+        ));
+    }
+    Ok((Some(relative), listed, false))
+}
+
+#[cfg(feature = "gcp")]
+fn collect_gcs_listing<F>(
+    bucket: &str,
+    prefix: &str,
+    max_objects: usize,
+    mut fetch: F,
+) -> Result<(
+    ObservedListing,
+    BTreeMap<RelativeObjectPath, GcsListedObject>,
+)>
+where
+    F: FnMut(&ListObjectsRequest) -> Result<ListObjectsResponse>,
+{
+    let prefix_boundary = format!("{prefix}/");
+    let mut listing = ObservedListing::default();
+    let mut listed_objects = BTreeMap::new();
+    let mut seen_names = BTreeSet::new();
+    let mut seen_tokens = BTreeSet::new();
+    let mut page_token = None;
+    let mut object_count = 0usize;
+
+    loop {
+        let request = ListObjectsRequest {
+            bucket: bucket.to_string(),
+            delimiter: None,
+            prefix: Some(prefix_boundary.clone()),
+            page_token: page_token.clone(),
+            versions: Some(false),
+            max_results: Some(
+                max_objects
+                    .saturating_sub(object_count)
+                    .saturating_add(1)
+                    .min(1000) as i32,
+            ),
+            ..Default::default()
+        };
+        let response = fetch(&request)?;
+        if response
+            .prefixes
+            .as_ref()
+            .is_some_and(|prefixes| !prefixes.is_empty())
+        {
+            return invalid("GCS JSON listing unexpectedly returned delimiter prefixes");
+        }
+        for object in response.items.unwrap_or_default() {
+            object_count = object_count
+                .checked_add(1)
+                .ok_or_else(|| HailError::InvalidFormat("GCS object count overflow".to_string()))?;
+            if object_count > max_objects {
+                return invalid(format!("source listing exceeds max_objects {max_objects}"));
+            }
+            if !seen_names.insert(object.name.clone()) {
+                return invalid(format!(
+                    "duplicate object in GCS JSON listing: {}",
+                    object.name
+                ));
+            }
+            let (relative, listed, directory_marker) =
+                convert_gcs_object(&object, bucket, &prefix_boundary)?;
+            if directory_marker {
+                listing.directory_markers += 1;
+                continue;
+            }
+            let relative = relative.expect("non-marker conversion returns a relative path");
+            listing.insert(
+                relative.clone(),
+                ObservedObject {
+                    size: listed.size,
+                    listing_identity: serde_json::to_string(&(
+                        &listed.generation,
+                        listed.size,
+                        &listed.crc32c,
+                        &listed.json_etag,
+                    ))
+                    .map_err(|error| {
+                        HailError::InvalidFormat(format!(
+                            "failed to encode GCS listing identity: {error}"
+                        ))
+                    })?,
+                    directory_marker: false,
+                    symlink: false,
+                },
+            )?;
+            if listed_objects.insert(relative, listed).is_some() {
+                return invalid("duplicate normalized object in GCS JSON listing");
+            }
+        }
+
+        match response.next_page_token.filter(|token| !token.is_empty()) {
+            Some(token) => {
+                if !seen_tokens.insert(token.clone()) {
+                    return invalid("GCS JSON listing repeated a page token");
+                }
+                page_token = Some(token);
+            }
+            None => break,
+        }
+    }
+    Ok((listing, listed_objects))
+}
+
+#[cfg(feature = "gcp")]
+fn merge_gcs_head(
+    canonical_root: &str,
+    relative: &RelativeObjectPath,
+    listed: &GcsListedObject,
+    head: &ObjectMeta,
+) -> Result<SourceObject> {
+    if head.location.to_string() != listed.name {
+        return invalid(format!(
+            "GCS generation-selected HEAD returned the wrong object for {}",
+            relative.as_str()
+        ));
+    }
+    if head.version.as_deref() != Some(listed.generation.as_str()) {
+        return invalid(format!(
+            "GCS generation-selected HEAD version mismatch for {}: expected {}, got {:?}",
+            relative.as_str(),
+            listed.generation,
+            head.version
+        ));
+    }
+    if head.size as u64 != listed.size {
+        return invalid(format!(
+            "GCS generation-selected HEAD size mismatch for {}: expected {}, got {}",
+            relative.as_str(),
+            listed.size,
+            head.size
+        ));
+    }
+    let etag = head
+        .e_tag
+        .as_ref()
+        .filter(|etag| !etag.trim().is_empty())
+        .ok_or_else(|| {
+            HailError::InvalidFormat(format!(
+                "GCS generation-selected HEAD has an empty ETag for {}",
+                relative.as_str()
+            ))
+        })?;
+    Ok(SourceObject {
+        uri: format!("{canonical_root}/{}", relative.as_str()),
+        version: listed.generation.clone(),
+        etag: etag.clone(),
+        size: listed.size,
+        crc32c: Some(listed.crc32c.clone()),
+        sha256: None,
+    })
+}
+
+/// Production GCS inventory backend. JSON API listing supplies generation,
+/// size, CRC32C, and listing ETag; `object_store` supplies the exact pinned-reader ETag.
+#[cfg(feature = "gcp")]
+pub struct GcsInventoryBackend {
+    bucket: String,
+    prefix: String,
+    canonical_root: String,
+    json_client: GoogleStorageClient,
+    object_store: std::sync::Arc<dyn ObjectStore>,
+    listed_objects: BTreeMap<RelativeObjectPath, GcsListedObject>,
+}
+
+#[cfg(feature = "gcp")]
+impl GcsInventoryBackend {
+    pub fn new(root: &str) -> Result<Self> {
+        let (bucket, prefix, canonical_root) = parse_gcs_root(root)?;
+        let config = super::adapter::IO_RUNTIME
+            .block_on(ClientConfig::default().with_auth())
+            .map_err(|error| {
+                HailError::InvalidFormat(format!(
+                    "failed to initialize GCS JSON API ADC credentials: {error}"
+                ))
+            })?;
+        let json_client = GoogleStorageClient::new(config);
+        let object_store = super::adapter::get_gcs_client(&bucket)?;
+        Ok(Self {
+            bucket,
+            prefix,
+            canonical_root,
+            json_client,
+            object_store,
+            listed_objects: BTreeMap::new(),
+        })
+    }
+
+    fn listed(&self, relative: &RelativeObjectPath) -> Result<&GcsListedObject> {
+        self.listed_objects.get(relative).ok_or_else(|| {
+            HailError::InvalidFormat(format!(
+                "object is absent from the current GCS JSON listing: {}",
+                relative.as_str()
+            ))
+        })
+    }
+
+    fn head(&self, relative: &RelativeObjectPath) -> Result<SourceObject> {
+        let listed = self.listed(relative)?;
+        let result = super::adapter::IO_RUNTIME.block_on(self.object_store.get_opts(
+            &ObjectStorePath::from(listed.name.clone()),
+            GetOptions {
+                version: Some(listed.generation.clone()),
+                head: true,
+                ..Default::default()
+            },
+        ))?;
+        merge_gcs_head(&self.canonical_root, relative, listed, &result.meta)
+    }
+}
+
+#[cfg(feature = "gcp")]
+impl SourceInventoryBackend for GcsInventoryBackend {
+    fn canonical_root(&self) -> &str {
+        &self.canonical_root
+    }
+
+    fn list(&mut self, max_objects: usize) -> Result<ObservedListing> {
+        let (listing, listed_objects) =
+            collect_gcs_listing(&self.bucket, &self.prefix, max_objects, |request| {
+                super::adapter::IO_RUNTIME
+                    .block_on(self.json_client.list_objects(request))
+                    .map_err(|error| {
+                        HailError::InvalidFormat(format!(
+                            "GCS JSON API listing failed for {}: {error}",
+                            self.canonical_root
+                        ))
+                    })
+            })?;
+        self.listed_objects = listed_objects;
+        Ok(listing)
+    }
+
+    fn stat(&mut self, relative: &RelativeObjectPath) -> Result<SourceObject> {
+        self.head(relative)
+    }
+
+    fn read_pinned(
+        &mut self,
+        relative: &RelativeObjectPath,
+        identity: &SourceObject,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>> {
+        if identity.size > max_bytes {
+            return invalid(format!(
+                "metadata object {} exceeds byte limit {}",
+                relative.as_str(),
+                max_bytes
+            ));
+        }
+        let listed = self.listed(relative)?;
+        if identity.version != listed.generation
+            || identity.size != listed.size
+            || identity.crc32c.as_deref() != Some(listed.crc32c.as_str())
+            || identity.uri != format!("{}/{}", self.canonical_root, relative.as_str())
+        {
+            return invalid(format!(
+                "metadata identity does not match the current GCS JSON listing: {}",
+                relative.as_str()
+            ));
+        }
+        let result = super::adapter::IO_RUNTIME.block_on(self.object_store.get_opts(
+            &ObjectStorePath::from(listed.name.clone()),
+            GetOptions {
+                version: Some(identity.version.clone()),
+                if_match: Some(identity.etag.clone()),
+                ..Default::default()
+            },
+        ))?;
+        let observed = merge_gcs_head(&self.canonical_root, relative, listed, &result.meta)?;
+        if &observed != identity {
+            return invalid(format!(
+                "metadata object changed before pinned GCS read: {}",
+                relative.as_str()
+            ));
+        }
+        let bytes = super::adapter::IO_RUNTIME.block_on(result.bytes())?;
+        if bytes.len() as u64 != identity.size {
+            return invalid(format!(
+                "metadata object size changed during pinned GCS read: {}",
+                relative.as_str()
+            ));
+        }
+        Ok(bytes.to_vec())
+    }
 }
 
 /// Local content-addressed inventory backend.
@@ -1130,6 +1592,223 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("unexpected relevant"), "{error}");
+    }
+
+    #[cfg(feature = "gcp")]
+    fn google_object(name: &str) -> GoogleObject {
+        GoogleObject {
+            bucket: "bucket".to_string(),
+            name: name.to_string(),
+            generation: 42,
+            size: 7,
+            crc32c: Some("AAAAAA==".to_string()),
+            etag: "json-etag".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "gcp")]
+    fn object_meta(name: &str) -> ObjectMeta {
+        ObjectMeta {
+            location: ObjectStorePath::from(name),
+            last_modified: Default::default(),
+            size: 7,
+            e_tag: Some("\"xml-head-etag\"".to_string()),
+            version: Some("42".to_string()),
+        }
+    }
+
+    #[cfg(feature = "gcp")]
+    #[test]
+    fn gcs_json_conversion_and_head_merge_are_strict() {
+        let object = google_object("table.ht/metadata.json.gz");
+        let (relative, listed, marker) =
+            convert_gcs_object(&object, "bucket", "table.ht/").unwrap();
+        let relative = relative.unwrap();
+        assert!(!marker);
+        assert_eq!(relative.as_str(), "metadata.json.gz");
+        assert_eq!(listed.generation, "42");
+        assert_eq!(listed.size, 7);
+        assert_eq!(listed.crc32c, "AAAAAA==");
+
+        let head = object_meta("table.ht/metadata.json.gz");
+        let identity = merge_gcs_head("gs://bucket/table.ht", &relative, &listed, &head).unwrap();
+        assert_eq!(identity.version, "42");
+        assert_eq!(identity.etag, "\"xml-head-etag\"");
+        assert_eq!(identity.crc32c.as_deref(), Some("AAAAAA=="));
+        assert!(identity.sha256.is_none());
+
+        for invalid_object in [
+            GoogleObject {
+                generation: 0,
+                ..object.clone()
+            },
+            GoogleObject {
+                size: -1,
+                ..object.clone()
+            },
+            GoogleObject {
+                crc32c: None,
+                ..object.clone()
+            },
+            GoogleObject {
+                crc32c: Some("not-base64".to_string()),
+                ..object.clone()
+            },
+            GoogleObject {
+                crc32c: Some("AA==".to_string()),
+                ..object.clone()
+            },
+            GoogleObject {
+                etag: String::new(),
+                ..object.clone()
+            },
+        ] {
+            assert!(convert_gcs_object(&invalid_object, "bucket", "table.ht/").is_err());
+        }
+
+        let mut wrong_generation = head.clone();
+        wrong_generation.version = Some("43".to_string());
+        assert!(merge_gcs_head(
+            "gs://bucket/table.ht",
+            &relative,
+            &listed,
+            &wrong_generation
+        )
+        .is_err());
+        let mut missing_generation = head.clone();
+        missing_generation.version = None;
+        assert!(merge_gcs_head(
+            "gs://bucket/table.ht",
+            &relative,
+            &listed,
+            &missing_generation
+        )
+        .is_err());
+        let mut wrong_size = head.clone();
+        wrong_size.size = 8;
+        assert!(merge_gcs_head("gs://bucket/table.ht", &relative, &listed, &wrong_size).is_err());
+        let mut missing_etag = head;
+        missing_etag.e_tag = None;
+        assert!(merge_gcs_head("gs://bucket/table.ht", &relative, &listed, &missing_etag).is_err());
+    }
+
+    #[cfg(feature = "gcp")]
+    #[test]
+    fn gcs_paginated_listing_enforces_tokens_boundaries_duplicates_and_limits() {
+        let mut tokens = Vec::new();
+        let (listing, _) = collect_gcs_listing("bucket", "table.ht", 3, |request| {
+            assert_eq!(request.prefix.as_deref(), Some("table.ht/"));
+            assert_eq!(request.versions, Some(false));
+            assert!(request.delimiter.is_none());
+            tokens.push(request.page_token.clone());
+            if request.page_token.is_none() {
+                Ok(ListObjectsResponse {
+                    prefixes: None,
+                    items: Some(vec![google_object("table.ht/metadata.json.gz")]),
+                    next_page_token: Some("page-2".to_string()),
+                })
+            } else {
+                let mut marker = google_object("table.ht/references/");
+                marker.size = 0;
+                Ok(ListObjectsResponse {
+                    prefixes: None,
+                    items: Some(vec![marker, google_object("table.ht/_SUCCESS")]),
+                    next_page_token: None,
+                })
+            }
+        })
+        .unwrap();
+        assert_eq!(tokens, vec![None, Some("page-2".to_string())]);
+        assert_eq!(listing.objects.len(), 2);
+        assert_eq!(listing.directory_markers, 1);
+
+        let outside = collect_gcs_listing("bucket", "table.ht", 2, |_| {
+            Ok(ListObjectsResponse {
+                prefixes: None,
+                items: Some(vec![google_object("table.ht-other/object")]),
+                next_page_token: None,
+            })
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            outside.contains("outside requested prefix boundary"),
+            "{outside}"
+        );
+
+        let duplicate = collect_gcs_listing("bucket", "table.ht", 2, |_| {
+            Ok(ListObjectsResponse {
+                prefixes: None,
+                items: Some(vec![
+                    google_object("table.ht/object"),
+                    google_object("table.ht/object"),
+                ]),
+                next_page_token: None,
+            })
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(duplicate.contains("duplicate object"), "{duplicate}");
+
+        let limit = collect_gcs_listing("bucket", "table.ht", 1, |_| {
+            Ok(ListObjectsResponse {
+                prefixes: None,
+                items: Some(vec![
+                    google_object("table.ht/a"),
+                    google_object("table.ht/b"),
+                ]),
+                next_page_token: None,
+            })
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(limit.contains("max_objects 1"), "{limit}");
+    }
+
+    #[cfg(feature = "gcp")]
+    #[test]
+    fn gcs_root_and_listing_identity_stability_are_strict() {
+        assert_eq!(
+            parse_gcs_root("gs://bucket/path/table.ht/").unwrap(),
+            (
+                "bucket".to_string(),
+                "path/table.ht".to_string(),
+                "gs://bucket/path/table.ht".to_string()
+            )
+        );
+        for root in [
+            "gs://bucket",
+            "gs://bucket/../table.ht",
+            "gs://bucket/a//table.ht",
+            "gs://bucket/a%2Ftable.ht",
+            "gs://bucket/table.ht?generation=1",
+        ] {
+            assert!(parse_gcs_root(root).is_err(), "accepted {root}");
+        }
+
+        let (a, _) = collect_gcs_listing("bucket", "table.ht", 1, |_| {
+            Ok(ListObjectsResponse {
+                prefixes: None,
+                items: Some(vec![google_object("table.ht/metadata.json.gz")]),
+                next_page_token: None,
+            })
+        })
+        .unwrap();
+        let (b, _) = collect_gcs_listing("bucket", "table.ht", 1, |_| {
+            let mut changed = google_object("table.ht/metadata.json.gz");
+            changed.generation = 43;
+            Ok(ListObjectsResponse {
+                prefixes: None,
+                items: Some(vec![changed]),
+                next_page_token: None,
+            })
+        })
+        .unwrap();
+        let path = RelativeObjectPath::new("metadata.json.gz").unwrap();
+        let mut closure = Closure::default();
+        closure.require(path, "top metadata").unwrap();
+        assert!(require_stable_observations(&a, &b, &closure).is_err());
     }
 
     #[test]

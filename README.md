@@ -103,7 +103,7 @@ genohype info "gs://gcp-public-data--gnomad/release/4.1/ht/exomes/gnomad.exomes.
 | `info` | Show metadata, keys, partition layout, schema, and optional globals |
 | `summary` | Scan a dataset to calculate row counts and field statistics |
 | `query` | Stream rows with optional field and interval filters |
-| `manifest inventory` | Create a bounded immutable local source inventory ([details](docs/source-manifest.md)) |
+| `manifest inventory` | Create a bounded immutable local or GCS source inventory ([details](docs/source-manifest.md)) |
 | `vcf index` | Create a tabix index for a BGZF-compressed VCF |
 | `cache clear` | Clear locally cached Hail metadata |
 

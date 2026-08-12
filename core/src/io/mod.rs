@@ -39,6 +39,8 @@ pub use adapter::{
     read_single_block, set_prefetch_depth, BoxedReader, CloudReader, MmapReader,
     PrefetchingCloudReader,
 };
+#[cfg(feature = "gcp")]
+pub use inventory::GcsInventoryBackend;
 pub use inventory::{
     inventory_hail_table, inventory_hail_table_path, IgnoredCounts, InventoryAccess,
     InventoryOptions, InventoryResult, InventoryRole, LocalInventoryBackend, ObservedListing,
