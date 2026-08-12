@@ -553,10 +553,24 @@ pub async fn run_coordinator(
                 }
             }
 
-            // Check if job is complete
-            // For batch/Manhattan: use the phase flag; for standard jobs: check partition counts
-            let job_complete = is_batch_complete
-                || (total > 0 && (completed + failed) == total && processing == 0 && pending == 0);
+            // Safe export completion authority is the Stage 5 finalizer, never
+            // generic counters. Stage 5a therefore leaves an all-receipt run in
+            // `running` for the finalizer rather than falsely marking success.
+            let is_safe_export = matches!(
+                monitor_state.lock().unwrap().config.job_spec.as_ref(),
+                Some(JobSpec::SafeExport(_))
+            );
+            // For batch/Manhattan: use the phase flag; for standard jobs: check partition counts.
+            let partition_work_finished =
+                total > 0 && (completed + failed) == total && processing == 0 && pending == 0;
+            // Successful safe exports remain running until Stage 5b seals
+            // release.json and _SUCCESS. Exhausted failures must still reach
+            // the existing terminal failed path instead of hanging forever.
+            let job_complete = if is_safe_export {
+                failed > 0 && partition_work_finished
+            } else {
+                is_batch_complete || partition_work_finished
+            };
 
             if job_complete {
                 if failed > 0 {
@@ -868,6 +882,35 @@ pub async fn run_coordinator(
     Ok(())
 }
 
+fn safe_export_incompatibility(
+    request: &WorkRequest,
+    expected: &genohype_core::release::SafeExportWorkerIdentity,
+) -> Option<WorkResponse> {
+    let compatible = request.protocol_version.unwrap_or(0) >= SAFE_EXPORT_WORKER_PROTOCOL_VERSION
+        && request
+            .capabilities
+            .iter()
+            .any(|capability| capability == "safe_export_v1")
+        && request.build_version.as_deref() == Some(expected.git_commit.as_str())
+        && request.build_identity.as_deref() == Some(expected.build_identity.as_str())
+        && request.binary_sha256.as_deref() == Some(expected.binary_sha256.as_str());
+    (!compatible).then(|| WorkResponse::Incompatible {
+        required_protocol_version: SAFE_EXPORT_WORKER_PROTOCOL_VERSION,
+        message: "safe export requires the exact sealed stock-worker build and binary identity"
+            .to_string(),
+    })
+}
+
+fn safe_export_dispatch_gate(
+    request: &WorkRequest,
+    expected: &genohype_core::release::SafeExportWorkerIdentity,
+) -> WorkResponse {
+    safe_export_incompatibility(request, expected).unwrap_or_else(|| WorkResponse::Incompatible {
+        required_protocol_version: SAFE_EXPORT_WORKER_PROTOCOL_VERSION,
+        message: "safe-export part receipt authority is installed; terminal resume/finalization is not yet installed".to_string(),
+    })
+}
+
 /// Handler for POST /work - worker requests work.
 async fn get_work(
     axum::extract::State(state): axum::extract::State<SharedState>,
@@ -876,31 +919,11 @@ async fn get_work(
     let mut data = state.lock().unwrap();
 
     if let Some(JobSpec::SafeExport(spec)) = &data.config.job_spec {
-        let compatible = req.protocol_version.unwrap_or(0) >= SAFE_EXPORT_WORKER_PROTOCOL_VERSION
-            && req
-                .capabilities
-                .iter()
-                .any(|capability| capability == "safe_export_v1")
-            && req.build_version.as_deref() == Some(spec.expected_worker.git_commit.as_str())
-            && req.build_identity.as_deref() == Some(spec.expected_worker.build_identity.as_str())
-            && req.binary_sha256.as_deref() == Some(spec.expected_worker.binary_sha256.as_str());
-        if !compatible {
-            return axum::Json(WorkResponse::Incompatible {
-                required_protocol_version: SAFE_EXPORT_WORKER_PROTOCOL_VERSION,
-                message:
-                    "safe export requires the exact sealed stock-worker build and binary identity"
-                        .to_string(),
-            });
-        }
-        // Keep the public execution gate fail-closed until the follow-up commit
-        // installs cloud publication plus atomic accepted-receipt authority.
-        // The typed assignment/claim machinery below is complete but must not
-        // expose a job that can stage bytes without reaching an authoritative
-        // terminal receipt.
-        return axum::Json(WorkResponse::Incompatible {
-            required_protocol_version: SAFE_EXPORT_WORKER_PROTOCOL_VERSION,
-            message: "safe-export durable assignment fencing is installed; immutable publication and accepted-receipt commit are not yet installed".to_string(),
-        });
+        // Stage 5a can durably converge part publication and receipts, but the
+        // Stage 5b resume/finalizer is still the only terminal authority. Do
+        // not publicly dispatch a job that cannot yet publish `_SUCCESS` and
+        // transition to completed.
+        return axum::Json(safe_export_dispatch_gate(&req, &spec.expected_worker));
     }
 
     // Custom tasks require workers that understand lease/session fencing. Reject
@@ -1244,10 +1267,80 @@ async fn complete_work(
         _ => None,
     };
     if let Some(spec) = safe_spec {
+        // An exact retransmission after the SQLite commit must acknowledge from
+        // durable evidence before lease validation and before any cloud call.
+        // Every stale or conflicting completion still returns false here.
+        if let Some(job_id) = data.current_job_id.as_deref() {
+            match data.metrics_db.is_identical_safe_export_completion(
+                job_id,
+                &data.session_id,
+                &req,
+            ) {
+                Ok(true) => {
+                    // SQLite may have committed even if its response was
+                    // uncertain. Reconcile advisory memory exactly once by
+                    // consuming a still-present matching assignment.
+                    let task_id = &req.tasks[0];
+                    let echoed = &req.assignments[0];
+                    if data
+                        .safe_export_assignments
+                        .get(task_id)
+                        .is_some_and(|current| {
+                            current.worker_id != req.worker_id
+                                || current.assignment_attempt != echoed.assignment_attempt
+                                || current.lease_token != echoed.lease_token
+                        })
+                    {
+                        // Durable accepted evidence must never consume a newer
+                        // advisory assignment for the same stable task ID.
+                        return axum::Json(CompleteResponse {
+                            acknowledged: false,
+                        });
+                    }
+                    if let Some(assignment) = data.safe_export_assignments.remove(task_id) {
+                        data.processing_partitions.remove(&assignment.partition_id);
+                        if req.error.is_some() {
+                            let retry = data
+                                .retry_counts
+                                .entry(assignment.partition_id)
+                                .or_insert(0);
+                            *retry += 1;
+                            if *retry > data.config.max_retries {
+                                data.failed_partitions.insert(assignment.partition_id);
+                            } else {
+                                data.pending_partitions.push_front(assignment.partition_id);
+                            }
+                        } else if let Some(report) = req
+                            .result_json
+                            .as_ref()
+                            .and_then(|value| serde_json::to_vec(value).ok())
+                            .and_then(|json| {
+                                genohype_core::release::ExportPartReport::from_json(&json).ok()
+                            })
+                        {
+                            if data.completed_tasks.insert(assignment.partition_id) {
+                                data.total_rows = data.total_rows.saturating_add(
+                                    usize::try_from(report.row_count).unwrap_or(usize::MAX),
+                                );
+                            }
+                        }
+                        data.last_progress_time = Instant::now();
+                    }
+                    return axum::Json(CompleteResponse { acknowledged: true });
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    eprintln!("Rejected safe-export retransmission lookup: {error}");
+                    return axum::Json(CompleteResponse {
+                        acknowledged: false,
+                    });
+                }
+            }
+        }
+
         // Safe completions must never fall through to generic in-memory
-        // accounting. Stage 4c validates the complete fence/report contract;
-        // publication and receipt commit are the only path that may eventually
-        // acknowledge it.
+        // accounting. Lease/report validation and the durable publishing claim
+        // happen while holding the coordinator mutex.
         if data
             .validate_safe_export_assignments(
                 req.session_id.as_deref(),
@@ -1293,6 +1386,7 @@ async fn complete_work(
         };
         if let Some(error) = req.error.as_deref() {
             if req.result_json.is_some()
+                || req.items_processed != 0
                 || data
                     .metrics_db
                     .fail_safe_export_assignment(&job_id, &data.session_id, &durable, error, now_ms)
@@ -1344,15 +1438,16 @@ async fn complete_work(
                 acknowledged: false,
             });
         };
-        if report
-            .validate_against(
-                &spec,
-                &task,
-                &req.worker_id,
-                assignment.assignment_attempt,
-                &lease_hash,
-            )
-            .is_err()
+        if usize::try_from(report.row_count).ok() != Some(req.items_processed)
+            || report
+                .validate_against(
+                    &spec,
+                    &task,
+                    &req.worker_id,
+                    assignment.assignment_attempt,
+                    &lease_hash,
+                )
+                .is_err()
         {
             return axum::Json(CompleteResponse {
                 acknowledged: false,
@@ -1382,13 +1477,116 @@ async fn complete_work(
                 });
             }
         }
-        eprintln!(
-            "Safe-export report {} is durably claimed for publication; cloud publication is not installed",
-            task_id
-        );
-        return axum::Json(CompleteResponse {
-            acknowledged: false,
-        });
+        let session_id = data.session_id.clone();
+        let publication_spec = spec.clone();
+        let publication_task = task.clone();
+        let publication_report = report.clone();
+
+        // The publishing claim is durable and non-requeueable. Never hold the
+        // coordinator mutex across object-store I/O.
+        drop(data);
+        let publication = match std::thread::spawn(move || {
+            services::safe_export::publish_claimed_part(
+                &publication_spec,
+                &publication_task,
+                &publication_report,
+            )
+        })
+        .join()
+        {
+            Ok(Ok(publication)) => publication,
+            Ok(Err(error)) => {
+                eprintln!("Safe-export publication failed closed for {task_id}: {error}");
+                return axum::Json(CompleteResponse {
+                    acknowledged: false,
+                });
+            }
+            Err(_) => {
+                eprintln!("Safe-export publication thread panicked for {task_id}");
+                return axum::Json(CompleteResponse {
+                    acknowledged: false,
+                });
+            }
+        };
+
+        let mut data = state.lock().unwrap();
+        let still_current = data.current_job_id.as_deref() == Some(job_id.as_str())
+            && data.session_id == session_id
+            && matches!(
+                data.config.job_spec.as_ref(),
+                Some(JobSpec::SafeExport(current)) if current.export_id == spec.export_id
+            )
+            && data
+                .safe_export_assignments
+                .get(task_id)
+                .is_some_and(|current| {
+                    current.state == state::SafeExportAssignmentState::Publishing
+                        && current.partition_id == assignment.partition_id
+                        && current.worker_id == assignment.worker_id
+                        && current.assignment_attempt == assignment.assignment_attempt
+                        && current.lease_token == assignment.lease_token
+                });
+        if !still_current {
+            // Cancellation/supersession during I/O consumes authority. Immutable
+            // cloud evidence may remain, but it cannot be accepted by this job.
+            return axum::Json(CompleteResponse {
+                acknowledged: false,
+            });
+        }
+
+        let durable = DurableSafeExportAssignment {
+            export_id: &spec.export_id,
+            task_id,
+            partition_id: assignment.partition_id,
+            assignment_attempt: assignment.assignment_attempt,
+            lease_token: &assignment.lease_token,
+            worker_id: &assignment.worker_id,
+            worker_git_commit: &assignment.worker_git_commit,
+            worker_build_identity: &assignment.worker_build_identity,
+            worker_binary_sha256: &assignment.worker_binary_sha256,
+        };
+        let evidence = crate::distributed::metrics_db::DurableSafeExportPartEvidence {
+            receipt_json: &publication.receipt_json,
+            receipt_uri: &publication.receipt_object.uri,
+            receipt_version: &publication.receipt_object.version,
+            receipt_etag: &publication.receipt_object.etag,
+        };
+        match data.metrics_db.commit_safe_export_completion(
+            &job_id,
+            &session_id,
+            &durable,
+            &report_json,
+            &evidence,
+            CoordinatorData::now_ms(),
+        ) {
+            Ok(crate::distributed::metrics_db::SafeExportCompletionOutcome::Stored)
+            | Ok(crate::distributed::metrics_db::SafeExportCompletionOutcome::Duplicate) => {}
+            Err(error) => {
+                eprintln!("Safe-export durable acceptance failed for {task_id}: {error}");
+                return axum::Json(CompleteResponse {
+                    acknowledged: false,
+                });
+            }
+        }
+
+        // Memory follows SQLite, never precedes it.
+        data.safe_export_assignments.remove(task_id);
+        data.processing_partitions.remove(&assignment.partition_id);
+        if data.completed_tasks.insert(assignment.partition_id) {
+            data.total_rows = data
+                .total_rows
+                .saturating_add(usize::try_from(report.row_count).unwrap_or(usize::MAX));
+        }
+        data.last_progress_time = Instant::now();
+        if let Some(worker) = data.worker_registry.get_mut(&req.worker_id) {
+            worker.status = WorkerStatus::Idle;
+            worker.current_task = None;
+            worker.total_rows = worker
+                .total_rows
+                .saturating_add(usize::try_from(report.row_count).unwrap_or(usize::MAX));
+            worker.partitions_completed = worker.partitions_completed.saturating_add(1);
+        }
+        return axum::Json(CompleteResponse { acknowledged: true });
     }
 
     let is_custom_job = matches!(data.config.job_spec, Some(JobSpec::Custom { .. }));
@@ -3291,6 +3489,37 @@ mod lease_coordinator_tests {
         let _ = assign(&state, "worker-b").await;
         assert_rejected_heartbeat_unchanged(&state, heartbeat("worker-a", Some(&session), lease))
             .await;
+    }
+
+    #[test]
+    fn compatible_safe_export_worker_remains_fenced_until_terminal_finalizer() {
+        let expected = genohype_core::release::SafeExportWorkerIdentity {
+            git_commit: "sealed-commit".to_string(),
+            build_identity: "sealed-build".to_string(),
+            binary_sha256: "a".repeat(64),
+        };
+        let request = WorkRequest {
+            worker_id: "stock-worker".to_string(),
+            hardware: None,
+            build_version: Some(expected.git_commit.clone()),
+            protocol_version: Some(SAFE_EXPORT_WORKER_PROTOCOL_VERSION),
+            build_identity: Some(expected.build_identity.clone()),
+            binary_sha256: Some(expected.binary_sha256.clone()),
+            capabilities: vec!["safe_export_v1".to_string()],
+        };
+        assert!(safe_export_incompatibility(&request, &expected).is_none());
+        assert!(matches!(
+            safe_export_dispatch_gate(&request, &expected),
+            WorkResponse::Incompatible { message, .. }
+                if message.contains("terminal resume/finalization")
+        ));
+
+        let mut wrong = request;
+        wrong.binary_sha256 = Some("b".repeat(64));
+        assert!(matches!(
+            safe_export_incompatibility(&wrong, &expected),
+            Some(WorkResponse::Incompatible { .. })
+        ));
     }
 
     #[tokio::test]

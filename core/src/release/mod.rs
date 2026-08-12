@@ -8,9 +8,10 @@
 mod safe_export;
 
 pub use safe_export::{
-    DecodedRowsHasher, ExportPartReport, SafeExportPartTask, SafeExportSpec,
-    SafeExportWorkerIdentity, SAFE_EXPORT_COMPLETION_SCHEMA_VERSION,
-    SAFE_EXPORT_RECEIPT_SCHEMA_VERSION, SAFE_EXPORT_SCHEMA_VERSION, SAFE_EXPORT_SHARDING_RULE_V1,
+    safe_export_part_receipt_uri, DecodedRowsHasher, ExportPartReport, SafeExportPartReceipt,
+    SafeExportPartTask, SafeExportSpec, SafeExportWorkerIdentity,
+    SAFE_EXPORT_COMPLETION_SCHEMA_VERSION, SAFE_EXPORT_RECEIPT_SCHEMA_VERSION,
+    SAFE_EXPORT_SCHEMA_VERSION, SAFE_EXPORT_SHARDING_RULE_V1,
 };
 
 use crate::codec::{canonical_digest, ETypeParser, EncodedType, LosslessValue, ValueDigest};

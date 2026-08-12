@@ -51,6 +51,39 @@ pub(crate) enum SafePublicationClaimOutcome {
     Duplicate,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SafeExportCompletionOutcome {
+    Stored,
+    Duplicate,
+}
+
+/// Conditioned cloud identity for the strict receipt envelope written by the
+/// coordinator. All part/output facts are decoded from `receipt_json`; callers
+/// cannot supply a second, divergent copy of those facts.
+pub(crate) struct DurableSafeExportPartEvidence<'a> {
+    pub receipt_json: &'a str,
+    pub receipt_uri: &'a str,
+    pub receipt_version: &'a str,
+    pub receipt_etag: &'a str,
+}
+
+struct PreparedSafeExportCompletion {
+    report_sha256: String,
+    receipt_sha256: String,
+    receipt_size: i64,
+    partition_id: i64,
+    assignment_attempt: i64,
+    output_size: i64,
+    row_count: i64,
+    row_group_count: i64,
+    output_uri: String,
+    output_version: String,
+    output_etag: String,
+    output_sha256: String,
+    schema_fingerprint_sha256: String,
+    decoded_rows_sha256: String,
+}
+
 fn sha256_hex(domain: &[u8], bytes: &[u8]) -> String {
     let mut digest = Sha256::new();
     digest.update(domain);
@@ -68,6 +101,173 @@ fn lease_identity(lease_token: &str) -> String {
         b"genohype/custom-assignment-lease/v1",
         lease_token.as_bytes(),
     )
+}
+
+fn raw_sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn canonical_gcs_root(uri: &str, marker: &str) -> Option<String> {
+    let parsed = url::Url::parse(uri).ok()?;
+    if parsed.scheme() != "gs"
+        || parsed.host_str().is_none()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.username() != ""
+        || parsed.password().is_some()
+        || parsed.port().is_some()
+        || !uri.ends_with(marker)
+    {
+        return None;
+    }
+    Some(uri[..uri.len() - marker.len()].to_string())
+}
+
+fn prepare_safe_export_completion(
+    assignment: &DurableSafeExportAssignment<'_>,
+    report_json: &str,
+    evidence: &DurableSafeExportPartEvidence<'_>,
+) -> Result<PreparedSafeExportCompletion, String> {
+    let report = genohype_core::release::ExportPartReport::from_json(report_json.as_bytes())
+        .map_err(|error| format!("invalid safe-export worker report: {error}"))?;
+    let canonical_report = serde_json::to_string(&report)
+        .map_err(|error| format!("failed to canonicalize safe-export worker report: {error}"))?;
+    if canonical_report != report_json {
+        return Err("safe-export worker report is not canonical compact JSON".to_string());
+    }
+
+    let envelope: genohype_core::release::SafeExportPartReceipt =
+        serde_json::from_str(evidence.receipt_json)
+            .map_err(|error| format!("invalid safe-export receipt envelope: {error}"))?;
+    let canonical_receipt = serde_json::to_string(&envelope)
+        .map_err(|error| format!("failed to canonicalize safe-export receipt: {error}"))?;
+    if canonical_receipt != evidence.receipt_json {
+        return Err("safe-export receipt envelope is not canonical compact JSON".to_string());
+    }
+
+    let partition_id = i64::try_from(assignment.partition_id)
+        .map_err(|_| "partition ID exceeds SQLite INTEGER".to_string())?;
+    let assignment_attempt = i64::try_from(assignment.assignment_attempt)
+        .map_err(|_| "assignment attempt exceeds SQLite INTEGER".to_string())?;
+    let lease_hash = genohype_core::io::lease_identity_sha256(assignment.lease_token)
+        .map_err(|error| format!("invalid safe-export lease: {error}"))?;
+    let part = &envelope.part;
+    let output_sha256 = part
+        .output_object
+        .sha256
+        .as_deref()
+        .ok_or_else(|| "safe-export output identity has no SHA-256".to_string())?;
+
+    if envelope.schema_version != genohype_core::release::SAFE_EXPORT_RECEIPT_SCHEMA_VERSION
+        || envelope.export_id != assignment.export_id
+        || envelope.task_id != assignment.task_id
+        || envelope.partition_index != assignment.partition_id
+        || !is_sha256(&envelope.source_manifest_sha256)
+        || envelope.source_manifest_sha256 != report.source_manifest_sha256
+    {
+        return Err(
+            "safe-export receipt envelope does not match the publishing assignment/report"
+                .to_string(),
+        );
+    }
+    if report.export_id != assignment.export_id
+        || report.task_id != assignment.task_id
+        || report.partition_index != assignment.partition_id
+        || report.assignment_attempt != assignment.assignment_attempt
+        || report.lease_identity_sha256 != lease_hash
+        || report.worker_id != assignment.worker_id
+        || report.worker_git_commit != assignment.worker_git_commit
+        || report.worker_binary_sha256 != assignment.worker_binary_sha256
+    {
+        return Err(
+            "safe-export worker report does not match the publishing assignment".to_string(),
+        );
+    }
+    if part.part_id != assignment.task_id
+        || part.source_partition_indices.as_slice() != [assignment.partition_id]
+        || part.assignment_attempt != assignment.assignment_attempt
+        || part.lease_identity_sha256 != lease_hash
+        || part.worker_id != assignment.worker_id
+        || part.worker_git_commit != assignment.worker_git_commit
+        || part.worker_binary_sha256 != assignment.worker_binary_sha256
+        || part.status != genohype_core::release::PartStatus::Complete
+        || part.error.is_some()
+    {
+        return Err("safe-export part receipt does not match the accepted attempt".to_string());
+    }
+    if part.byte_size != report.byte_size
+        || part.byte_size != part.output_object.size
+        || part.sha256 != output_sha256
+        || report.staging_object.sha256.as_deref() != Some(output_sha256)
+        || part.row_count != report.row_count
+        || part.row_group_count != report.row_group_count
+        || part.schema_fingerprint_sha256 != report.schema_fingerprint_sha256
+        || part.decoded_rows_sha256 != report.decoded_rows_sha256
+        || part.first_key != report.first_key
+        || part.last_key != report.last_key
+        || part.started_at != report.started_at
+        || part.completed_at != report.completed_at
+        || part.output_uri != part.output_object.uri
+        || !is_sha256(&part.sha256)
+    {
+        return Err(
+            "safe-export part receipt does not exactly derive from the worker report/output"
+                .to_string(),
+        );
+    }
+
+    if evidence.receipt_version.is_empty() || evidence.receipt_etag.is_empty() {
+        return Err("safe-export receipt object identity is incomplete".to_string());
+    }
+    let receipt_marker = format!(
+        "/_genohype/exports/{}/receipts/part-{:020}.json",
+        assignment.export_id, assignment.partition_id
+    );
+    let output_marker = format!(
+        "/_genohype/objects/sha256/{}/{}.parquet",
+        &part.sha256[..2],
+        part.sha256
+    );
+    let receipt_root = canonical_gcs_root(evidence.receipt_uri, &receipt_marker)
+        .ok_or_else(|| "safe-export receipt URI is not the exact canonical path".to_string())?;
+    let output_root = canonical_gcs_root(&part.output_uri, &output_marker).ok_or_else(|| {
+        "safe-export output URI is not the exact content-addressed path".to_string()
+    })?;
+    if receipt_root != output_root {
+        return Err("safe-export receipt and output use different output roots".to_string());
+    }
+
+    Ok(PreparedSafeExportCompletion {
+        report_sha256: sha256_hex(
+            b"genohype/safe-export-worker-report/v1",
+            report_json.as_bytes(),
+        ),
+        receipt_sha256: raw_sha256_hex(evidence.receipt_json.as_bytes()),
+        receipt_size: i64::try_from(evidence.receipt_json.len())
+            .map_err(|_| "receipt size exceeds SQLite INTEGER".to_string())?,
+        partition_id,
+        assignment_attempt,
+        output_size: i64::try_from(part.output_object.size)
+            .map_err(|_| "output size exceeds SQLite INTEGER".to_string())?,
+        row_count: i64::try_from(part.row_count)
+            .map_err(|_| "row count exceeds SQLite INTEGER".to_string())?,
+        row_group_count: i64::try_from(part.row_group_count)
+            .map_err(|_| "row-group count exceeds SQLite INTEGER".to_string())?,
+        output_uri: part.output_object.uri.clone(),
+        output_version: part.output_object.version.clone(),
+        output_etag: part.output_object.etag.clone(),
+        output_sha256: part.sha256.clone(),
+        schema_fingerprint_sha256: part.schema_fingerprint_sha256.clone(),
+        decoded_rows_sha256: part.decoded_rows_sha256.clone(),
+    })
 }
 
 fn has_exact_completion_shape(request: &CompleteRequest) -> bool {
@@ -1089,6 +1289,376 @@ impl MetricsDb {
         }
         tx.commit().map_err(|error| error.to_string())?;
         Ok(SafePublicationClaimOutcome::Claimed)
+    }
+
+    /// Recognize an exact accepted completion retransmission before any object
+    /// store call. This is the response-loss path after the fence was consumed.
+    pub(crate) fn is_identical_safe_export_completion(
+        &self,
+        job_id: &str,
+        coordinator_session_id: &str,
+        request: &CompleteRequest,
+    ) -> Result<bool, String> {
+        if request.session_id.as_deref() != Some(coordinator_session_id)
+            || request.tasks.len() != 1
+            || request.assignments.len() != 1
+        {
+            return Ok(false);
+        }
+        let assignment = &request.assignments[0];
+        if request.tasks[0] != assignment.task_id {
+            return Ok(false);
+        }
+        let lease_hash = genohype_core::io::lease_identity_sha256(&assignment.lease_token)
+            .map_err(|error| format!("invalid safe-export lease: {error}"))?;
+        let attempt = i64::try_from(assignment.assignment_attempt)
+            .map_err(|_| "assignment attempt exceeds SQLite INTEGER".to_string())?;
+
+        if let Some(error) = request.error.as_deref() {
+            if request.result_json.is_some() || request.items_processed != 0 {
+                return Ok(false);
+            }
+            let conn = self.conn.lock().unwrap();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM safe_export_attempt_receipts
+                     WHERE job_id = ?1 AND coordinator_session_id = ?2 AND task_id = ?3
+                       AND assignment_attempt = ?4 AND lease_identity_sha256 = ?5
+                       AND worker_id = ?6 AND terminal_status = 'failed'
+                       AND report_json IS NULL AND report_sha256 IS NULL AND error = ?7",
+                    params![
+                        job_id,
+                        coordinator_session_id,
+                        assignment.task_id,
+                        attempt,
+                        lease_hash,
+                        request.worker_id,
+                        error,
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(|failure| failure.to_string())?;
+            return Ok(count == 1);
+        }
+
+        let Some(value) = request.result_json.as_ref() else {
+            return Ok(false);
+        };
+        let report = genohype_core::release::ExportPartReport::from_json(
+            &serde_json::to_vec(value)
+                .map_err(|error| format!("failed to encode safe-export report: {error}"))?,
+        )
+        .map_err(|error| format!("invalid safe-export report: {error}"))?;
+        let report_json = serde_json::to_string(&report)
+            .map_err(|error| format!("failed to canonicalize safe-export report: {error}"))?;
+        if request.tasks[0] != report.task_id
+            || request.worker_id != report.worker_id
+            || usize::try_from(report.row_count).ok() != Some(request.items_processed)
+            || assignment.assignment_attempt != report.assignment_attempt
+        {
+            return Ok(false);
+        }
+        if lease_hash != report.lease_identity_sha256 {
+            return Ok(false);
+        }
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM safe_export_attempt_receipts
+                 WHERE job_id = ?1 AND coordinator_session_id = ?2 AND task_id = ?3
+                   AND assignment_attempt = ?4 AND lease_identity_sha256 = ?5
+                   AND worker_id = ?6 AND terminal_status = 'accepted'
+                   AND report_json = ?7 AND error IS NULL",
+                params![
+                    job_id,
+                    coordinator_session_id,
+                    assignment.task_id,
+                    attempt,
+                    lease_hash,
+                    request.worker_id,
+                    report_json,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(count == 1)
+    }
+
+    /// Atomically commit authoritative safe-export evidence. The first call
+    /// exact-matches and consumes the publishing fence; an exact redelivery
+    /// matches only immutable rows and converges without changing counters.
+    pub(crate) fn commit_safe_export_completion(
+        &self,
+        job_id: &str,
+        coordinator_session_id: &str,
+        assignment: &DurableSafeExportAssignment<'_>,
+        report_json: &str,
+        evidence: &DurableSafeExportPartEvidence<'_>,
+        accepted_at_ms: u64,
+    ) -> Result<SafeExportCompletionOutcome, String> {
+        let prepared = prepare_safe_export_completion(assignment, report_json, evidence)?;
+        let accepted_at = i64::try_from(accepted_at_ms)
+            .map_err(|_| "acceptance timestamp exceeds SQLite INTEGER".to_string())?;
+        let lease_hash = genohype_core::io::lease_identity_sha256(assignment.lease_token)
+            .map_err(|error| format!("invalid safe-export lease: {error}"))?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+
+        let authority: Option<(String, String)> = tx
+            .query_row(
+                "SELECT jobs.status, safe_export_runs.phase
+                 FROM jobs JOIN safe_export_runs USING (job_id)
+                 WHERE jobs.job_id = ?1 AND safe_export_runs.export_id = ?2",
+                params![job_id, assignment.export_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if authority
+            .as_ref()
+            .map(|(job, run)| (job.as_str(), run.as_str()))
+            != Some(("running", "running"))
+        {
+            return Err("safe-export run is not durably running".to_string());
+        }
+
+        let current_count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM current_safe_export_assignments
+                 WHERE job_id = ?1 AND task_id = ?2",
+                params![job_id, assignment.task_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let exact_current: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM current_safe_export_assignments
+                 WHERE job_id = ?1 AND export_id = ?2 AND coordinator_session_id = ?3
+                   AND task_id = ?4 AND partition_id = ?5 AND assignment_attempt = ?6
+                   AND lease_identity_sha256 = ?7 AND worker_id = ?8
+                   AND worker_git_commit = ?9 AND worker_build_identity = ?10
+                   AND worker_binary_sha256 = ?11 AND state = 'publishing'
+                   AND report_json = ?12 AND report_sha256 = ?13",
+                params![
+                    job_id,
+                    assignment.export_id,
+                    coordinator_session_id,
+                    assignment.task_id,
+                    prepared.partition_id,
+                    prepared.assignment_attempt,
+                    lease_hash,
+                    assignment.worker_id,
+                    assignment.worker_git_commit,
+                    assignment.worker_build_identity,
+                    assignment.worker_binary_sha256,
+                    report_json,
+                    prepared.report_sha256,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+
+        let exact_attempt = || -> Result<i64, String> {
+            tx.query_row(
+                "SELECT COUNT(*) FROM safe_export_attempt_receipts
+                 WHERE job_id = ?1 AND export_id = ?2 AND coordinator_session_id = ?3
+                   AND task_id = ?4 AND partition_id = ?5 AND assignment_attempt = ?6
+                   AND lease_identity_sha256 = ?7 AND worker_id = ?8
+                   AND worker_git_commit = ?9 AND worker_build_identity = ?10
+                   AND worker_binary_sha256 = ?11 AND terminal_status = 'accepted'
+                   AND report_json = ?12 AND report_sha256 = ?13 AND error IS NULL",
+                params![
+                    job_id,
+                    assignment.export_id,
+                    coordinator_session_id,
+                    assignment.task_id,
+                    prepared.partition_id,
+                    prepared.assignment_attempt,
+                    lease_hash,
+                    assignment.worker_id,
+                    assignment.worker_git_commit,
+                    assignment.worker_build_identity,
+                    assignment.worker_binary_sha256,
+                    report_json,
+                    prepared.report_sha256,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())
+        };
+        let exact_part = || -> Result<i64, String> {
+            tx.query_row(
+                "SELECT COUNT(*) FROM safe_export_part_receipts
+                 WHERE export_id = ?1 AND partition_id = ?2 AND task_id = ?3
+                   AND receipt_json = ?4 AND receipt_sha256 = ?5
+                   AND receipt_uri = ?6 AND receipt_version = ?7 AND receipt_etag = ?8
+                   AND receipt_size = ?9 AND receipt_object_sha256 = ?5
+                   AND output_uri = ?10 AND output_version = ?11 AND output_etag = ?12
+                   AND output_size = ?13 AND output_sha256 = ?14
+                   AND row_count = ?15 AND row_group_count = ?16
+                   AND schema_fingerprint_sha256 = ?17 AND decoded_rows_sha256 = ?18",
+                params![
+                    assignment.export_id,
+                    prepared.partition_id,
+                    assignment.task_id,
+                    evidence.receipt_json,
+                    prepared.receipt_sha256,
+                    evidence.receipt_uri,
+                    evidence.receipt_version,
+                    evidence.receipt_etag,
+                    prepared.receipt_size,
+                    prepared.output_uri,
+                    prepared.output_version,
+                    prepared.output_etag,
+                    prepared.output_size,
+                    prepared.output_sha256,
+                    prepared.row_count,
+                    prepared.row_group_count,
+                    prepared.schema_fingerprint_sha256,
+                    prepared.decoded_rows_sha256,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())
+        };
+
+        if exact_current != 1 {
+            if current_count == 0 && exact_attempt()? == 1 && exact_part()? == 1 {
+                tx.commit().map_err(|error| error.to_string())?;
+                return Ok(SafeExportCompletionOutcome::Duplicate);
+            }
+            return Err("no exact publishing safe-export fence/report to commit".to_string());
+        }
+
+        let any_part: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM safe_export_part_receipts
+                 WHERE (export_id = ?1 AND partition_id = ?2)
+                    OR (export_id = ?1 AND task_id = ?3)",
+                params![
+                    assignment.export_id,
+                    prepared.partition_id,
+                    assignment.task_id
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let matching_part = exact_part()?;
+        if any_part != matching_part || matching_part > 1 {
+            return Err("conflicting immutable safe-export part evidence".to_string());
+        }
+        if matching_part == 0 {
+            tx.execute(
+                "INSERT INTO safe_export_part_receipts (
+                     export_id, partition_id, task_id, first_job_id, first_assignment_attempt,
+                     receipt_json, receipt_sha256, receipt_uri, receipt_version, receipt_etag,
+                     receipt_size, receipt_object_sha256, output_uri, output_version, output_etag,
+                     output_size, output_sha256, row_count, row_group_count,
+                     schema_fingerprint_sha256, decoded_rows_sha256, accepted_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?7,
+                           ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                params![
+                    assignment.export_id,
+                    prepared.partition_id,
+                    assignment.task_id,
+                    job_id,
+                    prepared.assignment_attempt,
+                    evidence.receipt_json,
+                    prepared.receipt_sha256,
+                    evidence.receipt_uri,
+                    evidence.receipt_version,
+                    evidence.receipt_etag,
+                    prepared.receipt_size,
+                    prepared.output_uri,
+                    prepared.output_version,
+                    prepared.output_etag,
+                    prepared.output_size,
+                    prepared.output_sha256,
+                    prepared.row_count,
+                    prepared.row_group_count,
+                    prepared.schema_fingerprint_sha256,
+                    prepared.decoded_rows_sha256,
+                    accepted_at,
+                ],
+            )
+            .map_err(|error| format!("failed to insert safe-export part receipt: {error}"))?;
+        }
+
+        let inserted_attempt = tx
+            .execute(
+                "INSERT INTO safe_export_attempt_receipts (
+                     job_id, export_id, coordinator_session_id, task_id, partition_id,
+                     assignment_attempt, lease_identity_sha256, worker_id,
+                     worker_git_commit, worker_build_identity, worker_binary_sha256,
+                     terminal_status, report_json, report_sha256, error, accepted_at_ms
+                 )
+                 SELECT job_id, export_id, coordinator_session_id, task_id, partition_id,
+                        assignment_attempt, lease_identity_sha256, worker_id,
+                        worker_git_commit, worker_build_identity, worker_binary_sha256,
+                        'accepted', report_json, report_sha256, NULL, ?14
+                 FROM current_safe_export_assignments
+                 WHERE job_id = ?1 AND export_id = ?2 AND coordinator_session_id = ?3
+                   AND task_id = ?4 AND partition_id = ?5 AND assignment_attempt = ?6
+                   AND lease_identity_sha256 = ?7 AND worker_id = ?8
+                   AND worker_git_commit = ?9 AND worker_build_identity = ?10
+                   AND worker_binary_sha256 = ?11 AND state = 'publishing'
+                   AND report_json = ?12 AND report_sha256 = ?13",
+                params![
+                    job_id,
+                    assignment.export_id,
+                    coordinator_session_id,
+                    assignment.task_id,
+                    prepared.partition_id,
+                    prepared.assignment_attempt,
+                    lease_hash,
+                    assignment.worker_id,
+                    assignment.worker_git_commit,
+                    assignment.worker_build_identity,
+                    assignment.worker_binary_sha256,
+                    report_json,
+                    prepared.report_sha256,
+                    accepted_at,
+                ],
+            )
+            .map_err(|error| format!("failed to append accepted safe-export attempt: {error}"))?;
+        if inserted_attempt != 1 {
+            return Err("safe-export publishing fence changed during evidence commit".to_string());
+        }
+
+        let removed = tx
+            .execute(
+                "DELETE FROM current_safe_export_assignments
+                 WHERE job_id = ?1 AND task_id = ?2 AND state = 'publishing'
+                   AND assignment_attempt = ?3 AND lease_identity_sha256 = ?4
+                   AND report_json = ?5 AND report_sha256 = ?6",
+                params![
+                    job_id,
+                    assignment.task_id,
+                    prepared.assignment_attempt,
+                    lease_hash,
+                    report_json,
+                    prepared.report_sha256,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if removed != 1 {
+            return Err("safe-export publishing fence changed while consuming it".to_string());
+        }
+        let updated_run = tx
+            .execute(
+                "UPDATE safe_export_runs
+                 SET completed_part_count = completed_part_count + 1
+                 WHERE job_id = ?1 AND export_id = ?2 AND phase = 'running'
+                   AND completed_part_count < expected_part_count",
+                params![job_id, assignment.export_id],
+            )
+            .map_err(|error| error.to_string())?;
+        if updated_run != 1 {
+            return Err("safe-export run cannot accept another completed part".to_string());
+        }
+
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(SafeExportCompletionOutcome::Stored)
     }
 
     /// Clear one assigned safe-export fence during timeout/preemption. A
@@ -2168,6 +2738,111 @@ mod tests {
             .unwrap();
     }
 
+    fn safe_completion_evidence(
+        assignment: &DurableSafeExportAssignment<'_>,
+    ) -> (String, String, String) {
+        use genohype_core::io::SourceObject;
+        use genohype_core::release::{ExportPartReport, PartReceipt, PartStatus};
+
+        let source_sha = "c".repeat(64);
+        let output_sha = "d".repeat(64);
+        let lease_hash = genohype_core::io::lease_identity_sha256(assignment.lease_token).unwrap();
+        let source = SourceObject {
+            uri: "gs://bucket/input.ht/rows/parts/part-0".into(),
+            version: "11".into(),
+            etag: "source-etag".into(),
+            size: 12,
+            crc32c: Some("Nks/tw==".into()),
+            sha256: Some(source_sha),
+        };
+        let staging = SourceObject {
+            uri: format!(
+                "gs://bucket/output/_genohype/staging/{}/part-00000000/attempt-00000000000000000001/lease-{lease_hash}/upload-00000000-0000-4000-8000-000000000000/part.parquet",
+                assignment.export_id
+            ),
+            version: "12".into(),
+            etag: "staging-etag".into(),
+            size: 10,
+            crc32c: None,
+            sha256: Some(output_sha.clone()),
+        };
+        let output = SourceObject {
+            uri: format!(
+                "gs://bucket/output/_genohype/objects/sha256/{}/{}.parquet",
+                &output_sha[..2],
+                output_sha
+            ),
+            version: "13".into(),
+            etag: "output-etag".into(),
+            size: 10,
+            crc32c: None,
+            sha256: Some(output_sha.clone()),
+        };
+        let report = ExportPartReport {
+            schema_version: genohype_core::release::SAFE_EXPORT_SCHEMA_VERSION,
+            export_id: assignment.export_id.into(),
+            task_id: assignment.task_id.into(),
+            partition_index: assignment.partition_id,
+            source_manifest_sha256: "e".repeat(64),
+            source_part_file: "part-0".into(),
+            source_object: source,
+            schema_fingerprint_sha256: "f".repeat(64),
+            staging_object: staging,
+            byte_size: 10,
+            row_count: 7,
+            row_group_count: 1,
+            decoded_rows_sha256: "a".repeat(64),
+            first_key: None,
+            last_key: None,
+            worker_id: assignment.worker_id.into(),
+            worker_git_commit: assignment.worker_git_commit.into(),
+            worker_binary_sha256: assignment.worker_binary_sha256.into(),
+            assignment_attempt: assignment.assignment_attempt,
+            lease_identity_sha256: lease_hash.clone(),
+            started_at: "2026-08-12T10:00:00Z".into(),
+            completed_at: "2026-08-12T10:01:00Z".into(),
+        };
+        let part = PartReceipt {
+            part_id: assignment.task_id.into(),
+            output_uri: output.uri.clone(),
+            source_partition_indices: vec![assignment.partition_id],
+            output_object: output,
+            byte_size: report.byte_size,
+            sha256: output_sha,
+            row_count: report.row_count,
+            row_group_count: report.row_group_count,
+            schema_fingerprint_sha256: report.schema_fingerprint_sha256.clone(),
+            decoded_rows_sha256: report.decoded_rows_sha256.clone(),
+            first_key: None,
+            last_key: None,
+            worker_id: assignment.worker_id.into(),
+            worker_git_commit: assignment.worker_git_commit.into(),
+            worker_binary_sha256: assignment.worker_binary_sha256.into(),
+            assignment_attempt: assignment.assignment_attempt,
+            lease_identity_sha256: lease_hash,
+            started_at: report.started_at.clone(),
+            completed_at: report.completed_at.clone(),
+            status: PartStatus::Complete,
+            error: None,
+        };
+        let envelope = genohype_core::release::SafeExportPartReceipt {
+            schema_version: genohype_core::release::SAFE_EXPORT_RECEIPT_SCHEMA_VERSION,
+            export_id: assignment.export_id.into(),
+            source_manifest_sha256: report.source_manifest_sha256.clone(),
+            task_id: assignment.task_id.into(),
+            partition_index: assignment.partition_id,
+            part,
+        };
+        (
+            serde_json::to_string(&report).unwrap(),
+            serde_json::to_string(&envelope).unwrap(),
+            format!(
+                "gs://bucket/output/_genohype/exports/{}/receipts/part-{:020}.json",
+                assignment.export_id, assignment.partition_id
+            ),
+        )
+    }
+
     #[test]
     fn safe_export_assignment_is_parallel_hashed_and_persisted_before_dispatch() {
         let db = MetricsDb::in_memory().unwrap();
@@ -2335,6 +3010,22 @@ mod tests {
             .unwrap();
         db.fail_safe_export_assignment("safe-job", "session-1", &assignment, "worker failure", 3)
             .unwrap();
+        let mut retransmission = completion(
+            assignment.worker_id,
+            assignment.task_id,
+            assignment.assignment_attempt,
+            assignment.lease_token,
+        );
+        retransmission.result_json = None;
+        retransmission.items_processed = 0;
+        retransmission.error = Some("worker failure".to_string());
+        assert!(db
+            .is_identical_safe_export_completion("safe-job", "session-1", &retransmission)
+            .unwrap());
+        retransmission.error = Some("different failure".to_string());
+        assert!(!db
+            .is_identical_safe_export_completion("safe-job", "session-1", &retransmission)
+            .unwrap());
         let conn = db.conn.lock().unwrap();
         let current: i64 = conn
             .query_row(
@@ -2407,6 +3098,212 @@ mod tests {
                 4,
             )
             .is_err());
+    }
+
+    #[test]
+    fn safe_export_completion_atomically_commits_and_exact_duplicate_converges() {
+        let db = MetricsDb::in_memory().unwrap();
+        let export_id = "a".repeat(64);
+        let binary = "b".repeat(64);
+        let assignment = DurableSafeExportAssignment {
+            export_id: &export_id,
+            task_id: "part-00000000",
+            partition_id: 0,
+            assignment_attempt: 1,
+            lease_token: "raw-lease",
+            worker_id: "worker-1",
+            worker_git_commit: "commit-1",
+            worker_build_identity: "build-1",
+            worker_binary_sha256: &binary,
+        };
+        insert_safe_run(&db, "safe-job", &export_id, 1);
+        db.persist_safe_export_assignment("safe-job", "session-1", &assignment, 2)
+            .unwrap();
+        let (report, receipt, receipt_uri) = safe_completion_evidence(&assignment);
+        db.begin_safe_export_publication("safe-job", "session-1", &assignment, &report, 3)
+            .unwrap();
+        let evidence = DurableSafeExportPartEvidence {
+            receipt_json: &receipt,
+            receipt_uri: &receipt_uri,
+            receipt_version: "14",
+            receipt_etag: "receipt-etag",
+        };
+        assert_eq!(
+            db.commit_safe_export_completion(
+                "safe-job",
+                "session-1",
+                &assignment,
+                &report,
+                &evidence,
+                4,
+            )
+            .unwrap(),
+            SafeExportCompletionOutcome::Stored
+        );
+        assert_eq!(
+            db.commit_safe_export_completion(
+                "safe-job",
+                "session-1",
+                &assignment,
+                &report,
+                &evidence,
+                99,
+            )
+            .unwrap(),
+            SafeExportCompletionOutcome::Duplicate
+        );
+
+        let conn = db.conn.lock().unwrap();
+        let counts: (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM current_safe_export_assignments),
+                        (SELECT COUNT(*) FROM safe_export_attempt_receipts),
+                        (SELECT COUNT(*) FROM safe_export_part_receipts),
+                        completed_part_count FROM safe_export_runs WHERE job_id='safe-job'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (0, 1, 1, 1));
+        drop(conn);
+
+        let mut retransmission = completion(
+            assignment.worker_id,
+            assignment.task_id,
+            assignment.assignment_attempt,
+            assignment.lease_token,
+        );
+        retransmission.result_json = Some(serde_json::from_str(&report).unwrap());
+        assert!(db
+            .is_identical_safe_export_completion("safe-job", "session-1", &retransmission)
+            .unwrap());
+        retransmission.assignments[0].lease_token = "wrong-lease".to_string();
+        assert!(!db
+            .is_identical_safe_export_completion("safe-job", "session-1", &retransmission)
+            .unwrap());
+
+        let conflicting = DurableSafeExportPartEvidence {
+            receipt_etag: "changed-etag",
+            ..evidence
+        };
+        assert!(db
+            .commit_safe_export_completion(
+                "safe-job",
+                "session-1",
+                &assignment,
+                &report,
+                &conflicting,
+                100,
+            )
+            .is_err());
+        let conn = db.conn.lock().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT completed_part_count FROM safe_export_runs WHERE job_id='safe-job'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn safe_export_completion_conflict_rolls_back_publishing_fence() {
+        let db = MetricsDb::in_memory().unwrap();
+        let export_id = "a".repeat(64);
+        let binary = "b".repeat(64);
+        let assignment = DurableSafeExportAssignment {
+            export_id: &export_id,
+            task_id: "part-00000000",
+            partition_id: 0,
+            assignment_attempt: 1,
+            lease_token: "raw-lease",
+            worker_id: "worker-1",
+            worker_git_commit: "commit-1",
+            worker_build_identity: "build-1",
+            worker_binary_sha256: &binary,
+        };
+        insert_safe_run(&db, "safe-job", &export_id, 1);
+        db.persist_safe_export_assignment("safe-job", "session-1", &assignment, 2)
+            .unwrap();
+        let (report, receipt, receipt_uri) = safe_completion_evidence(&assignment);
+        db.begin_safe_export_publication("safe-job", "session-1", &assignment, &report, 3)
+            .unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+        value["unexpected"] = serde_json::json!(true);
+        let non_strict = serde_json::to_string(&value).unwrap();
+        assert!(db
+            .commit_safe_export_completion(
+                "safe-job",
+                "session-1",
+                &assignment,
+                &report,
+                &DurableSafeExportPartEvidence {
+                    receipt_json: &non_strict,
+                    receipt_uri: &receipt_uri,
+                    receipt_version: "14",
+                    receipt_etag: "receipt-etag",
+                },
+                4,
+            )
+            .is_err());
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO safe_export_part_receipts VALUES (
+                     ?1,0,'part-00000000','other-job',1,'{}','digest',
+                     'gs://bucket/other-receipt','1','etag',2,'receipt-digest',
+                     'gs://bucket/other-output','2','etag2',3,'output-digest',
+                     4,1,'schema','rows',5)",
+                [&export_id],
+            )
+            .unwrap();
+        }
+        let evidence = DurableSafeExportPartEvidence {
+            receipt_json: &receipt,
+            receipt_uri: &receipt_uri,
+            receipt_version: "14",
+            receipt_etag: "receipt-etag",
+        };
+        assert!(db
+            .commit_safe_export_completion(
+                "safe-job",
+                "session-1",
+                &assignment,
+                &report,
+                &evidence,
+                4,
+            )
+            .is_err());
+
+        let conn = db.conn.lock().unwrap();
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM current_safe_export_assignments",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "publishing");
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM safe_export_attempt_receipts",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT completed_part_count FROM safe_export_runs",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
     }
 
     #[test]

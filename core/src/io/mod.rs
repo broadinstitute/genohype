@@ -50,7 +50,8 @@ pub use inventory::{
 pub use manifest::{SourceManifest, SourceObject, SourceSnapshot, SOURCE_MANIFEST_SCHEMA_VERSION};
 pub use publication::{
     build_attempt_staging_location, content_addressed_path, lease_identity_sha256,
-    publish_content_addressed, AttemptStagingLocation, PublicationDisposition, PublishedObject,
+    publish_content_addressed, put_immutable, AttemptStagingLocation, PublicationDisposition,
+    PublishedObject,
 };
 pub use resolver::{
     resolve_object, resolve_url, resolve_url_for_write, ResolvedObject, ResolvedStore,

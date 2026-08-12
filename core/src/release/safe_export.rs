@@ -4,8 +4,8 @@
 //! durable completion authority remain coordinator concerns.
 
 use super::{
-    ComponentDescriptor, GlobalsPayload, ParquetDescriptor, PhysicalTypeDescriptor,
-    SourcePartition, TableDescriptor, ToolIdentity,
+    ComponentDescriptor, GlobalsPayload, ParquetDescriptor, PartReceipt, PartStatus,
+    PhysicalTypeDescriptor, SourcePartition, TableDescriptor, ToolIdentity,
 };
 use crate::codec::{canonical_bytes, ETypeParser, EncodedValue};
 use crate::io::{join_path, SourceManifest, SourceObject};
@@ -65,6 +65,23 @@ pub struct SafeExportPartTask {
     pub source_object: SourceObject,
     pub output_part_id: String,
     pub schema_fingerprint_sha256: String,
+}
+
+/// Export-bound immutable publication evidence for one canonical partition.
+///
+/// The envelope identity prevents a valid-looking [`PartReceipt`] from being
+/// copied between exports, manifests, or tasks. The nested receipt remains the
+/// release-sidecar representation so finalization does not need a lossy
+/// conversion.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SafeExportPartReceipt {
+    pub schema_version: u32,
+    pub export_id: String,
+    pub source_manifest_sha256: String,
+    pub task_id: String,
+    pub partition_index: usize,
+    pub part: PartReceipt,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -270,6 +287,17 @@ impl SafeExportSpec {
             .collect()
     }
 
+    /// Exact receipt URI for a partition, derived without listing storage.
+    pub fn part_receipt_uri(&self, partition_index: usize) -> Result<String> {
+        self.validate()?;
+        if partition_index >= self.table.partitions.len() {
+            return Err(invalid(format!(
+                "safe-export receipt partition {partition_index} is out of bounds"
+            )));
+        }
+        safe_export_part_receipt_uri(&self.output_root_uri, &self.export_id, partition_index)
+    }
+
     fn validate_intent(&self) -> Result<()> {
         require_version("safe-export spec", self.schema_version)?;
         if self.receipt_schema_version != SAFE_EXPORT_RECEIPT_SCHEMA_VERSION
@@ -389,6 +417,108 @@ impl SafeExportPartTask {
     }
 }
 
+impl SafeExportPartReceipt {
+    /// Construct the only valid receipt for an accepted report and its
+    /// conditioned, content-addressed publication identity.
+    pub fn from_publication(
+        spec: &SafeExportSpec,
+        task: &SafeExportPartTask,
+        report: &ExportPartReport,
+        output_object: SourceObject,
+    ) -> Result<Self> {
+        let part = part_from_publication(spec, task, report, &output_object)?;
+        let receipt = Self {
+            schema_version: SAFE_EXPORT_RECEIPT_SCHEMA_VERSION,
+            export_id: spec.export_id.clone(),
+            source_manifest_sha256: spec.source_manifest_sha256.clone(),
+            task_id: task.task_id.clone(),
+            partition_index: task.partition_index,
+            part,
+        };
+        receipt.validate_against_publication(spec, task, report, &output_object)?;
+        Ok(receipt)
+    }
+
+    /// Strictly decode receipt bytes and validate them without requiring the
+    /// original attempt report. This is the registration/finalization import
+    /// path; the published object identity must come from a conditioned read.
+    pub fn from_json(
+        data: &[u8],
+        spec: &SafeExportSpec,
+        task: &SafeExportPartTask,
+        output_object: &SourceObject,
+    ) -> Result<Self> {
+        let receipt: Self = serde_json::from_slice(data)
+            .map_err(|error| invalid(format!("invalid safe-export receipt JSON: {error}")))?;
+        receipt.validate_against(spec, task, output_object)?;
+        Ok(receipt)
+    }
+
+    /// Validate the export envelope, one-partition coverage, release fields,
+    /// and exact immutable output identity.
+    pub fn validate_against(
+        &self,
+        spec: &SafeExportSpec,
+        task: &SafeExportPartTask,
+        output_object: &SourceObject,
+    ) -> Result<()> {
+        spec.validate()?;
+        task.validate_against(spec)?;
+        if self.schema_version != SAFE_EXPORT_RECEIPT_SCHEMA_VERSION
+            || self.schema_version != spec.receipt_schema_version
+        {
+            return Err(invalid(format!(
+                "unsupported safe-export part receipt schema version {}",
+                self.schema_version
+            )));
+        }
+        if self.export_id != spec.export_id
+            || self.export_id != task.export_id
+            || self.source_manifest_sha256 != spec.source_manifest_sha256
+            || self.source_manifest_sha256 != task.source_manifest_sha256
+            || self.task_id != task.task_id
+            || self.partition_index != task.partition_index
+        {
+            return Err(invalid(
+                "safe-export part receipt envelope does not match its immutable task",
+            ));
+        }
+
+        validate_canonical_part_receipt(&self.part, spec, task, output_object)
+    }
+
+    /// Additionally prove that every nested receipt field is the canonical
+    /// projection of the exact accepted worker report.
+    pub fn validate_against_publication(
+        &self,
+        spec: &SafeExportSpec,
+        task: &SafeExportPartTask,
+        report: &ExportPartReport,
+        output_object: &SourceObject,
+    ) -> Result<()> {
+        self.validate_against(spec, task, output_object)?;
+        let expected = part_from_publication(spec, task, report, output_object)?;
+        if self.part != expected {
+            return Err(invalid(
+                "safe-export part receipt does not exactly match its accepted report",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Canonical compact JSON for immutable receipt publication.
+    pub fn canonical_bytes(
+        &self,
+        spec: &SafeExportSpec,
+        task: &SafeExportPartTask,
+        output_object: &SourceObject,
+    ) -> Result<Vec<u8>> {
+        self.validate_against(spec, task, output_object)?;
+        serde_json::to_vec(self)
+            .map_err(|error| invalid(format!("failed to encode safe-export receipt: {error}")))
+    }
+}
+
 impl ExportPartReport {
     pub fn from_json(data: &[u8]) -> Result<Self> {
         let value: Self = serde_json::from_slice(data)
@@ -489,6 +619,129 @@ impl ExportPartReport {
         }
         Ok(())
     }
+}
+
+fn part_from_publication(
+    spec: &SafeExportSpec,
+    task: &SafeExportPartTask,
+    report: &ExportPartReport,
+    output_object: &SourceObject,
+) -> Result<PartReceipt> {
+    report.validate_against(
+        spec,
+        task,
+        &report.worker_id,
+        report.assignment_attempt,
+        &report.lease_identity_sha256,
+    )?;
+    validate_published_output(spec, report, output_object)?;
+    Ok(PartReceipt {
+        part_id: task.output_part_id.clone(),
+        output_uri: output_object.uri.clone(),
+        source_partition_indices: vec![task.partition_index],
+        output_object: output_object.clone(),
+        byte_size: report.byte_size,
+        sha256: output_object
+            .sha256
+            .clone()
+            .expect("published output SHA-256 validated above"),
+        row_count: report.row_count,
+        row_group_count: report.row_group_count,
+        schema_fingerprint_sha256: report.schema_fingerprint_sha256.clone(),
+        decoded_rows_sha256: report.decoded_rows_sha256.clone(),
+        first_key: report.first_key.clone(),
+        last_key: report.last_key.clone(),
+        worker_id: report.worker_id.clone(),
+        worker_git_commit: report.worker_git_commit.clone(),
+        worker_binary_sha256: report.worker_binary_sha256.clone(),
+        assignment_attempt: report.assignment_attempt,
+        lease_identity_sha256: report.lease_identity_sha256.clone(),
+        started_at: report.started_at.clone(),
+        completed_at: report.completed_at.clone(),
+        status: PartStatus::Complete,
+        error: None,
+    })
+}
+
+fn validate_canonical_part_receipt(
+    part: &PartReceipt,
+    spec: &SafeExportSpec,
+    task: &SafeExportPartTask,
+    output_object: &SourceObject,
+) -> Result<()> {
+    validate_source_object("published output object", output_object, false)?;
+    validate_sha256("part SHA-256", &part.sha256)?;
+    validate_sha256("part decoded rows SHA-256", &part.decoded_rows_sha256)?;
+    validate_sha256("part worker binary SHA-256", &part.worker_binary_sha256)?;
+    validate_sha256("part lease identity SHA-256", &part.lease_identity_sha256)?;
+    validate_canonical_timestamp("part start timestamp", &part.started_at)?;
+    validate_canonical_timestamp("part completion timestamp", &part.completed_at)?;
+
+    let expected_output_uri = content_addressed_parquet_uri(&spec.output_root_uri, &part.sha256)?;
+    if part.part_id != task.output_part_id
+        || part.source_partition_indices.as_slice() != [task.partition_index]
+        || part.status != PartStatus::Complete
+        || part.error.is_some()
+        || part.schema_fingerprint_sha256 != task.schema_fingerprint_sha256
+        || part.schema_fingerprint_sha256 != spec.parquet.schema_fingerprint_sha256
+        || part.worker_id.is_empty()
+        || part.worker_git_commit != spec.expected_worker.git_commit
+        || part.worker_binary_sha256 != spec.expected_worker.binary_sha256
+        || part.assignment_attempt == 0
+        || part.output_object != *output_object
+        || part.output_uri != output_object.uri
+        || part.output_uri != expected_output_uri
+        || part.byte_size == 0
+        || part.byte_size != output_object.size
+        || output_object.sha256.as_deref() != Some(part.sha256.as_str())
+        || spec.table.partitions[task.partition_index]
+            .row_count
+            .is_some_and(|expected| expected != part.row_count)
+        || part.completed_at < part.started_at
+    {
+        return Err(invalid(
+            "safe-export part receipt does not match its task, build, or published object",
+        ));
+    }
+    if part.row_count == 0 {
+        if part.row_group_count != 0 || part.first_key.is_some() || part.last_key.is_some() {
+            return Err(invalid(
+                "empty safe-export part receipt has row groups or boundary keys",
+            ));
+        }
+    } else if part.row_group_count == 0
+        || part.first_key.is_some() != part.last_key.is_some()
+        || (!spec.table.key.fields.is_empty()
+            && (part.first_key.is_none() || part.last_key.is_none()))
+    {
+        return Err(invalid(
+            "non-empty safe-export part receipt has inconsistent row groups or boundary keys",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_published_output(
+    spec: &SafeExportSpec,
+    report: &ExportPartReport,
+    output_object: &SourceObject,
+) -> Result<()> {
+    validate_source_object("published output object", output_object, false)?;
+    let sha256 = report
+        .staging_object
+        .sha256
+        .as_deref()
+        .ok_or_else(|| invalid("safe-export report staging object lacks SHA-256"))?;
+    let expected_uri = content_addressed_parquet_uri(&spec.output_root_uri, sha256)?;
+    if output_object.uri != expected_uri
+        || output_object.size != report.byte_size
+        || output_object.sha256.as_deref() != Some(sha256)
+    {
+        return Err(invalid(
+            "published output does not exactly match the report's content identity",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_canonical_timestamp(label: &str, value: &str) -> Result<()> {
@@ -798,6 +1051,28 @@ fn validate_canonical_gcs_uri(label: &str, value: &str, require_path: bool) -> R
     Ok(())
 }
 
+/// Derive the exact receipt URI without listing storage.
+pub fn safe_export_part_receipt_uri(
+    output_root_uri: &str,
+    export_id: &str,
+    partition_index: usize,
+) -> Result<String> {
+    validate_canonical_gcs_uri("output root URI", output_root_uri, false)?;
+    validate_sha256("receipt export ID", export_id)?;
+    Ok(format!(
+        "{output_root_uri}/_genohype/exports/{export_id}/receipts/part-{partition_index:020}.json"
+    ))
+}
+
+fn content_addressed_parquet_uri(output_root_uri: &str, sha256: &str) -> Result<String> {
+    validate_canonical_gcs_uri("output root URI", output_root_uri, false)?;
+    validate_sha256("published output SHA-256", sha256)?;
+    Ok(format!(
+        "{output_root_uri}/_genohype/objects/sha256/{}/{sha256}.parquet",
+        &sha256[..2]
+    ))
+}
+
 fn row_part_uri(table_uri: &str, part_file: &str) -> String {
     join_path(
         &join_path(&join_path(table_uri, "rows"), "parts"),
@@ -1041,6 +1316,19 @@ mod tests {
         }
     }
 
+    fn published_object(spec: &SafeExportSpec, report: &ExportPartReport) -> SourceObject {
+        let sha256 = report.staging_object.sha256.as_deref().unwrap();
+        object(
+            &format!(
+                "{}/_genohype/objects/sha256/{}/{sha256}.parquet",
+                spec.output_root_uri,
+                &sha256[..2]
+            ),
+            report.byte_size,
+            Some(sha256),
+        )
+    }
+
     #[test]
     fn export_identity_is_stable_canonical_and_excludes_manifest_location() {
         let first = spec();
@@ -1137,6 +1425,86 @@ mod tests {
         broken.completed_at = "2026-08-12T11:59:59Z".into();
         assert!(broken
             .validate_against(&spec, &task, "worker-1", 2, &"c".repeat(64))
+            .is_err());
+    }
+
+    #[test]
+    fn safe_export_part_receipt_is_strict_export_bound_and_canonical() {
+        let spec = spec();
+        let task = task(&spec);
+        let report = report(&spec, &task);
+        let output = published_object(&spec, &report);
+        let receipt =
+            SafeExportPartReceipt::from_publication(&spec, &task, &report, output.clone()).unwrap();
+
+        assert_eq!(receipt.schema_version, SAFE_EXPORT_RECEIPT_SCHEMA_VERSION);
+        assert_eq!(receipt.export_id, spec.export_id);
+        assert_eq!(receipt.source_manifest_sha256, spec.source_manifest_sha256);
+        assert_eq!(receipt.task_id, task.task_id);
+        assert_eq!(receipt.partition_index, 0);
+        assert_eq!(receipt.part.source_partition_indices, vec![0]);
+        assert_eq!(receipt.part.output_object, output);
+        assert_eq!(
+            spec.part_receipt_uri(0).unwrap(),
+            format!(
+                "{}/_genohype/exports/{}/receipts/part-00000000000000000000.json",
+                spec.output_root_uri, spec.export_id
+            )
+        );
+
+        let bytes = receipt.canonical_bytes(&spec, &task, &output).unwrap();
+        assert_eq!(
+            SafeExportPartReceipt::from_json(&bytes, &spec, &task, &output).unwrap(),
+            receipt
+        );
+        let mut value: Value = serde_json::from_slice(&bytes).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("unknown".into(), Value::Null);
+        assert!(serde_json::from_value::<SafeExportPartReceipt>(value).is_err());
+    }
+
+    #[test]
+    fn safe_export_part_receipt_rejects_wrong_envelope_build_report_and_output() {
+        let spec = spec();
+        let task = task(&spec);
+        let report = report(&spec, &task);
+        let output = published_object(&spec, &report);
+        let valid =
+            SafeExportPartReceipt::from_publication(&spec, &task, &report, output.clone()).unwrap();
+
+        let mut broken = valid.clone();
+        broken.schema_version += 1;
+        assert!(broken.validate_against(&spec, &task, &output).is_err());
+        let mut broken = valid.clone();
+        broken.export_id = "f".repeat(64);
+        assert!(broken.validate_against(&spec, &task, &output).is_err());
+        let mut broken = valid.clone();
+        broken.source_manifest_sha256 = "f".repeat(64);
+        assert!(broken.validate_against(&spec, &task, &output).is_err());
+        let mut broken = valid.clone();
+        broken.task_id = "part-00000001".into();
+        assert!(broken.validate_against(&spec, &task, &output).is_err());
+        let mut broken = valid.clone();
+        broken.partition_index = 1;
+        assert!(broken.validate_against(&spec, &task, &output).is_err());
+        let mut broken = valid.clone();
+        broken.part.worker_git_commit = "other-build".into();
+        assert!(broken.validate_against(&spec, &task, &output).is_err());
+        let mut broken = valid.clone();
+        broken.part.output_uri = "gs://output/wrong.parquet".into();
+        assert!(broken.validate_against(&spec, &task, &output).is_err());
+
+        let mut changed_report = report.clone();
+        changed_report.row_count += 1;
+        assert!(valid
+            .validate_against_publication(&spec, &task, &changed_report, &output)
+            .is_err());
+        let mut changed_output = output.clone();
+        changed_output.version = "8".into();
+        assert!(valid
+            .validate_against(&spec, &task, &changed_output)
             .is_err());
     }
 

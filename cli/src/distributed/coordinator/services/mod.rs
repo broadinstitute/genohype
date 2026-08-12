@@ -7,6 +7,7 @@ pub mod batch_init;
 pub mod catalog;
 pub mod ingest_init;
 pub mod jobs;
+pub(crate) mod safe_export;
 
 pub use batch_init::{create_aggregate_spec_from_manhattan_spec, enrich_specs, init_batch_state};
 pub use catalog::{load_catalog, load_catalog_from_config, CatalogState};

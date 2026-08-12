@@ -4,7 +4,8 @@
 //! worker health, detect stuck jobs, handle timeouts, and perform backups.
 
 use crate::distributed::coordinator::state::{
-    CoordinatorData, JobExecutionState, SharedState, WorkerStatus, WORKER_SUSPECT_TIMEOUT_SECS,
+    CoordinatorData, JobExecutionState, SafeExportAssignmentState, SharedState, WorkerStatus,
+    WORKER_SUSPECT_TIMEOUT_SECS,
 };
 use crate::distributed::metrics_db::MetricsDb;
 use std::time::{Duration, Instant};
@@ -84,6 +85,18 @@ pub(crate) fn check_stuck_job(state: &SharedState) {
 
     // Only check if job is running
     if data.idle {
+        return;
+    }
+
+    // A publishing safe-export assignment is a durable, non-requeueable
+    // authority claim performing lock-free cloud I/O. Generic liveness logic
+    // must never revoke it mid-publication; explicit cancellation/supersession
+    // or classified terminal conflict handling owns that transition.
+    if data
+        .safe_export_assignments
+        .values()
+        .any(|assignment| assignment.state == SafeExportAssignmentState::Publishing)
+    {
         return;
     }
 

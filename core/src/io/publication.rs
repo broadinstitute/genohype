@@ -9,7 +9,7 @@ use crate::io::writer::StreamingWriteResult;
 use crate::{HailError, Result};
 use futures::StreamExt;
 use object_store::path::Path;
-use object_store::{GetOptions, ObjectMeta, ObjectStore, PutResult};
+use object_store::{GetOptions, ObjectMeta, ObjectStore, PutMode, PutResult};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use url::Url;
@@ -181,6 +181,47 @@ pub fn publish_content_addressed(
                     &staged.sha256,
                 )
                 .await
+            }
+            Err(error) => Err(error.into()),
+        }
+    })
+}
+
+/// Create a small immutable object, accepting an existing object only after a
+/// generation/ETag-conditioned full-byte comparison.
+///
+/// A transport error after a successful create is deliberately returned. An
+/// exact retry converges through the `AlreadyExists` path without overwriting.
+pub fn put_immutable(
+    store: Arc<dyn ObjectStore>,
+    path: &Path,
+    bytes: bytes::Bytes,
+) -> Result<PublishedObject> {
+    let byte_count = u64::try_from(bytes.len())
+        .map_err(|_| HailError::InvalidFormat("Immutable object size exceeds u64".to_string()))?;
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let expected_size = bytes.len();
+    let path = path.clone();
+
+    IO_RUNTIME.block_on(async move {
+        match store
+            .put_opts(&path, bytes.into(), PutMode::Create.into())
+            .await
+        {
+            Ok(created) => {
+                let meta = store.head(&path).await?;
+                validate_size("created immutable", &meta, expected_size)?;
+                validate_put_identity("created immutable", &created, &meta)?;
+                Ok(PublishedObject {
+                    path,
+                    byte_count,
+                    sha256,
+                    put_result: metadata_identity(&meta),
+                    disposition: PublicationDisposition::Created,
+                })
+            }
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                validate_existing(store.as_ref(), path, expected_size, byte_count, &sha256).await
             }
             Err(error) => Err(error.into()),
         }
@@ -408,6 +449,7 @@ mod tests {
     struct TestStore {
         inner: object_store::memory::InMemory,
         copy_mode: AtomicU8,
+        put_mode: AtomicU8,
         mutate_conditioned_get: AtomicBool,
     }
 
@@ -416,8 +458,15 @@ mod tests {
             Self {
                 inner: object_store::memory::InMemory::new(),
                 copy_mode: AtomicU8::new(copy_mode),
+                put_mode: AtomicU8::new(0),
                 mutate_conditioned_get: AtomicBool::new(false),
             }
+        }
+
+        fn with_put_mode(put_mode: u8) -> Self {
+            let store = Self::new(0);
+            store.put_mode.store(put_mode, Ordering::SeqCst);
+            store
         }
     }
 
@@ -435,6 +484,14 @@ mod tests {
             payload: PutPayload,
             options: PutOptions,
         ) -> object_store::Result<PutResult> {
+            if self.put_mode.load(Ordering::SeqCst) == 2 {
+                self.inner.put_opts(location, payload, options).await?;
+                self.put_mode.store(0, Ordering::SeqCst);
+                return Err(object_store::Error::Generic {
+                    store: "publication-test-store",
+                    source: "injected lost put response".into(),
+                });
+            }
             self.inner.put_opts(location, payload, options).await
         }
 
@@ -721,6 +778,49 @@ mod tests {
         let error =
             publish_content_addressed(store, &prefix, &staging, "bin", &identity).unwrap_err();
         assert!(error.to_string().contains("precondition"));
+    }
+
+    #[test]
+    fn immutable_small_object_is_create_only_conditioned_and_exact() {
+        let concrete = Arc::new(TestStore::new(0));
+        let store: Arc<dyn ObjectStore> = concrete.clone();
+        let path = Path::from("receipts/part.json");
+        let bytes = bytes::Bytes::from_static(b"{\"receipt\":1}");
+
+        let created = put_immutable(store.clone(), &path, bytes.clone()).unwrap();
+        assert_eq!(created.disposition, PublicationDisposition::Created);
+        let duplicate = put_immutable(store.clone(), &path, bytes).unwrap();
+        assert_eq!(
+            duplicate.disposition,
+            PublicationDisposition::ExistingIdentical
+        );
+        assert_eq!(duplicate.put_result, created.put_result);
+
+        assert!(put_immutable(
+            store.clone(),
+            &path,
+            bytes::Bytes::from_static(b"{\"receipt\":2}")
+        )
+        .is_err());
+        concrete
+            .mutate_conditioned_get
+            .store(true, Ordering::SeqCst);
+        assert!(
+            put_immutable(store, &path, bytes::Bytes::from_static(b"{\"receipt\":1}")).is_err()
+        );
+    }
+
+    #[test]
+    fn immutable_small_object_recovers_after_lost_create_response() {
+        let store: Arc<dyn ObjectStore> = Arc::new(TestStore::with_put_mode(2));
+        let path = Path::from("receipts/uncertain.json");
+        let bytes = bytes::Bytes::from_static(b"{\"receipt\":1}");
+        assert!(put_immutable(store.clone(), &path, bytes.clone()).is_err());
+        let recovered = put_immutable(store, &path, bytes).unwrap();
+        assert_eq!(
+            recovered.disposition,
+            PublicationDisposition::ExistingIdentical
+        );
     }
 
     #[test]
