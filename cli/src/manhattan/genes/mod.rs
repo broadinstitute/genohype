@@ -875,8 +875,12 @@ impl GeneWriterTrait for CloudGeneWriter {
 
     fn finish(self: Box<Self>) -> Result<usize> {
         let cloud_writer = self.writer.into_inner()?;
-        let rows = cloud_writer.bytes_written(); // Approximate
+        let bytes = usize::try_from(cloud_writer.bytes_written()).map_err(|_| {
+            crate::HailError::InvalidFormat(
+                "cloud gene output byte count exceeds platform usize".to_string(),
+            )
+        })?; // Approximate legacy return value
         cloud_writer.finish()?;
-        Ok(rows)
+        Ok(bytes)
     }
 }

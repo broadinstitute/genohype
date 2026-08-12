@@ -225,8 +225,12 @@ impl QQWriterTrait for CloudQQWriter {
 
     fn finish(self: Box<Self>) -> Result<usize> {
         let cloud_writer = self.writer.into_inner()?;
-        let rows = cloud_writer.bytes_written();
+        let bytes = usize::try_from(cloud_writer.bytes_written()).map_err(|_| {
+            crate::HailError::InvalidFormat(
+                "cloud QQ output byte count exceeds platform usize".to_string(),
+            )
+        })?; // Approximate legacy return value
         cloud_writer.finish()?;
-        Ok(rows)
+        Ok(bytes)
     }
 }
