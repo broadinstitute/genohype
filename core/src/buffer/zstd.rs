@@ -15,12 +15,24 @@ use crate::error::{HailError, Result};
 /// has the format: `[4-byte decompressed_len][zstd_compressed_data]`
 pub struct ZstdBuffer<B: InputBlockBuffer> {
     inner: B,
+    max_block_size: usize,
 }
 
 impl<B: InputBlockBuffer> ZstdBuffer<B> {
-    /// Create a new Zstd buffer
+    /// Create a new Zstd buffer without a metadata block-size limit.
     pub fn new(inner: B) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            max_block_size: usize::MAX,
+        }
+    }
+
+    /// Create a Zstd buffer that validates Hail's recorded `blockSize`.
+    pub fn with_max_block_size(inner: B, max_block_size: usize) -> Self {
+        Self {
+            inner,
+            max_block_size,
+        }
     }
 }
 
@@ -41,12 +53,18 @@ impl<B: InputBlockBuffer> InputBlockBuffer for ZstdBuffer<B> {
         }
 
         // Parse the first 4 bytes as the expected decompressed length
-        let expected_decompressed_len = i32::from_le_bytes([
-            compressed_block[0],
-            compressed_block[1],
-            compressed_block[2],
-            compressed_block[3],
-        ]) as usize;
+        let expected_i32 = i32::from_le_bytes(compressed_block[..4].try_into().unwrap());
+        let expected_decompressed_len = usize::try_from(expected_i32).map_err(|_| {
+            HailError::InvalidFormat(format!(
+                "Zstd block has negative decompressed length {expected_i32}"
+            ))
+        })?;
+        if expected_decompressed_len > self.max_block_size {
+            return Err(HailError::InvalidFormat(format!(
+                "Zstd decompressed length {expected_decompressed_len} exceeds recorded blockSize {}",
+                self.max_block_size
+            )));
+        }
 
         // The rest is the raw Zstd compressed data (no magic number)
         let compressed_data = &compressed_block[4..];

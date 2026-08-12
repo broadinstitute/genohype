@@ -30,3 +30,9 @@ pub trait InputBlockBuffer: Send {
     /// - Implementations should handle framing (e.g., length prefixes)
     fn read_block(&mut self, buf: &mut Vec<u8>) -> Result<usize>;
 }
+
+impl InputBlockBuffer for Box<dyn InputBlockBuffer> {
+    fn read_block(&mut self, buf: &mut Vec<u8>) -> Result<usize> {
+        (**self).read_block(buf)
+    }
+}

@@ -2,7 +2,7 @@
 //!
 //! This module implements the 4-layer buffer stack used by Hail:
 //! 1. StreamBlockBuffer - reads length-prefixed blocks
-//! 2. ZstdBuffer - decompresses Zstd data
+//! 2. ZstdBuffer or Lz4Buffer - decompresses block data
 //! 3. BlockingBuffer - provides fixed-size buffering
 //! 4. LEB128Buffer - decodes variable-length integers
 //!
@@ -28,6 +28,7 @@ pub mod block_map;
 pub mod blocking;
 pub mod builder;
 pub mod leb128;
+pub mod lz4;
 pub mod output;
 pub mod slice;
 pub mod stream_block;
@@ -38,6 +39,7 @@ pub use block_map::BlockMap;
 pub use blocking::BlockingBuffer;
 pub use builder::BufferBuilder;
 pub use leb128::LEB128Buffer;
+pub use lz4::Lz4Buffer;
 pub use output::{
     BlockingOutputBuffer, LEB128OutputBuffer, OutputBuffer, OutputBufferBuilder,
     StreamBlockOutputBuffer, ZstdOutputBuffer,

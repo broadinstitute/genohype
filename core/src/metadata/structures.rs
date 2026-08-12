@@ -137,9 +137,7 @@ pub enum BufferSpec {
         child: Box<BufferSpec>,
     },
 
-    /// Historical Hail tables declare this codec. It is represented here so
-    /// their metadata can be inspected; row/global/index decoding is not yet
-    /// supported for this buffer layer.
+    /// Historical Hail raw-block LZ4 codec. `HC` affects encoding only.
     #[serde(rename = "LZ4HCBlockBufferSpec")]
     LZ4HCBlock {
         #[serde(rename = "blockSize")]
@@ -159,20 +157,26 @@ pub enum BufferSpec {
 }
 
 impl BufferSpec {
-    /// Return the first metadata codec that Genohype can inspect but cannot use
-    /// to decode row/global/index data.
+    /// Return a recognized codec that cannot be decoded. All currently
+    /// represented layers are supported; unknown layer names fail metadata
+    /// deserialization before a `BufferSpec` can be constructed.
     pub fn unsupported_decode_codec(&self) -> Option<&'static str> {
-        match self {
-            Self::LZ4HCBlock { .. } => Some("LZ4HCBlockBufferSpec"),
-            Self::ZstdBlock { child, .. }
-            | Self::Blocking { child, .. }
-            | Self::LEB128 { child } => child.unsupported_decode_codec(),
-            Self::StreamBlock => None,
-        }
+        None
     }
 
     pub fn data_decode_supported(&self) -> bool {
         self.unsupported_decode_codec().is_none()
+    }
+
+    /// Whether this stack contains the historical LZ4HC block codec.
+    pub fn uses_lz4hc(&self) -> bool {
+        match self {
+            Self::LZ4HCBlock { .. } => true,
+            Self::ZstdBlock { child, .. }
+            | Self::Blocking { child, .. }
+            | Self::LEB128 { child } => child.uses_lz4hc(),
+            Self::StreamBlock => false,
+        }
     }
 }
 
@@ -427,11 +431,12 @@ mod tests {
         assert_eq!(compressed.key, vec!["locus"]);
         assert_eq!(compressed.codec_spec.e_type, "EBaseStruct{}");
         assert_eq!(compressed.codec_spec.v_type, "Struct{}");
-        assert!(!compressed.codec_spec.buffer_spec.data_decode_supported());
+        assert!(compressed.codec_spec.buffer_spec.data_decode_supported());
         assert_eq!(
             compressed.codec_spec.buffer_spec.unsupported_decode_codec(),
-            Some("LZ4HCBlockBufferSpec")
+            None
         );
+        assert!(compressed.codec_spec.buffer_spec.uses_lz4hc());
     }
 
     #[test]

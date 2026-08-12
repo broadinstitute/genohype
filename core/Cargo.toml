@@ -22,6 +22,7 @@ bigquery = ["export", "dep:google-cloud-bigquery", "dep:google-cloud-storage"]
 [dependencies]
 # Compression
 zstd = "0.13"
+lz4_flex = "0.11"
 flate2 = "1.0"
 
 # Arrow and Parquet

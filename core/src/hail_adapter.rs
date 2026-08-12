@@ -7,7 +7,7 @@ use crate::codec::{ETypeParser, EncodedType, EncodedValue};
 use crate::datasource::DataSource;
 use crate::index::IndexReader;
 use crate::io::join_path;
-use crate::metadata::{CacheOptions, MetadataCache, RVDComponentSpec, TableMetadata};
+use crate::metadata::{BufferSpec, CacheOptions, MetadataCache, RVDComponentSpec, TableMetadata};
 use crate::projection::ProjectionTree;
 use crate::query::{
     filter_partitions, filter_partitions_with_intervals, IntervalList, KeyRange, KeyValue,
@@ -30,6 +30,7 @@ pub struct SortedPartitionIterator {
     rows_path: String,
     part_files: Vec<String>,
     row_type: EncodedType,
+    buffer_spec: BufferSpec,
     ranges: Vec<KeyRange>,
 }
 
@@ -39,6 +40,7 @@ impl SortedPartitionIterator {
         rows_path: String,
         part_files: Vec<String>,
         row_type: EncodedType,
+        buffer_spec: BufferSpec,
         ranges: Vec<KeyRange>,
     ) -> Self {
         Self {
@@ -48,6 +50,7 @@ impl SortedPartitionIterator {
             rows_path,
             part_files,
             row_type,
+            buffer_spec,
             ranges,
         }
     }
@@ -57,7 +60,7 @@ impl SortedPartitionIterator {
         let parts_path = join_path(&self.rows_path, "parts");
         let part_path = join_path(&parts_path, part_file);
 
-        let buffer = BufferBuilder::from_path(&part_path)?.with_leb128().build();
+        let buffer = BufferBuilder::from_path(&part_path)?.build_from_spec(&self.buffer_spec)?;
         Ok(PartitionStream::new(
             buffer,
             self.row_type.clone(),
@@ -256,6 +259,15 @@ impl HailTableSource {
         Ok(())
     }
 
+    fn ensure_index_random_access_supported(&self, operation: &str) -> Result<()> {
+        if self.rvd_spec.codec_spec.buffer_spec.uses_lz4hc() {
+            return Err(HailError::Codec(format!(
+                "{operation} via historical LZ4HC index virtual offsets is not supported; sequential full-partition decoding is supported"
+            )));
+        }
+        Ok(())
+    }
+
     /// Check if partition counts are available without scanning index files
     pub fn has_fast_row_count(&self) -> bool {
         self.partition_counts.is_some()
@@ -364,7 +376,8 @@ impl HailTableSource {
         let mut reader = crate::io::get_reader(&part_path)?;
         use std::io::Seek;
         reader.seek(std::io::SeekFrom::Start(file_offset))?;
-        let mut buffer = BufferBuilder::from_reader(reader).with_leb128().build();
+        let mut buffer = BufferBuilder::from_reader(reader)
+            .build_from_spec(&self.rvd_spec.codec_spec.buffer_spec)?;
 
         // Skip past the local offset within the decompressed block
         if local_offset > 0 {
@@ -400,7 +413,8 @@ impl HailTableSource {
         let parts_path = join_path(&self.rows_path, "parts");
         let part_path = join_path(&parts_path, part_file);
 
-        let buffer = BufferBuilder::from_path(&part_path)?.with_leb128().build();
+        let buffer = BufferBuilder::from_path(&part_path)?
+            .build_from_spec(&self.rvd_spec.codec_spec.buffer_spec)?;
 
         Ok(PartitionStream::with_intervals(
             buffer,
@@ -501,7 +515,8 @@ impl DataSource for HailTableSource {
         let part_path = join_path(&parts_path, &globals_spec.part_files[0]);
 
         // Build buffer and decode
-        let mut buffer = BufferBuilder::from_path(&part_path)?.with_leb128().build();
+        let mut buffer = BufferBuilder::from_path(&part_path)?
+            .build_from_spec(&globals_spec.codec_spec.buffer_spec)?;
 
         // Hail partition streams always start with a row-present byte per row,
         // even for globals (which is a single-row partition). Consume it before
@@ -588,8 +603,12 @@ impl DataSource for HailTableSource {
         let rows_path = self.rows_path.clone();
         let part_files = self.rvd_spec.part_files.clone();
         let row_type = self.row_type.clone();
+        let row_buffer_spec = self.rvd_spec.codec_spec.buffer_spec.clone();
         let ranges = ranges.to_vec();
-        let has_index = self.rvd_spec.index_spec.is_some();
+        // Historical LZ4HC index virtual offsets are not validated. Keep
+        // sequential/full-partition decoding independent of random access.
+        let has_index = self.rvd_spec.index_spec.is_some()
+            && !self.rvd_spec.codec_spec.buffer_spec.uses_lz4hc();
         let index_readers = self.index_readers.clone();
         let block_maps = self.block_maps.clone();
         let table_path = self.table_path.clone();
@@ -702,15 +721,17 @@ impl DataSource for HailTableSource {
                                     use std::io::Seek;
                                     reader.seek(std::io::SeekFrom::Start(file_offset))?;
                                     let buffer = BufferBuilder::from_reader(reader)
-                                        .with_leb128()
-                                        .build();
+                                        .build_from_spec(&row_buffer_spec)?;
                                     Ok((buffer, local_offset))
                                 })()
                             }
                             None => {
                                 // Fallback: full scan from offset 0
-                                BufferBuilder::from_path(&part_path)
-                                    .map(|b| (b.with_leb128().build(), 0usize))
+                                BufferBuilder::from_path(&part_path).and_then(|builder| {
+                                    builder
+                                        .build_from_spec(&row_buffer_spec)
+                                        .map(|buffer| (buffer, 0usize))
+                                })
                             }
                         }
                     };
@@ -783,8 +804,10 @@ impl DataSource for HailTableSource {
         let rows_path = self.rows_path.clone();
         let part_files = self.rvd_spec.part_files.clone();
         let row_type = self.row_type.clone();
+        let row_buffer_spec = self.rvd_spec.codec_spec.buffer_spec.clone();
         let ranges = ranges.to_vec();
-        let has_index = self.rvd_spec.index_spec.is_some();
+        let has_index = self.rvd_spec.index_spec.is_some()
+            && !self.rvd_spec.codec_spec.buffer_spec.uses_lz4hc();
         let index_readers = self.index_readers.clone();
         let table_path = self.table_path.clone();
         let index_spec = self.rvd_spec.index_spec.clone();
@@ -873,12 +896,15 @@ impl DataSource for HailTableSource {
                                 let mut reader = crate::io::get_reader(&part_path)?;
                                 use std::io::Seek;
                                 reader.seek(std::io::SeekFrom::Start(file_offset))?;
-                                let buffer =
-                                    BufferBuilder::from_reader(reader).with_leb128().build();
+                                let buffer = BufferBuilder::from_reader(reader)
+                                    .build_from_spec(&row_buffer_spec)?;
                                 Ok((buffer, local_offset))
                             })(),
-                            None => BufferBuilder::from_path(&part_path)
-                                .map(|b| (b.with_leb128().build(), 0usize)),
+                            None => BufferBuilder::from_path(&part_path).and_then(|builder| {
+                                builder
+                                    .build_from_spec(&row_buffer_spec)
+                                    .map(|buffer| (buffer, 0usize))
+                            }),
                         }
                     };
 
@@ -931,6 +957,7 @@ impl DataSource for HailTableSource {
         let rows_path = self.rows_path.clone();
         let part_files = self.rvd_spec.part_files.clone();
         let row_type = self.row_type.clone();
+        let buffer_spec = self.rvd_spec.codec_spec.buffer_spec.clone();
         let ranges = ranges.to_vec();
 
         // Create an iterator that chains partition streams in order
@@ -939,6 +966,7 @@ impl DataSource for HailTableSource {
             rows_path,
             part_files,
             row_type,
+            buffer_spec,
             ranges,
         );
 
@@ -948,6 +976,7 @@ impl DataSource for HailTableSource {
     #[instrument(skip_all)]
     fn lookup(&self, key: &EncodedValue) -> Result<Option<EncodedValue>> {
         self.ensure_row_decode_supported("row lookup")?;
+        self.ensure_index_random_access_supported("row lookup")?;
         // For point lookups, skip partition pruning if there's only one partition
         let matching_partitions = if self.rvd_spec.part_files.len() == 1 {
             vec![0]
@@ -982,25 +1011,68 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
 
-    fn rewrite_fixture_rows_as_lz4hc(output: &std::path::Path) {
-        let mut decoder = flate2::read::GzDecoder::new(
-            std::fs::File::open("tests/fixtures/tiny-keyed.ht/rows/metadata.json.gz").unwrap(),
-        );
+    fn copy_tree(source: &std::path::Path, destination: &std::path::Path) {
+        std::fs::create_dir_all(destination).unwrap();
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let target = destination.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+
+    fn rewrite_codec_as_lz4hc(metadata_path: &std::path::Path) {
+        let mut decoder = flate2::read::GzDecoder::new(std::fs::File::open(metadata_path).unwrap());
         let mut json = Vec::new();
         decoder.read_to_end(&mut json).unwrap();
         let mut value: serde_json::Value = serde_json::from_slice(&json).unwrap();
         let codec = &mut value["_codecSpec"]["_bufferSpec"]["child"]["child"];
         codec["name"] = serde_json::json!("LZ4HCBlockBufferSpec");
-        codec["blockSize"] = serde_json::json!(32768);
 
         let mut encoder = flate2::write::GzEncoder::new(
-            std::fs::File::create(output).unwrap(),
+            std::fs::File::create(metadata_path).unwrap(),
             flate2::Compression::default(),
         );
         encoder
             .write_all(&serde_json::to_vec(&value).unwrap())
             .unwrap();
         encoder.finish().unwrap();
+    }
+
+    fn transcode_zstd_part_as_lz4hc(part_path: &std::path::Path) {
+        let source = std::fs::read(part_path).unwrap();
+        let mut position = 0;
+        let mut output = Vec::new();
+        while position < source.len() {
+            let outer_len =
+                u32::from_le_bytes(source[position..position + 4].try_into().unwrap()) as usize;
+            position += 4;
+            let payload = &source[position..position + outer_len];
+            position += outer_len;
+            let expected = i32::from_le_bytes(payload[..4].try_into().unwrap()) as usize;
+            let decoded = zstd::decode_all(&payload[4..]).unwrap();
+            assert_eq!(decoded.len(), expected);
+            let compressed = lz4_flex::block::compress(&decoded);
+            let lz4_outer_len = 4 + compressed.len();
+            output.extend_from_slice(&(lz4_outer_len as u32).to_le_bytes());
+            output.extend_from_slice(&(decoded.len() as i32).to_le_bytes());
+            output.extend_from_slice(&compressed);
+        }
+        std::fs::write(part_path, output).unwrap();
+    }
+
+    fn make_lz4hc_fixture(destination: &std::path::Path) {
+        copy_tree(
+            std::path::Path::new("tests/fixtures/tiny-keyed.ht"),
+            destination,
+        );
+        for component in ["rows", "globals"] {
+            rewrite_codec_as_lz4hc(&destination.join(component).join("metadata.json.gz"));
+            transcode_zstd_part_as_lz4hc(&destination.join(component).join("parts").join("part-0"));
+        }
     }
 
     #[test]
@@ -1031,30 +1103,46 @@ mod tests {
     }
 
     #[test]
-    fn lz4hc_metadata_opens_but_row_decode_fails_before_reading_parts() {
+    fn lz4hc_rows_globals_and_all_sequential_parallel_builders_decode() {
+        use crate::projection::FieldPath;
+
         let temp = tempfile::tempdir().unwrap();
         let table = temp.path().join("historical.ht");
-        std::fs::create_dir_all(table.join("rows")).unwrap();
-        std::fs::copy(
-            "tests/fixtures/tiny-keyed.ht/metadata.json.gz",
-            table.join("metadata.json.gz"),
-        )
-        .unwrap();
-        rewrite_fixture_rows_as_lz4hc(&table.join("rows/metadata.json.gz"));
+        make_lz4hc_fixture(&table);
 
         let source = HailTableSource::new(table.to_str().unwrap()).unwrap();
-        assert_eq!(
-            source.unsupported_row_decode_codec(),
-            Some("LZ4HCBlockBufferSpec")
-        );
+        assert_eq!(source.unsupported_row_decode_codec(), None);
         assert_eq!(source.table_metadata().unwrap().file_version, 67328);
         assert_eq!(source.key_fields(), ["gene_id", "chrom", "start"]);
+        assert!(source.globals().is_ok());
 
-        let error = match source.scan_partition_stream(0, &[]) {
-            Ok(_) => panic!("LZ4HC row scan unexpectedly opened"),
-            Err(error) => error.to_string(),
-        };
-        assert!(error.contains("LZ4HCBlockBufferSpec"), "{error}");
-        assert!(error.contains("metadata-only inspection"), "{error}");
+        let scanned: Vec<_> = source.scan_partition_stream(0, &[]).unwrap().collect();
+        assert_eq!(scanned.len(), 2);
+        assert!(scanned.iter().all(Result::is_ok));
+
+        let parallel: Vec<_> = source.query_stream(&[]).unwrap().collect();
+        assert_eq!(parallel.len(), 2);
+        assert!(parallel.iter().all(Result::is_ok));
+
+        let projection = Arc::new(ProjectionTree::from_fields(&[
+            FieldPath::parse("gene_id").unwrap()
+        ]));
+        let projected: Vec<_> = source
+            .query_stream_with_projection(&[], None, Some(projection))
+            .unwrap()
+            .collect();
+        assert_eq!(projected.len(), 2);
+        assert!(projected.iter().all(Result::is_ok));
+
+        let sorted: Vec<_> = source.query_stream_sorted(&[]).unwrap().collect();
+        assert_eq!(sorted.len(), 2);
+        assert!(sorted.iter().all(Result::is_ok));
+
+        let error = source
+            .lookup(&EncodedValue::Struct(vec![]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("index virtual offsets"), "{error}");
+        assert!(error.contains("sequential full-partition"), "{error}");
     }
 }

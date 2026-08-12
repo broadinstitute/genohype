@@ -4,8 +4,12 @@
 //! metadata's `_bufferSpec` field. This module provides builders to construct
 //! the appropriate stack.
 
-use crate::buffer::{BlockingBuffer, InputBuffer, LEB128Buffer, StreamBlockBuffer, ZstdBuffer};
-use crate::Result;
+use crate::buffer::{
+    BlockingBuffer, InputBlockBuffer, InputBuffer, LEB128Buffer, Lz4Buffer, StreamBlockBuffer,
+    ZstdBuffer,
+};
+use crate::metadata::BufferSpec;
+use crate::{HailError, Result};
 use std::fs::File;
 use std::path::Path;
 
@@ -114,6 +118,105 @@ impl<R: std::io::Read + Send + 'static> BufferBuilder<R> {
     pub fn without_leb128(self) -> RawBufferStack<R> {
         RawBufferStack { builder: self }
     }
+
+    /// Build the decoder described by an RVD `CodecSpec._bufferSpec`.
+    ///
+    /// Hail row and globals data observed in supported tables use exactly:
+    /// `LEB128 -> Blocking -> (Zstd | LZ4HC) -> StreamBlock`. The ordering is
+    /// semantically significant, so known layers in any other arrangement are
+    /// rejected rather than silently replaced with the modern Zstd default.
+    pub fn build_from_spec(self, spec: &BufferSpec) -> Result<Box<dyn InputBuffer>> {
+        let blocking = match spec {
+            BufferSpec::LEB128 { child } => match child.as_ref() {
+                BufferSpec::Blocking { block_size, child } => (*block_size, child.as_ref()),
+                other => {
+                    return Err(invalid_layer(
+                        "LEB128BufferSpec child",
+                        "BlockingBufferSpec",
+                        other,
+                    ))
+                }
+            },
+            other => {
+                return Err(invalid_layer(
+                    "buffer stack root",
+                    "LEB128BufferSpec",
+                    other,
+                ))
+            }
+        };
+
+        let (blocking_size, compression_spec) = blocking;
+        validate_block_size("BlockingBufferSpec", blocking_size)?;
+
+        let stream: Box<dyn InputBlockBuffer> = match compression_spec {
+            BufferSpec::ZstdBlock { block_size, child } => {
+                validate_block_size("ZstdBlockBufferSpec", *block_size)?;
+                require_stream_child("ZstdBlockBufferSpec", child)?;
+                Box::new(ZstdBuffer::with_max_block_size(
+                    StreamBlockBuffer::new(self.reader),
+                    *block_size,
+                ))
+            }
+            BufferSpec::LZ4HCBlock { block_size, child } => {
+                validate_block_size("LZ4HCBlockBufferSpec", *block_size)?;
+                require_stream_child("LZ4HCBlockBufferSpec", child)?;
+                Box::new(Lz4Buffer::new(
+                    StreamBlockBuffer::new(self.reader),
+                    *block_size,
+                ))
+            }
+            other => {
+                return Err(invalid_layer(
+                    "BlockingBufferSpec child",
+                    "ZstdBlockBufferSpec or LZ4HCBlockBufferSpec",
+                    other,
+                ))
+            }
+        };
+
+        Ok(Box::new(LEB128Buffer::new(BlockingBuffer::new(
+            stream,
+            blocking_size,
+        ))))
+    }
+}
+
+fn spec_name(spec: &BufferSpec) -> &'static str {
+    match spec {
+        BufferSpec::StreamBlock => "StreamBlockBufferSpec",
+        BufferSpec::ZstdBlock { .. } => "ZstdBlockBufferSpec",
+        BufferSpec::LZ4HCBlock { .. } => "LZ4HCBlockBufferSpec",
+        BufferSpec::Blocking { .. } => "BlockingBufferSpec",
+        BufferSpec::LEB128 { .. } => "LEB128BufferSpec",
+    }
+}
+
+fn invalid_layer(context: &str, expected: &str, actual: &BufferSpec) -> HailError {
+    HailError::Codec(format!(
+        "unsupported Hail buffer stack at {context}: expected {expected}, found {}",
+        spec_name(actual)
+    ))
+}
+
+fn validate_block_size(layer: &str, block_size: usize) -> Result<()> {
+    if block_size == 0 {
+        return Err(HailError::Codec(format!(
+            "invalid Hail buffer stack: {layer} has blockSize 0"
+        )));
+    }
+    Ok(())
+}
+
+fn require_stream_child(parent: &str, child: &BufferSpec) -> Result<()> {
+    if !matches!(child, BufferSpec::StreamBlock) {
+        return Err(invalid_layer(
+            &format!("{parent} child"),
+            "StreamBlockBufferSpec",
+            child,
+        ));
+    }
+    Ok(())
 }
 
 /// Buffer stack with LEB128 integer encoding (STANDARD)
@@ -174,5 +277,86 @@ mod tests {
             .with_blocking(32768)
             .with_leb128()
             .build();
+    }
+
+    fn canonical(compression: BufferSpec) -> BufferSpec {
+        BufferSpec::LEB128 {
+            child: Box::new(BufferSpec::Blocking {
+                block_size: 32,
+                child: Box::new(compression),
+            }),
+        }
+    }
+
+    #[test]
+    fn metadata_factory_builds_lz4hc_stack() {
+        let golden = [0x07, 0, 0, 0, 0x02, 0, 0, 0, 0x20, 0x01, 0x00];
+        let spec = canonical(BufferSpec::LZ4HCBlock {
+            block_size: 32,
+            child: Box::new(BufferSpec::StreamBlock),
+        });
+        let mut buffer = BufferBuilder::from_reader(Cursor::new(golden))
+            .build_from_spec(&spec)
+            .unwrap();
+        let mut decoded = [0; 2];
+        buffer.read_exact(&mut decoded).unwrap();
+        assert_eq!(decoded, [1, 0]);
+    }
+
+    #[test]
+    fn metadata_factory_builds_zstd_stack() {
+        let original = [1, 0];
+        let compressed = zstd::encode_all(original.as_slice(), 1).unwrap();
+        let payload_len = 4 + compressed.len();
+        let mut framed = Vec::new();
+        framed.extend_from_slice(&(payload_len as u32).to_le_bytes());
+        framed.extend_from_slice(&(original.len() as i32).to_le_bytes());
+        framed.extend_from_slice(&compressed);
+        let spec = canonical(BufferSpec::ZstdBlock {
+            block_size: 32,
+            child: Box::new(BufferSpec::StreamBlock),
+        });
+        let mut buffer = BufferBuilder::from_reader(Cursor::new(framed))
+            .build_from_spec(&spec)
+            .unwrap();
+        let mut decoded = [0; 2];
+        buffer.read_exact(&mut decoded).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn metadata_factory_rejects_invalid_order_and_block_sizes_contextually() {
+        let invalid = [
+            BufferSpec::StreamBlock,
+            BufferSpec::LEB128 {
+                child: Box::new(BufferSpec::ZstdBlock {
+                    block_size: 32,
+                    child: Box::new(BufferSpec::StreamBlock),
+                }),
+            },
+            canonical(BufferSpec::ZstdBlock {
+                block_size: 0,
+                child: Box::new(BufferSpec::StreamBlock),
+            }),
+            canonical(BufferSpec::ZstdBlock {
+                block_size: 32,
+                child: Box::new(BufferSpec::Blocking {
+                    block_size: 32,
+                    child: Box::new(BufferSpec::StreamBlock),
+                }),
+            }),
+        ];
+
+        for spec in invalid {
+            let error = BufferBuilder::from_reader(Cursor::new(Vec::<u8>::new()))
+                .build_from_spec(&spec)
+                .err()
+                .expect("invalid stack should fail")
+                .to_string();
+            assert!(
+                error.contains("buffer stack") || error.contains("blockSize"),
+                "{error}"
+            );
+        }
     }
 }
