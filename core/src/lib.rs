@@ -31,6 +31,7 @@ pub mod partitioning;
 pub mod progress;
 pub mod projection;
 pub mod query;
+pub mod release;
 pub mod schema;
 pub mod summary;
 pub mod vcf;

@@ -39,10 +39,9 @@ pub fn process_parquet_export(
     };
     let engine_ref = &engine;
 
-    let row_type = engine_ref.row_type().clone();
-    let arrow_schema = Arc::new(genohype_core::parquet::schema::create_schema(&row_type)?);
-    let row_type_ref = &row_type;
-    let arrow_schema_ref = &arrow_schema;
+    let plan =
+        Arc::new(engine_ref.parquet_plan(genohype_core::schema::PhysicalBinaryEncoding::Utf8)?);
+    let plan_ref = &plan;
 
     // Clone refs for the parallel closure
     let output_path = output_path.to_string();
@@ -94,11 +93,7 @@ pub fn process_parquet_export(
                         batch_rows.push(row);
 
                         if batch_rows.len() >= BATCH_SIZE {
-                            let batch = build_record_batch(
-                                &batch_rows,
-                                row_type_ref,
-                                arrow_schema_ref.clone(),
-                            )?;
+                            let batch = build_record_batch(&batch_rows, plan_ref)?;
                             writer.write_batch(&batch)?;
                             partition_rows += batch_rows.len();
                             // Update telemetry row count
@@ -111,11 +106,7 @@ pub fn process_parquet_export(
 
                     // Write remaining rows
                     if !batch_rows.is_empty() {
-                        let batch = build_record_batch(
-                            &batch_rows,
-                            row_type_ref,
-                            arrow_schema_ref.clone(),
-                        )?;
+                        let batch = build_record_batch(&batch_rows, plan_ref)?;
                         writer.write_batch(&batch)?;
                         partition_rows += batch_rows.len();
                         if let Some(ref t) = ts {
@@ -129,12 +120,12 @@ pub fn process_parquet_export(
 
             if output_is_cloud {
                 let cloud_writer = StreamingCloudWriter::new(&output_file)?;
-                let writer = ParquetWriter::from_writer(cloud_writer, row_type_ref)?;
+                let writer = ParquetWriter::from_writer(cloud_writer, plan_ref.clone())?;
                 let writer = process_with_writer!(writer);
                 let cloud_writer = writer.into_inner()?;
                 cloud_writer.finish()?;
             } else {
-                let writer = ParquetWriter::new(&output_file, row_type_ref)?;
+                let writer = ParquetWriter::new(&output_file, plan_ref.clone())?;
                 let writer = process_with_writer!(writer);
                 writer.close()?;
             }

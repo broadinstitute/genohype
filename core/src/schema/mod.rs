@@ -1,5 +1,13 @@
 //! Hail schema representation and parsing
 
+mod paired;
+mod vtype;
+
+pub use paired::{
+    ArrowFieldPlan, ArrowNode, ArrowSchemaPlan, ArrowTypePlan, PairedSchema, PhysicalBinaryEncoding,
+};
+pub use vtype::{LogicalField, LogicalType, VTypeParser};
+
 use crate::Result;
 use serde::{Deserialize, Serialize};
 
@@ -14,10 +22,11 @@ pub struct Metadata {
     pub extra: serde_json::Value,
 }
 
-/// Hail type system
+/// Legacy JSON-tagged Hail type used only by the old generic decoder.
+/// Codec VTypes use [`LogicalType`] and [`VTypeParser`] instead.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "name")]
-pub enum HailType {
+pub enum LegacyJsonHailType {
     #[serde(rename = "int32")]
     Int32,
 
@@ -39,14 +48,14 @@ pub enum HailType {
     #[serde(rename = "array")]
     Array {
         #[serde(rename = "elementType")]
-        element_type: Box<HailType>,
+        element_type: Box<LegacyJsonHailType>,
     },
 
     #[serde(rename = "struct")]
     Struct { fields: Vec<Field> },
 
     #[serde(rename = "tuple")]
-    Tuple { types: Vec<HailType> },
+    Tuple { types: Vec<LegacyJsonHailType> },
 
     #[serde(rename = "locus")]
     Locus {
@@ -57,7 +66,7 @@ pub enum HailType {
     #[serde(rename = "interval")]
     Interval {
         #[serde(rename = "pointType")]
-        point_type: Box<HailType>,
+        point_type: Box<LegacyJsonHailType>,
     },
 }
 
@@ -66,7 +75,7 @@ pub enum HailType {
 pub struct Field {
     pub name: String,
     #[serde(rename = "type")]
-    pub field_type: HailType,
+    pub field_type: LegacyJsonHailType,
 }
 
 impl Metadata {
@@ -92,17 +101,17 @@ mod tests {
     #[test]
     fn test_parse_simple_type() {
         let json = r#"{"name": "int32"}"#;
-        let hail_type: HailType = serde_json::from_str(json).unwrap();
-        assert!(matches!(hail_type, HailType::Int32));
+        let hail_type: LegacyJsonHailType = serde_json::from_str(json).unwrap();
+        assert!(matches!(hail_type, LegacyJsonHailType::Int32));
     }
 
     #[test]
     fn test_parse_array_type() {
         let json = r#"{"name": "array", "elementType": {"name": "int32"}}"#;
-        let hail_type: HailType = serde_json::from_str(json).unwrap();
+        let hail_type: LegacyJsonHailType = serde_json::from_str(json).unwrap();
         match hail_type {
-            HailType::Array { element_type } => {
-                assert!(matches!(*element_type, HailType::Int32));
+            LegacyJsonHailType::Array { element_type } => {
+                assert!(matches!(*element_type, LegacyJsonHailType::Int32));
             }
             _ => panic!("Expected array type"),
         }

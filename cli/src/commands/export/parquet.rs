@@ -317,6 +317,11 @@ pub fn run_export_parquet(args: ExportParquetArgs) -> Result<()> {
                 Some(proj) => proj.project_type(&row_type),
                 None => row_type,
             };
+            let projected_schema = engine
+                .row_schema()
+                .ok()
+                .map(|schema| schema.project_to(row_type.clone()))
+                .transpose()?;
             if width_projection.is_some() {
                 println!(
                     "{} {}",
@@ -336,6 +341,24 @@ pub fn run_export_parquet(args: ExportParquetArgs) -> Result<()> {
             // sort — fine at smoke scale (~554k rows); see the full-scale caveat in
             // the punch-list.
             let row_type = genohype_core::export::xpos::augment_type_with_xpos(&row_type);
+            let plan = Arc::new(if let Some(projected_schema) = projected_schema {
+                let logical = match projected_schema.logical {
+                    genohype_core::schema::LogicalType::Struct { mut fields } => {
+                        fields.push(genohype_core::schema::LogicalField {
+                            name: "xpos".to_string(),
+                            logical_type: genohype_core::schema::LogicalType::Int64,
+                        });
+                        genohype_core::schema::LogicalType::Struct { fields }
+                    }
+                    _ => unreachable!("Hail row schema root was validated as a struct"),
+                };
+                genohype_core::schema::PairedSchema::new(row_type.clone(), logical)?.arrow_plan()?
+            } else {
+                genohype_core::schema::ArrowSchemaPlan::physical_only(
+                    &row_type,
+                    genohype_core::schema::PhysicalBinaryEncoding::Utf8,
+                )?
+            });
 
             // Build the decode-time projection so dropped fields are never
             // decoded; keep `locus` for interval filtering.
@@ -384,9 +407,8 @@ pub fn run_export_parquet(args: ExportParquetArgs) -> Result<()> {
             // the within-locus (allele) order, so results are byte-identical aside
             // from row ordering. Memory caveat (full scale) is noted in the report.
             macro_rules! drive_sequential {
-                ($writer:expr, $arrow_schema:expr) => {{
+                ($writer:expr) => {{
                     let mut writer = $writer;
-                    let arrow_schema = $arrow_schema;
 
                     let mut all_rows: Vec<genohype_core::codec::EncodedValue> = Vec::new();
                     for row_result in iterator {
@@ -407,11 +429,7 @@ pub fn run_export_parquet(args: ExportParquetArgs) -> Result<()> {
                     for start in (0..all_rows.len()).step_by(batch_size) {
                         let end = (start + batch_size).min(all_rows.len());
                         pb.set_message(format!("{} / {} rows written...", end, total_rows));
-                        let batch = build_record_batch(
-                            &all_rows[start..end],
-                            &row_type,
-                            arrow_schema.clone(),
-                        )?;
+                        let batch = build_record_batch(&all_rows[start..end], &plan)?;
                         writer.write_batch(&batch)?;
                     }
 
@@ -422,20 +440,18 @@ pub fn run_export_parquet(args: ExportParquetArgs) -> Result<()> {
             let total_rows = if is_cloud_path(&args.output) {
                 // Cloud output: stream via multipart upload (mirrors sharded branch)
                 let cloud_writer = StreamingCloudWriter::new(&args.output)?;
-                let writer = ParquetWriter::from_writer(cloud_writer, &row_type)?;
-                let arrow_schema = writer.schema().clone();
+                let writer = ParquetWriter::from_writer(cloud_writer, plan.clone())?;
 
-                let (writer, total_rows) = drive_sequential!(writer, arrow_schema);
+                let (writer, total_rows) = drive_sequential!(writer);
 
                 let cloud_writer = writer.into_inner()?;
                 cloud_writer.finish()?;
                 total_rows
             } else {
                 // Local output: write to file
-                let writer = ParquetWriter::new(&args.output, &row_type)?;
-                let arrow_schema = writer.schema().clone();
+                let writer = ParquetWriter::new(&args.output, plan.clone())?;
 
-                let (writer, total_rows) = drive_sequential!(writer, arrow_schema);
+                let (writer, total_rows) = drive_sequential!(writer);
                 writer.close()?;
                 total_rows
             };

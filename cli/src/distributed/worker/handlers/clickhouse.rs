@@ -122,10 +122,9 @@ pub fn process_clickhouse_export(
     };
     let engine_ref = &engine;
 
-    let row_type = engine.row_type().clone();
-    let arrow_schema = Arc::new(genohype_core::parquet::schema::create_schema(&row_type)?);
-    let row_type_ref = &row_type;
-    let arrow_schema_ref = &arrow_schema;
+    let parquet_plan =
+        Arc::new(engine.parquet_plan(genohype_core::schema::PhysicalBinaryEncoding::Utf8)?);
+    let parquet_plan_ref = &parquet_plan;
 
     // Clone refs for the parallel closure
     let url = url.to_string();
@@ -235,8 +234,7 @@ pub fn process_clickhouse_export(
                         &client,
                         &temp_table,
                         &batch,
-                        row_type_ref,
-                        arrow_schema_ref.clone(),
+                        parquet_plan_ref.clone(),
                         BATCH_SIZE,
                     )?;
 
@@ -307,8 +305,7 @@ fn upload_chunk_to_clickhouse(
     client: &genohype_core::export::ClickHouseClient,
     table: &str,
     rows: &[genohype_core::codec::EncodedValue],
-    row_type: &genohype_core::codec::EncodedType,
-    arrow_schema: std::sync::Arc<arrow::datatypes::Schema>,
+    parquet_plan: std::sync::Arc<genohype_core::schema::ArrowSchemaPlan>,
     batch_size: usize,
 ) -> Result<usize> {
     use genohype_core::parquet::{build_record_batch, InMemoryParquetWriter};
@@ -318,12 +315,12 @@ fn upload_chunk_to_clickhouse(
     }
 
     // Write rows to in-memory Parquet buffer
-    let mut writer = InMemoryParquetWriter::new(row_type)?;
+    let mut writer = InMemoryParquetWriter::new(parquet_plan.clone())?;
 
     for batch_start in (0..rows.len()).step_by(batch_size) {
         let batch_end = (batch_start + batch_size).min(rows.len());
         let batch_rows = &rows[batch_start..batch_end];
-        let record_batch = build_record_batch(batch_rows, row_type, arrow_schema.clone())?;
+        let record_batch = build_record_batch(batch_rows, &parquet_plan)?;
         writer.write_batch(&record_batch)?;
     }
 

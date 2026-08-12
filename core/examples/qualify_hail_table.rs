@@ -10,11 +10,10 @@
 //!   [--parquet /tmp/two-rows.parquet]
 //! ```
 
-use genohype_core::codec::EncodedValue;
+use genohype_core::codec::{canonical_digest, EncodedValue};
 use genohype_core::parquet::ParquetWriter;
 use genohype_core::query::QueryEngine;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::env;
 use std::path::PathBuf;
 
@@ -74,67 +73,8 @@ fn parse_args() -> Result<Args, String> {
     })
 }
 
-// Type tags, fixed-width big-endian numbers, explicit lengths, original struct
-// order, and raw binary bytes make this encoding injective over EncodedValue.
-fn canonical_bytes(value: &EncodedValue, out: &mut Vec<u8>) {
-    match value {
-        EncodedValue::Null => out.push(0),
-        EncodedValue::Boolean(value) => {
-            out.push(1);
-            out.push(u8::from(*value));
-        }
-        EncodedValue::Int32(value) => {
-            out.push(2);
-            out.extend_from_slice(&value.to_be_bytes());
-        }
-        EncodedValue::Int64(value) => {
-            out.push(3);
-            out.extend_from_slice(&value.to_be_bytes());
-        }
-        EncodedValue::Float32(value) => {
-            out.push(4);
-            out.extend_from_slice(&value.to_bits().to_be_bytes());
-        }
-        EncodedValue::Float64(value) => {
-            out.push(5);
-            out.extend_from_slice(&value.to_bits().to_be_bytes());
-        }
-        EncodedValue::Binary(value) => {
-            out.push(6);
-            put_len(value.len(), out);
-            out.extend_from_slice(value);
-        }
-        EncodedValue::Array(values) => {
-            out.push(7);
-            put_len(values.len(), out);
-            for value in values {
-                canonical_bytes(value, out);
-            }
-        }
-        EncodedValue::Struct(fields) => {
-            out.push(8);
-            put_len(fields.len(), out);
-            for (name, value) in fields {
-                put_len(name.len(), out);
-                out.extend_from_slice(name.as_bytes());
-                canonical_bytes(value, out);
-            }
-        }
-    }
-}
-
-fn put_len(len: usize, out: &mut Vec<u8>) {
-    out.extend_from_slice(&(len as u64).to_be_bytes());
-}
-
 fn digest(value: &EncodedValue) -> Value {
-    let mut canonical = Vec::new();
-    canonical_bytes(value, &mut canonical);
-    json!({
-        "canonical_encoding": "genohype-encoded-value-v1",
-        "canonical_bytes": canonical.len(),
-        "sha256": format!("{:x}", Sha256::digest(&canonical)),
-    })
+    serde_json::to_value(canonical_digest(value)).expect("digest is serializable")
 }
 
 fn digest_sequence(values: &[EncodedValue]) -> Value {
@@ -235,7 +175,8 @@ fn main() {
     if let Some(path) = &args.parquet {
         let result = (|| -> genohype_core::Result<usize> {
             let path = path.to_string_lossy();
-            let mut writer = ParquetWriter::new(&path, engine.row_type())?;
+            let plan = std::sync::Arc::new(engine.row_schema()?.arrow_plan()?);
+            let mut writer = ParquetWriter::new(&path, plan)?;
             for row in &rows {
                 writer.write_row(row)?;
             }

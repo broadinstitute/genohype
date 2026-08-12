@@ -223,6 +223,65 @@ impl QueryEngine {
             .transpose()
     }
 
+    /// Complete typed globals component descriptor (metadata only).
+    pub fn globals_descriptor(&self) -> Result<crate::release::ComponentDescriptor> {
+        let spec = self.globals_rvd_spec()?.ok_or_else(|| {
+            crate::HailError::InvalidFormat(
+                "globals descriptor is available only for Hail tables".to_string(),
+            )
+        })?;
+        crate::release::ComponentDescriptor::from_spec(&spec)
+    }
+
+    /// Complete typed table descriptor assembled from retained metadata. Output
+    /// part IDs and source-object identities are filled by release orchestration.
+    pub fn table_descriptor(&self) -> Result<crate::release::TableDescriptor> {
+        let hail = self.hail_source.as_ref().ok_or_else(|| {
+            crate::HailError::InvalidFormat(
+                "table descriptor is available only for Hail tables".to_string(),
+            )
+        })?;
+        let metadata = hail.table_metadata().ok_or_else(|| {
+            crate::HailError::InvalidFormat("Hail table metadata is unavailable".to_string())
+        })?;
+        let rows = crate::release::ComponentDescriptor::from_spec(hail.rvd_spec())?;
+        let globals = self.globals_descriptor()?;
+        let partitions = hail
+            .rvd_spec()
+            .part_files
+            .iter()
+            .enumerate()
+            .map(|(index, part_file)| crate::release::SourcePartition {
+                index,
+                part_file: part_file.clone(),
+                range_bound: hail.rvd_spec().range_bounds.get(index).cloned(),
+                row_count: None,
+                index_objects: Vec::new(),
+                output_part_ids: Vec::new(),
+            })
+            .collect();
+        Ok(crate::release::TableDescriptor {
+            file_version: metadata.file_version,
+            hail_version: metadata.hail_version.clone(),
+            references_rel_path: metadata.references_rel_path.clone(),
+            table_type: metadata
+                .extra
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Table")
+                .to_string(),
+            top_metadata: metadata.extra.clone(),
+            key: crate::release::KeyDescriptor {
+                fields: hail.rvd_spec().key.clone(),
+                ordering: crate::release::KeyOrdering::LexicographicAscending,
+                distinctly_keyed: None,
+            },
+            rows,
+            globals,
+            partitions,
+        })
+    }
+
     /// Check if total_rows() is available without an expensive scan
     pub fn has_fast_row_count(&self) -> bool {
         self.hail_source
@@ -262,9 +321,38 @@ impl QueryEngine {
         Ok(range_bounds[partition_idx].clone())
     }
 
-    /// Get the row type (schema) for this table
+    /// Get the row type (schema) for this table.
     pub fn row_type(&self) -> &EncodedType {
         self.source.row_type()
+    }
+
+    /// Get the strict physical/logical row pairing for a Hail table.
+    /// Non-Hail sources must use an explicit physical-only Parquet policy.
+    pub fn row_schema(&self) -> Result<&crate::schema::PairedSchema> {
+        self.hail_source
+            .as_ref()
+            .map(|hail| hail.row_schema())
+            .ok_or_else(|| {
+                crate::HailError::InvalidFormat(
+                    "logical row schema is available only for Hail tables".to_string(),
+                )
+            })
+    }
+
+    /// Build a retained Parquet plan. Hail sources always use their strict
+    /// EType/VType pairing; the caller explicitly chooses EBinary semantics
+    /// only for a non-Hail source such as text VCF/BED.
+    pub fn parquet_plan(
+        &self,
+        non_hail_binary: crate::schema::PhysicalBinaryEncoding,
+    ) -> Result<crate::schema::ArrowSchemaPlan> {
+        match &self.hail_source {
+            Some(hail) => hail.row_schema().arrow_plan(),
+            None => crate::schema::ArrowSchemaPlan::physical_only(
+                self.source.row_type(),
+                non_hail_binary,
+            ),
+        }
     }
 
     /// Perform a point lookup by key
@@ -513,6 +601,9 @@ mod tests {
         assert_eq!(engine.key_fields(), &["gene_id", "chrom", "start"]);
         assert_eq!(engine.num_partitions(), 1);
         assert!(engine.has_index());
+        let descriptor = engine.table_descriptor().expect("typed descriptor");
+        assert_eq!(descriptor.key.fields, engine.key_fields());
+        assert_eq!(descriptor.partitions.len(), 1);
     }
 
     #[test]

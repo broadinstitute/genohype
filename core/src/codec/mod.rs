@@ -6,11 +6,16 @@ pub mod decoder;
 pub mod encoded_type;
 pub mod encoder;
 pub mod etype_parser;
+pub mod lossless_value;
 
 pub use decoder::{Decoder, HailDecoder, Value};
 pub use encoded_type::{EncodedField, EncodedType, EncodedValue};
 pub use encoder::Encoder;
 pub use etype_parser::ETypeParser;
+pub use lossless_value::{
+    canonical_bytes, canonical_digest, LosslessField, LosslessValue, ValueDigest,
+    CANONICAL_ENCODING,
+};
 
 use crate::Result;
 

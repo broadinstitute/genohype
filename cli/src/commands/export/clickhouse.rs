@@ -245,6 +245,11 @@ fn export_single_file(
         Some(proj) => proj.project_type(&row_type),
         None => row_type.clone(),
     };
+    let projected_schema = engine
+        .row_schema()
+        .ok()
+        .map(|schema| schema.project_to(projected_row_type.clone()))
+        .transpose()?;
     if projection.is_some() {
         println!(
             "  {} {}",
@@ -268,6 +273,30 @@ fn export_single_file(
     // matching the BKD-indexed ES arm. xpos is derived from each row's locus, so
     // query *results* are unchanged.
     let effective_schema = genohype_core::export::xpos::augment_type_with_xpos(&effective_schema);
+    let parquet_plan = Arc::new(if let Some(projected_schema) = projected_schema {
+        let logical = match projected_schema.logical {
+            genohype_core::schema::LogicalType::Struct { mut fields } => {
+                if let Some(column) = filename_column {
+                    fields.push(genohype_core::schema::LogicalField {
+                        name: column.to_string(),
+                        logical_type: genohype_core::schema::LogicalType::String,
+                    });
+                }
+                fields.push(genohype_core::schema::LogicalField {
+                    name: "xpos".to_string(),
+                    logical_type: genohype_core::schema::LogicalType::Int64,
+                });
+                genohype_core::schema::LogicalType::Struct { fields }
+            }
+            _ => unreachable!("Hail row schema root was validated as a struct"),
+        };
+        genohype_core::schema::PairedSchema::new(effective_schema.clone(), logical)?.arrow_plan()?
+    } else {
+        genohype_core::schema::ArrowSchemaPlan::physical_only(
+            &effective_schema,
+            genohype_core::schema::PhysicalBinaryEncoding::Utf8,
+        )?
+    });
 
     // Create table on first file only
     if !table_created {
@@ -295,10 +324,6 @@ fn export_single_file(
         .and_then(|s| s.parse().ok())
         .unwrap_or(25_000);
     const PARQUET_BATCH_SIZE: usize = 4096;
-
-    let arrow_schema = std::sync::Arc::new(genohype_core::parquet::schema::create_schema(
-        &effective_schema,
-    )?);
 
     // Build the decode-time projection (Level 2) for browser-minimal so dropped
     // fields are never decoded. Keep the ORDER BY / key columns (e.g. locus,
@@ -333,11 +358,10 @@ fn export_single_file(
         if rows.is_empty() {
             return Ok(());
         }
-        let mut writer = InMemoryParquetWriter::new(&effective_schema)?;
+        let mut writer = InMemoryParquetWriter::new(parquet_plan.clone())?;
         for start in (0..rows.len()).step_by(PARQUET_BATCH_SIZE) {
             let end = (start + PARQUET_BATCH_SIZE).min(rows.len());
-            let batch =
-                build_record_batch(&rows[start..end], &effective_schema, arrow_schema.clone())?;
+            let batch = build_record_batch(&rows[start..end], &parquet_plan)?;
             writer.write_batch(&batch)?;
         }
         let bytes = writer.finish()?;

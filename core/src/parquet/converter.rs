@@ -119,11 +119,10 @@ pub fn hail_to_parquet_with_options(
     let num_partitions = max_partitions
         .map(|m| m.min(total_partitions))
         .unwrap_or(total_partitions);
-    let row_type = engine.row_type().clone();
+    let plan = std::sync::Arc::new(engine.row_schema()?.arrow_plan()?);
 
-    // Create the Parquet writer to get the schema, then move to writer thread
-    let writer = ParquetWriter::new(output_path, &row_type)?;
-    let arrow_schema = writer.schema().clone();
+    // Create the Parquet writer with the retained physical/logical plan.
+    let writer = ParquetWriter::new(output_path, plan.clone())?;
 
     // Setup progress bar if requested
     let pb = if show_progress {
@@ -167,8 +166,7 @@ pub fn hail_to_parquet_with_options(
     // Run parallel workers using try_for_each_with
     // This clones the sender per-thread, enabling true parallelism
     let engine_ref = &engine;
-    let row_type_ref = &row_type;
-    let schema_ref = &arrow_schema;
+    let plan_ref = &plan;
 
     // Batch size for streaming - accumulate rows before building Arrow batch
     const BATCH_SIZE: usize = 4096;
@@ -189,8 +187,7 @@ pub fn hail_to_parquet_with_options(
 
                     if batch_rows.len() >= BATCH_SIZE {
                         // Build and send Arrow batch
-                        let batch =
-                            build_record_batch(&batch_rows, row_type_ref, schema_ref.clone())?;
+                        let batch = build_record_batch(&batch_rows, plan_ref)?;
 
                         if sender.send(Ok(batch)).is_err() {
                             return Err(crate::HailError::Io(std::io::Error::new(
@@ -205,7 +202,7 @@ pub fn hail_to_parquet_with_options(
 
                 // Send remaining rows
                 if !batch_rows.is_empty() {
-                    let batch = build_record_batch(&batch_rows, row_type_ref, schema_ref.clone())?;
+                    let batch = build_record_batch(&batch_rows, plan_ref)?;
                     if sender.send(Ok(batch)).is_err() {
                         return Err(crate::HailError::Io(std::io::Error::new(
                             std::io::ErrorKind::BrokenPipe,
@@ -346,7 +343,7 @@ pub fn hail_to_parquet_sharded_full(
     // Open the query engine to read the table
     let engine = QueryEngine::open_path(input_path)?;
     let total_partitions = engine.num_partitions();
-    let row_type = engine.row_type().clone();
+    let plan = std::sync::Arc::new(engine.row_schema()?.arrow_plan()?);
 
     // Determine number of shards
     let num_shards = shard_count.unwrap_or(total_partitions);
@@ -435,7 +432,7 @@ pub fn hail_to_parquet_sharded_full(
 
     // References for closures
     let engine_ref = &engine;
-    let row_type_ref = &row_type;
+    let plan_ref = &plan;
     let output_dir_ref = output_dir;
     let total_rows_ref = &total_rows;
     let pb_ref = &pb;
@@ -474,9 +471,8 @@ pub fn hail_to_parquet_sharded_full(
 
         // Helper macro to process partitions with any writer type
         macro_rules! process_partitions {
-            ($writer:expr, $arrow_schema:expr) => {{
+            ($writer:expr) => {{
                 let mut writer = $writer;
-                let arrow_schema = $arrow_schema;
 
                 // Process all assigned partitions
                 for &partition_idx in assigned_partitions {
@@ -508,11 +504,7 @@ pub fn hail_to_parquet_sharded_full(
                         batch_rows.push(row);
 
                         if batch_rows.len() >= BATCH_SIZE {
-                            let batch = build_record_batch(
-                                &batch_rows,
-                                row_type_ref,
-                                arrow_schema.clone(),
-                            )?;
+                            let batch = build_record_batch(&batch_rows, plan_ref)?;
                             writer.write_batch(&batch)?;
                             shard_rows += batch_rows.len();
 
@@ -551,8 +543,7 @@ pub fn hail_to_parquet_sharded_full(
 
                 // Write remaining rows
                 if !batch_rows.is_empty() {
-                    let batch =
-                        build_record_batch(&batch_rows, row_type_ref, arrow_schema.clone())?;
+                    let batch = build_record_batch(&batch_rows, plan_ref)?;
                     writer.write_batch(&batch)?;
                     shard_rows += batch_rows.len();
 
@@ -569,20 +560,19 @@ pub fn hail_to_parquet_sharded_full(
         if output_is_cloud {
             // Cloud output: use StreamingCloudWriter for background multipart upload
             let cloud_writer = StreamingCloudWriter::new(&output_path)?;
-            let writer = crate::parquet::ParquetWriter::from_writer(cloud_writer, row_type_ref)?;
-            let arrow_schema = writer.schema().clone();
+            let writer =
+                crate::parquet::ParquetWriter::from_writer(cloud_writer, plan_ref.clone())?;
 
-            let writer = process_partitions!(writer, arrow_schema);
+            let writer = process_partitions!(writer);
 
             // Get the StreamingCloudWriter back and finish it (complete multipart upload)
             let cloud_writer = writer.into_inner()?;
             cloud_writer.finish()?;
         } else {
             // Local output: use file
-            let writer = crate::parquet::ParquetWriter::new(&output_path, row_type_ref)?;
-            let arrow_schema = writer.schema().clone();
+            let writer = crate::parquet::ParquetWriter::new(&output_path, plan_ref.clone())?;
 
-            let writer = process_partitions!(writer, arrow_schema);
+            let writer = process_partitions!(writer);
             writer.close()?;
         }
 

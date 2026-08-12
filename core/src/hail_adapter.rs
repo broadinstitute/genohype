@@ -13,6 +13,7 @@ use crate::query::{
     filter_partitions, filter_partitions_with_intervals, IntervalList, KeyRange, KeyValue,
     PartitionStream,
 };
+use crate::schema::PairedSchema;
 use crate::HailError;
 use crate::Result;
 use crossbeam_channel;
@@ -128,6 +129,8 @@ pub struct HailTableSource {
     rvd_spec: RVDComponentSpec,
     /// Parsed row type for decoding
     row_type: EncodedType,
+    /// Strictly paired physical and logical row schema.
+    row_schema: PairedSchema,
     /// Cached index readers (one per partition) - Arc/Mutex for thread safety
     index_readers: Arc<Mutex<HashMap<usize, Arc<IndexReader>>>>,
     /// Cached block maps for efficient random access (one per partition) - Arc/Mutex for thread safety
@@ -199,8 +202,12 @@ impl HailTableSource {
             rvd_spec.range_bounds.len()
         );
 
-        // Parse the row type from the codec spec
+        // Parse and recursively validate both physical and logical row types.
+        // Opening a Hail table fails closed before any export can guess how an
+        // EBinary should be represented.
         let row_type = ETypeParser::parse(&rvd_spec.codec_spec.e_type)?;
+        let row_schema =
+            PairedSchema::from_raw_vtype(row_type.clone(), &rvd_spec.codec_spec.v_type)?;
 
         // Load top-level metadata for partition counts and version info
         let top_metadata_path = join_path(&table_path, "metadata.json.gz");
@@ -227,6 +234,7 @@ impl HailTableSource {
             table_path,
             rvd_spec,
             row_type,
+            row_schema,
             index_readers: Arc::new(Mutex::new(HashMap::new())),
             block_maps: Arc::new(Mutex::new(HashMap::new())),
             partition_counts,
@@ -242,6 +250,10 @@ impl HailTableSource {
     /// This provides access to Hail-specific metadata for inspection commands.
     pub fn rvd_spec(&self) -> &RVDComponentSpec {
         &self.rvd_spec
+    }
+
+    pub fn row_schema(&self) -> &PairedSchema {
+        &self.row_schema
     }
 
     /// Get the top-level table metadata (version info, references path)

@@ -124,7 +124,7 @@ pub struct CodecSpec {
 }
 
 /// Buffer specification describing the layered buffer stack
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "name")]
 pub enum BufferSpec {
     #[serde(rename = "StreamBlockBufferSpec")]
@@ -181,7 +181,7 @@ impl BufferSpec {
 }
 
 /// Partition boundary interval
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Interval {
     pub start: Value,
     pub end: Value,

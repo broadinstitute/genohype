@@ -68,7 +68,9 @@ pub fn run_export_bigquery(args: ExportBigqueryArgs) -> Result<()> {
     // 1. Get Schema/Metadata
     println!("{}", "Reading table metadata...".dimmed());
     let engine = QueryEngine::open_path(&args.common.input)?;
-    let row_type = engine.row_type().clone();
+    let plan = std::sync::Arc::new(
+        engine.parquet_plan(genohype_core::schema::PhysicalBinaryEncoding::Utf8)?,
+    );
     println!(
         "  {} {}",
         "Partitions:".cyan(),
@@ -87,8 +89,7 @@ pub fn run_export_bigquery(args: ExportBigqueryArgs) -> Result<()> {
     );
 
     // Create writer and get schema
-    let mut writer = ParquetWriter::new(temp_file_path.to_string_lossy().as_ref(), &row_type)?;
-    let arrow_schema = writer.schema().clone();
+    let mut writer = ParquetWriter::new(temp_file_path.to_string_lossy().as_ref(), plan.clone())?;
 
     // Use streaming query with filters and intervals
     let iterator = engine.query_iter_with_intervals(&where_filters, intervals)?;
@@ -116,7 +117,7 @@ pub fn run_export_bigquery(args: ExportBigqueryArgs) -> Result<()> {
 
         if batch_rows.len() >= batch_size {
             pb.set_message(format!("{} rows processed...", rows_written));
-            let batch = build_record_batch(&batch_rows, &row_type, arrow_schema.clone())?;
+            let batch = build_record_batch(&batch_rows, &plan)?;
             writer.write_batch(&batch)?;
             batch_rows.clear();
         }
@@ -124,7 +125,7 @@ pub fn run_export_bigquery(args: ExportBigqueryArgs) -> Result<()> {
 
     // Write remaining rows
     if !batch_rows.is_empty() {
-        let batch = build_record_batch(&batch_rows, &row_type, arrow_schema.clone())?;
+        let batch = build_record_batch(&batch_rows, &plan)?;
         writer.write_batch(&batch)?;
     }
 

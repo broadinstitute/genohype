@@ -917,7 +917,7 @@ pub struct SchemaGenerator;
 impl SchemaGenerator {
     /// Generate a JSON schema from a Hail table's VType string
     pub fn from_vtype(vtype: &str, title: Option<&str>) -> Result<Value> {
-        let parsed = Self::parse_type(vtype)?;
+        let parsed = crate::schema::VTypeParser::parse(vtype)?;
         let mut schema = Self::type_to_schema(&parsed);
 
         // Add schema metadata
@@ -1038,188 +1038,45 @@ impl SchemaGenerator {
         Ok(())
     }
 
-    /// Parse a Hail VType string into a ParsedType
-    fn parse_type(s: &str) -> Result<ParsedType> {
-        let s = s.trim();
-
-        // Handle nullable types (no + prefix means nullable in the EType,
-        // but VType doesn't have this - all VType fields can be null unless required)
-
-        if s.starts_with("Struct{") && s.ends_with('}') {
-            let inner = &s[7..s.len() - 1];
-            let fields = Self::parse_struct_fields(inner)?;
-            Ok(ParsedType::Struct(fields))
-        } else if s.starts_with("Array[") && s.ends_with(']') {
-            let inner = &s[6..s.len() - 1];
-            let elem_type = Self::parse_type(inner)?;
-            Ok(ParsedType::Array(Box::new(elem_type)))
-        } else if s.starts_with("Set[") && s.ends_with(']') {
-            let inner = &s[4..s.len() - 1];
-            let elem_type = Self::parse_type(inner)?;
-            Ok(ParsedType::Array(Box::new(elem_type))) // Sets are arrays in JSON
-        } else if s.starts_with("Dict[") && s.ends_with(']') {
-            // Dict[K,V] - in JSON this becomes an object or array of key-value pairs
-            // For simplicity, treat as object with additionalProperties
-            let inner = &s[5..s.len() - 1];
-            let parts: Vec<&str> = Self::split_type_args(inner);
-            if parts.len() == 2 {
-                let value_type = Self::parse_type(parts[1])?;
-                Ok(ParsedType::Dict(Box::new(value_type)))
-            } else {
-                Ok(ParsedType::Dict(Box::new(ParsedType::Any)))
-            }
-        } else if s.starts_with("Locus(") && s.ends_with(')') {
-            let rg = &s[6..s.len() - 1];
-            Ok(ParsedType::Locus(rg.to_string()))
-        } else if s.starts_with("Interval[") && s.ends_with(']') {
-            let inner = &s[9..s.len() - 1];
-            let point_type = Self::parse_type(inner)?;
-            Ok(ParsedType::Interval(Box::new(point_type)))
-        } else if s.starts_with("Tuple[") && s.ends_with(']') {
-            let inner = &s[6..s.len() - 1];
-            let parts = Self::split_type_args(inner);
-            let types: Result<Vec<_>> = parts.iter().map(|p| Self::parse_type(p)).collect();
-            Ok(ParsedType::Tuple(types?))
-        } else {
-            // Primitive types
-            match s {
-                "Int32" | "int32" => Ok(ParsedType::Int32),
-                "Int64" | "int64" => Ok(ParsedType::Int64),
-                "Float32" | "float32" => Ok(ParsedType::Float32),
-                "Float64" | "float64" => Ok(ParsedType::Float64),
-                "Boolean" | "bool" => Ok(ParsedType::Boolean),
-                "String" | "str" => Ok(ParsedType::String),
-                "Binary" => Ok(ParsedType::Binary),
-                "Call" => Ok(ParsedType::Call),
-                _ => {
-                    // Unknown type - treat as any
-                    Ok(ParsedType::Any)
-                }
-            }
-        }
-    }
-
-    /// Parse struct fields from the inner part of Struct{...}
-    fn parse_struct_fields(s: &str) -> Result<Vec<(String, ParsedType)>> {
-        let mut fields = Vec::new();
-        let mut depth = 0;
-        let mut current_start = 0;
-        let chars: Vec<char> = s.chars().collect();
-
-        for (i, c) in chars.iter().enumerate() {
-            match c {
-                '{' | '[' | '(' => depth += 1,
-                '}' | ']' | ')' => depth -= 1,
-                ',' if depth == 0 => {
-                    let field_str: String = chars[current_start..i].iter().collect();
-                    if let Some(field) = Self::parse_field(&field_str)? {
-                        fields.push(field);
-                    }
-                    current_start = i + 1;
-                }
-                _ => {}
-            }
-        }
-
-        // Don't forget the last field
-        if current_start < chars.len() {
-            let field_str: String = chars[current_start..].iter().collect();
-            if let Some(field) = Self::parse_field(&field_str)? {
-                fields.push(field);
-            }
-        }
-
-        Ok(fields)
-    }
-
-    /// Parse a single field "name:Type"
-    fn parse_field(s: &str) -> Result<Option<(String, ParsedType)>> {
-        let s = s.trim();
-        if s.is_empty() {
-            return Ok(None);
-        }
-
-        if let Some(colon_pos) = s.find(':') {
-            let name = s[..colon_pos].trim().to_string();
-            let type_str = s[colon_pos + 1..].trim();
-            let parsed_type = Self::parse_type(type_str)?;
-            Ok(Some((name, parsed_type)))
-        } else {
-            Err(HailError::InvalidFormat(format!(
-                "Invalid field format: {}",
-                s
-            )))
-        }
-    }
-
-    /// Split type arguments respecting nesting
-    fn split_type_args(s: &str) -> Vec<&str> {
-        let mut result = Vec::new();
-        let mut depth = 0;
-        let mut start = 0;
-        let bytes = s.as_bytes();
-
-        for (i, &b) in bytes.iter().enumerate() {
-            match b {
-                b'{' | b'[' | b'(' => depth += 1,
-                b'}' | b']' | b')' => depth -= 1,
-                b',' if depth == 0 => {
-                    result.push(s[start..i].trim());
-                    start = i + 1;
-                }
-                _ => {}
-            }
-        }
-
-        if start < s.len() {
-            result.push(s[start..].trim());
-        }
-
-        result
-    }
-
-    /// Convert a ParsedType to a JSON schema Value
-    fn type_to_schema(t: &ParsedType) -> Value {
+    /// Render the shared strict logical model as JSON Schema. Some logical
+    /// distinctions share a JSON representation, but they remain distinct in
+    /// `LogicalType` and release descriptors.
+    fn type_to_schema(t: &crate::schema::LogicalType) -> Value {
+        use crate::schema::LogicalType;
         match t {
-            ParsedType::Int32 | ParsedType::Int64 => json!({"type": ["integer", "null"]}),
-            ParsedType::Float32 | ParsedType::Float64 => json!({"type": ["number", "null"]}),
-            ParsedType::Boolean => json!({"type": ["boolean", "null"]}),
-            ParsedType::String | ParsedType::Binary => json!({"type": ["string", "null"]}),
-            ParsedType::Call => json!({
+            LogicalType::Int32 | LogicalType::Int64 => json!({"type": ["integer", "null"]}),
+            LogicalType::Float32 | LogicalType::Float64 => json!({"type": ["number", "null"]}),
+            LogicalType::Boolean => json!({"type": ["boolean", "null"]}),
+            LogicalType::String | LogicalType::Binary => json!({"type": ["string", "null"]}),
+            LogicalType::Call => json!({
                 "type": ["integer", "null"],
                 "description": "Genotype call (encoded as integer)"
             }),
-            ParsedType::Array(elem) => {
-                let elem_schema = Self::type_to_schema(elem);
-                json!({
-                    "type": ["array", "null"],
-                    "items": elem_schema
-                })
-            }
-            ParsedType::Dict(value_type) => {
-                // Hail serializes Dict as array of {key, value} objects
-                let value_schema = Self::type_to_schema(value_type);
-                json!({
-                    "type": ["array", "null"],
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "key": {},
-                            "value": value_schema
-                        },
-                        "required": ["key", "value"]
-                    }
-                })
-            }
-            ParsedType::Struct(fields) => {
+            LogicalType::Array { element } | LogicalType::Set { element } => json!({
+                "type": ["array", "null"],
+                "items": Self::type_to_schema(element)
+            }),
+            LogicalType::Dict { key, value } => json!({
+                "type": ["array", "null"],
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "key": Self::type_to_schema(key),
+                        "value": Self::type_to_schema(value)
+                    },
+                    "required": ["key", "value"]
+                }
+            }),
+            LogicalType::Struct { fields } => {
                 let mut properties = Map::new();
                 let mut required_fields = Vec::new();
-
-                for (name, field_type) in fields {
-                    properties.insert(name.clone(), Self::type_to_schema(field_type));
-                    required_fields.push(Value::String(name.clone()));
+                for field in fields {
+                    properties.insert(
+                        field.name.clone(),
+                        Self::type_to_schema(&field.logical_type),
+                    );
+                    required_fields.push(Value::String(field.name.clone()));
                 }
-
                 json!({
                     "type": ["object", "null"],
                     "properties": properties,
@@ -1227,27 +1084,20 @@ impl SchemaGenerator {
                     "additionalProperties": false
                 })
             }
-            ParsedType::Locus(rg) => {
-                // Locus is a struct with contig and position
-                let contigs = Self::get_contigs_for_reference(rg);
-                json!({
-                    "type": ["object", "null"],
-                    "description": format!("Genomic locus ({})", rg),
-                    "properties": {
-                        "contig": {
-                            "type": "string",
-                            "enum": contigs
-                        },
-                        "position": {
-                            "type": "integer",
-                            "minimum": 1
-                        }
+            LogicalType::Locus { reference_genome } => json!({
+                "type": ["object", "null"],
+                "description": format!("Genomic locus ({})", reference_genome),
+                "properties": {
+                    "contig": {
+                        "type": "string",
+                        "enum": Self::get_contigs_for_reference(reference_genome)
                     },
-                    "required": ["contig", "position"]
-                })
-            }
-            ParsedType::Interval(point_type) => {
-                let point_schema = Self::type_to_schema(point_type);
+                    "position": {"type": "integer", "minimum": 1}
+                },
+                "required": ["contig", "position"]
+            }),
+            LogicalType::Interval { point } => {
+                let point_schema = Self::type_to_schema(point);
                 json!({
                     "type": ["object", "null"],
                     "description": "Genomic interval",
@@ -1259,16 +1109,15 @@ impl SchemaGenerator {
                     }
                 })
             }
-            ParsedType::Tuple(types) => {
-                let items: Vec<Value> = types.iter().map(|t| Self::type_to_schema(t)).collect();
+            LogicalType::Tuple { elements } => {
+                let items: Vec<Value> = elements.iter().map(Self::type_to_schema).collect();
                 json!({
                     "type": ["array", "null"],
-                    "items": items,
-                    "minItems": types.len(),
-                    "maxItems": types.len()
+                    "prefixItems": items,
+                    "minItems": elements.len(),
+                    "maxItems": elements.len()
                 })
             }
-            ParsedType::Any => json!({}),
         }
     }
 
@@ -1287,24 +1136,4 @@ impl SchemaGenerator {
             _ => vec![], // Unknown reference genome - no enum constraint
         }
     }
-}
-
-/// Intermediate representation of a parsed Hail type
-#[derive(Debug, Clone)]
-enum ParsedType {
-    Int32,
-    Int64,
-    Float32,
-    Float64,
-    Boolean,
-    String,
-    Binary,
-    Call,
-    Array(Box<ParsedType>),
-    Dict(Box<ParsedType>),
-    Struct(Vec<(String, ParsedType)>),
-    Locus(String),
-    Interval(Box<ParsedType>),
-    Tuple(Vec<ParsedType>),
-    Any,
 }
