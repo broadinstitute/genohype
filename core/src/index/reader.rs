@@ -4,13 +4,153 @@ use crate::buffer::{InputBuffer, LEB128Buffer};
 use crate::codec::{ETypeParser, EncodedType};
 use crate::index::{IndexMetadata, IndexNode, InternalNode, LeafNode};
 use crate::io::join_path;
-use crate::metadata::{CacheOptions, IndexSpec, MetadataCache};
+use crate::metadata::{BufferSpec, CacheOptions, CodecSpec, IndexSpec, MetadataCache};
 use crate::HailError;
 use crate::Result;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+
+const SUPPORTED_INDEX_FILE_VERSION: u32 = 66_048;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexCompression {
+    Zstd { max_block_size: usize },
+    Lz4Hc { max_block_size: usize },
+}
+
+impl IndexCompression {
+    fn from_spec(spec: &IndexSpec) -> Result<Self> {
+        validate_typed_codec("leaf", &spec.leaf_codec)?;
+        validate_typed_codec("internal-node", &spec.internal_node_codec)?;
+
+        if spec.leaf_codec.buffer_spec != spec.internal_node_codec.buffer_spec {
+            return Err(HailError::Codec(
+                "Hail index leaf and internal-node codecs use different buffer stacks".to_string(),
+            ));
+        }
+
+        Self::from_buffer_spec(&spec.leaf_codec.buffer_spec)
+    }
+
+    fn from_buffer_spec(spec: &BufferSpec) -> Result<Self> {
+        let compression = match spec {
+            BufferSpec::LEB128 { child } => match child.as_ref() {
+                BufferSpec::Blocking { block_size, child } if *block_size > 0 => child.as_ref(),
+                BufferSpec::Blocking { .. } => {
+                    return Err(HailError::Codec(
+                        "invalid Hail index buffer stack: BlockingBufferSpec has blockSize 0"
+                            .to_string(),
+                    ))
+                }
+                other => return Err(unsupported_index_stack("LEB128BufferSpec child", other)),
+            },
+            other => return Err(unsupported_index_stack("buffer stack root", other)),
+        };
+
+        let (codec, child) = match compression {
+            BufferSpec::ZstdBlock { block_size, child } if *block_size > 0 => (
+                Self::Zstd {
+                    max_block_size: *block_size,
+                },
+                child.as_ref(),
+            ),
+            BufferSpec::LZ4HCBlock { block_size, child } if *block_size > 0 => (
+                Self::Lz4Hc {
+                    max_block_size: *block_size,
+                },
+                child.as_ref(),
+            ),
+            BufferSpec::ZstdBlock { .. } => {
+                return Err(HailError::Codec(
+                    "invalid Hail index buffer stack: ZstdBlockBufferSpec has blockSize 0"
+                        .to_string(),
+                ))
+            }
+            BufferSpec::LZ4HCBlock { .. } => {
+                return Err(HailError::Codec(
+                    "invalid Hail index buffer stack: LZ4HCBlockBufferSpec has blockSize 0"
+                        .to_string(),
+                ))
+            }
+            other => return Err(unsupported_index_stack("BlockingBufferSpec child", other)),
+        };
+        if !matches!(child, BufferSpec::StreamBlock) {
+            return Err(unsupported_index_stack(
+                &format!("{} child", codec.name()),
+                child,
+            ));
+        }
+        Ok(codec)
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Zstd { .. } => "ZstdBlockBufferSpec",
+            Self::Lz4Hc { .. } => "LZ4HCBlockBufferSpec",
+        }
+    }
+
+    fn max_block_size(self) -> usize {
+        match self {
+            Self::Zstd { max_block_size } | Self::Lz4Hc { max_block_size } => max_block_size,
+        }
+    }
+
+    fn decode(self, data: &[u8], expected_len: usize) -> Result<Vec<u8>> {
+        match self {
+            Self::Zstd { .. } => zstd::decode_all(data).map_err(|_| HailError::Zstd),
+            Self::Lz4Hc { .. } => {
+                lz4_flex::block::decompress(data, expected_len).map_err(|error| {
+                    HailError::InvalidFormat(format!("malformed LZ4HC index raw block: {error}"))
+                })
+            }
+        }
+    }
+}
+
+fn validate_typed_codec(role: &str, codec: &CodecSpec) -> Result<()> {
+    if codec.name != "TypedCodecSpec" {
+        return Err(HailError::Codec(format!(
+            "unsupported Hail index {role} codec {:?}; expected TypedCodecSpec",
+            codec.name
+        )));
+    }
+    Ok(())
+}
+
+fn validate_index_metadata(metadata: &IndexMetadata) -> Result<()> {
+    if metadata.file_version != SUPPORTED_INDEX_FILE_VERSION {
+        return Err(HailError::Index(format!(
+            "unsupported Hail index fileVersion {}; expected {}",
+            metadata.file_version, SUPPORTED_INDEX_FILE_VERSION
+        )));
+    }
+    if metadata.height == 0 {
+        return Err(HailError::Index(
+            "invalid Hail index metadata: height must be greater than 0".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn buffer_spec_name(spec: &BufferSpec) -> &'static str {
+    match spec {
+        BufferSpec::StreamBlock => "StreamBlockBufferSpec",
+        BufferSpec::ZstdBlock { .. } => "ZstdBlockBufferSpec",
+        BufferSpec::LZ4HCBlock { .. } => "LZ4HCBlockBufferSpec",
+        BufferSpec::Blocking { .. } => "BlockingBufferSpec",
+        BufferSpec::LEB128 { .. } => "LEB128BufferSpec",
+    }
+}
+
+fn unsupported_index_stack(context: &str, actual: &BufferSpec) -> HailError {
+    HailError::Codec(format!(
+        "unsupported Hail index buffer stack at {context}: found {}",
+        buffer_spec_name(actual)
+    ))
+}
 
 /// Index reader for Hail B-tree indexes
 pub struct IndexReader {
@@ -59,6 +199,8 @@ impl IndexReader {
         // Read index metadata
         let metadata_path = join_path(index_dir, "metadata.json.gz");
         let metadata = IndexMetadata::from_path_with_snapshot(&metadata_path, snapshot)?;
+        validate_index_metadata(&metadata)?;
+        let compression = IndexCompression::from_spec(spec)?;
 
         // Parse the EType for leaf nodes
         let leaf_type = ETypeParser::parse(&spec.leaf_codec.e_type)?;
@@ -72,6 +214,7 @@ impl IndexReader {
             &metadata,
             &leaf_type,
             &internal_type,
+            compression,
             snapshot,
         )?;
 
@@ -125,6 +268,8 @@ impl IndexReader {
 
                 let metadata_local_str = metadata_local.to_string_lossy().to_string();
                 let metadata = crate::index::IndexMetadata::from_path(&metadata_local_str)?;
+                validate_index_metadata(&metadata)?;
+                let compression = IndexCompression::from_spec(spec)?;
 
                 let leaf_type = ETypeParser::parse(&spec.leaf_codec.e_type)?;
                 let internal_type = ETypeParser::parse(&spec.internal_node_codec.e_type)?;
@@ -150,6 +295,7 @@ impl IndexReader {
                     &metadata,
                     &leaf_type,
                     &internal_type,
+                    compression,
                 )?;
 
                 Ok(IndexReader {
@@ -182,10 +328,11 @@ impl IndexReader {
         metadata: &IndexMetadata,
         leaf_type: &EncodedType,
         internal_type: &EncodedType,
+        compression: IndexCompression,
     ) -> Result<HashMap<u64, IndexNode>> {
         let index_file_path = index_dir.join(&metadata.index_path);
         let mut file = File::open(&index_file_path)?;
-        Self::load_all_nodes_from_reader(&mut file, metadata, leaf_type, internal_type)
+        Self::load_all_nodes_from_reader(&mut file, metadata, leaf_type, internal_type, compression)
     }
 
     /// Load all nodes from the index file into a cache (cloud path version)
@@ -194,6 +341,7 @@ impl IndexReader {
         metadata: &IndexMetadata,
         leaf_type: &EncodedType,
         internal_type: &EncodedType,
+        compression: IndexCompression,
         snapshot: Option<&crate::io::SourceSnapshot>,
     ) -> Result<HashMap<u64, IndexNode>> {
         let index_file_path = join_path(index_dir, &metadata.index_path);
@@ -204,7 +352,13 @@ impl IndexReader {
         reader.read_to_end(&mut data)?;
         let mut cursor = std::io::Cursor::new(data);
 
-        Self::load_all_nodes_from_reader(&mut cursor, metadata, leaf_type, internal_type)
+        Self::load_all_nodes_from_reader(
+            &mut cursor,
+            metadata,
+            leaf_type,
+            internal_type,
+            compression,
+        )
     }
 
     /// Load all nodes from any reader that implements Read + Seek
@@ -213,53 +367,106 @@ impl IndexReader {
         metadata: &IndexMetadata,
         leaf_type: &EncodedType,
         internal_type: &EncodedType,
+        compression: IndexCompression,
     ) -> Result<HashMap<u64, IndexNode>> {
-        // Map physical file offset -> offset in decompressed_data
-        let mut block_map: HashMap<u64, usize> = HashMap::new();
+        // Map physical file offset -> (offset in decompressed_data, block length).
+        let mut block_map: HashMap<u64, (usize, usize)> = HashMap::new();
         let mut decompressed_data: Vec<u8> = Vec::new();
 
         // Read blocks until EOF
-        loop {
+        'blocks: loop {
             let phys_offset = reader.seek(SeekFrom::Current(0))?;
 
-            // Read 4-byte block length
+            // A clean EOF is valid only before the first byte of the next
+            // StreamBlock prefix. A partial prefix is corrupt index data.
             let mut len_buf = [0u8; 4];
-            match reader.read_exact(&mut len_buf) {
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break, // EOF
-                Err(e) => return Err(e.into()),
+            loop {
+                match reader.read(&mut len_buf[..1]) {
+                    Ok(0) => break 'blocks,
+                    Ok(1) => break,
+                    Ok(_) => unreachable!(),
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error.into()),
+                }
             }
+            reader.read_exact(&mut len_buf[1..]).map_err(|error| {
+                HailError::InvalidFormat(format!(
+                    "truncated Hail index StreamBlock length prefix: {error}"
+                ))
+            })?;
             let block_len = u32::from_le_bytes(len_buf) as usize;
+            let max_encoded_len = compression
+                .max_block_size()
+                .saturating_mul(2)
+                .saturating_add(1024);
+            if block_len > max_encoded_len {
+                return Err(HailError::InvalidFormat(format!(
+                    "Hail index compressed block length {block_len} exceeds safe bound {max_encoded_len} for codec blockSize {}",
+                    compression.max_block_size()
+                )));
+            }
 
             // Read compressed block data
             let mut compressed = vec![0u8; block_len];
             reader.read_exact(&mut compressed)?;
 
-            // Decompress (format: [4-byte decompressed len][zstd data])
+            // Decode the raw compression block selected by IndexSpec codec metadata.
+            // Both Zstd and historical LZ4HC use a signed little-endian
+            // decompressed-size prefix inside the outer StreamBlock framing.
             if block_len < 4 {
-                return Err(HailError::InvalidFormat("Block too small".to_string()));
+                return Err(HailError::InvalidFormat(
+                    "Hail index block is too small for its decompressed-size prefix".to_string(),
+                ));
             }
 
-            let expected_len =
-                i32::from_le_bytes([compressed[0], compressed[1], compressed[2], compressed[3]])
-                    as usize;
+            let expected_i32 =
+                i32::from_le_bytes([compressed[0], compressed[1], compressed[2], compressed[3]]);
+            if expected_i32 < 0 {
+                return Err(HailError::InvalidFormat(format!(
+                    "Hail index block has negative decompressed length {expected_i32}"
+                )));
+            }
+            let expected_len = expected_i32 as usize;
+            if expected_len > compression.max_block_size() {
+                return Err(HailError::InvalidFormat(format!(
+                    "Hail index decompressed length {expected_len} exceeds codec blockSize {}",
+                    compression.max_block_size()
+                )));
+            }
 
-            let zstd_data = &compressed[4..];
-            let decompressed_block = zstd::decode_all(zstd_data).map_err(|_| HailError::Zstd)?;
+            let decompressed_block = compression.decode(&compressed[4..], expected_len)?;
 
             if decompressed_block.len() != expected_len {
                 return Err(HailError::InvalidFormat(format!(
-                    "Decompressed size mismatch: expected {}, got {}",
-                    expected_len,
+                    "Hail index decompressed size mismatch: expected {expected_len}, got {}",
                     decompressed_block.len()
                 )));
             }
 
             // Record mapping and append data
-            block_map.insert(phys_offset, decompressed_data.len());
+            block_map.insert(
+                phys_offset,
+                (decompressed_data.len(), decompressed_block.len()),
+            );
             decompressed_data.extend_from_slice(&decompressed_block);
         }
 
+        Self::parse_nodes(
+            metadata,
+            leaf_type,
+            internal_type,
+            block_map,
+            decompressed_data,
+        )
+    }
+
+    fn parse_nodes(
+        metadata: &IndexMetadata,
+        leaf_type: &EncodedType,
+        internal_type: &EncodedType,
+        block_map: HashMap<u64, (usize, usize)>,
+        decompressed_data: Vec<u8>,
+    ) -> Result<HashMap<u64, IndexNode>> {
         // Helper to resolve offsets
         // Hail index offsets can be either:
         // 1. Direct physical file offsets (for root_offset) - maps to start of a block
@@ -269,7 +476,7 @@ impl IndexReader {
         // If it does, we use the block's start. Otherwise we decode as virtual offset.
         let resolve_offset = |v_off: u64| -> Result<usize> {
             // First check if this is a direct physical block offset
-            if let Some(&mem_base) = block_map.get(&v_off) {
+            if let Some(&(mem_base, _)) = block_map.get(&v_off) {
                 return Ok(mem_base);
             }
 
@@ -277,21 +484,21 @@ impl IndexReader {
             let phys = v_off >> 16;
             let local = (v_off & 0xFFFF) as usize;
 
-            let mem_base = block_map.get(&phys).ok_or_else(|| {
+            let &(mem_base, block_len) = block_map.get(&phys).ok_or_else(|| {
                 HailError::Index(format!(
                     "Invalid physical offset in virtual offset: {} (from v_off={})",
                     phys, v_off
                 ))
             })?;
-
-            let mem_offset = mem_base + local;
-            if mem_offset >= decompressed_data.len() {
+            if local >= block_len {
                 return Err(HailError::Index(format!(
-                    "Virtual offset out of bounds: {} -> {}",
-                    v_off, mem_offset
+                    "Virtual offset local position {local} is outside decompressed block length {block_len} (v_off={v_off})"
                 )));
             }
-            Ok(mem_offset)
+
+            mem_base.checked_add(local).ok_or_else(|| {
+                HailError::Index(format!("Virtual offset overflows memory position: {v_off}"))
+            })
         };
 
         // Parse nodes starting from root
@@ -314,11 +521,9 @@ impl IndexReader {
             };
             let mut leb_buffer = LEB128Buffer::new(slice_buffer);
 
-            // Read node type
-            let node_type = match leb_buffer.read_u8() {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
+            // A queued node offset must resolve to a complete encoded node.
+            // Do not silently omit corrupt root or child nodes from the cache.
+            let node_type = leb_buffer.read_u8()?;
 
             let node = match node_type {
                 0 => {
@@ -708,19 +913,25 @@ mod tests {
         }
 
         let buf_spec = crate::metadata::BufferSpec::LEB128 {
-            child: Box::new(crate::metadata::BufferSpec::StreamBlock),
+            child: Box::new(crate::metadata::BufferSpec::Blocking {
+                block_size: 65_536,
+                child: Box::new(crate::metadata::BufferSpec::ZstdBlock {
+                    block_size: 65_536,
+                    child: Box::new(crate::metadata::BufferSpec::StreamBlock),
+                }),
+            }),
         };
         let spec = IndexSpec {
             name: "index".to_string(),
             rel_path: "index".to_string(),
             leaf_codec: crate::metadata::CodecSpec {
-                name: "leaf".to_string(),
+                name: "TypedCodecSpec".to_string(),
                 e_type: "EBaseStruct{first_idx:+EInt64,keys:+EArray[+EBaseStruct{key:+EBaseStruct{locus:EBaseStruct{contig:+EBinary,position:+EInt32},alleles:EArray[EBinary]},offset:+EInt64,annotation:+EBaseStruct{}}]}".to_string(),
                 v_type: String::new(),
                 buffer_spec: buf_spec.clone(),
             },
             internal_node_codec: crate::metadata::CodecSpec {
-                name: "internal".to_string(),
+                name: "TypedCodecSpec".to_string(),
                 e_type: "EBaseStruct{children:+EArray[+EBaseStruct{index_file_offset:+EInt64,first_idx:+EInt64,first_key:+EBaseStruct{locus:EBaseStruct{contig:+EBinary,position:+EInt32},alleles:EArray[EBinary]},first_record_offset:+EInt64,first_annotation:+EBaseStruct{}}]}".to_string(),
                 v_type: String::new(),
                 buffer_spec: buf_spec,

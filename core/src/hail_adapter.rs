@@ -297,15 +297,6 @@ impl HailTableSource {
         Ok(())
     }
 
-    fn ensure_index_random_access_supported(&self, operation: &str) -> Result<()> {
-        if self.rvd_spec.codec_spec.buffer_spec.uses_lz4hc() {
-            return Err(HailError::Codec(format!(
-                "{operation} via historical LZ4HC index virtual offsets is not supported; sequential full-partition decoding is supported"
-            )));
-        }
-        Ok(())
-    }
-
     /// Check if partition counts are available without scanning index files
     pub fn has_fast_row_count(&self) -> bool {
         self.partition_counts.is_some()
@@ -700,10 +691,7 @@ impl DataSource for HailTableSource {
         let row_type = self.row_type.clone();
         let row_buffer_spec = self.rvd_spec.codec_spec.buffer_spec.clone();
         let ranges = ranges.to_vec();
-        // Historical LZ4HC index virtual offsets are not validated. Keep
-        // sequential/full-partition decoding independent of random access.
-        let has_index = self.rvd_spec.index_spec.is_some()
-            && !self.rvd_spec.codec_spec.buffer_spec.uses_lz4hc();
+        let has_index = self.rvd_spec.index_spec.is_some();
         let index_readers = self.index_readers.clone();
         let block_maps = self.block_maps.clone();
         let table_path = self.table_path.clone();
@@ -718,9 +706,9 @@ impl DataSource for HailTableSource {
             .as_ref()
             .and_then(|ivl| build_seek_key_from_intervals(ivl, &key_fields));
 
-        // Identity failures in snapshot index reads must never be converted to
-        // a silent full-scan fallback.
-        if source_snapshot.is_some() && has_index && seek_key.is_some() {
+        // Codec, version, corruption, and snapshot-identity failures must not
+        // be converted to a silent full-scan fallback.
+        if has_index && seek_key.is_some() {
             for &partition_idx in &matching_partitions {
                 self.get_index_reader(partition_idx)?;
             }
@@ -922,8 +910,7 @@ impl DataSource for HailTableSource {
         let row_type = self.row_type.clone();
         let row_buffer_spec = self.rvd_spec.codec_spec.buffer_spec.clone();
         let ranges = ranges.to_vec();
-        let has_index = self.rvd_spec.index_spec.is_some()
-            && !self.rvd_spec.codec_spec.buffer_spec.uses_lz4hc();
+        let has_index = self.rvd_spec.index_spec.is_some();
         let index_readers = self.index_readers.clone();
         let table_path = self.table_path.clone();
         let index_spec = self.rvd_spec.index_spec.clone();
@@ -936,7 +923,7 @@ impl DataSource for HailTableSource {
             .as_ref()
             .and_then(|ivl| build_seek_key_from_intervals(ivl, &key_fields));
 
-        if source_snapshot.is_some() && has_index && seek_key.is_some() {
+        if has_index && seek_key.is_some() {
             for &partition_idx in &matching_partitions {
                 self.get_index_reader(partition_idx)?;
             }
@@ -1108,7 +1095,6 @@ impl DataSource for HailTableSource {
     #[instrument(skip_all)]
     fn lookup(&self, key: &EncodedValue) -> Result<Option<EncodedValue>> {
         self.ensure_row_decode_supported("row lookup")?;
-        self.ensure_index_random_access_supported("row lookup")?;
         // For point lookups, skip partition pruning if there's only one partition
         let matching_partitions = if self.rvd_spec.part_files.len() == 1 {
             vec![0]
@@ -1156,13 +1142,15 @@ mod tests {
         }
     }
 
-    fn rewrite_codec_as_lz4hc(metadata_path: &std::path::Path) {
+    fn update_gzipped_json(
+        metadata_path: &std::path::Path,
+        update: impl FnOnce(&mut serde_json::Value),
+    ) {
         let mut decoder = flate2::read::GzDecoder::new(std::fs::File::open(metadata_path).unwrap());
         let mut json = Vec::new();
         decoder.read_to_end(&mut json).unwrap();
         let mut value: serde_json::Value = serde_json::from_slice(&json).unwrap();
-        let codec = &mut value["_codecSpec"]["_bufferSpec"]["child"]["child"];
-        codec["name"] = serde_json::json!("LZ4HCBlockBufferSpec");
+        update(&mut value);
 
         let mut encoder = flate2::write::GzEncoder::new(
             std::fs::File::create(metadata_path).unwrap(),
@@ -1174,11 +1162,33 @@ mod tests {
         encoder.finish().unwrap();
     }
 
-    fn transcode_zstd_part_as_lz4hc(part_path: &std::path::Path) {
+    fn set_data_compression(metadata_path: &std::path::Path, codec_name: &str) {
+        update_gzipped_json(metadata_path, |value| {
+            value["_codecSpec"]["_bufferSpec"]["child"]["child"]["name"] =
+                serde_json::json!(codec_name);
+        });
+    }
+
+    fn set_index_compression(metadata_path: &std::path::Path, codec_name: &str) {
+        update_gzipped_json(metadata_path, |value| {
+            for codec in ["_leafCodec", "_internalNodeCodec"] {
+                value["_indexSpec"][codec]["_bufferSpec"]["child"]["child"]["name"] =
+                    serde_json::json!(codec_name);
+            }
+        });
+    }
+
+    /// Transcode the fixture's StreamBlock payloads and return old-to-new
+    /// physical block offsets. This is fixture construction, not production
+    /// qualification of historical Hail bytes.
+    fn transcode_zstd_part_as_lz4hc(part_path: &std::path::Path) -> Vec<(u64, u64)> {
         let source = std::fs::read(part_path).unwrap();
         let mut position = 0;
         let mut output = Vec::new();
+        let mut block_offsets = Vec::new();
         while position < source.len() {
+            let old_offset = position as u64;
+            let new_offset = output.len() as u64;
             let outer_len =
                 u32::from_le_bytes(source[position..position + 4].try_into().unwrap()) as usize;
             position += 4;
@@ -1192,8 +1202,10 @@ mod tests {
             output.extend_from_slice(&(lz4_outer_len as u32).to_le_bytes());
             output.extend_from_slice(&(decoded.len() as i32).to_le_bytes());
             output.extend_from_slice(&compressed);
+            block_offsets.push((old_offset, new_offset));
         }
         std::fs::write(part_path, output).unwrap();
+        block_offsets
     }
 
     fn make_lz4hc_fixture(destination: &std::path::Path) {
@@ -1202,9 +1214,46 @@ mod tests {
             destination,
         );
         for component in ["rows", "globals"] {
-            rewrite_codec_as_lz4hc(&destination.join(component).join("metadata.json.gz"));
+            let metadata_path = destination.join(component).join("metadata.json.gz");
+            set_data_compression(&metadata_path, "LZ4HCBlockBufferSpec");
             transcode_zstd_part_as_lz4hc(&destination.join(component).join("parts").join("part-0"));
         }
+
+        let rows_metadata = destination.join("rows/metadata.json.gz");
+        set_index_compression(&rows_metadata, "LZ4HCBlockBufferSpec");
+        let offsets = transcode_zstd_part_as_lz4hc(&destination.join("index/part-0.idx/index"));
+        update_gzipped_json(
+            &destination.join("index/part-0.idx/metadata.json.gz"),
+            |value| {
+                let old_root = value["rootOffset"].as_u64().unwrap();
+                value["rootOffset"] = serde_json::json!(offsets
+                    .iter()
+                    .find_map(|(old, new)| (*old == old_root).then_some(*new))
+                    .expect("fixture rootOffset must point to a physical block boundary"));
+            },
+        );
+    }
+
+    fn first_fixture_key() -> EncodedValue {
+        EncodedValue::Struct(vec![
+            (
+                "gene_id".to_string(),
+                EncodedValue::Binary(b"ENSG00000066468".to_vec()),
+            ),
+            ("chrom".to_string(), EncodedValue::Binary(b"10".to_vec())),
+            ("start".to_string(), EncodedValue::Int32(121478332)),
+        ])
+    }
+
+    fn second_fixture_key() -> EncodedValue {
+        EncodedValue::Struct(vec![
+            (
+                "gene_id".to_string(),
+                EncodedValue::Binary(b"ENSG00000141510".to_vec()),
+            ),
+            ("chrom".to_string(), EncodedValue::Binary(b"17".to_vec())),
+            ("start".to_string(), EncodedValue::Int32(7668402)),
+        ])
     }
 
     fn snapshot_for_tree(root: &std::path::Path) -> crate::io::SourceSnapshot {
@@ -1359,7 +1408,7 @@ mod tests {
     }
 
     #[test]
-    fn lz4hc_rows_globals_and_all_sequential_parallel_builders_decode() {
+    fn synthetic_lz4hc_rows_globals_index_and_lookup_decode() {
         use crate::projection::FieldPath;
 
         let temp = tempfile::tempdir().unwrap();
@@ -1394,11 +1443,75 @@ mod tests {
         assert_eq!(sorted.len(), 2);
         assert!(sorted.iter().all(Result::is_ok));
 
-        let error = source
-            .lookup(&EncodedValue::Struct(vec![]))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("index virtual offsets"), "{error}");
-        assert!(error.contains("sequential full-partition"), "{error}");
+        for (expected, key) in scanned
+            .iter()
+            .map(|row| row.as_ref().unwrap())
+            .zip([first_fixture_key(), second_fixture_key()])
+        {
+            let indexed_row = source
+                .lookup(&key)
+                .unwrap()
+                .expect("synthetic LZ4HC index lookup should find the retained fixture row");
+            assert_eq!(&indexed_row, expected);
+        }
+    }
+
+    #[test]
+    fn lz4hc_index_wrong_codec_metadata_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let table = temp.path().join("wrong-index-codec.ht");
+        make_lz4hc_fixture(&table);
+        set_index_compression(&table.join("rows/metadata.json.gz"), "ZstdBlockBufferSpec");
+
+        let source = HailTableSource::new(table.to_str().unwrap()).unwrap();
+        let error = source.lookup(&first_fixture_key()).unwrap_err().to_string();
+        assert!(error.contains("Zstd decompression"), "{error}");
+    }
+
+    #[test]
+    fn lz4hc_index_corrupt_block_length_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let table = temp.path().join("corrupt-index.ht");
+        make_lz4hc_fixture(&table);
+        let index_path = table.join("index/part-0.idx/index");
+        let mut index = std::fs::read(&index_path).unwrap();
+        index[4..8].copy_from_slice(&1_000_000i32.to_le_bytes());
+        std::fs::write(index_path, index).unwrap();
+
+        let source = HailTableSource::new(table.to_str().unwrap()).unwrap();
+        let error = source.lookup(&first_fixture_key()).unwrap_err().to_string();
+        assert!(error.contains("exceeds codec blockSize"), "{error}");
+    }
+
+    #[test]
+    fn unsupported_index_version_and_codec_name_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let version_table = temp.path().join("wrong-index-version.ht");
+        copy_tree(
+            std::path::Path::new("tests/fixtures/tiny-keyed.ht"),
+            &version_table,
+        );
+        update_gzipped_json(
+            &version_table.join("index/part-0.idx/metadata.json.gz"),
+            |value| value["fileVersion"] = serde_json::json!(66_049),
+        );
+        let source = HailTableSource::new(version_table.to_str().unwrap()).unwrap();
+        let error = source.lookup(&first_fixture_key()).unwrap_err().to_string();
+        assert!(
+            error.contains("unsupported Hail index fileVersion"),
+            "{error}"
+        );
+
+        let codec_table = temp.path().join("wrong-index-codec-name.ht");
+        copy_tree(
+            std::path::Path::new("tests/fixtures/tiny-keyed.ht"),
+            &codec_table,
+        );
+        update_gzipped_json(&codec_table.join("rows/metadata.json.gz"), |value| {
+            value["_indexSpec"]["_leafCodec"]["name"] = serde_json::json!("UnknownCodecSpec");
+        });
+        let source = HailTableSource::new(codec_table.to_str().unwrap()).unwrap();
+        let error = source.lookup(&first_fixture_key()).unwrap_err().to_string();
+        assert!(error.contains("expected TypedCodecSpec"), "{error}");
     }
 }
