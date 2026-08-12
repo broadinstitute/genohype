@@ -9,6 +9,8 @@ use serde_json::Value;
 
 /// Minimum worker protocol that understands custom-task lease fencing.
 pub const CUSTOM_WORKER_PROTOCOL_VERSION: u32 = 1;
+/// Minimum stock-worker protocol for pinned safe-export execution.
+pub const SAFE_EXPORT_WORKER_PROTOCOL_VERSION: u32 = 2;
 
 /// A self-describing work unit in the coordinator's queue.
 ///
@@ -124,9 +126,19 @@ pub struct WorkRequest {
     /// Git commit hash of the worker binary
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_version: Option<String>,
-    /// Custom-worker wire protocol version. Legacy workers omit this field.
+    /// Monotonic worker wire protocol version. Legacy workers omit this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol_version: Option<u32>,
+    /// Stable build/provenance identity advertised by the stock worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_identity: Option<String>,
+    /// SHA-256 of the exact running executable, computed once at startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_sha256: Option<String>,
+    /// Explicit execution capabilities; protocol version alone never grants a
+    /// stock worker permission to consume arbitrary custom payloads.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
 }
 
 /// Response from coordinator with work assignment.
@@ -554,6 +566,9 @@ mod lease_protocol_tests {
         }))
         .unwrap();
         assert_eq!(work.protocol_version, None);
+        assert_eq!(work.build_identity, None);
+        assert_eq!(work.binary_sha256, None);
+        assert!(work.capabilities.is_empty());
     }
 
     #[test]
@@ -591,5 +606,22 @@ mod lease_protocol_tests {
                 ..
             }
         ));
+
+        let safe = WorkRequest {
+            worker_id: "stock".into(),
+            hardware: None,
+            build_version: Some("commit".into()),
+            protocol_version: Some(SAFE_EXPORT_WORKER_PROTOCOL_VERSION),
+            build_identity: Some("0.1:commit".into()),
+            binary_sha256: Some("a".repeat(64)),
+            capabilities: vec!["safe_export_v1".into()],
+        };
+        let decoded: WorkRequest =
+            serde_json::from_value(serde_json::to_value(safe).unwrap()).unwrap();
+        assert_eq!(decoded.protocol_version, Some(2));
+        assert_eq!(
+            decoded.binary_sha256.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
     }
 }

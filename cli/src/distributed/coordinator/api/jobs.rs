@@ -93,6 +93,29 @@ pub(crate) async fn submit_job(
         }
     }
 
+    if let JobSpec::SafeExport(spec) = &req.job_spec {
+        if let Err(error) = spec.validate() {
+            return axum::Json(JobConfigResponse {
+                acknowledged: false,
+                job_id: None,
+                error: Some(format!("invalid safe-export spec: {error}")),
+            });
+        }
+        if req.input_path != spec.canonical_table_uri
+            || req.total_tasks != spec.table.partitions.len()
+            || req.batch_size != Some(1)
+            || req.force
+            || !req.filters.is_empty()
+            || !req.intervals.is_empty()
+        {
+            return axum::Json(JobConfigResponse {
+                acknowledged: false,
+                job_id: None,
+                error: Some("safe export requires exact sealed input/count, batch size 1, and no force/filters/intervals".to_string()),
+            });
+        }
+    }
+
     let mut data = state.lock().unwrap();
 
     // R1: Check if workers are available. A custom job may be durably

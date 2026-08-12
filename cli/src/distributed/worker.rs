@@ -10,7 +10,10 @@ pub mod dispatch;
 pub mod handlers;
 pub mod telemetry;
 
-use crate::distributed::message::{CompleteRequest, JobSpec, TaskType, WorkRequest, WorkResponse};
+use crate::distributed::message::{
+    CompleteRequest, CompleteResponse, JobSpec, TaskType, WorkRequest, WorkResponse,
+    SAFE_EXPORT_WORKER_PROTOCOL_VERSION,
+};
 use crate::Result;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -84,6 +87,8 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
 
     let work_url = format!("{}/work", config.coordinator_url);
     let complete_url = format!("{}/complete", config.coordinator_url);
+    let binary_sha256 = current_executable_sha256()?;
+    let build_identity = format!("{}:{}", env!("CARGO_PKG_VERSION"), env!("GIT_HASH"));
 
     // Shared telemetry state between main loop and background heartbeat task
     let telemetry_state = Arc::new(TelemetryState::new());
@@ -101,18 +106,26 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
 
     loop {
         // Request work from coordinator
-        let work_response =
-            match request_work(&client, &work_url, &config.worker_id, &hardware).await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    eprintln!(
-                        "Failed to connect to coordinator: {}. Retrying in {}ms...",
-                        e, config.poll_interval_ms
-                    );
-                    tokio::time::sleep(Duration::from_millis(config.poll_interval_ms * 2)).await;
-                    continue;
-                }
-            };
+        let work_response = match request_work(
+            &client,
+            &work_url,
+            &config.worker_id,
+            &hardware,
+            &build_identity,
+            &binary_sha256,
+        )
+        .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                eprintln!(
+                    "Failed to connect to coordinator: {}. Retrying in {}ms...",
+                    e, config.poll_interval_ms
+                );
+                tokio::time::sleep(Duration::from_millis(config.poll_interval_ms * 2)).await;
+                continue;
+            }
+        };
 
         match work_response {
             WorkResponse::Exit => {
@@ -234,6 +247,9 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
                                     partition_index, ..
                                 } => return Some(partition_index),
                                 TaskType::Stress { iteration } => return Some(iteration),
+                                TaskType::SafeExportPart { task } => {
+                                    return Some(task.partition_index)
+                                }
                                 _ => {}
                             }
                         }
@@ -247,8 +263,19 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
                     })
                     .collect();
 
-                // Extract task IDs for completion reporting
+                // Extract task IDs and exact fenced assignment identities for completion/heartbeats.
                 let task_ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
+                let assignments: Vec<_> = tasks
+                    .iter()
+                    .filter_map(|task| task.assignment_lease())
+                    .collect();
+                let is_safe_export = matches!(job_spec, JobSpec::SafeExport(_));
+                if is_safe_export && (tasks.len() != 1 || assignments.len() != 1) {
+                    return Err(crate::HailError::InvalidFormat(
+                        "safe export requires exactly one fenced task".to_string(),
+                    ));
+                }
+                telemetry_state.set_active_fence(session_id.clone(), assignments.clone());
 
                 // Build description including batch info for aggregate batch jobs
                 let desc = if let JobSpec::ManhattanAggregateBatch { specs } = &job_spec {
@@ -278,9 +305,42 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
                 let job_spec_clone = job_spec.clone();
                 let filters_clone = filters.clone();
                 let intervals_clone = intervals.clone();
+                let tasks_clone = tasks.clone();
+                let assignments_clone = assignments.clone();
+                let worker_id_clone = config.worker_id.clone();
+                let worker_binary_sha256 = binary_sha256.clone();
                 let ts = telemetry_state.clone();
 
                 let result = tokio::task::spawn_blocking(move || {
+                    if let JobSpec::SafeExport(spec) = &job_spec_clone {
+                        let task_type: TaskType = serde_json::from_value(
+                            tasks_clone[0].payload.clone(),
+                        )
+                        .map_err(|error| {
+                            crate::HailError::InvalidFormat(format!(
+                                "invalid safe-export task payload: {error}"
+                            ))
+                        })?;
+                        let TaskType::SafeExportPart { task } = task_type else {
+                            return Err(crate::HailError::InvalidFormat(
+                                "safe-export job received a non-safe task".to_string(),
+                            ));
+                        };
+                        let report = handlers::export::process_safe_export_part(
+                            spec,
+                            &task,
+                            &assignments_clone[0],
+                            &worker_id_clone,
+                            env!("GIT_HASH"),
+                            &worker_binary_sha256,
+                        )?;
+                        let rows = usize::try_from(report.row_count).map_err(|_| {
+                            crate::HailError::InvalidFormat(
+                                "safe-export row count exceeds usize".to_string(),
+                            )
+                        })?;
+                        return Ok((rows, Some(serde_json::to_value(report)?), None));
+                    }
                     dispatch_job(
                         cached_engine,
                         &partitions_clone,
@@ -311,12 +371,16 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
                             result_json: None,
                             error: Some(error_msg),
                             session_id: session_id.clone(),
-                            assignments: Vec::new(),
+                            assignments: assignments.clone(),
                         };
-                        if let Err(post_err) =
-                            client.post(&complete_url).json(&fail_req).send().await
+                        match post_completion_until_acknowledged(&client, &complete_url, &fail_req)
+                            .await
                         {
-                            eprintln!("Failed to report error to coordinator: {}", post_err);
+                            Ok(()) => telemetry_state.clear_active_fence(),
+                            Err(post_err) if is_safe_export => return Err(post_err),
+                            Err(post_err) => {
+                                eprintln!("Failed to report error to coordinator: {}", post_err)
+                            }
                         }
                         continue;
                     }
@@ -333,12 +397,16 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
                             result_json: None,
                             error: Some(error_msg),
                             session_id: session_id.clone(),
-                            assignments: Vec::new(),
+                            assignments: assignments.clone(),
                         };
-                        if let Err(post_err) =
-                            client.post(&complete_url).json(&fail_req).send().await
+                        match post_completion_until_acknowledged(&client, &complete_url, &fail_req)
+                            .await
                         {
-                            eprintln!("Failed to report panic to coordinator: {}", post_err);
+                            Ok(()) => telemetry_state.clear_active_fence(),
+                            Err(post_err) if is_safe_export => return Err(post_err),
+                            Err(post_err) => {
+                                eprintln!("Failed to report panic to coordinator: {}", post_err)
+                            }
                         }
                         continue;
                     }
@@ -361,11 +429,16 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
                     rows_processed,
                     result_json,
                     session_id.clone(),
+                    assignments.clone(),
                 )
                 .await
                 {
+                    if is_safe_export {
+                        return Err(e);
+                    }
                     eprintln!("Failed to report completion: {}", e);
-                    // Continue anyway - coordinator will handle duplicates
+                } else {
+                    telemetry_state.clear_active_fence();
                 }
 
                 println!("Completed tasks {:?} ({} rows)", task_ids, rows_processed);
@@ -386,8 +459,10 @@ async fn request_work(
     url: &str,
     worker_id: &str,
     hardware: &crate::distributed::message::HardwareSpec,
+    build_identity: &str,
+    binary_sha256: &str,
 ) -> Result<WorkResponse> {
-    let request = build_work_request(worker_id, hardware);
+    let request = build_work_request(worker_id, hardware, build_identity, binary_sha256);
 
     let response = client.post(url).json(&request).send().await.map_err(|e| {
         crate::HailError::Io(std::io::Error::new(
@@ -414,12 +489,17 @@ async fn request_work(
 pub(crate) fn build_work_request(
     worker_id: &str,
     hardware: &crate::distributed::message::HardwareSpec,
+    build_identity: &str,
+    binary_sha256: &str,
 ) -> WorkRequest {
     WorkRequest {
         worker_id: worker_id.to_string(),
         hardware: Some(hardware.clone()),
         build_version: Some(env!("GIT_HASH").to_string()),
-        protocol_version: None,
+        protocol_version: Some(SAFE_EXPORT_WORKER_PROTOCOL_VERSION),
+        build_identity: Some(build_identity.to_string()),
+        binary_sha256: Some(binary_sha256.to_string()),
+        capabilities: vec!["safe_export_v1".to_string()],
     }
 }
 
@@ -432,6 +512,7 @@ async fn report_completion(
     items_processed: usize,
     result_json: Option<serde_json::Value>,
     session_id: Option<String>,
+    assignments: Vec<crate::distributed::message::AssignmentLease>,
 ) -> Result<()> {
     let request = CompleteRequest {
         worker_id: worker_id.to_string(),
@@ -440,15 +521,49 @@ async fn report_completion(
         result_json,
         error: None,
         session_id,
-        assignments: Vec::new(),
+        assignments,
     };
 
-    client.post(url).json(&request).send().await.map_err(|e| {
-        crate::HailError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("HTTP request failed: {}", e),
-        ))
-    })?;
+    post_completion_until_acknowledged(client, url, &request).await
+}
 
-    Ok(())
+async fn post_completion_until_acknowledged(
+    client: &reqwest::Client,
+    url: &str,
+    request: &CompleteRequest,
+) -> Result<()> {
+    let mut delay = Duration::from_millis(250);
+    for _ in 0..10 {
+        let response = client.post(url).json(request).send().await;
+        if let Ok(response) = response {
+            if let Ok(ack) = response.json::<CompleteResponse>().await {
+                if ack.acknowledged {
+                    return Ok(());
+                }
+            }
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_secs(10));
+    }
+    Err(crate::HailError::Io(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "coordinator did not acknowledge completion after bounded retries",
+    )))
+}
+
+fn current_executable_sha256() -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let path = std::env::current_exe().map_err(crate::HailError::Io)?;
+    let mut file = std::fs::File::open(path).map_err(crate::HailError::Io)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(crate::HailError::Io)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }

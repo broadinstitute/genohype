@@ -11,6 +11,12 @@ use std::fs::File;
 use std::io::Write;
 use std::sync::Arc;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParquetWriteStats {
+    pub row_count: u64,
+    pub row_group_count: u64,
+}
+
 pub struct ParquetWriter<W: Write + Send> {
     writer: ArrowWriter<W>,
     builders: Vec<ColumnBuilder>,
@@ -138,6 +144,41 @@ impl<W: Write + Send> ParquetWriter<W> {
         self.flush()?;
         Ok(self.writer.into_inner()?)
     }
+
+    /// Finalize the footer and return the underlying sink plus authoritative
+    /// file-level counts measured from Parquet metadata.
+    pub fn finish_into_inner(mut self) -> Result<(W, ParquetWriteStats)> {
+        self.flush()?;
+        self.writer.flush()?;
+        let row_count =
+            self.writer
+                .flushed_row_groups()
+                .iter()
+                .try_fold(0_u64, |total, group| {
+                    let rows = u64::try_from(group.num_rows()).map_err(|_| {
+                        HailError::InvalidFormat(
+                            "Parquet row group contains a negative row count".to_string(),
+                        )
+                    })?;
+                    total.checked_add(rows).ok_or_else(|| {
+                        HailError::InvalidFormat("Parquet row count overflow".to_string())
+                    })
+                })?;
+        let row_group_count =
+            u64::try_from(self.writer.flushed_row_groups().len()).map_err(|_| {
+                HailError::InvalidFormat("Parquet row-group count exceeds u64".to_string())
+            })?;
+        // `into_inner` writes the footer from these exact flushed row-group
+        // metadata records and returns the sink only after finalization.
+        let sink = self.writer.into_inner()?;
+        Ok((
+            sink,
+            ParquetWriteStats {
+                row_count,
+                row_group_count,
+            },
+        ))
+    }
 }
 
 fn builders(plan: &ArrowSchemaPlan) -> Result<Vec<ColumnBuilder>> {
@@ -196,6 +237,28 @@ mod tests {
     use arrow::array::{Array, BinaryArray};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn finalized_stats_come_from_parquet_footer() {
+        let paired = PairedSchema::from_raw_vtype(
+            ETypeParser::parse("+EBaseStruct{x:+EInt32}").unwrap(),
+            "Struct{x:Int32}",
+        )
+        .unwrap();
+        let plan = Arc::new(paired.arrow_plan().unwrap());
+        let mut writer =
+            ParquetWriter::from_writer(std::io::Cursor::new(Vec::new()), plan).unwrap();
+        writer
+            .write_row(&EncodedValue::Struct(vec![(
+                "x".into(),
+                EncodedValue::Int32(1),
+            )]))
+            .unwrap();
+        let (bytes, stats) = writer.finish_into_inner().unwrap();
+        assert!(!bytes.into_inner().is_empty());
+        assert_eq!(stats.row_count, 1);
+        assert_eq!(stats.row_group_count, 1);
+    }
 
     #[test]
     fn forced_flush_keeps_binary_plan_and_bytes() {

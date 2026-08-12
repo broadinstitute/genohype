@@ -96,11 +96,18 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
 
         // Use provided batch_size or fall back to sensible defaults per job type
         // Larger batches let workers parallelize with rayon
-        let batch_size = batch_size.or_else(|| match job_spec {
-            crate::distributed::message::JobSpec::Manhattan { .. } => Some(40),
-            crate::distributed::message::JobSpec::ExportParquet { .. } => Some(100),
-            _ => Some(50),
-        });
+        let batch_size = if matches!(
+            job_spec,
+            crate::distributed::message::JobSpec::SafeExport(_)
+        ) {
+            Some(1)
+        } else {
+            batch_size.or_else(|| match job_spec {
+                crate::distributed::message::JobSpec::Manhattan { .. } => Some(40),
+                crate::distributed::message::JobSpec::ExportParquet { .. } => Some(100),
+                _ => Some(50),
+            })
+        };
 
         // Phase 3: Job-type memory weight hints (MB per partition)
         // Use CLI override if provided, otherwise fall back to job-type heuristics
@@ -108,17 +115,31 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             crate::distributed::message::JobSpec::Manhattan { .. }
             | crate::distributed::message::JobSpec::ManhattanBatch { .. }
             | crate::distributed::message::JobSpec::ManhattanScan(_) => Some(1024), // 1GB per partition
-            crate::distributed::message::JobSpec::ExportParquet { .. }
+            crate::distributed::message::JobSpec::SafeExport(_)
+            | crate::distributed::message::JobSpec::ExportParquet { .. }
             | crate::distributed::message::JobSpec::ExportJson { .. } => Some(256), // 256MB
             crate::distributed::message::JobSpec::Summary => Some(64), // 64MB, very light
             crate::distributed::message::JobSpec::Custom { .. } => Some(512), // Safe default for external bins
             _ => None,
         });
 
+        let safe_count = match job_spec {
+            crate::distributed::message::JobSpec::SafeExport(spec) => {
+                if force || !filters.is_empty() || !intervals.is_empty() {
+                    return Err(HailError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "safe export forbids force, filters, and intervals",
+                    )));
+                }
+                spec.validate()?;
+                spec.table.partitions.len()
+            }
+            _ => total_partitions,
+        };
         let request = JobConfigRequest {
             input_path: input_path.to_string(),
             job_spec: job_spec.clone(),
-            total_tasks: total_partitions,
+            total_tasks: safe_count,
             batch_size,
             force,
             filters: filters.to_vec(),

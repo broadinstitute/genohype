@@ -10,6 +10,7 @@ pub use genohype_pool::distributed::{
     AssignmentLease, CompleteRequest, CompleteResponse, CoreTaskInfo, HardwareSpec,
     HeartbeatRequest, HeartbeatResponse, StatusResponse, TaskDescriptor, TelemetrySnapshot,
     UpdateFleetRequest, WorkRequest, WorkResponse, CUSTOM_WORKER_PROTOCOL_VERSION,
+    SAFE_EXPORT_WORKER_PROTOCOL_VERSION,
 };
 
 /// Durable coordinator receipt for one terminal custom-task assignment attempt.
@@ -88,6 +89,11 @@ pub enum TaskType {
         position: u32,
     },
 
+    /// One manifest-pinned Hail partition written to attempt-private staging.
+    SafeExportPart {
+        task: genohype_core::release::SafeExportPartTask,
+    },
+
     /// Generic/custom task type
     Custom {
         name: String,
@@ -156,6 +162,7 @@ impl TaskType {
             TaskType::Phenotype { .. } => "phenotype",
             TaskType::Stress { .. } => "stress",
             TaskType::Locus { .. } => "locus",
+            TaskType::SafeExportPart { .. } => "safe_export_part",
             TaskType::Custom { .. } => "custom",
         }
         .to_string();
@@ -200,6 +207,8 @@ pub enum ExecutionMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum JobSpec {
+    /// Manifest-pinned, one-source-partition-per-part safe Parquet export.
+    SafeExport(genohype_core::release::SafeExportSpec),
     /// Export to Parquet files
     ExportParquet { output_path: String },
     /// Export to JSON files (NDJSON)
@@ -703,6 +712,7 @@ impl JobSpec {
     /// Get a human-readable description of the job type.
     pub fn description(&self) -> &'static str {
         match self {
+            JobSpec::SafeExport(_) => "safe export parquet",
             JobSpec::ExportParquet { .. } => "export parquet",
             JobSpec::ExportJson { .. } => "export json",
             JobSpec::Summary => "summary",
@@ -733,6 +743,7 @@ impl JobSpec {
     /// Get the output path if this job produces output.
     pub fn output_path(&self) -> Option<&str> {
         match self {
+            JobSpec::SafeExport(spec) => Some(&spec.output_root_uri),
             JobSpec::ExportParquet { output_path } => Some(output_path),
             JobSpec::ExportJson { output_path, .. } => Some(output_path),
             JobSpec::Summary => None,
@@ -767,6 +778,22 @@ impl JobSpec {
     /// * `total_tasks` - Total number of tasks to generate (usually partition count)
     pub fn generate_tasks(&self, input_path: &str, total_tasks: usize) -> Vec<TaskDescriptor> {
         match self {
+            JobSpec::SafeExport(spec) => spec
+                .sealed_part_tasks()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|task| {
+                    let index = task.partition_index;
+                    let total = spec.table.partitions.len();
+                    TaskType::SafeExportPart { task: task.clone() }.into_descriptor(
+                        task.task_id.clone(),
+                        Some(format!("Pinned partition {} → safe Parquet", index + 1)),
+                        Some(index),
+                        Some(total),
+                    )
+                })
+                .collect(),
+
             JobSpec::ExportParquet { output_path } => (0..total_tasks)
                 .map(|i| {
                     TaskType::Partition {

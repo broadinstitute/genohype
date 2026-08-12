@@ -18,4 +18,4 @@ pub use converter::{
     hail_to_parquet_sharded_with_metrics, hail_to_parquet_with_options,
     hail_to_parquet_with_progress, ConversionMetadata, ConversionOptions,
 };
-pub use writer::{build_record_batch, InMemoryParquetWriter, ParquetWriter};
+pub use writer::{build_record_batch, InMemoryParquetWriter, ParquetWriteStats, ParquetWriter};

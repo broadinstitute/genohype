@@ -1151,6 +1151,53 @@ EOF
                 spec.partitions
             );
             (spec.partitions, None)
+        } else if let crate::distributed::message::JobSpec::SafeExport(ref spec) = job_spec {
+            spec.validate()?;
+            if !filters.is_empty()
+                || !intervals.is_empty()
+                || batch_size.is_some_and(|size| size != 1)
+            {
+                return Err(HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "safe export forbids filters/intervals and requires batch size 1",
+                )));
+            }
+            let manifest = genohype_core::io::SourceManifest::from_path(&spec.source_manifest_uri)?;
+            let tasks = spec.part_tasks(&manifest)?;
+            let engine = QueryEngine::open_path_with_manifest(
+                &spec.canonical_table_uri,
+                &spec.source_manifest_uri,
+                &spec.source_manifest_sha256,
+            )?;
+            let mut actual_table = engine.table_descriptor()?;
+            for (actual, expected) in actual_table
+                .partitions
+                .iter_mut()
+                .zip(&spec.table.partitions)
+            {
+                actual.output_part_ids = expected.output_part_ids.clone();
+                actual.row_count = expected.row_count;
+                actual.index_objects = expected.index_objects.clone();
+            }
+            if actual_table != spec.table
+                || genohype_core::release::GlobalsPayload::from_value(&engine.globals()?)
+                    != spec.globals
+                || tasks.iter().any(|task| {
+                    match engine.row_partition_source_object(task.partition_index) {
+                        Ok(source) => source != task.source_object,
+                        Err(_) => true,
+                    }
+                })
+            {
+                return Err(HailError::InvalidFormat(
+                    "safe-export pinned preflight does not match the sealed descriptor".to_string(),
+                ));
+            }
+            println!(
+                "Safe export: verified {} pinned source partitions",
+                tasks.len()
+            );
+            (tasks.len(), Some(engine))
         } else if let crate::distributed::message::JobSpec::Custom {
             ref manifest,
             tasks,

@@ -13,7 +13,7 @@ pub use message::{
     AssignmentLease, CompleteRequest, CompleteResponse, CoreTaskInfo, DashboardBottleneck,
     DashboardMetrics, DashboardSummary, DashboardWorker, HardwareSpec, HeartbeatRequest,
     HeartbeatResponse, StatusResponse, TaskDescriptor, TelemetrySnapshot, UpdateFleetRequest,
-    WorkRequest, WorkResponse, CUSTOM_WORKER_PROTOCOL_VERSION,
+    WorkRequest, WorkResponse, CUSTOM_WORKER_PROTOCOL_VERSION, SAFE_EXPORT_WORKER_PROTOCOL_VERSION,
 };
 
 // Re-export coordinator and worker

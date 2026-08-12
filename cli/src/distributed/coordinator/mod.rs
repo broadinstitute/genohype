@@ -40,6 +40,7 @@ use crate::distributed::message::{
     ActiveTaskInfo, CompleteRequest, CompleteResponse, FailureRecord, HeartbeatRequest,
     HeartbeatResponse, JobEvent, JobResultResponse, JobSpec, ManhattanSource, StatusResponse,
     TaskDescriptor, WorkRequest, WorkResponse, CUSTOM_WORKER_PROTOCOL_VERSION,
+    SAFE_EXPORT_WORKER_PROTOCOL_VERSION,
 };
 use crate::distributed::metrics_db::{CustomCompletionOutcome, DurableCustomAssignment, MetricsDb};
 use crate::Result;
@@ -867,11 +868,40 @@ async fn get_work(
 ) -> axum::Json<WorkResponse> {
     let mut data = state.lock().unwrap();
 
+    if let Some(JobSpec::SafeExport(spec)) = &data.config.job_spec {
+        let compatible = req.protocol_version.unwrap_or(0) >= SAFE_EXPORT_WORKER_PROTOCOL_VERSION
+            && req
+                .capabilities
+                .iter()
+                .any(|capability| capability == "safe_export_v1")
+            && req.build_version.as_deref() == Some(spec.expected_worker.git_commit.as_str())
+            && req.build_identity.as_deref() == Some(spec.expected_worker.build_identity.as_str())
+            && req.binary_sha256.as_deref() == Some(spec.expected_worker.binary_sha256.as_str());
+        if !compatible {
+            return axum::Json(WorkResponse::Incompatible {
+                required_protocol_version: SAFE_EXPORT_WORKER_PROTOCOL_VERSION,
+                message:
+                    "safe export requires the exact sealed stock-worker build and binary identity"
+                        .to_string(),
+            });
+        }
+        // Stage 4b deliberately does not expose a lease until the parallel
+        // durable safe-assignment fence lands in Stage 4c/5a.
+        return axum::Json(WorkResponse::Incompatible {
+            required_protocol_version: SAFE_EXPORT_WORKER_PROTOCOL_VERSION,
+            message: "safe-export execution is fenced off until durable coordinator publication support is installed".to_string(),
+        });
+    }
+
     // Custom tasks require workers that understand lease/session fencing. Reject
     // legacy custom workers before assignment so incompatibility is immediate
     // rather than surfacing as repeated completion timeouts.
     if matches!(data.config.job_spec, Some(JobSpec::Custom { .. }))
-        && req.protocol_version.unwrap_or(0) < CUSTOM_WORKER_PROTOCOL_VERSION
+        && (req.protocol_version.unwrap_or(0) < CUSTOM_WORKER_PROTOCOL_VERSION
+            || !req
+                .capabilities
+                .iter()
+                .any(|capability| capability == "custom_v1"))
     {
         return axum::Json(WorkResponse::Incompatible {
             required_protocol_version: CUSTOM_WORKER_PROTOCOL_VERSION,
@@ -2116,6 +2146,9 @@ mod lease_coordinator_tests {
                 hardware: None,
                 build_version: Some("test-build".to_string()),
                 protocol_version: Some(CUSTOM_WORKER_PROTOCOL_VERSION),
+                build_identity: None,
+                binary_sha256: None,
+                capabilities: vec!["custom_v1".to_string()],
             })
             .send()
             .await
@@ -2149,6 +2182,9 @@ mod lease_coordinator_tests {
                 hardware: None,
                 build_version: Some("test-build".to_string()),
                 protocol_version: Some(CUSTOM_WORKER_PROTOCOL_VERSION),
+                build_identity: None,
+                binary_sha256: None,
+                capabilities: vec!["custom_v1".to_string()],
             }),
         )
         .await
@@ -2301,6 +2337,9 @@ mod lease_coordinator_tests {
                 hardware: None,
                 build_version: Some("replacement-build-b".to_string()),
                 protocol_version: Some(CUSTOM_WORKER_PROTOCOL_VERSION),
+                build_identity: None,
+                binary_sha256: None,
+                capabilities: vec!["custom_v1".to_string()],
             }),
         )
         .await;
@@ -3015,8 +3054,14 @@ mod lease_coordinator_tests {
                 num_cores: 4,
                 total_memory_mb: 8192,
             },
+            "test-build-identity",
+            &"a".repeat(64),
         );
-        assert_eq!(stock_request.protocol_version, None);
+        assert_eq!(
+            stock_request.protocol_version,
+            Some(SAFE_EXPORT_WORKER_PROTOCOL_VERSION)
+        );
+        assert_eq!(stock_request.capabilities, vec!["safe_export_v1"]);
         let before_preflight = signature(&state);
         let preflight: WorkResponse = client
             .post(format!("{base_url}/work"))
@@ -3043,6 +3088,9 @@ mod lease_coordinator_tests {
             hardware: None,
             build_version: Some("integration-test".to_string()),
             protocol_version: Some(CUSTOM_WORKER_PROTOCOL_VERSION),
+            build_identity: None,
+            binary_sha256: None,
+            capabilities: vec!["custom_v1".to_string()],
         };
         let assignment: WorkResponse = client
             .post(format!("{base_url}/work"))
@@ -3378,6 +3426,9 @@ mod lease_coordinator_tests {
                 hardware: None,
                 build_version: None,
                 protocol_version: None,
+                build_identity: None,
+                binary_sha256: None,
+                capabilities: vec![],
             }),
         )
         .await

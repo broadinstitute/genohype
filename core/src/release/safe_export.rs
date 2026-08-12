@@ -243,6 +243,33 @@ impl SafeExportSpec {
             .collect()
     }
 
+    /// Deterministic task plan from the source identities already sealed into
+    /// this spec. Submission and workers must still validate those identities
+    /// against the digest-bound manifest before any source read.
+    pub fn sealed_part_tasks(&self) -> Result<Vec<SafeExportPartTask>> {
+        self.validate()?;
+        self.table
+            .partitions
+            .iter()
+            .zip(&self.source_parts)
+            .map(|(partition, source_object)| {
+                let task = SafeExportPartTask {
+                    schema_version: SAFE_EXPORT_SCHEMA_VERSION,
+                    export_id: self.export_id.clone(),
+                    task_id: canonical_part_id(partition.index),
+                    partition_index: partition.index,
+                    source_manifest_sha256: self.source_manifest_sha256.clone(),
+                    source_part_file: partition.part_file.clone(),
+                    source_object: source_object.clone(),
+                    output_part_id: canonical_part_id(partition.index),
+                    schema_fingerprint_sha256: self.parquet.schema_fingerprint_sha256.clone(),
+                };
+                task.validate_against(self)?;
+                Ok(task)
+            })
+            .collect()
+    }
+
     fn validate_intent(&self) -> Result<()> {
         require_version("safe-export spec", self.schema_version)?;
         if self.receipt_schema_version != SAFE_EXPORT_RECEIPT_SCHEMA_VERSION
@@ -618,13 +645,18 @@ fn validate_parquet(parquet: &ParquetDescriptor, table: &TableDescriptor) -> Res
         ));
     }
     let writer = &parquet.writer_properties;
-    if writer.compression.is_empty()
-        || writer.max_row_group_size == 0
-        || writer.converter_batch_size == 0
-        || writer.data_page_version.is_empty()
-        || writer.writer_version.is_empty()
+    if !writer.compression.eq_ignore_ascii_case("zstd")
+        || writer.compression_level.is_some()
+        || writer.max_row_group_size != 100_000
+        || writer.converter_batch_size != 4096
+        || !writer.dictionary_enabled
+        || !writer.statistics_enabled
+        || writer.data_page_version != "v1"
+        || writer.writer_version != "v1"
     {
-        return Err(invalid("Parquet writer policy is incomplete"));
+        return Err(invalid(
+            "safe-export v1 requires the fixed qualified Parquet writer policy",
+        ));
     }
     Ok(())
 }
@@ -901,9 +933,9 @@ mod tests {
                 schema_fingerprint_sha256: fingerprint,
                 writer_properties: WriterPropertiesDescriptor {
                     compression: "zstd".into(),
-                    compression_level: Some(3),
-                    max_row_group_size: 100,
-                    converter_batch_size: 16,
+                    compression_level: None,
+                    max_row_group_size: 100_000,
+                    converter_batch_size: 4096,
                     dictionary_enabled: true,
                     statistics_enabled: true,
                     data_page_version: "v1".into(),
@@ -1034,7 +1066,7 @@ mod tests {
         assert_ne!(changed.computed_export_id().unwrap(), first.export_id);
         let mut changed = first.clone();
         changed.parquet.writer_properties.max_row_group_size += 1;
-        assert_ne!(changed.computed_export_id().unwrap(), first.export_id);
+        assert!(changed.computed_export_id().is_err());
         let mut changed = first.clone();
         changed.expected_worker.binary_sha256 = "f".repeat(64);
         changed.tool.binary_sha256 = "f".repeat(64);
@@ -1072,6 +1104,7 @@ mod tests {
     fn task_and_report_validation_are_assignment_exact() {
         let spec = spec();
         let task = task(&spec);
+        assert_eq!(spec.sealed_part_tasks().unwrap(), vec![task.clone()]);
         let valid = report(&spec, &task);
         valid
             .validate_against(&spec, &task, "worker-1", 2, &"c".repeat(64))

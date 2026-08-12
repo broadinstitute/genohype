@@ -3,7 +3,9 @@
 //! Contains shared state structures and the background heartbeat loop that
 //! sends system metrics to the coordinator.
 
-use crate::distributed::message::{CoreTaskInfo, HeartbeatRequest, TelemetrySnapshot};
+use crate::distributed::message::{
+    AssignmentLease, CoreTaskInfo, HeartbeatRequest, TelemetrySnapshot,
+};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -39,6 +41,8 @@ pub struct TelemetryState {
     pub core_tasks: std::sync::Mutex<std::collections::HashMap<usize, CoreTaskInfo>>,
     /// Current phenotype context for visibility tracking
     pub phenotype_context: std::sync::Mutex<PhenotypeContext>,
+    /// One coherent coordinator session + assignment snapshot for active work.
+    active_fence: std::sync::Mutex<Option<(Option<String>, Vec<AssignmentLease>)>>,
 }
 
 impl TelemetryState {
@@ -51,7 +55,30 @@ impl TelemetryState {
             stop: AtomicBool::new(false),
             core_tasks: std::sync::Mutex::new(std::collections::HashMap::new()),
             phenotype_context: std::sync::Mutex::new(PhenotypeContext::default()),
+            active_fence: std::sync::Mutex::new(None),
         }
+    }
+
+    pub fn set_active_fence(&self, session_id: Option<String>, assignments: Vec<AssignmentLease>) {
+        *self
+            .active_fence
+            .lock()
+            .expect("active fence lock poisoned") = Some((session_id, assignments));
+    }
+
+    pub fn clear_active_fence(&self) {
+        *self
+            .active_fence
+            .lock()
+            .expect("active fence lock poisoned") = None;
+    }
+
+    fn active_fence_snapshot(&self) -> (Option<String>, Vec<AssignmentLease>) {
+        self.active_fence
+            .lock()
+            .expect("active fence lock poisoned")
+            .clone()
+            .unwrap_or_default()
     }
 
     /// Set the current phenotype context for visibility tracking.
@@ -365,16 +392,40 @@ pub fn spawn_telemetry_loop(
                 prefetch_depth: Some(prefetch_depth),
             };
 
+            let (session_id, assignments) = state.active_fence_snapshot();
             let req = HeartbeatRequest {
                 worker_id: worker_id.clone(),
                 telemetry: snapshot,
                 build_version: Some(env!("GIT_HASH").to_string()),
-                session_id: None,
-                assignments: Vec::new(),
+                session_id,
+                assignments,
             };
 
             // Best-effort: don't let heartbeat failures block the worker
             let _ = client.post(&heartbeat_url).json(&req).send().await;
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_fence_snapshot_is_coherent_and_clears_only_explicitly() {
+        let state = TelemetryState::new();
+        let lease = AssignmentLease {
+            task_id: "part-00000000".into(),
+            assignment_attempt: 3,
+            lease_token: "secret".into(),
+        };
+        assert_eq!(state.active_fence_snapshot(), (None, vec![]));
+        state.set_active_fence(Some("session".into()), vec![lease.clone()]);
+        assert_eq!(
+            state.active_fence_snapshot(),
+            (Some("session".into()), vec![lease])
+        );
+        state.clear_active_fence();
+        assert_eq!(state.active_fence_snapshot(), (None, vec![]));
+    }
 }

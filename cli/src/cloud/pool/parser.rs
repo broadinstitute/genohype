@@ -94,6 +94,26 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             )));
         }
 
+        if command.get(1).map(String::as_str) == Some("safe-parquet") {
+            if command.len() != 6 || command.get(4).map(String::as_str) != Some("--spec") {
+                return Err(HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Safe export requires exactly: export safe-parquet <input-gs-uri> <output-gs-uri> --spec <local-safe-spec.json>",
+                )));
+            }
+            let input_path = command[2].clone();
+            let output_path = command[3].clone();
+            let bytes = std::fs::read(&command[5]).map_err(HailError::Io)?;
+            let spec = genohype_core::release::SafeExportSpec::from_json(&bytes)?;
+            if spec.canonical_table_uri != input_path || spec.output_root_uri != output_path {
+                return Err(HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "safe-export command input/output must exactly match the sealed spec",
+                )));
+            }
+            return Ok((input_path, JobSpec::SafeExport(spec), vec![], vec![]));
+        }
+
         if command.len() < 4 {
             return Err(HailError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,

@@ -30,6 +30,9 @@ pub fn dispatch_job(
     let interval_list = parse_interval_strings(intervals);
 
     match job_spec {
+        JobSpec::SafeExport(_) => Err(crate::HailError::InvalidFormat(
+            "safe export must use the dedicated fenced one-part worker path".to_string(),
+        )),
         JobSpec::ExportParquet { output_path } => {
             let (rows, engine) = handlers::export::process_parquet_export(
                 cached_engine,

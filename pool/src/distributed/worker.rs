@@ -321,6 +321,9 @@ async fn request_work(
         hardware: None,
         build_version: config.build_version.clone(),
         protocol_version: Some(super::message::CUSTOM_WORKER_PROTOCOL_VERSION),
+        build_identity: None,
+        binary_sha256: None,
+        capabilities: vec!["custom_v1".to_string()],
     };
 
     let response = client.post(url).json(&request).send().await?;

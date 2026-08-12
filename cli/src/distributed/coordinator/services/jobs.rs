@@ -31,6 +31,18 @@ pub(crate) fn start_new_job(
     if let JobSpec::ManhattanBatch { ref mut specs, .. } = job_spec {
         super::batch_init::enrich_specs(specs);
     }
+    if let JobSpec::SafeExport(spec) = &job_spec {
+        spec.validate()
+            .map_err(|error| format!("invalid safe-export spec: {error}"))?;
+        if input_path != spec.canonical_table_uri
+            || total_tasks != spec.table.partitions.len()
+            || batch_size != Some(1)
+            || !filters.is_empty()
+            || !intervals.is_empty()
+        {
+            return Err("safe export requires exact sealed input/count, batch size 1, and no filters/intervals".to_string());
+        }
+    }
 
     // Superseding a running job is a durable terminal transition. Clear only
     // its live assignment fences; immutable receipts remain queryable.

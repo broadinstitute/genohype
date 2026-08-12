@@ -10,6 +10,206 @@ use genohype_core::query::{IntervalList, KeyRange, QueryEngine};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+/// Execute exactly one manifest-pinned safe-export task into attempt-private
+/// staging. This function never publishes a canonical object or receipt.
+pub fn process_safe_export_part(
+    spec: &genohype_core::release::SafeExportSpec,
+    task: &genohype_core::release::SafeExportPartTask,
+    assignment: &crate::distributed::message::AssignmentLease,
+    worker_id: &str,
+    worker_git_commit: &str,
+    worker_binary_sha256: &str,
+) -> Result<genohype_core::release::ExportPartReport> {
+    use genohype_core::io::{
+        build_attempt_staging_location, lease_identity_sha256, SourceManifest, SourceObject,
+    };
+    use genohype_core::release::{DecodedRowsHasher, GlobalsPayload};
+
+    spec.validate()?;
+    if assignment.task_id != task.task_id || assignment.assignment_attempt == 0 {
+        return Err(crate::HailError::InvalidFormat(
+            "safe-export assignment does not match task".to_string(),
+        ));
+    }
+    let manifest = SourceManifest::from_path(&spec.source_manifest_uri)?;
+    task.validate_against_manifest(spec, &manifest)?;
+    let engine = QueryEngine::open_path_with_manifest(
+        &spec.canonical_table_uri,
+        &spec.source_manifest_uri,
+        &spec.source_manifest_sha256,
+    )?;
+    if engine.num_partitions() != spec.table.partitions.len()
+        || engine.row_partition_uri(task.partition_index)? != task.source_object.uri
+        || engine.row_partition_source_object(task.partition_index)? != task.source_object
+    {
+        return Err(crate::HailError::InvalidFormat(
+            "safe-export pinned partition identity mismatch".to_string(),
+        ));
+    }
+    let mut actual_table = engine.table_descriptor()?;
+    for (actual, expected) in actual_table
+        .partitions
+        .iter_mut()
+        .zip(&spec.table.partitions)
+    {
+        actual.output_part_ids = expected.output_part_ids.clone();
+        actual.row_count = expected.row_count;
+        actual.index_objects = expected.index_objects.clone();
+    }
+    if actual_table != spec.table
+        || GlobalsPayload::from_value(&engine.globals()?) != spec.globals
+        || engine
+            .parquet_plan(genohype_core::schema::PhysicalBinaryEncoding::Utf8)?
+            .fingerprint_sha256()?
+            != task.schema_fingerprint_sha256
+    {
+        return Err(crate::HailError::InvalidFormat(
+            "safe-export table/globals/schema descriptor mismatch".to_string(),
+        ));
+    }
+    if worker_git_commit != spec.expected_worker.git_commit
+        || worker_binary_sha256 != spec.expected_worker.binary_sha256
+    {
+        return Err(crate::HailError::InvalidFormat(
+            "safe-export running worker identity mismatch".to_string(),
+        ));
+    }
+
+    let started_at = canonical_utc_now();
+    let staging = build_attempt_staging_location(
+        &spec.output_root_uri,
+        &spec.export_id,
+        &task.task_id,
+        assignment.assignment_attempt,
+        &assignment.lease_token,
+        "parquet",
+    )?;
+    let plan = Arc::new(engine.parquet_plan(genohype_core::schema::PhysicalBinaryEncoding::Utf8)?);
+    let cloud_writer = StreamingCloudWriter::new(&staging.uri)?;
+    let mut writer = ParquetWriter::from_writer(cloud_writer, plan)?;
+    let mut digest = DecodedRowsHasher::new();
+    let mut first_key = None;
+    let mut last_key = None;
+    for row in engine.scan_partition_iter(task.partition_index, &[])? {
+        let row = row?;
+        digest.update(&row)?;
+        if !spec.table.key.fields.is_empty() {
+            let key = lossless_key(&row, &spec.table.key.fields)?;
+            if first_key.is_none() {
+                first_key = Some(key.clone());
+            }
+            last_key = Some(key);
+        }
+        writer.write_row(&row)?;
+    }
+    let row_count = digest.row_count();
+    let decoded_rows_sha256 = digest.finalize();
+    let (cloud_writer, stats) = writer.finish_into_inner()?;
+    if stats.row_count != row_count {
+        return Err(crate::HailError::InvalidFormat(
+            "safe-export decoded and Parquet row counts differ".to_string(),
+        ));
+    }
+    let uploaded = cloud_writer.finish()?;
+    let etag = uploaded.put_result.e_tag.clone().ok_or_else(|| {
+        crate::HailError::InvalidFormat("staging completion returned no ETag".to_string())
+    })?;
+    let version = uploaded.put_result.version.clone().ok_or_else(|| {
+        crate::HailError::InvalidFormat("staging completion returned no generation".to_string())
+    })?;
+    let staging_object = SourceObject {
+        uri: staging.uri,
+        version,
+        etag,
+        size: uploaded.byte_count,
+        crc32c: None,
+        sha256: Some(uploaded.sha256),
+    };
+    let report = genohype_core::release::ExportPartReport {
+        schema_version: genohype_core::release::SAFE_EXPORT_SCHEMA_VERSION,
+        export_id: spec.export_id.clone(),
+        task_id: task.task_id.clone(),
+        partition_index: task.partition_index,
+        source_manifest_sha256: task.source_manifest_sha256.clone(),
+        source_part_file: task.source_part_file.clone(),
+        source_object: task.source_object.clone(),
+        schema_fingerprint_sha256: task.schema_fingerprint_sha256.clone(),
+        byte_size: staging_object.size,
+        staging_object,
+        row_count,
+        row_group_count: stats.row_group_count,
+        decoded_rows_sha256,
+        first_key,
+        last_key,
+        worker_id: worker_id.to_string(),
+        worker_git_commit: worker_git_commit.to_string(),
+        worker_binary_sha256: worker_binary_sha256.to_string(),
+        assignment_attempt: assignment.assignment_attempt,
+        lease_identity_sha256: lease_identity_sha256(&assignment.lease_token)?,
+        started_at,
+        completed_at: canonical_utc_now(),
+    };
+    report.validate_against(
+        spec,
+        task,
+        worker_id,
+        assignment.assignment_attempt,
+        &staging.lease_identity_sha256,
+    )?;
+    Ok(report)
+}
+
+fn lossless_key(
+    row: &genohype_core::codec::EncodedValue,
+    key_fields: &[String],
+) -> Result<genohype_core::codec::LosslessValue> {
+    let genohype_core::codec::EncodedValue::Struct(fields) = row else {
+        return Err(crate::HailError::InvalidFormat(
+            "safe-export key extraction requires a struct row".to_string(),
+        ));
+    };
+    let mut key = Vec::with_capacity(key_fields.len());
+    for name in key_fields {
+        let value = fields
+            .iter()
+            .find(|(field, _)| field == name)
+            .map(|(_, value)| value.clone())
+            .ok_or_else(|| {
+                crate::HailError::InvalidFormat(format!(
+                    "safe-export row is missing key field {name}"
+                ))
+            })?;
+        key.push((name.clone(), value));
+    }
+    Ok(genohype_core::codec::LosslessValue::from(
+        &genohype_core::codec::EncodedValue::Struct(key),
+    ))
+}
+
+fn canonical_utc_now() -> String {
+    // Civil-date conversion from Unix days; avoids locale/process dependencies.
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let days = seconds.div_euclid(86_400);
+    let day_seconds = seconds.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    let hour = day_seconds / 3_600;
+    let minute = day_seconds % 3_600 / 60;
+    let second = day_seconds % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
 /// Process partitions and write to Parquet output (synchronous version).
 /// Uses rayon to process partitions in parallel across all CPU cores.
 pub fn process_parquet_export(
