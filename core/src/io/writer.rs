@@ -25,7 +25,8 @@ use crate::{HailError, Result};
 use bytes::Bytes;
 use crossbeam_channel::{bounded, Sender};
 use object_store::path::Path as ObjPath;
-use object_store::{ObjectStore, PutMode, WriteMultipart};
+use object_store::{ObjectStore, PutMode, PutResult, WriteMultipart};
+use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -198,6 +199,22 @@ impl Write for CloudWriter {
     }
 }
 
+/// The durable identity of a successfully completed streaming upload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamingWriteResult {
+    /// Number of bytes accepted by the writer.
+    pub byte_count: u64,
+    /// Lowercase SHA-256 of the accepted bytes.
+    pub sha256: String,
+    /// Object-store identity returned by multipart completion.
+    pub put_result: PutResult,
+}
+
+enum UploadCommand {
+    Part(Bytes),
+    Complete,
+}
+
 /// A streaming cloud writer that uploads parts in the background
 ///
 /// This writer uses multipart upload to stream data to cloud storage as it's
@@ -228,20 +245,25 @@ impl Write for CloudWriter {
 /// // Write data in chunks - uploads happen in background
 /// writer.write_all(data)?;
 /// // Finish uploads and complete the multipart upload
-/// writer.finish()?;
+/// let result = writer.finish()?;
+/// assert_eq!(result.byte_count, data.len() as u64);
 /// # Ok::<(), genohype_core::HailError>(())
 /// ```
 pub struct StreamingCloudWriter {
     /// Channel to send completed parts to the upload task
-    part_tx: Option<Sender<Bytes>>,
+    part_tx: Option<Sender<UploadCommand>>,
     /// Current buffer accumulating writes until it reaches part size
     buffer: Vec<u8>,
     /// Size threshold for sending a part
     part_size: usize,
     /// Handle to the background upload task
-    upload_handle: Option<JoinHandle<std::result::Result<(), String>>>,
-    /// Total bytes written (for reporting)
-    total_bytes: usize,
+    upload_handle: Option<JoinHandle<std::result::Result<PutResult, String>>>,
+    /// Total bytes accepted (for reporting)
+    total_bytes: u64,
+    /// Incremental digest of accepted writes.
+    sha256: Sha256,
+    /// A failed write makes the writer permanently unusable.
+    terminal: bool,
 }
 
 impl StreamingCloudWriter {
@@ -267,32 +289,40 @@ impl StreamingCloudWriter {
         path: ObjPath,
         part_size: usize,
     ) -> Result<Self> {
-        let (part_tx, part_rx) = bounded::<Bytes>(UPLOAD_CHANNEL_CAPACITY);
+        let (part_tx, part_rx) = bounded::<UploadCommand>(UPLOAD_CHANNEL_CAPACITY);
 
-        // Start the multipart upload and spawn the background task
+        // Start the multipart upload and spawn the background task. Channel
+        // disconnect is deliberately abort, never implicit completion.
         let path_clone = path.clone();
         let upload_handle = std::thread::spawn(move || {
             IO_RUNTIME.block_on(async move {
-                // Initialize multipart upload
                 let upload = store
                     .put_multipart(&path_clone)
                     .await
-                    .map_err(|e| format!("Failed to initiate multipart upload: {}", e))?;
-
+                    .map_err(|e| format!("Failed to initiate multipart upload: {e}"))?;
                 let mut writer = WriteMultipart::new(upload);
 
-                // Receive and upload parts
-                while let Ok(part_data) = part_rx.recv() {
-                    writer.write(&part_data);
+                loop {
+                    match part_rx.recv() {
+                        Ok(UploadCommand::Part(part_data)) => writer.put(part_data),
+                        Ok(UploadCommand::Complete) => {
+                            return writer
+                                .finish()
+                                .await
+                                .map_err(|e| format!("Failed to complete multipart upload: {e}"));
+                        }
+                        Err(_) => {
+                            return match writer.abort().await {
+                                Ok(()) => {
+                                    Err("Multipart upload aborted before completion".to_string())
+                                }
+                                Err(error) => Err(format!(
+                                    "Failed to abort incomplete multipart upload: {error}"
+                                )),
+                            };
+                        }
+                    }
                 }
-
-                // Complete the multipart upload
-                writer
-                    .finish()
-                    .await
-                    .map_err(|e| format!("Failed to complete multipart upload: {}", e))?;
-
-                Ok(())
             })
         });
 
@@ -302,6 +332,8 @@ impl StreamingCloudWriter {
             part_size,
             upload_handle: Some(upload_handle),
             total_bytes: 0,
+            sha256: Sha256::new(),
+            terminal: false,
         })
     }
 
@@ -322,15 +354,17 @@ impl StreamingCloudWriter {
         let part_data = std::mem::replace(&mut self.buffer, Vec::with_capacity(self.part_size));
         let part_size = part_data.len();
 
-        if let Some(ref tx) = self.part_tx {
-            tx.send(Bytes::from(part_data)).map_err(|e| {
+        let tx = self.part_tx.as_ref().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Upload task is unavailable")
+        })?;
+        tx.send(UploadCommand::Part(Bytes::from(part_data)))
+            .map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
-                    format!("Upload task disconnected: {}", e),
+                    format!("Upload task disconnected: {e}"),
                 )
             })?;
-            tracing::trace!("StreamingCloudWriter: sent part of {} bytes", part_size);
-        }
+        tracing::trace!("StreamingCloudWriter: sent part of {} bytes", part_size);
 
         Ok(())
     }
@@ -341,52 +375,94 @@ impl StreamingCloudWriter {
     /// upload task to complete.
     ///
     /// # Returns
-    /// The total number of bytes uploaded.
-    pub fn finish(mut self) -> Result<usize> {
-        // Send any remaining data
-        self.send_current_buffer().map_err(HailError::Io)?;
-
-        // Drop the sender to signal completion to the upload task
-        self.part_tx = None;
-
-        // Wait for the upload task to finish
-        if let Some(handle) = self.upload_handle.take() {
-            match handle.join() {
-                Ok(Ok(())) => {
-                    tracing::trace!(
-                        "StreamingCloudWriter: upload complete, {} bytes total",
-                        self.total_bytes
-                    );
-                }
-                Ok(Err(e)) => {
-                    return Err(HailError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Upload failed: {}", e),
-                    )));
-                }
-                Err(_) => {
-                    return Err(HailError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "Upload task panicked",
-                    )));
-                }
-            }
+    /// The byte count, SHA-256, and object-store identity of the completed upload.
+    pub fn finish(mut self) -> Result<StreamingWriteResult> {
+        if self.terminal {
+            return Err(HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "Streaming writer previously failed",
+            )));
         }
 
-        Ok(self.total_bytes)
+        self.send_current_buffer().map_err(HailError::Io)?;
+        let tx = self.part_tx.as_ref().ok_or_else(|| {
+            HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "Upload task is unavailable",
+            ))
+        })?;
+        tx.send(UploadCommand::Complete).map_err(|error| {
+            HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                format!("Upload task disconnected: {error}"),
+            ))
+        })?;
+        self.part_tx = None;
+
+        let put_result = match self.upload_handle.take().map(JoinHandle::join) {
+            Some(Ok(Ok(result))) => result,
+            Some(Ok(Err(error))) => {
+                return Err(HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Upload failed: {error}"),
+                )))
+            }
+            Some(Err(_)) => {
+                return Err(HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Upload task panicked",
+                )))
+            }
+            None => {
+                return Err(HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "Upload task is unavailable",
+                )))
+            }
+        };
+
+        let sha256 = format!("{:x}", std::mem::take(&mut self.sha256).finalize());
+        tracing::trace!(
+            "StreamingCloudWriter: upload complete, {} bytes total",
+            self.total_bytes
+        );
+        Ok(StreamingWriteResult {
+            byte_count: self.total_bytes,
+            sha256,
+            put_result,
+        })
     }
 
-    /// Get the total bytes written so far
-    pub fn bytes_written(&self) -> usize {
+    /// Get the total bytes accepted so far. Advisory until `finish` succeeds.
+    pub fn bytes_written(&self) -> u64 {
         self.total_bytes
     }
 }
 
 impl Write for StreamingCloudWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.terminal {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "Streaming writer previously failed",
+            ));
+        }
+        let next_total = self
+            .total_bytes
+            .checked_add(u64::try_from(buf.len()).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "Write length exceeds u64")
+            })?)
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "Byte count overflow")
+            })?;
+
         self.buffer.extend_from_slice(buf);
-        self.total_bytes += buf.len();
-        self.maybe_send_part()?;
+        if let Err(error) = self.maybe_send_part() {
+            self.terminal = true;
+            return Err(error);
+        }
+        self.sha256.update(buf);
+        self.total_bytes = next_total;
         Ok(buf.len())
     }
 
@@ -398,14 +474,11 @@ impl Write for StreamingCloudWriter {
 
 impl Drop for StreamingCloudWriter {
     fn drop(&mut self) {
-        // If we're being dropped without finish() being called, try to clean up gracefully
-        if self.part_tx.is_some() {
-            // Drop the sender to signal the upload task to stop
-            self.part_tx = None;
-            // Wait briefly for the task to finish
-            if let Some(handle) = self.upload_handle.take() {
-                let _ = handle.join();
-            }
+        // Disconnect without Complete means abort. Joining ensures best-effort
+        // multipart cleanup finishes before this writer disappears.
+        self.part_tx = None;
+        if let Some(handle) = self.upload_handle.take() {
+            let _ = handle.join();
         }
     }
 }
@@ -468,6 +541,55 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn streaming_writer_returns_incremental_identity() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let path = ObjPath::from("streaming/identity");
+        let mut writer = StreamingCloudWriter::from_store(store.clone(), path.clone(), 3).unwrap();
+        writer.write_all(b"ab").unwrap();
+        writer.write_all(b"cdef").unwrap();
+        assert_eq!(writer.bytes_written(), 6);
+        let result = writer.finish().unwrap();
+        assert_eq!(result.byte_count, 6);
+        assert_eq!(
+            result.sha256,
+            "bef57ec7f53a6d40beb640a780a639c83bc29ac8a9816f1fc6c5c6dcd93c4721"
+        );
+        let head = IO_RUNTIME.block_on(store.head(&path)).unwrap();
+        assert_eq!(head.size, 6);
+        assert_eq!(result.put_result.e_tag, head.e_tag);
+        assert_eq!(result.put_result.version, head.version);
+    }
+
+    #[test]
+    fn streaming_writer_supports_empty_identity() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let path = ObjPath::from("streaming/empty");
+        let writer = StreamingCloudWriter::from_store(store.clone(), path.clone(), 3).unwrap();
+        let result = writer.finish().unwrap();
+        assert_eq!(result.byte_count, 0);
+        assert_eq!(
+            result.sha256,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(IO_RUNTIME.block_on(store.head(&path)).unwrap().size, 0);
+    }
+
+    #[test]
+    fn dropping_streaming_writer_aborts_without_object() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let path = ObjPath::from("streaming/truncated");
+        {
+            let mut writer =
+                StreamingCloudWriter::from_store(store.clone(), path.clone(), 3).unwrap();
+            writer.write_all(b"truncated bytes").unwrap();
+        }
+        assert!(matches!(
+            IO_RUNTIME.block_on(store.head(&path)),
+            Err(object_store::Error::NotFound { .. })
+        ));
+    }
 
     #[test]
     fn test_output_writer_local() {

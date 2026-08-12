@@ -27,6 +27,7 @@
 pub mod adapter;
 pub mod inventory;
 pub mod manifest;
+pub mod publication;
 pub mod resolver;
 pub mod writer;
 
@@ -45,7 +46,11 @@ pub use inventory::{
     MAX_METADATA_BYTES,
 };
 pub use manifest::{SourceManifest, SourceObject, SourceSnapshot, SOURCE_MANIFEST_SCHEMA_VERSION};
+pub use publication::{
+    build_attempt_staging_location, content_addressed_path, publish_content_addressed,
+    AttemptStagingLocation, PublicationDisposition, PublishedObject,
+};
 pub use resolver::{
     resolve_object, resolve_url, resolve_url_for_write, ResolvedObject, ResolvedStore,
 };
-pub use writer::{CloudWriter, OutputWriter, StreamingCloudWriter};
+pub use writer::{CloudWriter, OutputWriter, StreamingCloudWriter, StreamingWriteResult};
