@@ -297,6 +297,22 @@ impl HailTableSource {
         Ok(())
     }
 
+    fn index_uses_lz4hc(&self) -> bool {
+        self.rvd_spec.index_spec.as_ref().is_some_and(|spec| {
+            spec.leaf_codec.buffer_spec.uses_lz4hc()
+                || spec.internal_node_codec.buffer_spec.uses_lz4hc()
+        })
+    }
+
+    fn ensure_index_random_access_supported(&self, operation: &str) -> Result<()> {
+        if self.index_uses_lz4hc() {
+            return Err(HailError::Codec(format!(
+                "{operation} via historical LZ4HC index virtual offsets is not qualified; sequential full-partition decoding is supported"
+            )));
+        }
+        Ok(())
+    }
+
     /// Check if partition counts are available without scanning index files
     pub fn has_fast_row_count(&self) -> bool {
         self.partition_counts.is_some()
@@ -691,7 +707,9 @@ impl DataSource for HailTableSource {
         let row_type = self.row_type.clone();
         let row_buffer_spec = self.rvd_spec.codec_spec.buffer_spec.clone();
         let ranges = ranges.to_vec();
-        let has_index = self.rvd_spec.index_spec.is_some();
+        // Real Hail-produced historical LZ4HC index virtual offsets have not
+        // been qualified. Preserve sequential interval scans for those tables.
+        let has_index = self.rvd_spec.index_spec.is_some() && !self.index_uses_lz4hc();
         let index_readers = self.index_readers.clone();
         let block_maps = self.block_maps.clone();
         let table_path = self.table_path.clone();
@@ -910,7 +928,7 @@ impl DataSource for HailTableSource {
         let row_type = self.row_type.clone();
         let row_buffer_spec = self.rvd_spec.codec_spec.buffer_spec.clone();
         let ranges = ranges.to_vec();
-        let has_index = self.rvd_spec.index_spec.is_some();
+        let has_index = self.rvd_spec.index_spec.is_some() && !self.index_uses_lz4hc();
         let index_readers = self.index_readers.clone();
         let table_path = self.table_path.clone();
         let index_spec = self.rvd_spec.index_spec.clone();
@@ -1095,6 +1113,7 @@ impl DataSource for HailTableSource {
     #[instrument(skip_all)]
     fn lookup(&self, key: &EncodedValue) -> Result<Option<EncodedValue>> {
         self.ensure_row_decode_supported("row lookup")?;
+        self.ensure_index_random_access_supported("row lookup")?;
         // For point lookups, skip partition pruning if there's only one partition
         let matching_partitions = if self.rvd_spec.part_files.len() == 1 {
             vec![0]
@@ -1226,6 +1245,7 @@ mod tests {
             &destination.join("index/part-0.idx/metadata.json.gz"),
             |value| {
                 let old_root = value["rootOffset"].as_u64().unwrap();
+                value["fileVersion"] = serde_json::json!(65_792);
                 value["rootOffset"] = serde_json::json!(offsets
                     .iter()
                     .find_map(|(old, new)| (*old == old_root).then_some(*new))
@@ -1408,7 +1428,7 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_lz4hc_rows_globals_index_and_lookup_decode() {
+    fn synthetic_historical_lz4hc_rows_decode_but_public_index_access_stays_guarded() {
         use crate::projection::FieldPath;
 
         let temp = tempfile::tempdir().unwrap();
@@ -1443,17 +1463,32 @@ mod tests {
         assert_eq!(sorted.len(), 2);
         assert!(sorted.iter().all(Result::is_ok));
 
+        // This synthetic fixture proves only decoder mechanics. It now carries
+        // the historical 1.1.0 fileVersion and contains a root plus leaf in
+        // separate compressed blocks, but it is not Hail-produced evidence.
+        let index_reader = IndexReader::new(
+            table.join("index/part-0.idx"),
+            source.rvd_spec().index_spec.as_ref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(index_reader.metadata().file_version, 65_792);
+        assert_eq!(index_reader.metadata().height, 2);
         for (expected, key) in scanned
             .iter()
             .map(|row| row.as_ref().unwrap())
             .zip([first_fixture_key(), second_fixture_key()])
         {
-            let indexed_row = source
+            let row_offset = index_reader
                 .lookup(&key)
                 .unwrap()
-                .expect("synthetic LZ4HC index lookup should find the retained fixture row");
+                .expect("synthetic historical index should contain the retained key");
+            let indexed_row = source.read_row_at_offset(0, row_offset).unwrap();
             assert_eq!(&indexed_row, expected);
         }
+
+        let error = source.lookup(&first_fixture_key()).unwrap_err().to_string();
+        assert!(error.contains("not qualified"), "{error}");
+        assert!(error.contains("sequential full-partition"), "{error}");
     }
 
     #[test]
@@ -1464,8 +1499,19 @@ mod tests {
         set_index_compression(&table.join("rows/metadata.json.gz"), "ZstdBlockBufferSpec");
 
         let source = HailTableSource::new(table.to_str().unwrap()).unwrap();
-        let error = source.lookup(&first_fixture_key()).unwrap_err().to_string();
-        assert!(error.contains("Zstd decompression"), "{error}");
+        let error = IndexReader::new(
+            table.join("index/part-0.idx"),
+            source.rvd_spec().index_spec.as_ref().unwrap(),
+        )
+        .err()
+        .expect("historical version with Zstd metadata must fail")
+        .to_string();
+        assert!(
+            error.contains("invalid Hail index version/codec pairing"),
+            "{error}"
+        );
+        assert!(error.contains("1.1.0"), "{error}");
+        assert!(error.contains("requires LZ4HC"), "{error}");
     }
 
     #[test]
@@ -1479,7 +1525,13 @@ mod tests {
         std::fs::write(index_path, index).unwrap();
 
         let source = HailTableSource::new(table.to_str().unwrap()).unwrap();
-        let error = source.lookup(&first_fixture_key()).unwrap_err().to_string();
+        let error = IndexReader::new(
+            table.join("index/part-0.idx"),
+            source.rvd_spec().index_spec.as_ref().unwrap(),
+        )
+        .err()
+        .expect("corrupt synthetic historical index must fail")
+        .to_string();
         assert!(error.contains("exceeds codec blockSize"), "{error}");
     }
 

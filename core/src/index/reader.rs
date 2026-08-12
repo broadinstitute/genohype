@@ -12,7 +12,9 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-const SUPPORTED_INDEX_FILE_VERSION: u32 = 66_048;
+const INDEX_FILE_VERSION_1_0_0: u32 = 65_536;
+const INDEX_FILE_VERSION_1_1_0: u32 = 65_792;
+const INDEX_FILE_VERSION_1_2_0: u32 = 66_048;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IndexCompression {
@@ -120,12 +122,40 @@ fn validate_typed_codec(role: &str, codec: &CodecSpec) -> Result<()> {
     Ok(())
 }
 
-fn validate_index_metadata(metadata: &IndexMetadata) -> Result<()> {
-    if metadata.file_version != SUPPORTED_INDEX_FILE_VERSION {
-        return Err(HailError::Index(format!(
-            "unsupported Hail index fileVersion {}; expected {}",
-            metadata.file_version, SUPPORTED_INDEX_FILE_VERSION
-        )));
+fn validate_index_metadata(metadata: &IndexMetadata, compression: IndexCompression) -> Result<()> {
+    match (metadata.file_version, compression) {
+        // Hail's historical 1.1 writer used the typed LZ4HC stack. The raw
+        // block decoder is retained for mechanics testing, but public table
+        // random access remains guarded until real historical index bytes are
+        // qualified.
+        (INDEX_FILE_VERSION_1_1_0, IndexCompression::Lz4Hc { .. })
+        // Hail's modern 1.2 writer uses the typed Zstd stack.
+        | (INDEX_FILE_VERSION_1_2_0, IndexCompression::Zstd { .. }) => {}
+        (INDEX_FILE_VERSION_1_0_0, _) => {
+            return Err(HailError::Index(format!(
+                "unsupported Hail index fileVersion {} (1.0.0): format behavior is not qualified",
+                metadata.file_version
+            )))
+        }
+        (INDEX_FILE_VERSION_1_1_0, actual) => {
+            return Err(HailError::Index(format!(
+                "invalid Hail index version/codec pairing: fileVersion {} (1.1.0) requires LZ4HCBlockBufferSpec, found {}",
+                metadata.file_version,
+                actual.name()
+            )))
+        }
+        (INDEX_FILE_VERSION_1_2_0, actual) => {
+            return Err(HailError::Index(format!(
+                "invalid Hail index version/codec pairing: fileVersion {} (1.2.0) requires ZstdBlockBufferSpec, found {}",
+                metadata.file_version,
+                actual.name()
+            )))
+        }
+        (actual, _) => {
+            return Err(HailError::Index(format!(
+                "unsupported Hail index fileVersion {actual}; supported pairings are 65792 (1.1.0) with LZ4HC and 66048 (1.2.0) with Zstd"
+            )))
+        }
     }
     if metadata.height == 0 {
         return Err(HailError::Index(
@@ -199,8 +229,8 @@ impl IndexReader {
         // Read index metadata
         let metadata_path = join_path(index_dir, "metadata.json.gz");
         let metadata = IndexMetadata::from_path_with_snapshot(&metadata_path, snapshot)?;
-        validate_index_metadata(&metadata)?;
         let compression = IndexCompression::from_spec(spec)?;
+        validate_index_metadata(&metadata, compression)?;
 
         // Parse the EType for leaf nodes
         let leaf_type = ETypeParser::parse(&spec.leaf_codec.e_type)?;
@@ -268,8 +298,8 @@ impl IndexReader {
 
                 let metadata_local_str = metadata_local.to_string_lossy().to_string();
                 let metadata = crate::index::IndexMetadata::from_path(&metadata_local_str)?;
-                validate_index_metadata(&metadata)?;
                 let compression = IndexCompression::from_spec(spec)?;
+                validate_index_metadata(&metadata, compression)?;
 
                 let leaf_type = ETypeParser::parse(&spec.leaf_codec.e_type)?;
                 let internal_type = ETypeParser::parse(&spec.internal_node_codec.e_type)?;
@@ -818,7 +848,199 @@ impl<'a> InputBuffer for SliceBuffer<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::EncodedValue;
+    use crate::buffer::{BlockingOutputBuffer, LEB128OutputBuffer, OutputBuffer};
+    use crate::codec::{EncodedValue, Encoder};
+
+    fn test_index_metadata(file_version: u32, root_offset: u64, height: u32) -> IndexMetadata {
+        IndexMetadata {
+            file_version,
+            branching_factor: 2,
+            height,
+            key_type: "Struct{k:Int32}".to_string(),
+            annotation_type: "Struct{}".to_string(),
+            n_keys: 2,
+            index_path: "index".to_string(),
+            root_offset,
+            attributes: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn index_version_codec_matrix_accepts_only_authoritative_pairings() {
+        let lz4hc = IndexCompression::Lz4Hc {
+            max_block_size: 32_768,
+        };
+        let zstd = IndexCompression::Zstd {
+            max_block_size: 65_536,
+        };
+
+        assert!(validate_index_metadata(
+            &test_index_metadata(INDEX_FILE_VERSION_1_1_0, 0, 1),
+            lz4hc,
+        )
+        .is_ok());
+        assert!(validate_index_metadata(
+            &test_index_metadata(INDEX_FILE_VERSION_1_2_0, 0, 1),
+            zstd,
+        )
+        .is_ok());
+
+        for (version, compression, required) in [
+            (INDEX_FILE_VERSION_1_1_0, zstd, "requires LZ4HC"),
+            (INDEX_FILE_VERSION_1_2_0, lz4hc, "requires Zstd"),
+        ] {
+            let error = validate_index_metadata(&test_index_metadata(version, 0, 1), compression)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("invalid Hail index version/codec pairing"),
+                "{error}"
+            );
+            assert!(error.contains(required), "{error}");
+        }
+
+        for compression in [lz4hc, zstd] {
+            let error = validate_index_metadata(
+                &test_index_metadata(INDEX_FILE_VERSION_1_0_0, 0, 1),
+                compression,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("1.0.0"), "{error}");
+            assert!(error.contains("not qualified"), "{error}");
+        }
+    }
+
+    fn key_value(k: i32) -> EncodedValue {
+        EncodedValue::Struct(vec![("k".to_string(), EncodedValue::Int32(k))])
+    }
+
+    fn leaf_value(k: i32, row_offset: i64) -> EncodedValue {
+        EncodedValue::Struct(vec![
+            ("first_idx".to_string(), EncodedValue::Int64((k - 1) as i64)),
+            (
+                "keys".to_string(),
+                EncodedValue::Array(vec![EncodedValue::Struct(vec![
+                    ("key".to_string(), key_value(k)),
+                    ("offset".to_string(), EncodedValue::Int64(row_offset)),
+                    ("annotation".to_string(), EncodedValue::Struct(vec![])),
+                ])]),
+            ),
+        ])
+    }
+
+    fn internal_value(children: &[(i64, i32, i64)]) -> EncodedValue {
+        EncodedValue::Struct(vec![(
+            "children".to_string(),
+            EncodedValue::Array(
+                children
+                    .iter()
+                    .enumerate()
+                    .map(|(first_idx, (index_offset, key, row_offset))| {
+                        EncodedValue::Struct(vec![
+                            (
+                                "index_file_offset".to_string(),
+                                EncodedValue::Int64(*index_offset),
+                            ),
+                            (
+                                "first_idx".to_string(),
+                                EncodedValue::Int64(first_idx as i64),
+                            ),
+                            ("first_key".to_string(), key_value(*key)),
+                            (
+                                "first_record_offset".to_string(),
+                                EncodedValue::Int64(*row_offset),
+                            ),
+                            ("first_annotation".to_string(), EncodedValue::Struct(vec![])),
+                        ])
+                    })
+                    .collect(),
+            ),
+        )])
+    }
+
+    fn encode_node(node_tag: u8, ty: &EncodedType, value: &EncodedValue) -> Vec<u8> {
+        let mut output = LEB128OutputBuffer::new(BlockingOutputBuffer::new(32_768));
+        output.write_u8(node_tag).unwrap();
+        Encoder::write_present_value(&mut output, ty, value).unwrap();
+        output.into_inner().into_data()
+    }
+
+    fn frame_lz4hc_block(decoded: &[u8]) -> Vec<u8> {
+        let compressed = lz4_flex::block::compress(decoded);
+        let mut framed = Vec::with_capacity(8 + compressed.len());
+        framed.extend_from_slice(&((4 + compressed.len()) as u32).to_le_bytes());
+        framed.extend_from_slice(&(decoded.len() as i32).to_le_bytes());
+        framed.extend_from_slice(&compressed);
+        framed
+    }
+
+    #[test]
+    fn synthetic_historical_lz4hc_decodes_nonzero_virtual_offsets_and_multiple_nodes() {
+        let leaf_type = ETypeParser::parse(
+            "EBaseStruct{first_idx:+EInt64,keys:+EArray[+EBaseStruct{key:+EBaseStruct{k:+EInt32},offset:+EInt64,annotation:+EBaseStruct{}}]}",
+        )
+        .unwrap();
+        let internal_type = ETypeParser::parse(
+            "EBaseStruct{children:+EArray[+EBaseStruct{index_file_offset:+EInt64,first_idx:+EInt64,first_key:+EBaseStruct{k:+EInt32},first_record_offset:+EInt64,first_annotation:+EBaseStruct{}}]}",
+        )
+        .unwrap();
+
+        // Put two leaves at nonzero local offsets in the first decompressed
+        // block. The root occupies a second compressed block at a physical
+        // boundary, matching Hail's rootOffset convention.
+        let mut leaves = vec![0xA5; 7];
+        let first_local = leaves.len() as u64;
+        leaves.extend_from_slice(&encode_node(0, &leaf_type, &leaf_value(1, 101)));
+        leaves.extend_from_slice(&[0x5A; 11]);
+        let second_local = leaves.len() as u64;
+        leaves.extend_from_slice(&encode_node(0, &leaf_type, &leaf_value(2, 202)));
+        assert!(first_local > 0 && second_local > first_local);
+        assert!(second_local <= u16::MAX as u64);
+
+        let first_block = frame_lz4hc_block(&leaves);
+        let root_physical = first_block.len() as u64;
+        assert_ne!(root_physical, first_local);
+        assert_ne!(root_physical, second_local);
+        let root = encode_node(
+            1,
+            &internal_type,
+            &internal_value(&[(first_local as i64, 1, 101), (second_local as i64, 2, 202)]),
+        );
+        let mut index_bytes = first_block;
+        index_bytes.extend_from_slice(&frame_lz4hc_block(&root));
+
+        let metadata = test_index_metadata(INDEX_FILE_VERSION_1_1_0, root_physical, 2);
+        let compression = IndexCompression::Lz4Hc {
+            max_block_size: 32_768,
+        };
+        validate_index_metadata(&metadata, compression).unwrap();
+        let mut cursor = std::io::Cursor::new(index_bytes);
+        let node_cache = IndexReader::load_all_nodes_from_reader(
+            &mut cursor,
+            &metadata,
+            &leaf_type,
+            &internal_type,
+            compression,
+        )
+        .unwrap();
+        assert_eq!(node_cache.len(), 3);
+
+        let reader = IndexReader {
+            _index_dir: "synthetic-only-not-hail-produced".to_string(),
+            metadata,
+            _leaf_type: leaf_type,
+            _internal_type: internal_type,
+            node_cache,
+        };
+        assert_eq!(reader.lookup(&key_value(1)).unwrap(), Some(101));
+        assert_eq!(reader.lookup(&key_value(2)).unwrap(), Some(202));
+        let IndexNode::Internal(root) = reader.read_node(root_physical).unwrap() else {
+            panic!("synthetic root must be internal");
+        };
+        assert_eq!(root.children[0].index_file_offset as u64, first_local);
+        assert_eq!(root.children[1].index_file_offset as u64, second_local);
+    }
 
     #[test]
     fn test_compare_encoded_values_contig_ordering() {
