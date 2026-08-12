@@ -4,7 +4,9 @@ mod paired;
 mod vtype;
 
 pub use paired::{
-    ArrowFieldPlan, ArrowNode, ArrowSchemaPlan, ArrowTypePlan, PairedSchema, PhysicalBinaryEncoding,
+    ArrowFieldDescriptor, ArrowFieldPlan, ArrowNode, ArrowSchemaDescriptor, ArrowSchemaPlan,
+    ArrowTypeDescriptor, ArrowTypePlan, PairedSchema, PhysicalBinaryEncoding,
+    ARROW_SCHEMA_DESCRIPTOR_VERSION,
 };
 pub use vtype::{LogicalField, LogicalType, VTypeParser};
 

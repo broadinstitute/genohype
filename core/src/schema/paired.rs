@@ -4,8 +4,13 @@ use super::{LogicalType, VTypeParser};
 use crate::codec::{EncodedField, EncodedType};
 use crate::{HailError, Result};
 use arrow::datatypes::{DataType, Field, Fields, Schema};
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+
+const ARROW_SCHEMA_FINGERPRINT_DOMAIN: &[u8] = b"genohype.arrow-schema-plan.sha256.v1\0";
+pub const ARROW_SCHEMA_DESCRIPTOR_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PhysicalBinaryEncoding {
@@ -40,6 +45,119 @@ pub struct ArrowFieldPlan {
     pub name: String,
     pub plan: ArrowTypePlan,
     pub metadata: HashMap<String, String>,
+}
+
+/// Project-owned, canonical description of an Arrow schema plan. Unlike Arrow
+/// or Rust debug output, this format is versioned and safe to fingerprint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArrowSchemaDescriptor {
+    pub schema_version: u32,
+    pub root: ArrowTypeDescriptor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ArrowTypeDescriptor {
+    Int32 {
+        nullable: bool,
+    },
+    Int64 {
+        nullable: bool,
+    },
+    Float32 {
+        nullable: bool,
+    },
+    Float64 {
+        nullable: bool,
+    },
+    Boolean {
+        nullable: bool,
+    },
+    Utf8 {
+        nullable: bool,
+    },
+    Binary {
+        nullable: bool,
+    },
+    List {
+        nullable: bool,
+        element: Box<ArrowTypeDescriptor>,
+    },
+    Struct {
+        nullable: bool,
+        fields: Vec<ArrowFieldDescriptor>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArrowFieldDescriptor {
+    pub name: String,
+    pub field_type: ArrowTypeDescriptor,
+    /// A BTreeMap makes metadata ordering canonical by construction.
+    pub metadata: BTreeMap<String, String>,
+}
+
+impl ArrowSchemaDescriptor {
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != ARROW_SCHEMA_DESCRIPTOR_VERSION {
+            return Err(HailError::InvalidFormat(format!(
+                "unsupported Arrow schema descriptor version {}",
+                self.schema_version
+            )));
+        }
+        if !matches!(self.root, ArrowTypeDescriptor::Struct { .. }) {
+            return Err(HailError::InvalidFormat(
+                "Arrow schema descriptor root must be a struct".to_string(),
+            ));
+        }
+        validate_descriptor_type(&self.root, "$")
+    }
+
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        serde_json::to_vec(self).map_err(|error| {
+            HailError::InvalidFormat(format!("failed to encode Arrow schema descriptor: {error}"))
+        })
+    }
+
+    pub fn fingerprint_sha256(&self) -> Result<String> {
+        let bytes = self.canonical_bytes()?;
+        let mut hasher = Sha256::new();
+        hasher.update(ARROW_SCHEMA_FINGERPRINT_DOMAIN);
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+        Ok(format!("{:x}", hasher.finalize()))
+    }
+}
+
+fn validate_descriptor_type(descriptor: &ArrowTypeDescriptor, path: &str) -> Result<()> {
+    match descriptor {
+        ArrowTypeDescriptor::List { element, .. } => {
+            validate_descriptor_type(element, &format!("{path}[]"))
+        }
+        ArrowTypeDescriptor::Struct { fields, .. } => {
+            let mut names = HashSet::with_capacity(fields.len());
+            for field in fields {
+                if field.name.is_empty() || !names.insert(field.name.as_str()) {
+                    return Err(HailError::InvalidFormat(format!(
+                        "Arrow schema descriptor has an empty or duplicate field at {path}: {:?}",
+                        field.name
+                    )));
+                }
+                if field.metadata.keys().any(String::is_empty) {
+                    return Err(HailError::InvalidFormat(format!(
+                        "Arrow schema descriptor has an empty metadata key at {path}.{}",
+                        field.name
+                    )));
+                }
+                validate_descriptor_type(&field.field_type, &format!("{path}.{}", field.name))?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 impl ArrowFieldPlan {
@@ -94,6 +212,50 @@ impl ArrowSchemaPlan {
             ArrowNode::Struct { fields } => fields,
             _ => unreachable!("root checked by constructor"),
         }
+    }
+
+    pub fn descriptor(&self) -> ArrowSchemaDescriptor {
+        ArrowSchemaDescriptor {
+            schema_version: ARROW_SCHEMA_DESCRIPTOR_VERSION,
+            root: describe_type(&self.root),
+        }
+    }
+
+    /// Domain-separated SHA-256 over the versioned canonical descriptor.
+    pub fn fingerprint_sha256(&self) -> Result<String> {
+        self.descriptor().fingerprint_sha256()
+    }
+}
+
+fn describe_type(plan: &ArrowTypePlan) -> ArrowTypeDescriptor {
+    let nullable = plan.nullable;
+    match &plan.node {
+        ArrowNode::Int32 => ArrowTypeDescriptor::Int32 { nullable },
+        ArrowNode::Int64 => ArrowTypeDescriptor::Int64 { nullable },
+        ArrowNode::Float32 => ArrowTypeDescriptor::Float32 { nullable },
+        ArrowNode::Float64 => ArrowTypeDescriptor::Float64 { nullable },
+        ArrowNode::Boolean => ArrowTypeDescriptor::Boolean { nullable },
+        ArrowNode::Utf8 => ArrowTypeDescriptor::Utf8 { nullable },
+        ArrowNode::Binary => ArrowTypeDescriptor::Binary { nullable },
+        ArrowNode::List { element } => ArrowTypeDescriptor::List {
+            nullable,
+            element: Box::new(describe_type(element)),
+        },
+        ArrowNode::Struct { fields } => ArrowTypeDescriptor::Struct {
+            nullable,
+            fields: fields
+                .iter()
+                .map(|field| ArrowFieldDescriptor {
+                    name: field.name.clone(),
+                    field_type: describe_type(&field.plan),
+                    metadata: field
+                        .metadata
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect(),
+                })
+                .collect(),
+        },
     }
 }
 
@@ -529,5 +691,43 @@ mod tests {
 
         let error = pair("+EBaseStruct{x:+EBinary}", "Struct{y:String}").unwrap_err();
         assert!(error.to_string().contains("field mismatch at $"), "{error}");
+    }
+
+    #[test]
+    fn canonical_fingerprint_distinguishes_semantic_schema_changes() {
+        let string = pair("+EBaseStruct{x:+EBinary}", "Struct{x:String}").unwrap();
+        let binary = pair("+EBaseStruct{x:+EBinary}", "Struct{x:Binary}").unwrap();
+        let nullable = pair("+EBaseStruct{x:EBinary}", "Struct{x:String}").unwrap();
+        let reordered = pair(
+            "+EBaseStruct{y:+EInt32,x:+EBinary}",
+            "Struct{y:Int32,x:String}",
+        )
+        .unwrap();
+        let ordered = pair(
+            "+EBaseStruct{x:+EBinary,y:+EInt32}",
+            "Struct{x:String,y:Int32}",
+        )
+        .unwrap();
+
+        assert_ne!(
+            string.fingerprint_sha256().unwrap(),
+            binary.fingerprint_sha256().unwrap()
+        );
+        assert_ne!(
+            string.fingerprint_sha256().unwrap(),
+            nullable.fingerprint_sha256().unwrap()
+        );
+        assert_ne!(
+            ordered.fingerprint_sha256().unwrap(),
+            reordered.fingerprint_sha256().unwrap()
+        );
+        assert_eq!(
+            string.fingerprint_sha256().unwrap(),
+            string.fingerprint_sha256().unwrap()
+        );
+        assert_eq!(
+            string.descriptor().schema_version,
+            ARROW_SCHEMA_DESCRIPTOR_VERSION
+        );
     }
 }

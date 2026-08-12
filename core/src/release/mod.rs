@@ -5,6 +5,14 @@
 //! later stage; a sidecar cannot be marked complete unless this validator can
 //! prove its receipts and source manifest agree.
 
+mod safe_export;
+
+pub use safe_export::{
+    DecodedRowsHasher, ExportPartReport, SafeExportPartTask, SafeExportSpec,
+    SafeExportWorkerIdentity, SAFE_EXPORT_COMPLETION_SCHEMA_VERSION,
+    SAFE_EXPORT_RECEIPT_SCHEMA_VERSION, SAFE_EXPORT_SCHEMA_VERSION, SAFE_EXPORT_SHARDING_RULE_V1,
+};
+
 use crate::codec::{canonical_digest, ETypeParser, EncodedType, LosslessValue, ValueDigest};
 use crate::io::{SourceManifest, SourceObject};
 use crate::metadata::{BufferSpec, CodecSpec, IndexSpec, Interval, RVDComponentSpec};
@@ -376,8 +384,8 @@ pub struct PartReceipt {
     pub worker_id: String,
     pub worker_git_commit: String,
     pub worker_binary_sha256: String,
-    pub assignment_attempt: String,
-    pub lease_id: String,
+    pub assignment_attempt: u64,
+    pub lease_identity_sha256: String,
     pub started_at: String,
     pub completed_at: String,
     pub status: PartStatus,
@@ -477,6 +485,12 @@ impl TableReleaseSidecar {
                 || receipt.byte_size != receipt.output_object.size
                 || receipt.sha256.len() != 64
                 || receipt.output_object.sha256.as_deref() != Some(receipt.sha256.as_str())
+                || receipt.assignment_attempt == 0
+                || receipt.lease_identity_sha256.len() != 64
+                || !receipt
+                    .lease_identity_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             {
                 return Err(invalid(format!(
                     "part {} output identity mismatch",
@@ -586,8 +600,8 @@ mod tests {
             worker_id: "worker".into(),
             worker_git_commit: "commit".into(),
             worker_binary_sha256: "binary".into(),
-            assignment_attempt: "attempt".into(),
-            lease_id: "lease".into(),
+            assignment_attempt: 1,
+            lease_identity_sha256: "f".repeat(64),
             started_at: "start".into(),
             completed_at: "end".into(),
             status: PartStatus::Complete,

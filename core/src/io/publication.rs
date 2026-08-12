@@ -86,13 +86,7 @@ fn build_attempt_staging_location_with_id(
         HailError::InvalidFormat(format!("Invalid output prefix path: {error}"))
     })?;
 
-    let lease_len = u64::try_from(lease_token.len())
-        .map_err(|_| HailError::InvalidFormat("Lease token length exceeds u64".to_string()))?;
-    let mut lease_hash = Sha256::new();
-    lease_hash.update(LEASE_HASH_DOMAIN);
-    lease_hash.update(lease_len.to_be_bytes());
-    lease_hash.update(lease_token.as_bytes());
-    let lease_identity_sha256 = format!("{:x}", lease_hash.finalize());
+    let lease_identity_sha256 = lease_identity_sha256(lease_token)?;
 
     let path = output_prefix
         .child("_genohype")
@@ -111,6 +105,23 @@ fn build_attempt_staging_location_with_id(
         lease_identity_sha256,
         upload_id,
     })
+}
+
+/// Domain-separated identity for a lease capability. Raw lease tokens must
+/// never be persisted in reports, receipts, paths, or logs.
+pub fn lease_identity_sha256(lease_token: &str) -> Result<String> {
+    if lease_token.is_empty() {
+        return Err(HailError::InvalidFormat(
+            "Lease token must not be empty".to_string(),
+        ));
+    }
+    let lease_len = u64::try_from(lease_token.len())
+        .map_err(|_| HailError::InvalidFormat("Lease token length exceeds u64".to_string()))?;
+    let mut lease_hash = Sha256::new();
+    lease_hash.update(LEASE_HASH_DOMAIN);
+    lease_hash.update(lease_len.to_be_bytes());
+    lease_hash.update(lease_token.as_bytes());
+    Ok(format!("{:x}", lease_hash.finalize()))
 }
 
 /// Derive the only valid final path for a digest and extension.

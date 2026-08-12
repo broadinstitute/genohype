@@ -311,11 +311,38 @@ impl HailTableSource {
         self.partition_counts.is_some()
     }
 
-    /// Get the path to a partition file
-    fn get_partition_path(&self, partition_idx: usize) -> String {
-        let part_file = &self.rvd_spec.part_files[partition_idx];
+    /// Exact canonical URI of a rows partition. This accessor is intentionally
+    /// narrow so safe orchestration never reconstructs manifest joins by suffix.
+    pub fn row_partition_uri(&self, partition_idx: usize) -> Result<String> {
+        let part_file = self.rvd_spec.part_files.get(partition_idx).ok_or_else(|| {
+            HailError::InvalidFormat(format!(
+                "row partition {partition_idx} is out of bounds for {} partitions",
+                self.rvd_spec.part_files.len()
+            ))
+        })?;
         let parts_path = join_path(&self.rows_path, "parts");
-        join_path(&parts_path, part_file)
+        Ok(join_path(&parts_path, part_file))
+    }
+
+    /// Exact pinned source identity for one rows partition. Unpinned engines
+    /// cannot provide publication authority and therefore fail closed.
+    pub fn row_partition_source_object(
+        &self,
+        partition_idx: usize,
+    ) -> Result<crate::io::SourceObject> {
+        let uri = self.row_partition_uri(partition_idx)?;
+        let snapshot = self.source_snapshot.as_ref().ok_or_else(|| {
+            HailError::InvalidFormat(
+                "row partition source identity requires a pinned source manifest".to_string(),
+            )
+        })?;
+        Ok(snapshot.object(&uri)?.clone())
+    }
+
+    /// Get the path to a partition file.
+    fn get_partition_path(&self, partition_idx: usize) -> String {
+        self.row_partition_uri(partition_idx)
+            .expect("partition index validated by caller")
     }
 
     /// Convert an EncodedValue key to KeyRanges for partition pruning

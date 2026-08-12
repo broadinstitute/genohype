@@ -282,6 +282,34 @@ impl QueryEngine {
         })
     }
 
+    /// Exact canonical URI for one Hail rows partition.
+    pub fn row_partition_uri(&self, partition_idx: usize) -> Result<String> {
+        self.hail_source
+            .as_ref()
+            .ok_or_else(|| {
+                crate::HailError::InvalidFormat(
+                    "row partition URI is available only for Hail tables".to_string(),
+                )
+            })?
+            .row_partition_uri(partition_idx)
+    }
+
+    /// Exact manifest identity for one Hail rows partition. This succeeds only
+    /// for an engine opened under a validated source snapshot.
+    pub fn row_partition_source_object(
+        &self,
+        partition_idx: usize,
+    ) -> Result<crate::io::SourceObject> {
+        self.hail_source
+            .as_ref()
+            .ok_or_else(|| {
+                crate::HailError::InvalidFormat(
+                    "row partition source identity is available only for Hail tables".to_string(),
+                )
+            })?
+            .row_partition_source_object(partition_idx)
+    }
+
     /// Check if total_rows() is available without an expensive scan
     pub fn has_fast_row_count(&self) -> bool {
         self.hail_source
