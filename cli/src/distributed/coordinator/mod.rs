@@ -97,11 +97,10 @@ pub async fn start_coordinator(config: CoordinatorConfig) -> Result<()> {
     .await
 }
 
-fn terminal_job_status(failed_tasks: usize, max_retries: usize) -> &'static str {
-    if failed_tasks > 0 && max_retries == 0 {
+fn terminal_job_status(failed_tasks: usize) -> &'static str {
+    if failed_tasks > 0 {
         "failed"
     } else {
-        // Preserve the existing terminal status for ordinary/default-policy jobs.
         "completed"
     }
 }
@@ -655,7 +654,7 @@ pub async fn run_coordinator(
                         // Build a summary for persistence
                         let summary = build_dashboard_summary(&data);
                         let summary_json = serde_json::to_string(&summary).ok();
-                        let terminal_status = terminal_job_status(failed, max_retries);
+                        let terminal_status = terminal_job_status(failed);
                         if let Err(e) = data.metrics_db.update_job_status(
                             job_id,
                             terminal_status,
@@ -1917,8 +1916,8 @@ async fn handle_heartbeat(
 mod lease_coordinator_tests {
     use super::*;
     use crate::distributed::message::{
-        AssignmentLease, CancelRequest, CompleteResponse, HardwareSpec, HeartbeatResponse,
-        JobConfigRequest, JobConfigResponse, JobRecord, TelemetrySnapshot,
+        AssignmentLease, CancelRequest, CompleteResponse, DashboardSummary, HardwareSpec,
+        HeartbeatResponse, JobConfigRequest, JobConfigResponse, JobRecord, TelemetrySnapshot,
     };
     use axum::{
         routing::{get, post},
@@ -2583,11 +2582,90 @@ mod lease_coordinator_tests {
         );
     }
 
+    fn persist_test_terminal_job(state: &SharedState) {
+        let data = state.lock().unwrap();
+        let job_id = data.current_job_id.as_deref().unwrap();
+        let summary = build_dashboard_summary(&data);
+        let summary_json = serde_json::to_string(&summary).unwrap();
+        data.metrics_db
+            .update_job_status(
+                job_id,
+                terminal_job_status(summary.failed_tasks),
+                Some(CoordinatorData::now_ms()),
+                Some(&summary_json),
+            )
+            .unwrap();
+    }
+
+    fn assert_failed_ordinary_job_is_terminal(max_retries: usize) {
+        let state = test_state(1);
+        {
+            let mut data = state.lock().unwrap();
+            data.config.job_spec = Some(JobSpec::Summary);
+            data.config.max_retries = max_retries;
+            data.pending_partitions.clear();
+            data.failed_partitions.insert(0);
+        }
+
+        persist_test_terminal_job(&state);
+
+        let data = state.lock().unwrap();
+        let job = data.metrics_db.get_job("job-1").unwrap().unwrap();
+        assert_eq!(job.status, "failed");
+        assert!(job.end_time_ms.is_some());
+
+        let summary: DashboardSummary = serde_json::from_str(
+            &data
+                .metrics_db
+                .get_job_summary("job-1")
+                .unwrap()
+                .expect("persisted terminal summary"),
+        )
+        .unwrap();
+        assert!(summary.is_complete, "failure must remain terminal");
+        assert_eq!(summary.completed_tasks, 0);
+        assert_eq!(summary.failed_tasks, 1);
+        assert_eq!(summary.pending_tasks, 0);
+    }
+
     #[test]
-    fn zero_retry_failed_jobs_are_terminally_failed_without_changing_default_status() {
-        assert_eq!(terminal_job_status(1, 0), "failed");
-        assert_eq!(terminal_job_status(0, 0), "completed");
-        assert_eq!(terminal_job_status(1, 3), "completed");
+    fn zero_retry_exhausted_partition_persists_failed_terminal_job() {
+        assert_failed_ordinary_job_is_terminal(0);
+    }
+
+    #[test]
+    fn retried_exhausted_partition_persists_failed_terminal_job() {
+        assert_failed_ordinary_job_is_terminal(3);
+    }
+
+    #[test]
+    fn terminal_job_without_failed_partitions_persists_completed_status() {
+        let state = test_state(1);
+        {
+            let mut data = state.lock().unwrap();
+            data.config.job_spec = Some(JobSpec::Summary);
+            data.pending_partitions.clear();
+            data.completed_tasks.insert(0);
+        }
+
+        persist_test_terminal_job(&state);
+
+        let data = state.lock().unwrap();
+        assert_eq!(
+            data.metrics_db.get_job("job-1").unwrap().unwrap().status,
+            "completed"
+        );
+        let summary: DashboardSummary = serde_json::from_str(
+            &data
+                .metrics_db
+                .get_job_summary("job-1")
+                .unwrap()
+                .expect("persisted terminal summary"),
+        )
+        .unwrap();
+        assert!(summary.is_complete);
+        assert_eq!(summary.completed_tasks, 1);
+        assert_eq!(summary.failed_tasks, 0);
     }
 
     #[tokio::test]
