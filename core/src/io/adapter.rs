@@ -25,7 +25,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use super::{ResolvedObject, SourceObject, SourceSnapshot};
 
@@ -176,7 +176,9 @@ async fn head_resolved(resolved: &ResolvedObject) -> Result<ObjectMeta> {
     Ok(result.meta)
 }
 
-/// Fetch a byte range with app-level retries for transient mid-stream failures.
+/// Fetch a byte range with app-level retries for transient request and body-stream
+/// failures. `object_store::get_opts` returns before the response body is consumed,
+/// so retrying only that future misses mid-body decode/connection failures.
 /// Every snapshot request carries both version and If-Match, then verifies the
 /// identity returned with the body before exposing bytes to a decoder.
 async fn get_range_retrying(
@@ -185,17 +187,48 @@ async fn get_range_retrying(
     context: &CloudObjectContext,
     range: std::ops::Range<usize>,
 ) -> Result<bytes::Bytes> {
-    const MAX_ATTEMPTS: u32 = 6;
-    let mut backoff = std::time::Duration::from_millis(500);
-    let mut attempt = 0;
-    loop {
+    get_range_retrying_with_policy(
+        store,
+        path,
+        context,
+        range,
+        6,
+        std::time::Duration::from_millis(500),
+    )
+    .await
+}
+
+fn transient_range_error(error: &object_store::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("error decoding response body")
+        || message.contains("decoding response")
+        || message.contains("connection")
+        || message.contains("timed out")
+        || message.contains("broken pipe")
+        || message.contains("reset")
+        || message.contains("unexpected eof")
+}
+
+async fn get_range_retrying_with_policy(
+    store: &Arc<dyn ObjectStore>,
+    path: &ObjPath,
+    context: &CloudObjectContext,
+    range: std::ops::Range<usize>,
+    max_attempts: u32,
+    initial_backoff: std::time::Duration,
+) -> Result<bytes::Bytes> {
+    let max_attempts = max_attempts.max(1);
+    let mut backoff = initial_backoff;
+
+    for attempt in 1..=max_attempts {
         let request = store
             .get_opts(
                 path,
                 pinned_options(context.expected.as_ref(), Some(range.clone()), false),
             )
             .await;
-        match request {
+
+        let (phase, body) = match request {
             Ok(result) => {
                 if let Some(expected) = &context.expected {
                     verify_object_meta(&context.canonical_uri, expected, &result.meta)?;
@@ -206,7 +239,13 @@ async fn get_range_retrying(
                         context.canonical_uri, range, result.range
                     )));
                 }
-                let bytes = result.bytes().await?;
+                ("body", result.bytes().await)
+            }
+            Err(error) => ("request", Err(error)),
+        };
+
+        match body {
+            Ok(bytes) => {
                 if bytes.len() != range.len() {
                     return Err(HailError::InvalidFormat(format!(
                         "source object short range for {}: expected {} bytes, got {}",
@@ -215,25 +254,47 @@ async fn get_range_retrying(
                         bytes.len()
                     )));
                 }
+                if attempt > 1 {
+                    debug!(
+                        uri = %context.canonical_uri,
+                        range_start = range.start,
+                        range_end = range.end,
+                        attempt,
+                        "object-store range read retry succeeded"
+                    );
+                }
                 return Ok(bytes);
             }
             Err(error) => {
-                attempt += 1;
-                let message = error.to_string();
-                let transient = message.contains("error decoding response body")
-                    || message.contains("decoding response")
-                    || message.contains("connection")
-                    || message.contains("timed out")
-                    || message.contains("broken pipe")
-                    || message.contains("reset");
-                if attempt >= MAX_ATTEMPTS || !transient {
-                    return Err(error.into());
+                let transient = transient_range_error(&error);
+                if attempt == max_attempts || !transient {
+                    return Err(HailError::ObjectStoreRangeRead {
+                        uri: context.canonical_uri.clone(),
+                        range_start: range.start,
+                        range_end: range.end,
+                        attempts: attempt,
+                        source: error,
+                    });
                 }
+                warn!(
+                    uri = %context.canonical_uri,
+                    range_start = range.start,
+                    range_end = range.end,
+                    range_len = range.len(),
+                    attempt,
+                    max_attempts,
+                    phase,
+                    backoff_ms = backoff.as_millis(),
+                    error = %error,
+                    "transient object-store range read failed; retrying exact range"
+                );
                 tokio::time::sleep(backoff).await;
                 backoff = std::cmp::min(backoff * 2, std::time::Duration::from_secs(30));
             }
         }
     }
+
+    unreachable!("range retry loop always returns")
 }
 
 /// Get or create a GCS client for the given bucket.
@@ -378,7 +439,7 @@ impl CloudReader {
         let start_time = std::time::Instant::now();
         let bytes = IO_RUNTIME
             .block_on(async { get_range_retrying(&store, &path, &context, range).await })
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
 
         trace!("CloudReader: fetch completed in {:?}", start_time.elapsed());
 
@@ -594,10 +655,9 @@ impl PrefetchingCloudReader {
                                 CHUNK_CACHE.insert(cache_key, bytes.clone()).await;
                                 Ok(bytes)
                             }
-                            Err(e) => Err(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                e.to_string(),
-                            )),
+                            Err(error) => {
+                                Err(std::io::Error::new(std::io::ErrorKind::Other, error))
+                            }
                         }
                     }
                 })
@@ -1152,6 +1212,114 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct BodyFaultStore {
+        inner: InMemory,
+        body_failures_remaining: AtomicUsize,
+    }
+
+    impl std::fmt::Display for BodyFaultStore {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "body-fault-memory")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for BodyFaultStore {
+        async fn put_opts(
+            &self,
+            location: &ObjPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjPath,
+            opts: PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjPath,
+            options: GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            let mut result = self.inner.get_opts(location, options).await?;
+            if self
+                .body_failures_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                let error = object_store::Error::Generic {
+                    store: "test-gcs",
+                    source: std::io::Error::other(
+                        "error decoding response body (HTTP 206, test body context)",
+                    )
+                    .into(),
+                };
+                result.payload = object_store::GetResultPayload::Stream(
+                    futures::stream::once(async move { Err(error) }).boxed(),
+                );
+            }
+            Ok(result)
+        }
+
+        async fn delete(&self, location: &ObjPath) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &ObjPath, to: &ObjPath) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &ObjPath,
+            to: &ObjPath,
+        ) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    fn body_fault_object(failures: usize) -> (Arc<dyn ObjectStore>, ObjPath, CloudObjectContext) {
+        let store = Arc::new(BodyFaultStore {
+            inner: InMemory::new(),
+            body_failures_remaining: AtomicUsize::new(failures),
+        });
+        let path = ObjPath::from("range/object");
+        IO_RUNTIME
+            .block_on(store.put(&path, bytes::Bytes::from_static(b"abcdefgh").into()))
+            .unwrap();
+        let context = CloudObjectContext {
+            canonical_store_id: "gs://test-bucket".to_string(),
+            canonical_uri: "gs://test-bucket/range/object".to_string(),
+            expected: None,
+            observed_version: None,
+            observed_etag: None,
+        };
+        (store, path, context)
+    }
+
     fn versioned_object(
         uri: &str,
         store_id: &str,
@@ -1182,6 +1350,42 @@ mod tests {
             observed_etag: None,
         };
         (store, path, context)
+    }
+
+    #[test]
+    fn retries_response_body_failure_for_the_exact_range() {
+        let (store, path, context) = body_fault_object(1);
+        let bytes = IO_RUNTIME
+            .block_on(get_range_retrying_with_policy(
+                &store,
+                &path,
+                &context,
+                2..6,
+                2,
+                std::time::Duration::ZERO,
+            ))
+            .unwrap();
+        assert_eq!(&bytes[..], b"cdef");
+    }
+
+    #[test]
+    fn exhausted_body_retries_preserve_uri_range_attempts_and_source_context() {
+        let (store, path, context) = body_fault_object(3);
+        let error = IO_RUNTIME
+            .block_on(get_range_retrying_with_policy(
+                &store,
+                &path,
+                &context,
+                2..6,
+                2,
+                std::time::Duration::ZERO,
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("gs://test-bucket/range/object"), "{error}");
+        assert!(error.contains("bytes 2..6"), "{error}");
+        assert!(error.contains("after 2 attempt(s)"), "{error}");
+        assert!(error.contains("HTTP 206, test body context"), "{error}");
     }
 
     #[test]

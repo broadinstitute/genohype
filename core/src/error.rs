@@ -42,6 +42,18 @@ pub enum HailError {
     #[error("Object store error: {0}")]
     ObjectStore(#[from] object_store::Error),
 
+    #[error(
+        "Object store range read failed for {uri} bytes {range_start}..{range_end} after {attempts} attempt(s): {source}"
+    )]
+    ObjectStoreRangeRead {
+        uri: String,
+        range_start: usize,
+        range_end: usize,
+        attempts: u32,
+        #[source]
+        source: object_store::Error,
+    },
+
     #[error("Parse error: {0}")]
     ParseError(String),
 

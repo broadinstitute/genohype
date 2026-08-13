@@ -365,9 +365,26 @@ pub fn run_export_parquet(args: ExportParquetArgs) -> Result<()> {
                 _ => None,
             };
 
-            // Use streaming query with filters, intervals, and decode projection.
-            let iterator =
-                engine.query_iter_with_projection(&where_filters, intervals, decode_projection)?;
+            // A bounded export is a deterministic prefix, not a race among
+            // parallel partitions. Preserve the parallel iterator for unbounded
+            // filtered exports, but process partitions/files sequentially whenever
+            // `--limit` is present. Unsupported data sources fail closed in the
+            // deterministic query API rather than silently changing samples.
+            let iterator: Box<
+                dyn Iterator<Item = genohype_core::Result<genohype_core::codec::EncodedValue>>,
+            > = if args.common.limit.is_some() {
+                Box::new(engine.query_iter_deterministic_with_projection(
+                    &where_filters,
+                    intervals,
+                    decode_projection,
+                )?)
+            } else {
+                Box::new(engine.query_iter_with_projection(
+                    &where_filters,
+                    intervals,
+                    decode_projection,
+                )?)
+            };
 
             // Apply the output projection so each row's top-level fields exactly
             // match the (narrowed) `row_type`, then append a derived `xpos` only
@@ -434,7 +451,7 @@ pub fn run_export_parquet(args: ExportParquetArgs) -> Result<()> {
             let total_rows = if is_cloud_path(&args.output) {
                 // Cloud output: stream via multipart upload (mirrors sharded branch)
                 let cloud_writer = StreamingCloudWriter::new(&args.output)?;
-                let writer = ParquetWriter::from_writer(cloud_writer, plan.clone())?;
+                let writer = ParquetWriter::from_writer_deterministic(cloud_writer, plan.clone())?;
 
                 let (writer, total_rows) = drive_sequential!(writer);
 
@@ -443,7 +460,7 @@ pub fn run_export_parquet(args: ExportParquetArgs) -> Result<()> {
                 total_rows
             } else {
                 // Local output: write to file
-                let writer = ParquetWriter::new(&args.output, plan.clone())?;
+                let writer = ParquetWriter::new_deterministic(&args.output, plan.clone())?;
 
                 let (writer, total_rows) = drive_sequential!(writer);
                 writer.close()?;

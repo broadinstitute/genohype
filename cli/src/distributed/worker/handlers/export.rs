@@ -357,12 +357,13 @@ pub fn process_parquet_export(
 
             if output_is_cloud {
                 let cloud_writer = StreamingCloudWriter::new(&output_file)?;
-                let writer = ParquetWriter::from_writer(cloud_writer, plan_ref.clone())?;
+                let writer =
+                    ParquetWriter::from_writer_deterministic(cloud_writer, plan_ref.clone())?;
                 let writer = process_with_writer!(writer);
                 let cloud_writer = writer.into_inner()?;
                 cloud_writer.finish()?;
             } else {
-                let writer = ParquetWriter::new(&output_file, plan_ref.clone())?;
+                let writer = ParquetWriter::new_deterministic(&output_file, plan_ref.clone())?;
                 let writer = process_with_writer!(writer);
                 writer.close()?;
             }

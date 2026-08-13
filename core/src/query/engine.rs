@@ -571,6 +571,19 @@ impl QueryEngine {
             .query_stream_with_projection(ranges, intervals, decode_projection)
     }
 
+    /// Stream rows in deterministic source order while honoring the same
+    /// interval and decode projection semantics as the parallel query path.
+    /// Data sources which cannot prove this order fail closed.
+    pub fn query_iter_deterministic_with_projection(
+        &self,
+        ranges: &[KeyRange],
+        intervals: Option<Arc<IntervalList>>,
+        decode_projection: Option<Arc<ProjectionTree>>,
+    ) -> Result<impl Iterator<Item = Result<EncodedValue>>> {
+        self.source
+            .query_stream_sorted_with_projection(ranges, intervals, decode_projection)
+    }
+
     /// Sample random rows from the data source
     ///
     /// Returns a random sample of rows using an optimized strategy based on

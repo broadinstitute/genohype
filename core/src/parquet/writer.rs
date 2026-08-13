@@ -5,8 +5,10 @@ use crate::error::{HailError, Result};
 use crate::parquet::builder::ColumnBuilder;
 use crate::schema::ArrowSchemaPlan;
 use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriterOptions;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
+use parquet::format::KeyValue;
 use std::fs::File;
 use std::io::Write;
 use std::sync::Arc;
@@ -31,6 +33,13 @@ impl ParquetWriter<File> {
         Self::with_batch_size(path, plan, 4096)
     }
 
+    /// Legacy export writer with deterministic project-owned schema metadata.
+    /// Safe export deliberately continues using `new`/`from_writer`, whose
+    /// embedded Arrow schema participates in its existing completion gates.
+    pub fn new_deterministic(path: &str, plan: Arc<ArrowSchemaPlan>) -> Result<Self> {
+        Self::from_writer_with_batch_size_and_metadata(File::create(path)?, plan, 4096, true)
+    }
+
     pub fn with_batch_size(
         path: &str,
         plan: Arc<ArrowSchemaPlan>,
@@ -45,21 +54,59 @@ impl<W: Write + Send> ParquetWriter<W> {
         Self::from_writer_with_batch_size(writer, plan, 4096)
     }
 
+    pub fn from_writer_deterministic(writer: W, plan: Arc<ArrowSchemaPlan>) -> Result<Self> {
+        Self::from_writer_with_batch_size_and_metadata(writer, plan, 4096, true)
+    }
+
     pub fn from_writer_with_batch_size(
         writer: W,
         plan: Arc<ArrowSchemaPlan>,
         batch_size: usize,
+    ) -> Result<Self> {
+        Self::from_writer_with_batch_size_and_metadata(writer, plan, batch_size, false)
+    }
+
+    fn from_writer_with_batch_size_and_metadata(
+        writer: W,
+        plan: Arc<ArrowSchemaPlan>,
+        batch_size: usize,
+        deterministic_metadata: bool,
     ) -> Result<Self> {
         if batch_size == 0 {
             return Err(HailError::InvalidFormat(
                 "Parquet batch size must be greater than zero".to_string(),
             ));
         }
-        let props = WriterProperties::builder()
+        let props_builder = WriterProperties::builder()
             .set_compression(parquet::basic::Compression::ZSTD(Default::default()))
-            .set_max_row_group_size(100_000)
-            .build();
-        let arrow_writer = ArrowWriter::try_new(writer, plan.schema().clone(), Some(props))?;
+            .set_max_row_group_size(100_000);
+        let arrow_writer = if deterministic_metadata {
+            // Arrow 53 serializes field HashMaps into `ARROW:schema` in their
+            // randomized iteration order. Keep a canonical, sorted descriptor
+            // instead and omit only that nondeterministic compatibility blob.
+            // The physical Parquet schema and all row values are unchanged.
+            let descriptor =
+                String::from_utf8(plan.descriptor().canonical_bytes()?).map_err(|error| {
+                    HailError::InvalidFormat(format!(
+                        "canonical Arrow schema descriptor is not UTF-8: {error}"
+                    ))
+                })?;
+            let props = props_builder
+                .set_key_value_metadata(Some(vec![KeyValue::new(
+                    "genohype.arrow_schema_descriptor.v1".to_string(),
+                    Some(descriptor),
+                )]))
+                .build();
+            ArrowWriter::try_new_with_options(
+                writer,
+                plan.schema().clone(),
+                ArrowWriterOptions::new()
+                    .with_properties(props)
+                    .with_skip_arrow_metadata(true),
+            )?
+        } else {
+            ArrowWriter::try_new(writer, plan.schema().clone(), Some(props_builder.build()))?
+        };
         let builders = builders(&plan)?;
         Ok(Self {
             writer: arrow_writer,
@@ -237,6 +284,78 @@ mod tests {
     use arrow::array::{Array, BinaryArray};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use tempfile::NamedTempFile;
+
+    fn deterministic_locus_parquet() -> Vec<u8> {
+        let paired = PairedSchema::from_raw_vtype(
+            ETypeParser::parse(
+                "+EBaseStruct{locus:+EBaseStruct{contig:+EBinary,position:+EInt32}}",
+            )
+            .unwrap(),
+            "Struct{locus:Locus(GRCh38)}",
+        )
+        .unwrap();
+        let plan = Arc::new(paired.arrow_plan().unwrap());
+        let mut writer =
+            ParquetWriter::from_writer_deterministic(std::io::Cursor::new(Vec::new()), plan)
+                .unwrap();
+        writer
+            .write_row(&EncodedValue::Struct(vec![(
+                "locus".into(),
+                EncodedValue::Struct(vec![
+                    ("contig".into(), EncodedValue::Binary(b"chr1".to_vec())),
+                    ("position".into(), EncodedValue::Int32(123)),
+                ]),
+            )]))
+            .unwrap();
+        writer.into_inner().unwrap().into_inner()
+    }
+
+    #[test]
+    fn deterministic_metadata_produces_identical_bytes_and_canonical_descriptor() {
+        let first = deterministic_locus_parquet();
+        let second = deterministic_locus_parquet();
+        assert_eq!(first, second);
+
+        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(first)).unwrap();
+        let metadata = builder
+            .metadata()
+            .file_metadata()
+            .key_value_metadata()
+            .unwrap();
+        assert!(metadata
+            .iter()
+            .any(|entry| entry.key == "genohype.arrow_schema_descriptor.v1"));
+        assert!(!metadata.iter().any(|entry| entry.key == "ARROW:schema"));
+    }
+
+    #[test]
+    fn default_writer_retains_embedded_arrow_schema_for_safe_export() {
+        let paired = PairedSchema::from_raw_vtype(
+            ETypeParser::parse("+EBaseStruct{x:+EInt32}").unwrap(),
+            "Struct{x:Int32}",
+        )
+        .unwrap();
+        let plan = Arc::new(paired.arrow_plan().unwrap());
+        let mut writer =
+            ParquetWriter::from_writer(std::io::Cursor::new(Vec::new()), plan).unwrap();
+        writer
+            .write_row(&EncodedValue::Struct(vec![(
+                "x".into(),
+                EncodedValue::Int32(1),
+            )]))
+            .unwrap();
+        let bytes = writer.into_inner().unwrap().into_inner();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes)).unwrap();
+        let metadata = builder
+            .metadata()
+            .file_metadata()
+            .key_value_metadata()
+            .unwrap();
+        assert!(metadata.iter().any(|entry| entry.key == "ARROW:schema"));
+        assert!(!metadata
+            .iter()
+            .any(|entry| entry.key == "genohype.arrow_schema_descriptor.v1"));
+    }
 
     #[test]
     fn finalized_stats_come_from_parquet_footer() {

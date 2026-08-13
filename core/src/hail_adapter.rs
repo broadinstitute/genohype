@@ -33,6 +33,8 @@ pub struct SortedPartitionIterator {
     row_type: EncodedType,
     buffer_spec: BufferSpec,
     ranges: Vec<KeyRange>,
+    intervals: Option<Arc<IntervalList>>,
+    decode_projection: Option<Arc<ProjectionTree>>,
     snapshot: Option<crate::io::SourceSnapshot>,
 }
 
@@ -46,6 +48,31 @@ impl SortedPartitionIterator {
         ranges: Vec<KeyRange>,
         snapshot: Option<crate::io::SourceSnapshot>,
     ) -> Self {
+        Self::new_with_projection(
+            partition_indices,
+            rows_path,
+            part_files,
+            row_type,
+            buffer_spec,
+            ranges,
+            None,
+            None,
+            snapshot,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_projection(
+        partition_indices: Vec<usize>,
+        rows_path: String,
+        part_files: Vec<String>,
+        row_type: EncodedType,
+        buffer_spec: BufferSpec,
+        ranges: Vec<KeyRange>,
+        intervals: Option<Arc<IntervalList>>,
+        decode_projection: Option<Arc<ProjectionTree>>,
+        snapshot: Option<crate::io::SourceSnapshot>,
+    ) -> Self {
         Self {
             partition_indices,
             current_partition: 0,
@@ -55,6 +82,8 @@ impl SortedPartitionIterator {
             row_type,
             buffer_spec,
             ranges,
+            intervals,
+            decode_projection,
             snapshot,
         }
     }
@@ -66,11 +95,14 @@ impl SortedPartitionIterator {
 
         let reader = crate::io::get_reader_with_snapshot(&part_path, self.snapshot.as_ref())?;
         let buffer = BufferBuilder::from_reader(reader).build_from_spec(&self.buffer_spec)?;
-        Ok(PartitionStream::new(
+        Ok(PartitionStream::with_intervals(
             buffer,
             self.row_type.clone(),
             self.ranges.clone(),
-        ))
+            self.intervals.clone(),
+            0,
+        )
+        .with_decode_projection(self.decode_projection.clone()))
     }
 }
 
@@ -1080,30 +1112,40 @@ impl DataSource for HailTableSource {
         &self,
         ranges: &[KeyRange],
     ) -> Result<Box<dyn Iterator<Item = Result<EncodedValue>> + Send>> {
-        self.ensure_row_decode_supported("sorted row querying")?;
-        // Sequential iteration through partitions in sorted order
-        let matching_partitions = filter_partitions(&self.rvd_spec.range_bounds, ranges);
+        self.query_stream_sorted_with_projection(ranges, None, None)
+    }
+
+    fn query_stream_sorted_with_projection(
+        &self,
+        ranges: &[KeyRange],
+        intervals: Option<Arc<IntervalList>>,
+        decode_projection: Option<Arc<ProjectionTree>>,
+    ) -> Result<Box<dyn Iterator<Item = Result<EncodedValue>> + Send>> {
+        self.ensure_row_decode_supported("deterministic row querying")?;
+        // Sequential iteration through physical partitions is the canonical
+        // prefix order for bounded legacy exports. Hail keyed tables preserve
+        // global key order in this same partition/file order; unkeyed tables
+        // receive a stable physical prefix.
+        let matching_partitions = filter_partitions_with_intervals(
+            &self.rvd_spec.range_bounds,
+            ranges,
+            intervals.as_deref(),
+        );
 
         info!(
-            "query_stream_sorted: {} partitions matched filter (sequential)",
+            "query_stream_deterministic: {} partitions matched filter (sequential)",
             matching_partitions.len()
         );
 
-        // Build a sequential iterator that processes partitions in order
-        let rows_path = self.rows_path.clone();
-        let part_files = self.rvd_spec.part_files.clone();
-        let row_type = self.row_type.clone();
-        let buffer_spec = self.rvd_spec.codec_spec.buffer_spec.clone();
-        let ranges = ranges.to_vec();
-
-        // Create an iterator that chains partition streams in order
-        let iter = SortedPartitionIterator::new(
+        let iter = SortedPartitionIterator::new_with_projection(
             matching_partitions,
-            rows_path,
-            part_files,
-            row_type,
-            buffer_spec,
-            ranges,
+            self.rows_path.clone(),
+            self.rvd_spec.part_files.clone(),
+            self.row_type.clone(),
+            self.rvd_spec.codec_spec.buffer_spec.clone(),
+            ranges.to_vec(),
+            intervals,
+            decode_projection,
             self.source_snapshot.clone(),
         );
 
@@ -1387,6 +1429,33 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("SHA-256 mismatch"), "{error}");
+    }
+
+    #[test]
+    fn deterministic_stream_repeats_the_same_projected_prefix() {
+        use crate::projection::FieldPath;
+
+        let source = HailTableSource::new("tests/fixtures/tiny-keyed.ht").unwrap();
+        let prefix = || {
+            let projection = Arc::new(ProjectionTree::from_fields(&[
+                FieldPath::parse("gene_id").unwrap()
+            ]));
+            source
+                .query_stream_sorted_with_projection(&[], None, Some(projection))
+                .unwrap()
+                .take(1)
+                .collect::<Result<Vec<_>>>()
+                .unwrap()
+        };
+
+        let first = prefix();
+        let second = prefix();
+        assert_eq!(first, second);
+        let EncodedValue::Struct(fields) = &first[0] else {
+            panic!("expected projected struct")
+        };
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].0, "gene_id");
     }
 
     #[test]

@@ -122,7 +122,7 @@ pub fn hail_to_parquet_with_options(
     let plan = std::sync::Arc::new(engine.row_schema()?.arrow_plan()?);
 
     // Create the Parquet writer with the retained physical/logical plan.
-    let writer = ParquetWriter::new(output_path, plan.clone())?;
+    let writer = ParquetWriter::new_deterministic(output_path, plan.clone())?;
 
     // Setup progress bar if requested
     let pb = if show_progress {
@@ -560,8 +560,10 @@ pub fn hail_to_parquet_sharded_full(
         if output_is_cloud {
             // Cloud output: use StreamingCloudWriter for background multipart upload
             let cloud_writer = StreamingCloudWriter::new(&output_path)?;
-            let writer =
-                crate::parquet::ParquetWriter::from_writer(cloud_writer, plan_ref.clone())?;
+            let writer = crate::parquet::ParquetWriter::from_writer_deterministic(
+                cloud_writer,
+                plan_ref.clone(),
+            )?;
 
             let writer = process_partitions!(writer);
 
@@ -570,7 +572,8 @@ pub fn hail_to_parquet_sharded_full(
             cloud_writer.finish()?;
         } else {
             // Local output: use file
-            let writer = crate::parquet::ParquetWriter::new(&output_path, plan_ref.clone())?;
+            let writer =
+                crate::parquet::ParquetWriter::new_deterministic(&output_path, plan_ref.clone())?;
 
             let writer = process_partitions!(writer);
             writer.close()?;

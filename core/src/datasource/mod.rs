@@ -132,6 +132,20 @@ pub trait DataSource: Send + Sync {
         self.query_stream(ranges)
     }
 
+    /// Stream rows in deterministic source order while also honoring interval
+    /// filtering and decode-time projection. Implementations must fail closed
+    /// rather than silently fall back to a parallel/racing iterator.
+    fn query_stream_sorted_with_projection(
+        &self,
+        _ranges: &[KeyRange],
+        _intervals: Option<Arc<IntervalList>>,
+        _decode_projection: Option<Arc<ProjectionTree>>,
+    ) -> Result<Box<dyn Iterator<Item = Result<EncodedValue>> + Send>> {
+        Err(crate::HailError::InvalidFormat(
+            "deterministic source-order streaming is not supported by this data source".to_string(),
+        ))
+    }
+
     /// Perform a point lookup for a specific key
     ///
     /// Returns the first row matching the key, or None if not found.
