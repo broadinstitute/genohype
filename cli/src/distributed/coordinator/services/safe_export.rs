@@ -46,6 +46,14 @@ pub(crate) struct FinalizedSafeExport {
     pub(crate) success_object: SourceObject,
 }
 
+/// Evidence returned only after independently traversing the complete,
+/// spec-bound publication graph from its exact `_SUCCESS` path.
+#[derive(Debug, Clone)]
+pub(crate) struct VerifiedSafeExportSuccessGraph {
+    pub(crate) sidecar: TableReleaseSidecar,
+    pub(crate) output_objects: Vec<(Path, SourceObject)>,
+}
+
 const MAX_RECEIPT_BYTES: u64 = 1024 * 1024;
 /// Protocol-level upper bound independent of receipt-claimed object size.
 /// This prevents a corrupt exact-path receipt from authorizing an unbounded read.
@@ -284,6 +292,192 @@ fn validate_receipt_and_output(
         receipt_json,
         receipt_object,
     })
+}
+
+/// Independently verify an existing completion graph without listing storage.
+/// Every path after `_SUCCESS` is first proven against the sealed spec or its
+/// parent object, then read at the exact identity observed by a conditioned
+/// HEAD/GET.
+pub(crate) fn verify_success_graph_with_store(
+    spec: &SafeExportSpec,
+    store: Arc<dyn ObjectStore>,
+    output_prefix: Path,
+) -> Result<VerifiedSafeExportSuccessGraph, String> {
+    spec.validate()
+        .map_err(|error| format!("invalid safe-export spec: {error}"))?;
+    let success_uri = spec.success_uri().map_err(|error| error.to_string())?;
+    let success_path = same_store_path(&spec.output_root_uri, &success_uri)?;
+    require_beneath_output(&output_prefix, &success_path, "_SUCCESS")?;
+    let success_read = read_conditioned(store.clone(), &success_path, MAX_COMPLETION_BYTES)
+        .map_err(|error| format!("failed conditioned _SUCCESS read at {success_uri}: {error}"))?;
+    let success = SafeExportSuccess::from_json(&success_read.bytes, spec)
+        .map_err(|error| format!("invalid safe-export _SUCCESS: {error}"))?;
+    if success
+        .canonical_bytes(spec)
+        .map_err(|error| error.to_string())?
+        .as_slice()
+        != success_read.bytes.as_ref()
+    {
+        return Err("safe-export _SUCCESS is not canonical compact JSON".to_string());
+    }
+
+    let release_path = same_store_path(&spec.output_root_uri, &success.release_object.uri)?;
+    require_beneath_output(&output_prefix, &release_path, "release")?;
+    let release_read = read_conditioned(store.clone(), &release_path, MAX_COMPLETION_BYTES)
+        .map_err(|error| {
+            format!(
+                "failed conditioned release read at {}: {error}",
+                success.release_object.uri
+            )
+        })?;
+    let observed_release =
+        conditioned_source_object(success.release_object.uri.clone(), &release_read)?;
+    if observed_release != success.release_object {
+        return Err("conditioned release identity/size/SHA does not match _SUCCESS".to_string());
+    }
+    let sidecar: TableReleaseSidecar = serde_json::from_slice(&release_read.bytes)
+        .map_err(|error| format!("invalid release sidecar JSON: {error}"))?;
+    if serde_json::to_vec(&sidecar)
+        .map_err(|error| format!("failed to re-encode release sidecar: {error}"))?
+        .as_slice()
+        != release_read.bytes.as_ref()
+    {
+        return Err("safe-export release sidecar is not canonical compact JSON".to_string());
+    }
+    sidecar
+        .validate_complete()
+        .map_err(|error| format!("invalid complete release sidecar: {error}"))?;
+    validate_sidecar_against_spec(&sidecar, &success, spec)?;
+
+    let tasks = spec
+        .sealed_part_tasks()
+        .map_err(|error| format!("invalid sealed safe-export tasks: {error}"))?;
+    let mut output_objects = Vec::with_capacity(tasks.len());
+    for ((identity, task), expected_part) in success.receipts.iter().zip(&tasks).zip(&sidecar.parts)
+    {
+        let receipt_path = same_store_path(&spec.output_root_uri, &identity.receipt_object.uri)?;
+        require_beneath_output(&output_prefix, &receipt_path, "receipt")?;
+        let receipt_read = read_conditioned(store.clone(), &receipt_path, MAX_RECEIPT_BYTES)
+            .map_err(|error| {
+                format!(
+                    "failed conditioned receipt read at {}: {error}",
+                    identity.receipt_object.uri
+                )
+            })?;
+        let observed_receipt =
+            conditioned_source_object(identity.receipt_object.uri.clone(), &receipt_read)?;
+        if observed_receipt != identity.receipt_object {
+            return Err(format!(
+                "conditioned receipt identity/size/SHA does not match _SUCCESS for partition {}",
+                identity.partition_index
+            ));
+        }
+
+        // Validate every receipt field before following its claimed output URI.
+        let untrusted: SafeExportPartReceipt = serde_json::from_slice(&receipt_read.bytes)
+            .map_err(|error| format!("invalid safe-export receipt JSON: {error}"))?;
+        untrusted
+            .validate_against(spec, task, &untrusted.part.output_object)
+            .map_err(|error| format!("invalid receipt before output read: {error}"))?;
+        if untrusted
+            .canonical_bytes(spec, task, &untrusted.part.output_object)
+            .map_err(|error| error.to_string())?
+            .as_slice()
+            != receipt_read.bytes.as_ref()
+        {
+            return Err("safe-export receipt is not canonical compact JSON".to_string());
+        }
+        if untrusted.part != *expected_part {
+            return Err(format!(
+                "release/receipt mismatch for partition {}",
+                identity.partition_index
+            ));
+        }
+        if untrusted.part.output_object.size > MAX_OUTPUT_BYTES {
+            return Err(format!(
+                "safe-export output exceeds protocol read limit {MAX_OUTPUT_BYTES}"
+            ));
+        }
+
+        let output_path =
+            same_store_path(&spec.output_root_uri, &untrusted.part.output_object.uri)?;
+        require_beneath_output(&output_prefix, &output_path, "output")?;
+        let output_read =
+            hash_conditioned(store.clone(), &output_path, MAX_OUTPUT_BYTES).map_err(|error| {
+                format!(
+                    "failed conditioned output validation for {}: {error}",
+                    untrusted.part.output_object.uri
+                )
+            })?;
+        let observed_output =
+            published_source_object(untrusted.part.output_object.uri.clone(), &output_read)?;
+        if observed_output != untrusted.part.output_object {
+            return Err(format!(
+                "conditioned output identity/size/SHA does not match receipt for partition {}",
+                identity.partition_index
+            ));
+        }
+        output_objects.push((output_path, observed_output));
+    }
+
+    Ok(VerifiedSafeExportSuccessGraph {
+        sidecar,
+        output_objects,
+    })
+}
+
+fn validate_sidecar_against_spec(
+    sidecar: &TableReleaseSidecar,
+    success: &SafeExportSuccess,
+    spec: &SafeExportSpec,
+) -> Result<(), String> {
+    let canonical = spec
+        .canonicalized_for_publication()
+        .map_err(|error| format!("failed to canonicalize safe-export spec: {error}"))?;
+    if sidecar.release_id != spec.export_id
+        || sidecar.source.canonical_table_uri != spec.canonical_table_uri
+        || sidecar.source.snapshot_timestamp != spec.source_snapshot_timestamp
+        || sidecar.source.manifest_sha256 != spec.source_manifest_sha256
+        || sidecar.table != canonical.table
+        || sidecar.globals != canonical.globals
+        || sidecar.tool != canonical.tool
+        || sidecar.parquet != canonical.parquet
+        || sidecar.receipt_set_sha256 != success.receipt_set_sha256
+        || sidecar.parts.len() != success.receipts.len()
+    {
+        return Err("release sidecar does not exactly match the sealed spec/_SUCCESS".to_string());
+    }
+    if spec.source_parts.iter().any(|source| {
+        !sidecar
+            .source
+            .manifest
+            .objects
+            .iter()
+            .any(|object| object == source)
+    }) {
+        return Err(
+            "release source manifest does not contain every sealed source part".to_string(),
+        );
+    }
+    if sidecar
+        .source
+        .manifest
+        .objects
+        .windows(2)
+        .any(|pair| pair[0].uri >= pair[1].uri)
+    {
+        return Err("release source manifest is not in canonical URI order".to_string());
+    }
+    Ok(())
+}
+
+fn require_beneath_output(prefix: &Path, path: &Path, label: &str) -> Result<(), String> {
+    if !path.as_ref().starts_with(prefix.as_ref()) {
+        return Err(format!(
+            "safe-export {label} path escaped the sealed output prefix"
+        ));
+    }
+    Ok(())
 }
 
 /// Independently rebuild and publish deterministic completion evidence. This
@@ -570,6 +764,23 @@ mod tests {
         fn accessed(&self, path: &Path) -> bool {
             self.accessed.lock().unwrap().contains(path)
         }
+
+        fn accesses(&self) -> Vec<Path> {
+            self.accessed.lock().unwrap().clone()
+        }
+
+        fn overwrite(&self, path: &Path, bytes: Vec<u8>) {
+            futures::executor::block_on(self.inner.put_opts(
+                path,
+                bytes.into(),
+                PutOptions::default(),
+            ))
+            .unwrap();
+        }
+
+        fn remove(&self, path: &Path) {
+            futures::executor::block_on(self.inner.delete(path)).unwrap();
+        }
     }
 
     impl std::fmt::Display for ExactPathStore {
@@ -822,6 +1033,80 @@ mod tests {
             same_store_path(&spec.output_root_uri, &spec.part_receipt_uri(0).unwrap()).unwrap();
         put_immutable(store, &receipt_path, receipt_bytes.into()).unwrap();
         (receipt_path, output_path)
+    }
+
+    fn finalized_graph() -> (
+        Arc<ExactPathStore>,
+        Arc<dyn ObjectStore>,
+        SafeExportSpec,
+        Path,
+        Path,
+    ) {
+        let concrete = Arc::new(ExactPathStore::new());
+        let store: Arc<dyn ObjectStore> = concrete.clone();
+        let prefix = Path::from("release");
+        let spec = spec();
+        let (_, output_path) = put_receipt(store.clone(), &prefix, &spec, |_| {});
+        finalize_with_store(&spec, store.clone(), prefix.clone(), &manifest()).unwrap();
+        concrete.clear_accesses();
+        (concrete, store, spec, prefix, output_path)
+    }
+
+    #[test]
+    fn safe_export_success_graph_traverses_only_exact_paths_without_listing() {
+        let (concrete, store, spec, prefix, output_path) = finalized_graph();
+        let success_path =
+            same_store_path(&spec.output_root_uri, &spec.success_uri().unwrap()).unwrap();
+        let release_path =
+            same_store_path(&spec.output_root_uri, &spec.release_uri().unwrap()).unwrap();
+        let receipt_path =
+            same_store_path(&spec.output_root_uri, &spec.part_receipt_uri(0).unwrap()).unwrap();
+
+        let verified = verify_success_graph_with_store(&spec, store, prefix).unwrap();
+
+        assert_eq!(verified.sidecar.release_id, spec.export_id);
+        assert_eq!(verified.output_objects.len(), 1);
+        assert_eq!(verified.output_objects[0].0, output_path);
+        assert_eq!(
+            verified.output_objects[0].1,
+            verified.sidecar.parts[0].output_object
+        );
+        let expected = [success_path, release_path, receipt_path, output_path];
+        let accesses = concrete.accesses();
+        assert!(expected.iter().all(|path| concrete.accessed(path)));
+        assert!(accesses.iter().all(|path| expected.contains(path)));
+        assert!(!concrete.listed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn safe_export_success_graph_rejects_wrong_release_generation_without_listing() {
+        let (concrete, store, spec, prefix, _) = finalized_graph();
+        let success_path =
+            same_store_path(&spec.output_root_uri, &spec.success_uri().unwrap()).unwrap();
+        let success_read =
+            read_conditioned(store.clone(), &success_path, MAX_COMPLETION_BYTES).unwrap();
+        let mut success = SafeExportSuccess::from_json(&success_read.bytes, &spec).unwrap();
+        success.release_object.version = "wrong-generation".to_string();
+        concrete.overwrite(&success_path, success.canonical_bytes(&spec).unwrap());
+        concrete.clear_accesses();
+
+        let error = verify_success_graph_with_store(&spec, store, prefix).unwrap_err();
+
+        assert!(error.contains("release identity/size/SHA"), "{error}");
+        assert!(!concrete.listed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn safe_export_success_graph_fails_closed_when_exact_output_is_missing() {
+        let (concrete, store, spec, prefix, output_path) = finalized_graph();
+        concrete.remove(&output_path);
+        concrete.clear_accesses();
+
+        let error = verify_success_graph_with_store(&spec, store, prefix).unwrap_err();
+
+        assert!(error.contains("conditioned output validation"), "{error}");
+        assert!(concrete.accessed(&output_path));
+        assert!(!concrete.listed.load(Ordering::SeqCst));
     }
 
     #[test]
