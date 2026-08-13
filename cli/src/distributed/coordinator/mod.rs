@@ -109,6 +109,20 @@ fn terminal_job_status(failed_tasks: usize) -> &'static str {
     }
 }
 
+fn open_and_reconcile_database(db_path: &str) -> std::result::Result<MetricsDb, String> {
+    let db = MetricsDb::open(db_path)
+        .map_err(|error| format!("failed to open metrics database: {error}"))?;
+    let reconciled = db
+        .reconcile_startup_fenced_jobs(CoordinatorData::now_ms())
+        .map_err(|error| format!("failed to reconcile fenced jobs after startup: {error}"))?;
+    if reconciled > 0 {
+        eprintln!(
+            "  Marked {reconciled} prior-session running fenced job(s) failed and cleared assignments"
+        );
+    }
+    Ok(db)
+}
+
 fn restore_and_reconcile_database<F>(
     db_path: &str,
     copy_backup: F,
@@ -147,16 +161,9 @@ where
     }
     eprintln!("  Successfully restored DB ({} bytes)", metadata.len());
 
-    let restored = MetricsDb::open(db_path)
-        .map_err(|error| format!("failed to open restored metrics database: {error}"))?;
-    let reconciled = restored
-        .reconcile_restored_fenced_jobs(CoordinatorData::now_ms())
-        .map_err(|error| format!("failed to reconcile restored custom jobs: {error}"))?;
-    if reconciled > 0 {
-        eprintln!(
-            "  Marked {reconciled} restored running fenced job(s) failed and cleared assignments"
-        );
-    }
+    // Reconcile immediately after installation as well as at the unconditional
+    // startup open below. The second pass is intentionally idempotent.
+    open_and_reconcile_database(db_path)?;
     Ok(true)
 }
 
@@ -280,12 +287,10 @@ pub async fn run_coordinator(
         }
     }
 
-    // Initialize SQLite database for metrics persistence
-    let metrics_db = MetricsDb::open(&db_path).map_err(|e| {
-        crate::HailError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Failed to open metrics database: {}", e),
-        ))
+    // Initialize SQLite and always fence prior-session custom/safe-export jobs,
+    // including an existing local DB when no backup path is configured.
+    let metrics_db = open_and_reconcile_database(&db_path).map_err(|error| {
+        crate::HailError::Io(std::io::Error::new(std::io::ErrorKind::Other, error))
     })?;
     println!("  Metrics DB: {}", db_path);
     if let Some(ref bp) = backup_path {
@@ -3047,6 +3052,53 @@ mod lease_coordinator_tests {
     }
 
     #[test]
+    fn safe_export_existing_local_db_is_reconciled_without_a_backup_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("local.db");
+        let db = MetricsDb::open(&db_path).unwrap();
+        db.insert_job(&crate::distributed::message::JobRecord {
+            job_id: "safe-local".to_string(),
+            status: "running".to_string(),
+            start_time_ms: 1,
+            end_time_ms: None,
+            job_spec_json: None,
+            input_path: "input".to_string(),
+            total_tasks: 1,
+            job_type: Some("safe export parquet".to_string()),
+        })
+        .unwrap();
+        db.execute_test_sql(
+            "INSERT INTO safe_export_runs
+                 (job_id, export_id, expected_part_count, imported_part_count,
+                  completed_part_count, phase, created_at_ms)
+             VALUES ('safe-local',
+                     'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                     1, 0, 0, 'finalizing', 1);
+             INSERT INTO current_safe_export_assignments
+                 (job_id, export_id, coordinator_session_id, task_id, partition_id,
+                  assignment_attempt, lease_identity_sha256, worker_id,
+                  worker_git_commit, worker_build_identity, worker_binary_sha256,
+                  state, assigned_at_ms)
+             VALUES ('safe-local',
+                     'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                     'old-session', 'part-00000000', 0, 1,
+                     'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                     'worker', 'commit', 'build',
+                     'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+                     'assigned', 1);",
+        )
+        .unwrap();
+        drop(db);
+
+        // This is the same unconditional open path used when backup_path=None.
+        let reopened = open_and_reconcile_database(db_path.to_str().unwrap()).unwrap();
+        let status = reopened.get_safe_export_status("safe-local").unwrap();
+        assert_eq!(status.phase.as_deref(), Some("failed"));
+        assert_eq!(status.current_assignment_count, 0);
+        assert!(!status.complete);
+    }
+
+    #[test]
     fn restored_running_custom_jobs_fail_closed_before_startup_serves() {
         let dir = tempfile::tempdir().unwrap();
         let source_path = dir.path().join("source.db");
@@ -3217,7 +3269,7 @@ mod lease_coordinator_tests {
                 .map_err(|error| error.to_string())
         })
         .unwrap_err();
-        assert!(error.contains("failed to reconcile restored custom jobs"));
+        assert!(error.contains("failed to reconcile fenced jobs after startup"));
         assert!(error.contains("injected restore failure"));
 
         let db = MetricsDb::open(&restored_path).unwrap();

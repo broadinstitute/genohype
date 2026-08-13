@@ -1765,6 +1765,7 @@ dependencies = [
  "anyhow",
  "arrow 53.4.1",
  "async-stream",
+ "async-trait",
  "axum",
  "axum-extra",
  "bytes",

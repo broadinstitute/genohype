@@ -1903,18 +1903,13 @@ impl MetricsDb {
                 |row| row.get(0),
             )
             .map_err(|error| error.to_string())?;
-        let failures: i64 = tx
-            .query_row(
-                "SELECT COUNT(*) FROM safe_export_attempt_receipts
-                 WHERE job_id=?1 AND terminal_status='failed'",
-                [job_id],
-                |row| row.get(0),
-            )
-            .map_err(|error| error.to_string())?;
+        // Failed attempt receipts are immutable history, not current terminal
+        // authority. A later successful retry is finalizable when every exact
+        // partition receipt exists, coverage is complete, and no assignment is
+        // current. An exhausted partition cannot satisfy those predicates.
         if exact != 1
             || receipts != (expected, Some(0), Some(expected - 1), expected)
             || assignments != 0
-            || failures != 0
         {
             return Err("safe-export durable final predicate is not satisfied".to_string());
         }
@@ -2037,9 +2032,7 @@ impl MetricsDb {
                      success_size=?11, success_sha256=?12, error=NULL
                  WHERE job_id=?1 AND export_id=?2 AND phase='finalizing'
                    AND completed_part_count=expected_part_count
-                   AND NOT EXISTS (SELECT 1 FROM current_safe_export_assignments WHERE job_id=?1)
-                   AND NOT EXISTS (SELECT 1 FROM safe_export_attempt_receipts
-                                   WHERE job_id=?1 AND terminal_status='failed')",
+                   AND NOT EXISTS (SELECT 1 FROM current_safe_export_assignments WHERE job_id=?1)",
                 params![
                     job_id,
                     export_id,
@@ -2407,14 +2400,14 @@ impl MetricsDb {
         Ok(CustomCompletionOutcome::Stored)
     }
 
-    /// Fail closed any custom or safe-export job running in a restored backup.
-    /// Restored receipts remain immutable audit records, but cannot revive an
-    /// old coordinator session or assignment fence.
-    pub(crate) fn reconcile_restored_fenced_jobs(&self, end_time_ms: u64) -> Result<usize, String> {
+    /// Fail closed any custom or safe-export job left running across coordinator
+    /// startup, whether the database is local or restored from backup. Receipts
+    /// remain immutable audit records but cannot revive an old session or fence.
+    pub(crate) fn reconcile_startup_fenced_jobs(&self, end_time_ms: u64) -> Result<usize, String> {
         let end_time_ms = i64::try_from(end_time_ms)
             .map_err(|_| "restore reconciliation timestamp exceeds SQLite INTEGER".to_string())?;
         let summary = serde_json::json!({
-            "error": "Fenced job interrupted by coordinator startup after database backup restore; restored receipts are not completion authority"
+            "error": "Fenced job interrupted by coordinator restart; prior-session receipts are not completion authority"
         })
         .to_string();
         let mut conn = self.conn.lock().unwrap();
@@ -3573,7 +3566,7 @@ mod tests {
             2,
         )
         .unwrap();
-        assert_eq!(db.reconcile_restored_fenced_jobs(3).unwrap(), 1);
+        assert_eq!(db.reconcile_startup_fenced_jobs(3).unwrap(), 1);
         let conn = db.conn.lock().unwrap();
         let authority: (String, String, i64) = conn
             .query_row(
@@ -3877,6 +3870,90 @@ mod tests {
         assert!(db
             .terminalize_safe_export("safe-job", "cancelled", None, 6)
             .is_err());
+    }
+
+    #[test]
+    fn safe_export_failed_attempt_then_successful_retry_can_finalize() {
+        let db = MetricsDb::in_memory().unwrap();
+        let export_id = "a".repeat(64);
+        let binary = "b".repeat(64);
+        let first = DurableSafeExportAssignment {
+            export_id: &export_id,
+            task_id: "part-00000000",
+            partition_id: 0,
+            assignment_attempt: 1,
+            lease_token: "failed-lease",
+            worker_id: "worker-1",
+            worker_git_commit: "commit-1",
+            worker_build_identity: "build-1",
+            worker_binary_sha256: &binary,
+        };
+        insert_safe_run(&db, "safe-job", &export_id, 1);
+        db.persist_safe_export_assignment("safe-job", "session-1", &first, 2)
+            .unwrap();
+        db.fail_safe_export_assignment("safe-job", "session-1", &first, "transient", 3)
+            .unwrap();
+
+        let retry = DurableSafeExportAssignment {
+            assignment_attempt: 2,
+            lease_token: "successful-lease",
+            worker_id: "worker-2",
+            ..first
+        };
+        db.persist_safe_export_assignment("safe-job", "session-1", &retry, 4)
+            .unwrap();
+        let (report, receipt, receipt_uri) = safe_completion_evidence(&retry);
+        db.begin_safe_export_publication("safe-job", "session-1", &retry, &report, 5)
+            .unwrap();
+        db.commit_safe_export_completion(
+            "safe-job",
+            "session-1",
+            &retry,
+            &report,
+            &DurableSafeExportPartEvidence {
+                receipt_json: &receipt,
+                receipt_uri: &receipt_uri,
+                receipt_version: "14",
+                receipt_etag: "receipt-etag",
+            },
+            6,
+        )
+        .unwrap();
+
+        db.claim_safe_export_finalization("safe-job", &export_id, 1)
+            .unwrap();
+        let object = |name: &str, sha: char| genohype_core::io::SourceObject {
+            uri: format!("gs://bucket/output/_genohype/exports/{export_id}/{name}"),
+            version: "20".into(),
+            etag: "etag-20".into(),
+            size: 10,
+            crc32c: None,
+            sha256: Some(sha.to_string().repeat(64)),
+        };
+        db.complete_safe_export_finalization(
+            "safe-job",
+            &export_id,
+            &crate::distributed::coordinator::services::safe_export::FinalizedSafeExport {
+                release_object: object("release.json", 'c'),
+                success_object: object("_SUCCESS", 'd'),
+            },
+            7,
+        )
+        .unwrap();
+
+        let conn = db.conn.lock().unwrap();
+        let authority: (String, String, i64, i64) = conn
+            .query_row(
+                "SELECT jobs.status, safe_export_runs.phase,
+                        (SELECT COUNT(*) FROM safe_export_attempt_receipts
+                         WHERE terminal_status='failed'),
+                        (SELECT COUNT(*) FROM safe_export_part_receipts)
+                 FROM jobs JOIN safe_export_runs USING(job_id)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(authority, ("completed".into(), "completed".into(), 1, 1));
     }
 
     #[test]

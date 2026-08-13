@@ -140,5 +140,6 @@ path = "src/bin/hail-server.rs"
 required-features = ["server"]
 
 [dev-dependencies]
+async-trait = "0.1"
 tempfile = "3.8"
 criterion = "0.5"

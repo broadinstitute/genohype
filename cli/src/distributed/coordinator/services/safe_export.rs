@@ -47,6 +47,9 @@ pub(crate) struct FinalizedSafeExport {
 }
 
 const MAX_RECEIPT_BYTES: u64 = 1024 * 1024;
+/// Protocol-level upper bound independent of receipt-claimed object size.
+/// This prevents a corrupt exact-path receipt from authorizing an unbounded read.
+const MAX_OUTPUT_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 const MAX_COMPLETION_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Resolve production cloud storage and publish one exact report.
@@ -220,15 +223,37 @@ fn validate_receipt_and_output(
         serde_json::from_slice(&receipt_read.bytes).map_err(|error| {
             ReceiptValidationError::Invalid(format!("invalid receipt JSON: {error}"))
         })?;
+
+    // Bind the entire envelope, task, build, schema, digest, and canonical
+    // content-addressed output URI before any HEAD/GET of receipt-claimed output.
+    // Passing the claimed object here is safe: validation is pure and proves
+    // that its URI is the one derivable from the sealed spec and SHA-256.
+    untrusted
+        .validate_against(spec, task, &untrusted.part.output_object)
+        .map_err(|error| {
+            ReceiptValidationError::Invalid(format!("invalid receipt before output read: {error}"))
+        })?;
+    if untrusted.part.output_object.size > MAX_OUTPUT_BYTES {
+        return Err(ReceiptValidationError::Invalid(format!(
+            "safe-export output exceeds protocol read limit {MAX_OUTPUT_BYTES}"
+        )));
+    }
     let output_path = same_store_path(&spec.output_root_uri, &untrusted.part.output_object.uri)
         .map_err(ReceiptValidationError::Invalid)?;
-    let output_read = hash_conditioned(store, &output_path, untrusted.part.output_object.size)
-        .map_err(|error| {
-            ReceiptValidationError::Invalid(format!(
-                "failed conditioned output validation for {}: {error}",
-                untrusted.part.output_object.uri
-            ))
-        })?;
+    if !output_path
+        .as_ref()
+        .starts_with(output_prefix_for(spec)?.as_ref())
+    {
+        return Err(ReceiptValidationError::Invalid(
+            "safe-export output path escaped the sealed output prefix".to_string(),
+        ));
+    }
+    let output_read = hash_conditioned(store, &output_path, MAX_OUTPUT_BYTES).map_err(|error| {
+        ReceiptValidationError::Invalid(format!(
+            "failed conditioned output validation for {}: {error}",
+            untrusted.part.output_object.uri
+        ))
+    })?;
     let output_object =
         published_source_object(untrusted.part.output_object.uri.clone(), &output_read)
             .map_err(ReceiptValidationError::Invalid)?;
@@ -333,6 +358,9 @@ fn publish_completion_with_store(
     release_manifest
         .objects
         .sort_by(|left, right| left.uri.cmp(&right.uri));
+    let canonical_spec = spec
+        .canonicalized_for_publication()
+        .map_err(|error| format!("failed to canonicalize safe-export release: {error}"))?;
     let mut sidecar = TableReleaseSidecar {
         schema_version: RELEASE_SIDECAR_SCHEMA_VERSION,
         release_id: spec.export_id.clone(),
@@ -343,10 +371,10 @@ fn publish_completion_with_store(
             manifest: release_manifest,
             manifest_sha256: spec.source_manifest_sha256.clone(),
         },
-        table: spec.table.clone(),
-        globals: spec.globals.clone(),
-        tool: spec.tool.clone(),
-        parquet: spec.parquet.clone(),
+        table: canonical_spec.table,
+        globals: canonical_spec.globals,
+        tool: canonical_spec.tool,
+        parquet: canonical_spec.parquet,
         parts,
         totals: ReleaseTotals {
             expected_partition_count: spec.table.partitions.len(),
@@ -470,6 +498,15 @@ fn published_source_object(
     })
 }
 
+fn output_prefix_for(spec: &SafeExportSpec) -> Result<Path, ReceiptValidationError> {
+    let root = Url::parse(&spec.output_root_uri).map_err(|error| {
+        ReceiptValidationError::Invalid(format!("invalid output root URI: {error}"))
+    })?;
+    Path::from_url_path(root.path()).map_err(|error| {
+        ReceiptValidationError::Invalid(format!("invalid output root path: {error}"))
+    })
+}
+
 fn same_store_path(root: &str, object: &str) -> Result<Path, String> {
     let root = Url::parse(root).map_err(|error| format!("invalid output root URI: {error}"))?;
     let object = Url::parse(object).map_err(|error| format!("invalid object URI: {error}"))?;
@@ -484,4 +521,386 @@ fn object_uri(root: &str, path: &Path) -> Result<String, String> {
     let mut uri = Url::parse(root).map_err(|error| format!("invalid output root URI: {error}"))?;
     uri.set_path(&format!("/{path}"));
     Ok(uri.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::stream::BoxStream;
+    use genohype_core::codec::{ETypeParser, EncodedValue, LosslessValue};
+    use genohype_core::io::content_addressed_path;
+    use genohype_core::metadata::BufferSpec;
+    use genohype_core::release::{
+        ComponentDescriptor, GlobalsPayload, KeyDescriptor, KeyOrdering, ParquetDescriptor,
+        PhysicalTypeDescriptor, SafeExportWorkerIdentity, SourcePartition, TableDescriptor,
+        ToolIdentity, WriterPropertiesDescriptor, SAFE_EXPORT_SHARDING_RULE_V1,
+    };
+    use genohype_core::schema::{PairedSchema, VTypeParser};
+    use object_store::memory::InMemory;
+    use object_store::{
+        GetOptions, ListResult, MultipartUpload, ObjectMeta, PutMultipartOpts, PutOptions,
+        PutPayload,
+    };
+    use sha2::{Digest, Sha256};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+
+    #[derive(Debug)]
+    struct ExactPathStore {
+        inner: InMemory,
+        version: String,
+        accessed: Mutex<Vec<Path>>,
+        listed: AtomicBool,
+    }
+
+    impl ExactPathStore {
+        fn new() -> Self {
+            Self {
+                inner: InMemory::new(),
+                version: "test-generation-1".to_string(),
+                accessed: Mutex::new(Vec::new()),
+                listed: AtomicBool::new(false),
+            }
+        }
+
+        fn clear_accesses(&self) {
+            self.accessed.lock().unwrap().clear();
+        }
+
+        fn accessed(&self, path: &Path) -> bool {
+            self.accessed.lock().unwrap().contains(path)
+        }
+    }
+
+    impl std::fmt::Display for ExactPathStore {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "safe-export-exact-path-test-store")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for ExactPathStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            options: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(location, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            options: PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            mut options: GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.accessed.lock().unwrap().push(location.clone());
+            if let Some(requested) = options.version.take() {
+                if requested != self.version {
+                    return Err(object_store::Error::Precondition {
+                        path: location.to_string(),
+                        source: format!("version {requested} does not match {}", self.version)
+                            .into(),
+                    });
+                }
+            }
+            let mut result = self.inner.get_opts(location, options).await?;
+            result.meta.version = Some(self.version.clone());
+            Ok(result)
+        }
+
+        async fn delete(&self, location: &Path) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
+            self.listed.store(true, Ordering::SeqCst);
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.listed.store(true, Ordering::SeqCst);
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    fn source_object(uri: &str, size: u64, sha256: Option<String>) -> SourceObject {
+        SourceObject {
+            uri: uri.to_string(),
+            version: "source-generation-7".to_string(),
+            etag: "source-etag-7".to_string(),
+            size,
+            crc32c: Some("Nks/tw==".to_string()),
+            sha256,
+        }
+    }
+
+    fn component(part_files: Vec<String>) -> ComponentDescriptor {
+        let physical = ETypeParser::parse("+EBaseStruct{x:+EBinary}").unwrap();
+        ComponentDescriptor {
+            name: "OrderedRVDComponentSpec".to_string(),
+            raw_e_type: "+EBaseStruct{x:+EBinary}".to_string(),
+            physical_type: PhysicalTypeDescriptor::from(&physical),
+            raw_v_type: "Struct{x:String}".to_string(),
+            logical_type: VTypeParser::parse("Struct{x:String}").unwrap(),
+            buffer_spec: BufferSpec::StreamBlock,
+            part_files,
+            attrs: serde_json::json!({}),
+            range_bounds: Vec::new(),
+            index: None,
+        }
+    }
+
+    fn manifest() -> SourceManifest {
+        SourceManifest::new(vec![source_object(
+            "gs://source/table.ht/rows/parts/part-0",
+            10,
+            None,
+        )])
+        .unwrap()
+    }
+
+    fn spec() -> SafeExportSpec {
+        let arrow = PairedSchema::from_raw_vtype(
+            ETypeParser::parse("+EBaseStruct{x:+EBinary}").unwrap(),
+            "Struct{x:String}",
+        )
+        .unwrap()
+        .arrow_plan()
+        .unwrap();
+        let worker_sha = "b".repeat(64);
+        SafeExportSpec {
+            schema_version: 1,
+            export_id: String::new(),
+            canonical_table_uri: "gs://source/table.ht".to_string(),
+            source_manifest_uri: "gs://authority/manifest.json".to_string(),
+            source_manifest_sha256: manifest().digest_sha256().unwrap(),
+            source_snapshot_timestamp: "2026-08-12T12:00:00Z".to_string(),
+            output_root_uri: "gs://output/release".to_string(),
+            source_parts: manifest().objects,
+            parquet: ParquetDescriptor {
+                arrow_schema: serde_json::to_value(arrow.descriptor()).unwrap(),
+                schema_fingerprint_sha256: arrow.fingerprint_sha256().unwrap(),
+                writer_properties: WriterPropertiesDescriptor {
+                    compression: "zstd".to_string(),
+                    compression_level: None,
+                    max_row_group_size: 100_000,
+                    converter_batch_size: 4096,
+                    dictionary_enabled: true,
+                    statistics_enabled: true,
+                    data_page_version: "v1".to_string(),
+                    writer_version: "v1".to_string(),
+                },
+                sharding_rule: SAFE_EXPORT_SHARDING_RULE_V1.to_string(),
+                projection: Vec::new(),
+                filters: Vec::new(),
+                output_ordering: vec!["x".to_string()],
+            },
+            expected_worker: SafeExportWorkerIdentity {
+                git_commit: "commit-a".to_string(),
+                build_identity: "release:gcp".to_string(),
+                binary_sha256: worker_sha.clone(),
+            },
+            table: TableDescriptor {
+                file_version: 1,
+                hail_version: "0.2".to_string(),
+                references_rel_path: "references".to_string(),
+                table_type: "Table".to_string(),
+                top_metadata: serde_json::json!({"z": 1, "a": {"b": 2}}),
+                key: KeyDescriptor {
+                    fields: vec!["x".to_string()],
+                    ordering: KeyOrdering::LexicographicAscending,
+                    distinctly_keyed: Some(true),
+                },
+                rows: component(vec!["part-0".to_string()]),
+                globals: component(vec!["part-0".to_string()]),
+                partitions: vec![SourcePartition {
+                    index: 0,
+                    part_file: "part-0".to_string(),
+                    range_bound: None,
+                    row_count: Some(2),
+                    index_objects: vec!["z".to_string(), "a".to_string()],
+                    output_part_ids: vec!["part-00000000".to_string()],
+                }],
+            },
+            globals: GlobalsPayload::from_value(&EncodedValue::Struct(Vec::new())),
+            tool: ToolIdentity {
+                package_version: "0.1".to_string(),
+                git_commit: "commit-a".to_string(),
+                dirty_build: false,
+                build_provenance: "release:gcp".to_string(),
+                binary_name: "genohype-worker".to_string(),
+                binary_uri: Some("gs://binaries/genohype-worker".to_string()),
+                binary_sha256: worker_sha,
+                target_triple: "x86_64-unknown-linux-gnu".to_string(),
+                enabled_features: vec!["validation".to_string(), "gcp".to_string()],
+                arrow_crate_version: "53.3".to_string(),
+                parquet_crate_version: "53.3".to_string(),
+            },
+            receipt_schema_version: 1,
+            completion_schema_version: 1,
+        }
+        .with_computed_export_id()
+        .unwrap()
+    }
+
+    fn put_receipt(
+        store: Arc<dyn ObjectStore>,
+        prefix: &Path,
+        spec: &SafeExportSpec,
+        mutate: impl FnOnce(&mut SafeExportPartReceipt),
+    ) -> (Path, Path) {
+        let task = spec.task_for_partition(0, &manifest()).unwrap();
+        let output_bytes = bytes::Bytes::from_static(b"deterministic parquet bytes");
+        let output_sha = format!("{:x}", Sha256::digest(&output_bytes));
+        let output_path = content_addressed_path(prefix, &output_sha, "parquet").unwrap();
+        let published = put_immutable(store.clone(), &output_path, output_bytes).unwrap();
+        let output = SourceObject {
+            uri: object_uri(&spec.output_root_uri, &output_path).unwrap(),
+            version: published.put_result.version.unwrap(),
+            etag: published.put_result.e_tag.unwrap(),
+            size: published.byte_count,
+            crc32c: None,
+            sha256: Some(published.sha256),
+        };
+        let lease = "c".repeat(64);
+        let report = ExportPartReport {
+            schema_version: 1,
+            export_id: spec.export_id.clone(),
+            task_id: task.task_id.clone(),
+            partition_index: 0,
+            source_manifest_sha256: spec.source_manifest_sha256.clone(),
+            source_part_file: "part-0".to_string(),
+            source_object: task.source_object.clone(),
+            schema_fingerprint_sha256: spec.parquet.schema_fingerprint_sha256.clone(),
+            staging_object: source_object(
+                &format!(
+                    "{}/_genohype/staging/{}/part-00000000/attempt-00000000000000000002/lease-{lease}/upload-00000000-0000-4000-8000-000000000000/part.parquet",
+                    spec.output_root_uri, spec.export_id
+                ),
+                output.size,
+                output.sha256.clone(),
+            ),
+            byte_size: output.size,
+            row_count: 2,
+            row_group_count: 1,
+            decoded_rows_sha256: "d".repeat(64),
+            first_key: Some(LosslessValue::Int32 { value: 1 }),
+            last_key: Some(LosslessValue::Int32 { value: 2 }),
+            worker_id: "worker-1".to_string(),
+            worker_git_commit: spec.expected_worker.git_commit.clone(),
+            worker_binary_sha256: spec.expected_worker.binary_sha256.clone(),
+            assignment_attempt: 2,
+            lease_identity_sha256: lease,
+            started_at: "2026-08-12T12:00:00Z".to_string(),
+            completed_at: "2026-08-12T12:00:01Z".to_string(),
+        };
+        let mut receipt =
+            SafeExportPartReceipt::from_publication(spec, &task, &report, output.clone()).unwrap();
+        mutate(&mut receipt);
+        let receipt_bytes = serde_json::to_vec(&receipt).unwrap();
+        let receipt_path =
+            same_store_path(&spec.output_root_uri, &spec.part_receipt_uri(0).unwrap()).unwrap();
+        put_immutable(store, &receipt_path, receipt_bytes.into()).unwrap();
+        (receipt_path, output_path)
+    }
+
+    #[test]
+    fn safe_export_equivalent_specs_publish_identical_release_and_success_without_listing() {
+        let concrete = Arc::new(ExactPathStore::new());
+        let store: Arc<dyn ObjectStore> = concrete.clone();
+        let prefix = Path::from("release");
+        let spec = spec();
+        put_receipt(store.clone(), &prefix, &spec, |_| {});
+
+        let first = finalize_with_store(&spec, store.clone(), prefix.clone(), &manifest()).unwrap();
+        let release_path =
+            same_store_path(&spec.output_root_uri, &spec.release_uri().unwrap()).unwrap();
+        let success_path =
+            same_store_path(&spec.output_root_uri, &spec.success_uri().unwrap()).unwrap();
+        let first_release = read_conditioned(store.clone(), &release_path, MAX_COMPLETION_BYTES)
+            .unwrap()
+            .bytes;
+        let first_success = read_conditioned(store.clone(), &success_path, MAX_COMPLETION_BYTES)
+            .unwrap()
+            .bytes;
+
+        let mut equivalent = spec.clone();
+        equivalent.table.partitions[0].index_objects.reverse();
+        equivalent.tool.enabled_features.reverse();
+        equivalent.validate().unwrap();
+        assert_eq!(equivalent.export_id, spec.export_id);
+        let second = finalize_with_store(&equivalent, store.clone(), prefix, &manifest()).unwrap();
+        let second_release = read_conditioned(store.clone(), &release_path, MAX_COMPLETION_BYTES)
+            .unwrap()
+            .bytes;
+        let second_success = read_conditioned(store, &success_path, MAX_COMPLETION_BYTES)
+            .unwrap()
+            .bytes;
+
+        assert_eq!(first.release_object, second.release_object);
+        assert_eq!(first.success_object, second.success_object);
+        assert_eq!(first_release, second_release);
+        assert_eq!(first_success, second_success);
+        assert!(!concrete.listed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn safe_export_invalid_receipt_cannot_trigger_an_arbitrary_output_read() {
+        let concrete = Arc::new(ExactPathStore::new());
+        let store: Arc<dyn ObjectStore> = concrete.clone();
+        let prefix = Path::from("release");
+        let spec = spec();
+        let (receipt_path, _) = put_receipt(store.clone(), &prefix, &spec, |receipt| {
+            receipt.part.output_uri = "gs://output/release/sensitive-object".to_string();
+            receipt.part.output_object.uri = receipt.part.output_uri.clone();
+        });
+        concrete.clear_accesses();
+
+        let error = prepare_registration_with_store(&spec, store, prefix, &manifest()).unwrap_err();
+        assert!(
+            error.contains("invalid receipt before output read"),
+            "{error}"
+        );
+        assert!(concrete.accessed(&receipt_path));
+        assert!(!concrete.accessed(&Path::from("release/sensitive-object")));
+        assert!(!concrete.listed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn safe_export_receipt_claimed_size_cannot_raise_the_output_read_limit() {
+        let concrete = Arc::new(ExactPathStore::new());
+        let store: Arc<dyn ObjectStore> = concrete.clone();
+        let prefix = Path::from("release");
+        let spec = spec();
+        let (_, output_path) = put_receipt(store.clone(), &prefix, &spec, |receipt| {
+            receipt.part.byte_size = MAX_OUTPUT_BYTES + 1;
+            receipt.part.output_object.size = MAX_OUTPUT_BYTES + 1;
+        });
+        concrete.clear_accesses();
+
+        let error = prepare_registration_with_store(&spec, store, prefix, &manifest()).unwrap_err();
+        assert!(error.contains("exceeds protocol read limit"), "{error}");
+        assert!(!concrete.accessed(&output_path));
+        assert!(!concrete.listed.load(Ordering::SeqCst));
+    }
 }

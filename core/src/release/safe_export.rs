@@ -161,52 +161,29 @@ impl SafeExportSpec {
         Ok(())
     }
 
+    /// Return a validated copy with every semantically unordered field in the
+    /// same order used by export identity hashing. Publication must serialize
+    /// this form so equivalent same-export-ID submissions converge byte-for-byte.
+    pub fn canonicalized_for_publication(&self) -> Result<Self> {
+        self.validate()?;
+        let mut canonical = self.clone();
+        canonical.canonicalize_unordered_fields();
+        Ok(canonical)
+    }
+
     /// Stable identity excludes manifest location and all runtime assignment
     /// state. JSON object keys are recursively sorted before hashing.
     pub fn computed_export_id(&self) -> Result<String> {
         self.validate_intent()?;
-        let mut identity = serde_json::to_value(self)
+        let mut identity_source = self.clone();
+        identity_source.canonicalize_unordered_fields();
+        let mut identity = serde_json::to_value(identity_source)
             .map_err(|error| invalid(format!("failed to encode safe-export identity: {error}")))?;
         let object = identity
             .as_object_mut()
             .ok_or_else(|| invalid("safe-export identity must encode as an object"))?;
         object.remove("export_id");
         object.remove("source_manifest_uri");
-
-        // Feature declarations and index object lists are semantically
-        // unordered. Source partition identities deliberately remain ordered.
-        if let Some(features) = object
-            .get_mut("tool")
-            .and_then(Value::as_object_mut)
-            .and_then(|tool| tool.get_mut("enabled_features"))
-            .and_then(Value::as_array_mut)
-        {
-            features.sort_by(|left, right| {
-                left.as_str()
-                    .unwrap_or_default()
-                    .cmp(right.as_str().unwrap_or_default())
-            });
-        }
-        if let Some(partitions) = object
-            .get_mut("table")
-            .and_then(Value::as_object_mut)
-            .and_then(|table| table.get_mut("partitions"))
-            .and_then(Value::as_array_mut)
-        {
-            for partition in partitions {
-                if let Some(index_objects) = partition
-                    .as_object_mut()
-                    .and_then(|part| part.get_mut("index_objects"))
-                    .and_then(Value::as_array_mut)
-                {
-                    index_objects.sort_by(|left, right| {
-                        left.as_str()
-                            .unwrap_or_default()
-                            .cmp(right.as_str().unwrap_or_default())
-                    });
-                }
-            }
-        }
 
         let canonical = canonical_json(identity);
         let bytes = serde_json::to_vec(&canonical).map_err(|error| {
@@ -327,6 +304,16 @@ impl SafeExportSpec {
     pub fn success_uri(&self) -> Result<String> {
         self.validate()?;
         safe_export_success_uri(&self.output_root_uri, &self.export_id)
+    }
+
+    fn canonicalize_unordered_fields(&mut self) {
+        // Source partition identities deliberately remain ordered. These two
+        // declarations are sets: validation rejects duplicates and this sort
+        // supplies their unique deterministic wire representation.
+        self.tool.enabled_features.sort();
+        for partition in &mut self.table.partitions {
+            partition.index_objects.sort();
+        }
     }
 
     fn validate_intent(&self) -> Result<()> {
@@ -1432,6 +1419,10 @@ mod tests {
         equivalent.table.partitions[0].index_objects.reverse();
         equivalent.tool.enabled_features.reverse();
         assert_eq!(equivalent.computed_export_id().unwrap(), first.export_id);
+        let canonical = equivalent.canonicalized_for_publication().unwrap();
+        assert_eq!(canonical.tool.enabled_features, vec!["gcp", "validation"]);
+        assert_eq!(canonical.table.partitions[0].index_objects, vec!["a", "z"]);
+        assert_eq!(canonical.export_id, first.export_id);
 
         let mut changed = first.clone();
         changed.canonical_table_uri = "gs://source/other.ht".into();
