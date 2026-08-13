@@ -21,6 +21,8 @@
 
 pub mod api;
 pub mod monitor;
+#[cfg(test)]
+mod safe_export_e2e;
 pub mod scheduler;
 pub mod services;
 pub mod state;
@@ -298,6 +300,8 @@ pub async fn run_coordinator(
     }
 
     let state = Arc::new(Mutex::new(CoordinatorData {
+        #[cfg(test)]
+        safe_export_test_repository: None,
         pending_partitions: (0..total_tasks).collect(),
         processing_partitions: HashMap::new(),
         completed_tasks: HashSet::new(),
@@ -1374,6 +1378,21 @@ async fn get_work(
     }
 }
 
+#[cfg(test)]
+fn safe_export_test_path(
+    root: &str,
+    object: &str,
+) -> std::result::Result<object_store::path::Path, String> {
+    let root =
+        url::Url::parse(root).map_err(|error| format!("invalid output root URI: {error}"))?;
+    let object = url::Url::parse(object).map_err(|error| format!("invalid object URI: {error}"))?;
+    if root.scheme() != object.scheme() || root.host_str() != object.host_str() {
+        return Err("safe-export test object is not in the sealed output store".to_string());
+    }
+    object_store::path::Path::from_url_path(object.path())
+        .map_err(|error| format!("invalid safe-export test object path: {error}"))
+}
+
 /// Handler for POST /complete - worker reports completion.
 async fn complete_work(
     axum::extract::State(state): axum::extract::State<SharedState>,
@@ -1613,11 +1632,35 @@ async fn complete_work(
         let publication_spec = spec.clone();
         let publication_task = task.clone();
         let publication_report = report.clone();
+        #[cfg(test)]
+        let test_repository = data.safe_export_test_repository.clone();
 
         // The publishing claim is durable and non-requeueable. Never hold the
         // coordinator mutex across object-store I/O.
         drop(data);
         let publication = match std::thread::spawn(move || {
+            #[cfg(test)]
+            if let Some(repository) = test_repository {
+                let staging_path = safe_export_test_path(
+                    &publication_spec.output_root_uri,
+                    &publication_report.staging_object.uri,
+                )?;
+                let receipt_uri = publication_spec
+                    .part_receipt_uri(publication_task.partition_index)
+                    .map_err(|error| error.to_string())?;
+                let receipt_path =
+                    safe_export_test_path(&publication_spec.output_root_uri, &receipt_uri)?;
+                return services::safe_export::publish_claimed_part_with_store(
+                    repository.store,
+                    repository.output_prefix,
+                    staging_path,
+                    receipt_path,
+                    receipt_uri,
+                    &publication_spec,
+                    &publication_task,
+                    &publication_report,
+                );
+            }
             services::safe_export::publish_claimed_part(
                 &publication_spec,
                 &publication_task,
@@ -2597,6 +2640,7 @@ mod lease_coordinator_tests {
             })
             .unwrap();
         Arc::new(Mutex::new(CoordinatorData {
+            safe_export_test_repository: None,
             pending_partitions: (0..tasks).collect(),
             processing_partitions: HashMap::new(),
             completed_tasks: HashSet::new(),

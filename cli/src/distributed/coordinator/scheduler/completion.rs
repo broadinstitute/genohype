@@ -645,6 +645,7 @@ mod tests {
         let metrics_db = MetricsDb::in_memory().unwrap();
 
         let mut data = CoordinatorData {
+            safe_export_test_repository: None,
             pending_partitions: VecDeque::new(),
             processing_partitions: HashMap::new(),
             completed_tasks: HashSet::new(),
@@ -753,6 +754,7 @@ mod tests {
         let metrics_db = MetricsDb::in_memory().unwrap();
 
         let mut data = CoordinatorData {
+            safe_export_test_repository: None,
             pending_partitions: VecDeque::new(),
             processing_partitions: HashMap::new(),
             completed_tasks: HashSet::new(),
@@ -832,6 +834,7 @@ mod tests {
         let metrics_db = MetricsDb::in_memory().unwrap();
 
         let mut data = CoordinatorData {
+            safe_export_test_repository: None,
             pending_partitions: VecDeque::new(),
             processing_partitions: HashMap::new(),
             completed_tasks: HashSet::new(),

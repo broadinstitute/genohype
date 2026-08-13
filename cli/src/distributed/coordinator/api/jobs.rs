@@ -130,7 +130,18 @@ pub(crate) async fn submit_job(
             }
         }
         let spec = spec.clone();
+        #[cfg(test)]
+        let test_repository = state.lock().unwrap().safe_export_test_repository.clone();
         match tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(repository) = test_repository {
+                return services::safe_export::prepare_registration_with_store(
+                    &spec,
+                    repository.store,
+                    repository.output_prefix,
+                    &repository.manifest,
+                );
+            }
             services::safe_export::prepare_registration(&spec)
         })
         .await

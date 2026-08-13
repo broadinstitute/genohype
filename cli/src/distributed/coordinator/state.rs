@@ -331,6 +331,14 @@ pub(crate) enum SafeExportAssignmentState {
     Publishing,
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct SafeExportTestRepository {
+    pub(crate) store: std::sync::Arc<dyn object_store::ObjectStore>,
+    pub(crate) output_prefix: object_store::path::Path,
+    pub(crate) manifest: genohype_core::io::SourceManifest,
+}
+
 /// Parallel, typed safe-export assignment authority. The raw lease exists only
 /// in process memory and on the worker wire; SQLite stores its digest.
 #[derive(Clone)]
@@ -347,6 +355,10 @@ pub(crate) struct SafeExportAssignment {
 
 /// Internal state of the coordinator.
 pub(crate) struct CoordinatorData {
+    /// Local exact-path repository used only by the bounded safe-export fault campaign.
+    /// Production always resolves the sealed gs:// authorities itself.
+    #[cfg(test)]
+    pub(crate) safe_export_test_repository: Option<SafeExportTestRepository>,
     /// Partitions waiting to be assigned
     pub(crate) pending_partitions: VecDeque<usize>,
     /// Partitions currently being processed: partition_id -> (worker_id, start_time)

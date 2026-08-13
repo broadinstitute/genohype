@@ -7,8 +7,62 @@ use crate::Result;
 use genohype_core::io::{is_cloud_path, StreamingCloudWriter};
 use genohype_core::parquet::{build_record_batch, ParquetWriter};
 use genohype_core::query::{IntervalList, KeyRange, QueryEngine};
+use std::io::Write;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+
+struct SafePartitionWrite<W> {
+    sink: W,
+    stats: genohype_core::parquet::ParquetWriteStats,
+    row_count: u64,
+    decoded_rows_sha256: String,
+    first_key: Option<genohype_core::codec::LosslessValue>,
+    last_key: Option<genohype_core::codec::LosslessValue>,
+}
+
+/// Scan one already snapshot-pinned partition into an injected Parquet sink.
+/// Keeping this below URI resolution lets local checked fixtures qualify the
+/// real decode/write loop without making local destinations valid safe-export URLs.
+fn write_pinned_safe_partition<W: Write + Send>(
+    engine: &QueryEngine,
+    partition_index: usize,
+    key_fields: &[String],
+    mut writer: ParquetWriter<W>,
+) -> Result<SafePartitionWrite<W>> {
+    use genohype_core::release::DecodedRowsHasher;
+
+    let mut digest = DecodedRowsHasher::new();
+    let mut first_key = None;
+    let mut last_key = None;
+    for row in engine.scan_partition_iter(partition_index, &[])? {
+        let row = row?;
+        digest.update(&row)?;
+        if !key_fields.is_empty() {
+            let key = lossless_key(&row, key_fields)?;
+            if first_key.is_none() {
+                first_key = Some(key.clone());
+            }
+            last_key = Some(key);
+        }
+        writer.write_row(&row)?;
+    }
+    let row_count = digest.row_count();
+    let decoded_rows_sha256 = digest.finalize();
+    let (sink, stats) = writer.finish_into_inner()?;
+    if stats.row_count != row_count {
+        return Err(crate::HailError::InvalidFormat(
+            "safe-export decoded and Parquet row counts differ".to_string(),
+        ));
+    }
+    Ok(SafePartitionWrite {
+        sink,
+        stats,
+        row_count,
+        decoded_rows_sha256,
+        first_key,
+        last_key,
+    })
+}
 
 /// Execute exactly one manifest-pinned safe-export task into attempt-private
 /// staging. This function never publishes a canonical object or receipt.
@@ -23,7 +77,7 @@ pub fn process_safe_export_part(
     use genohype_core::io::{
         build_attempt_staging_location, lease_identity_sha256, SourceManifest, SourceObject,
     };
-    use genohype_core::release::{DecodedRowsHasher, GlobalsPayload};
+    use genohype_core::release::GlobalsPayload;
 
     spec.validate()?;
     if assignment.task_id != task.task_id || assignment.assignment_attempt == 0 {
@@ -86,31 +140,14 @@ pub fn process_safe_export_part(
     )?;
     let plan = Arc::new(engine.parquet_plan(genohype_core::schema::PhysicalBinaryEncoding::Utf8)?);
     let cloud_writer = StreamingCloudWriter::new(&staging.uri)?;
-    let mut writer = ParquetWriter::from_writer(cloud_writer, plan)?;
-    let mut digest = DecodedRowsHasher::new();
-    let mut first_key = None;
-    let mut last_key = None;
-    for row in engine.scan_partition_iter(task.partition_index, &[])? {
-        let row = row?;
-        digest.update(&row)?;
-        if !spec.table.key.fields.is_empty() {
-            let key = lossless_key(&row, &spec.table.key.fields)?;
-            if first_key.is_none() {
-                first_key = Some(key.clone());
-            }
-            last_key = Some(key);
-        }
-        writer.write_row(&row)?;
-    }
-    let row_count = digest.row_count();
-    let decoded_rows_sha256 = digest.finalize();
-    let (cloud_writer, stats) = writer.finish_into_inner()?;
-    if stats.row_count != row_count {
-        return Err(crate::HailError::InvalidFormat(
-            "safe-export decoded and Parquet row counts differ".to_string(),
-        ));
-    }
-    let uploaded = cloud_writer.finish()?;
+    let writer = ParquetWriter::from_writer(cloud_writer, plan)?;
+    let written = write_pinned_safe_partition(
+        &engine,
+        task.partition_index,
+        &spec.table.key.fields,
+        writer,
+    )?;
+    let uploaded = written.sink.finish()?;
     let etag = uploaded.put_result.e_tag.clone().ok_or_else(|| {
         crate::HailError::InvalidFormat("staging completion returned no ETag".to_string())
     })?;
@@ -136,11 +173,11 @@ pub fn process_safe_export_part(
         schema_fingerprint_sha256: task.schema_fingerprint_sha256.clone(),
         byte_size: staging_object.size,
         staging_object,
-        row_count,
-        row_group_count: stats.row_group_count,
-        decoded_rows_sha256,
-        first_key,
-        last_key,
+        row_count: written.row_count,
+        row_group_count: written.stats.row_group_count,
+        decoded_rows_sha256: written.decoded_rows_sha256,
+        first_key: written.first_key,
+        last_key: written.last_key,
         worker_id: worker_id.to_string(),
         worker_git_commit: worker_git_commit.to_string(),
         worker_binary_sha256: worker_binary_sha256.to_string(),
@@ -558,4 +595,104 @@ pub fn process_summary(
     );
 
     Ok((total_rows, stats, Some((input_path.to_string(), engine))))
+}
+
+#[cfg(test)]
+mod safe_export_tests {
+    use super::*;
+    use genohype_core::io::{SourceManifest, SourceObject, SourceSnapshot};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use sha2::{Digest, Sha256};
+    use std::io::Cursor;
+    use std::path::Path;
+
+    fn copy_tree(source: &Path, destination: &Path) {
+        std::fs::create_dir_all(destination).unwrap();
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let target = destination.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+
+    fn snapshot(root: &Path) -> SourceSnapshot {
+        fn collect(current: &Path, objects: &mut Vec<SourceObject>) {
+            for entry in std::fs::read_dir(current).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    collect(&entry.path(), objects);
+                } else {
+                    let bytes = std::fs::read(entry.path()).unwrap();
+                    let digest = format!("{:x}", Sha256::digest(&bytes));
+                    objects.push(SourceObject {
+                        uri: entry.path().to_string_lossy().to_string(),
+                        version: "checked-fixture-v1".to_string(),
+                        etag: digest.clone(),
+                        size: bytes.len() as u64,
+                        crc32c: None,
+                        sha256: Some(digest),
+                    });
+                }
+            }
+        }
+
+        let mut objects = Vec::new();
+        collect(root, &mut objects);
+        let manifest = SourceManifest::new(objects).unwrap();
+        let digest = manifest.digest_sha256().unwrap();
+        SourceSnapshot::new(manifest, &digest).unwrap()
+    }
+
+    #[test]
+    fn pinned_local_hail_mutation_fails_before_safe_parquet_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let table = temp.path().join("tiny-keyed.ht");
+        copy_tree(Path::new("../core/tests/fixtures/tiny-keyed.ht"), &table);
+        let pinned = snapshot(&table);
+        let engine =
+            QueryEngine::open_path_with_snapshot(table.to_str().unwrap(), pinned.clone()).unwrap();
+        let plan = Arc::new(
+            engine
+                .parquet_plan(genohype_core::schema::PhysicalBinaryEncoding::Utf8)
+                .unwrap(),
+        );
+        let writer = ParquetWriter::from_writer(Cursor::new(Vec::new()), plan).unwrap();
+        let written = write_pinned_safe_partition(&engine, 0, engine.key_fields(), writer).unwrap();
+        assert_eq!(written.row_count, 2);
+        let bytes = written.sink.into_inner();
+        let mut reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
+            .unwrap()
+            .build()
+            .unwrap();
+        let rows: usize = reader.by_ref().map(|batch| batch.unwrap().num_rows()).sum();
+        assert_eq!(rows, 2);
+
+        let mutated_engine =
+            QueryEngine::open_path_with_snapshot(table.to_str().unwrap(), pinned).unwrap();
+        let row_part = table.join("rows/parts/part-0");
+        let mut mutated = std::fs::read(&row_part).unwrap();
+        let last = mutated.len() - 1;
+        mutated[last] ^= 1;
+        std::fs::write(&row_part, mutated).unwrap();
+        let plan = Arc::new(
+            mutated_engine
+                .parquet_plan(genohype_core::schema::PhysicalBinaryEncoding::Utf8)
+                .unwrap(),
+        );
+        let writer = ParquetWriter::from_writer(Cursor::new(Vec::new()), plan).unwrap();
+        let error = match write_pinned_safe_partition(
+            &mutated_engine,
+            0,
+            mutated_engine.key_fields(),
+            writer,
+        ) {
+            Ok(_) => panic!("mutated pinned Hail part produced safe Parquet evidence"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("SHA-256 mismatch"), "{error}");
+    }
 }
