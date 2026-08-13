@@ -56,6 +56,8 @@ genohype safe-export seal \
 
 `seal` digest-checks the local manifest, opens the canonical GCS table under that source snapshot, derives table/globals/Arrow/writer descriptors, binds row-source identities in partition order, verifies the stock Linux worker shape and advertised identity, hashes its exact bytes, and refuses overwrite. Thus sealing reads approved source objects even though its manifest, worker binary, and output spec are local files. Local spec storage does **not** make the export a local or authorized cloud operation.
 
+For bounded local/mock qualification only, `--metadata-evidence-bundle LOCAL_JSON` may supply schema-v1 decoded table/globals evidence bound to the exact canonical `gs://` table URI and manifest digest. This seam performs no cloud reads, does not relax any sealed GCS URI or worker identity rule, and is not production authority. Production sealing must omit it and use the snapshot-conditioned GCS reads above.
+
 Record the command, inventory timestamp, manifest digest, export ID, source/manifest/output URIs, worker git/build/binary SHA-256, feature set, and operator approval with the archived files.
 
 ## 3. Submit

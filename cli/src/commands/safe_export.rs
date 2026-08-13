@@ -3,14 +3,15 @@ use crate::{HailError, Result};
 use bytes::Bytes;
 use futures::stream::{self, BoxStream};
 use futures::StreamExt;
+use genohype_core::codec::ETypeParser;
 use genohype_core::io::{join_path, SourceManifest, SourceSnapshot};
 use genohype_core::query::QueryEngine;
 use genohype_core::release::{
-    GlobalsPayload, ParquetDescriptor, SafeExportSpec, SafeExportWorkerIdentity, ToolIdentity,
-    WriterPropertiesDescriptor, SAFE_EXPORT_COMPLETION_SCHEMA_VERSION,
+    GlobalsPayload, ParquetDescriptor, SafeExportSpec, SafeExportWorkerIdentity, TableDescriptor,
+    ToolIdentity, WriterPropertiesDescriptor, SAFE_EXPORT_COMPLETION_SCHEMA_VERSION,
     SAFE_EXPORT_RECEIPT_SCHEMA_VERSION, SAFE_EXPORT_SCHEMA_VERSION, SAFE_EXPORT_SHARDING_RULE_V1,
 };
-use genohype_core::schema::PhysicalBinaryEncoding;
+use genohype_core::schema::{PairedSchema, PhysicalBinaryEncoding};
 use object_store::memory::InMemory;
 use object_store::path::Path;
 use object_store::{
@@ -42,17 +43,48 @@ fn seal(args: SafeExportSealArgs) -> Result<()> {
     let manifest_bytes = std::fs::read(&args.manifest)?;
     let manifest = SourceManifest::from_json(&manifest_bytes)?;
     let manifest_sha256 = manifest.digest_sha256()?;
-    let snapshot = SourceSnapshot::new(manifest, &manifest_sha256)?;
+    let snapshot = SourceSnapshot::new(manifest.clone(), &manifest_sha256)?;
 
     let worker_bytes = std::fs::read(&args.worker_binary)?;
     validate_stock_worker_identity(&args, &worker_bytes)?;
     let worker_sha256 = format!("{:x}", Sha256::digest(&worker_bytes));
 
-    // This is deliberately the canonical GCS table, not a local mirror. Opening
-    // under the digest-checked snapshot makes all planning metadata/globals reads
-    // conditional on the manifest identities.
-    let engine = QueryEngine::open_path_with_snapshot(&args.table, snapshot.clone())?;
-    let mut table = engine.table_descriptor()?;
+    // Production deliberately opens the canonical GCS table under the
+    // digest-checked snapshot. The optional decoded bundle is an explicit
+    // local/mock qualification seam: it still binds the exact manifest digest,
+    // canonical gs:// identities, and project-owned schema descriptor, but it
+    // performs no cloud access and is never an alternate production authority.
+    let (mut table, globals, arrow_descriptor) =
+        if let Some(bundle_path) = args.metadata_evidence_bundle.as_deref() {
+            require_local_input(bundle_path, "metadata evidence bundle")?;
+            let bundle: SealMetadataEvidenceBundle =
+                serde_json::from_slice(&std::fs::read(bundle_path)?)?;
+            if bundle.schema_version != 1
+                || bundle.canonical_table_uri != args.table
+                || bundle.source_manifest_sha256 != manifest_sha256
+            {
+                return invalid(
+                    "metadata evidence bundle does not match the exact table/manifest authority",
+                );
+            }
+            bundle.globals.validate_digest()?;
+            let arrow = PairedSchema::from_raw_vtype(
+                ETypeParser::parse(&bundle.table.rows.raw_e_type)?,
+                &bundle.table.rows.raw_v_type,
+            )?
+            .arrow_plan()?
+            .descriptor();
+            (bundle.table, bundle.globals, arrow)
+        } else {
+            let engine = QueryEngine::open_path_with_snapshot(&args.table, snapshot.clone())?;
+            (
+                engine.table_descriptor()?,
+                GlobalsPayload::from_value(&engine.globals()?),
+                engine
+                    .parquet_plan(PhysicalBinaryEncoding::Utf8)?
+                    .descriptor(),
+            )
+        };
     let mut source_parts = Vec::with_capacity(table.partitions.len());
     for partition in &mut table.partitions {
         partition.output_part_ids = vec![format!("part-{:08}", partition.index)];
@@ -69,8 +101,6 @@ fn seal(args: SafeExportSealArgs) -> Result<()> {
         source_parts.push(source);
     }
 
-    let plan = engine.parquet_plan(PhysicalBinaryEncoding::Utf8)?;
-    let arrow_descriptor = plan.descriptor();
     let schema_fingerprint_sha256 = arrow_descriptor.fingerprint_sha256()?;
     let expected_worker = SafeExportWorkerIdentity {
         git_commit: args.worker_git_commit.clone(),
@@ -125,7 +155,7 @@ fn seal(args: SafeExportSealArgs) -> Result<()> {
         parquet,
         expected_worker,
         table,
-        globals: GlobalsPayload::from_value(&engine.globals()?),
+        globals,
         tool,
         receipt_schema_version: SAFE_EXPORT_RECEIPT_SCHEMA_VERSION,
         completion_schema_version: SAFE_EXPORT_COMPLETION_SCHEMA_VERSION,
@@ -235,6 +265,16 @@ fn validate_stock_worker_identity(args: &SafeExportSealArgs, bytes: &[u8]) -> Re
         return invalid("worker binary does not embed its advertised git commit");
     }
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SealMetadataEvidenceBundle {
+    schema_version: u32,
+    canonical_table_uri: String,
+    source_manifest_sha256: String,
+    table: TableDescriptor,
+    globals: GlobalsPayload,
 }
 
 #[derive(Debug, Serialize)]

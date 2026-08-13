@@ -3,6 +3,7 @@
 //! These tests deliberately use authority-shaped `gs://` specs with an injected
 //! versioned store. Production URI resolution remains unchanged.
 
+use super::monitor::{check_stuck_job, check_timeouts, check_worker_liveness};
 use super::services::safe_export;
 use super::state::{CoordinatorData, JobExecutionState, SafeExportTestRepository, SharedState};
 use super::{api, complete_work, get_work, open_and_reconcile_database};
@@ -28,7 +29,7 @@ use genohype_core::release::{
     SafeExportWorkerIdentity, SourcePartition, TableDescriptor, ToolIdentity,
     WriterPropertiesDescriptor, SAFE_EXPORT_SCHEMA_VERSION, SAFE_EXPORT_SHARDING_RULE_V1,
 };
-use genohype_core::schema::{PairedSchema, VTypeParser};
+use genohype_core::schema::{ArrowSchemaDescriptor, PairedSchema, VTypeParser};
 use object_store::memory::InMemory;
 use object_store::path::Path;
 use object_store::{
@@ -41,7 +42,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tower::ServiceExt;
 
 #[derive(Debug)]
@@ -694,6 +695,122 @@ async fn assign_next(
 }
 
 #[tokio::test]
+async fn timeout_requeues_for_replacement_before_same_loop_stuck_check() {
+    let fixture = fixture().await;
+    let state = empty_state(MetricsDb::in_memory().unwrap(), &fixture, "session-timeout");
+    let (job_id, first, _) = submit_and_assign(&state, &fixture.spec, "worker-old").await;
+    {
+        let mut data = state.lock().unwrap();
+        data.config.timeout_secs = 1;
+        data.config.stuck_timeout_secs = 1;
+        data.processing_partitions.get_mut(&0).unwrap().1 =
+            Instant::now() - Duration::from_secs(10);
+        data.last_progress_time = Instant::now() - Duration::from_secs(10);
+    }
+
+    check_timeouts(&state);
+    check_stuck_job(&state);
+    {
+        let data = state.lock().unwrap();
+        assert!(!data.idle, "same-loop stuck check terminated a fresh retry");
+        assert_eq!(data.pending_partitions, VecDeque::from([0, 1]));
+        assert!(data.processing_partitions.is_empty());
+        let status = data.metrics_db.get_safe_export_status(&job_id).unwrap();
+        assert_eq!(status.phase.as_deref(), Some("running"));
+        assert_eq!(status.current_assignment_count, 0);
+        assert!(status.error.is_none());
+    }
+
+    let (replacement, session) = assign_next(&state, &fixture.spec, "worker-new").await;
+    assert_eq!(replacement.id, first.id);
+    assert_eq!(replacement.assignment_attempt, Some(2));
+    let (stale, _) = report_for(&fixture, &first, &session, "worker-old").await;
+    fixture.store.clear_operations();
+    let rejected = complete_work(axum::extract::State(state), axum::Json(stale))
+        .await
+        .0;
+    assert!(!rejected.acknowledged);
+    assert_eq!(fixture.store.operation_count_beneath(&fixture.prefix), 0);
+    assert_eq!(fixture.store.list_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn suspected_worker_death_requeues_safe_export_for_replacement() {
+    let fixture = fixture().await;
+    let state = empty_state(MetricsDb::in_memory().unwrap(), &fixture, "session-death");
+    let (job_id, first, _) = submit_and_assign(&state, &fixture.spec, "worker-dead").await;
+    {
+        let mut data = state.lock().unwrap();
+        data.config.stuck_timeout_secs = 1;
+        data.worker_registry
+            .get_mut("worker-dead")
+            .unwrap()
+            .last_seen =
+            Instant::now() - Duration::from_secs(super::state::WORKER_SUSPECT_TIMEOUT_SECS + 1);
+        data.last_progress_time = Instant::now() - Duration::from_secs(10);
+    }
+
+    check_worker_liveness(&state);
+    check_stuck_job(&state);
+    {
+        let data = state.lock().unwrap();
+        assert!(!data.idle, "same-loop stuck check terminated a death retry");
+        assert_eq!(data.pending_partitions, VecDeque::from([0, 1]));
+        assert_eq!(
+            data.metrics_db
+                .get_safe_export_status(&job_id)
+                .unwrap()
+                .phase
+                .as_deref(),
+            Some("running")
+        );
+    }
+
+    let (replacement, session) = assign_next(&state, &fixture.spec, "worker-replacement").await;
+    assert_eq!(replacement.id, first.id);
+    assert_eq!(replacement.assignment_attempt, Some(2));
+    let (stale, _) = report_for(&fixture, &first, &session, "worker-dead").await;
+    fixture.store.clear_operations();
+    let rejected = complete_work(axum::extract::State(state), axum::Json(stale))
+        .await
+        .0;
+    assert!(!rejected.acknowledged);
+    assert_eq!(fixture.store.operation_count_beneath(&fixture.prefix), 0);
+    assert_eq!(fixture.store.list_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn stuck_safe_export_terminalizes_job_phase_and_exact_status_atomically() {
+    let fixture = fixture().await;
+    let state = empty_state(MetricsDb::in_memory().unwrap(), &fixture, "session-stuck");
+    let (job_id, _, _) = submit_and_assign(&state, &fixture.spec, "worker-stuck").await;
+    {
+        let mut data = state.lock().unwrap();
+        data.config.stuck_timeout_secs = 1;
+        data.last_progress_time = Instant::now() - Duration::from_secs(10);
+    }
+
+    check_stuck_job(&state);
+
+    let data = state.lock().unwrap();
+    assert!(data.idle);
+    assert!(data.safe_export_assignments.is_empty());
+    assert_eq!(
+        data.metrics_db.get_job(&job_id).unwrap().unwrap().status,
+        "failed"
+    );
+    let status = data.metrics_db.get_safe_export_status(&job_id).unwrap();
+    assert_eq!(status.phase.as_deref(), Some("failed"));
+    assert!(!status.complete);
+    assert_eq!(status.current_assignment_count, 0);
+    assert!(
+        status.error.as_deref().is_some_and(
+            |error| error.starts_with("safe export stuck with zero completed partitions")
+        )
+    );
+}
+
+#[tokio::test]
 async fn source_mutation_and_stale_attempt_cannot_publish() {
     let fixture = fixture().await;
     let state = empty_state(MetricsDb::in_memory().unwrap(), &fixture, "session-a");
@@ -1112,10 +1229,19 @@ async fn success_is_last_and_graph_is_independently_readable() {
             .await
             .unwrap();
         assert_eq!(bytes.len() as u64, expected.size);
-        let mut reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
-            .unwrap()
-            .build()
-            .unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+        let observed_descriptor =
+            ArrowSchemaDescriptor::from_arrow_schema(builder.schema().as_ref()).unwrap();
+        assert_eq!(
+            observed_descriptor.fingerprint_sha256().unwrap(),
+            graph.sidecar.parquet.schema_fingerprint_sha256,
+            "Parquet bytes at {path} do not carry the sealed release schema"
+        );
+        assert_eq!(
+            serde_json::to_value(&observed_descriptor).unwrap(),
+            graph.sidecar.parquet.arrow_schema
+        );
+        let mut reader = builder.build().unwrap();
         total_rows += reader
             .by_ref()
             .map(|batch| batch.unwrap().num_rows() as u64)

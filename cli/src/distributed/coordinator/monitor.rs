@@ -7,6 +7,7 @@ use crate::distributed::coordinator::state::{
     CoordinatorData, JobExecutionState, SafeExportAssignmentState, SharedState, WorkerStatus,
     WORKER_SUSPECT_TIMEOUT_SECS,
 };
+use crate::distributed::message::JobSpec;
 use crate::distributed::metrics_db::MetricsDb;
 use std::time::{Duration, Instant};
 
@@ -137,26 +138,38 @@ pub(crate) fn check_stuck_job(state: &SharedState) {
             elapsed.as_secs()
         );
 
-        // Update job status in database
-        if let Some(ref job_id) = data.current_job_id {
+        // Safe export has one transactional terminal authority for the job,
+        // run phase/error, and durable assignment fences. Never fall back to
+        // the generic jobs-table transition: an in-memory reset is allowed
+        // only after that authority commits.
+        if let Some(job_id) = data.current_job_id.clone() {
             let end_time_ms = CoordinatorData::now_ms();
-            if let Err(e) =
-                data.metrics_db
-                    .update_job_status(job_id, "failed", Some(end_time_ms), None)
-            {
-                eprintln!("Warning: failed to update job status in DB: {}", e);
-            }
-            if let Err(e) = data.metrics_db.clear_current_custom_assignments(job_id) {
-                eprintln!("Warning: failed to clear failed custom assignments: {}", e);
-            }
-            if let Err(e) = data
-                .metrics_db
-                .clear_current_safe_export_assignments(job_id)
-            {
-                eprintln!(
-                    "Warning: failed to clear failed safe-export assignments: {}",
-                    e
+            if matches!(data.config.job_spec, Some(JobSpec::SafeExport(_))) {
+                let error = format!(
+                    "safe export stuck with zero completed partitions for {}s",
+                    elapsed.as_secs()
                 );
+                if let Err(failure) = data.metrics_db.terminalize_safe_export(
+                    &job_id,
+                    "failed",
+                    Some(&error),
+                    end_time_ms,
+                ) {
+                    eprintln!(
+                        "Warning: refusing in-memory safe-export reset after failed durable terminalization: {failure}"
+                    );
+                    return;
+                }
+            } else {
+                if let Err(e) =
+                    data.metrics_db
+                        .update_job_status(&job_id, "failed", Some(end_time_ms), None)
+                {
+                    eprintln!("Warning: failed to update job status in DB: {}", e);
+                }
+                if let Err(e) = data.metrics_db.clear_current_custom_assignments(&job_id) {
+                    eprintln!("Warning: failed to clear failed custom assignments: {}", e);
+                }
             }
         }
 
@@ -181,6 +194,7 @@ pub(crate) fn check_timeouts(state: &SharedState) {
     let max_retries = data.config.max_retries;
 
     let mut timed_out = Vec::new();
+    let mut requeued = false;
     for (part_id, (worker, start_time)) in &data.processing_partitions {
         if now.duration_since(*start_time) > timeout {
             timed_out.push((*part_id, worker.clone(), *start_time));
@@ -226,7 +240,15 @@ pub(crate) fn check_timeouts(state: &SharedState) {
                 part_id, worker, retries, max_retries, elapsed_secs
             );
             data.pending_partitions.push_front(part_id);
+            requeued = true;
         }
+    }
+
+    // A real retry transition gives the replacement attempt a fresh bounded
+    // chance. In particular, the monitor's immediately following stuck check
+    // must not terminalize a safe export that this same loop just requeued.
+    if requeued {
+        data.last_progress_time = now;
     }
 }
 

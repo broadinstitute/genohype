@@ -50,6 +50,10 @@ pub struct SafeExportSealArgs {
     #[arg(long = "worker-feature", value_name = "FEATURE", required = true)]
     pub worker_features: Vec<String>,
 
+    /// Local/mock decoded metadata evidence (qualification only; production must omit)
+    #[arg(long, value_name = "LOCAL_JSON")]
+    pub metadata_evidence_bundle: Option<String>,
+
     /// Create-new local specification path
     #[arg(long, value_name = "LOCAL")]
     pub output: String,

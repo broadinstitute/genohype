@@ -1,13 +1,17 @@
 use genohype_core::codec::{ETypeParser, EncodedValue};
-use genohype_core::io::{SourceManifest, SourceObject};
+use genohype_core::io::{
+    build_attempt_staging_location, content_addressed_path, SourceManifest, SourceObject,
+};
 use genohype_core::metadata::BufferSpec;
 use genohype_core::release::{
-    ComponentDescriptor, GlobalsPayload, KeyDescriptor, KeyOrdering, ParquetDescriptor,
-    PhysicalTypeDescriptor, SafeExportReceiptIdentity, SafeExportSpec, SafeExportSuccess,
-    SafeExportWorkerIdentity, SourcePartition, TableDescriptor, ToolIdentity,
+    ComponentDescriptor, ExportPartReport, GlobalsPayload, KeyDescriptor, KeyOrdering,
+    ParquetDescriptor, PhysicalTypeDescriptor, ReleaseSourceSnapshot, ReleaseStatus, ReleaseTotals,
+    SafeExportPartReceipt, SafeExportReceiptIdentity, SafeExportSpec, SafeExportSuccess,
+    SafeExportWorkerIdentity, SourcePartition, TableDescriptor, TableReleaseSidecar, ToolIdentity,
     WriterPropertiesDescriptor, SAFE_EXPORT_SHARDING_RULE_V1,
 };
 use genohype_core::schema::{PairedSchema, VTypeParser};
+use object_store::path::Path as ObjectPath;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::process::{Command, Output};
@@ -80,6 +84,115 @@ fn malformed_manifest_creates_no_spec() {
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("source manifest JSON"));
     assert!(!output.exists());
+}
+
+fn write_mock_worker(path: &std::path::Path, identity_byte: u8) {
+    let mut bytes = vec![identity_byte; 64];
+    bytes[..4].copy_from_slice(b"\x7fELF");
+    bytes[4] = 2;
+    bytes[5] = 1;
+    bytes[18..20].copy_from_slice(&62_u16.to_le_bytes());
+    bytes.extend_from_slice(b"abc1234");
+    fs::write(path, bytes).unwrap();
+}
+
+fn black_box_seal(
+    directory: &std::path::Path,
+    name: &str,
+    source: SourceObject,
+    output_root: &str,
+    worker_identity_byte: u8,
+) -> SafeExportSpec {
+    let base = unsealed_spec();
+    let manifest = SourceManifest::new(vec![source]).unwrap();
+    let manifest_path = directory.join(format!("{name}-manifest.json"));
+    let metadata_path = directory.join(format!("{name}-metadata.json"));
+    let worker_path = directory.join(format!("{name}-worker"));
+    let output_path = directory.join(format!("{name}-spec.json"));
+    fs::write(&manifest_path, manifest.canonical_bytes().unwrap()).unwrap();
+    fs::write(
+        &metadata_path,
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "canonical_table_uri": base.canonical_table_uri,
+            "source_manifest_sha256": manifest.digest_sha256().unwrap(),
+            "table": base.table,
+            "globals": base.globals,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    write_mock_worker(&worker_path, worker_identity_byte);
+
+    let manifest_arg = manifest_path.to_str().unwrap().to_string();
+    let worker_arg = worker_path.to_str().unwrap().to_string();
+    let output_arg = output_path.to_str().unwrap().to_string();
+    let metadata_arg = metadata_path.to_str().unwrap().to_string();
+    let mut args = seal_args(&manifest_arg, &worker_arg, &output_arg);
+    let root_index = args.iter().position(|arg| *arg == "--output-root").unwrap() + 1;
+    args[root_index] = output_root;
+    args.push("--metadata-evidence-bundle");
+    args.push(&metadata_arg);
+    let result = run(&args);
+    assert!(
+        result.status.success(),
+        "seal failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    SafeExportSpec::from_json(&fs::read(output_path).unwrap()).unwrap()
+}
+
+#[test]
+fn black_box_seal_is_deterministic_and_binds_source_output_and_worker() {
+    let temp = tempfile::tempdir().unwrap();
+    let original_source = object("gs://source/table.ht/rows/parts/part-0");
+    let first = black_box_seal(
+        temp.path(),
+        "first",
+        original_source.clone(),
+        "gs://output/release",
+        0,
+    );
+    let again = black_box_seal(
+        temp.path(),
+        "again",
+        original_source.clone(),
+        "gs://output/release",
+        0,
+    );
+    assert_eq!(
+        fs::read(temp.path().join("first-spec.json")).unwrap(),
+        fs::read(temp.path().join("again-spec.json")).unwrap()
+    );
+    assert_eq!(first.export_id, again.export_id);
+
+    let mut changed_source = original_source.clone();
+    changed_source.version = "8".into();
+    changed_source.etag = "etag-8".into();
+    let source = black_box_seal(
+        temp.path(),
+        "source",
+        changed_source,
+        "gs://output/release",
+        0,
+    );
+    let output = black_box_seal(
+        temp.path(),
+        "output",
+        original_source.clone(),
+        "gs://output/other",
+        0,
+    );
+    let worker = black_box_seal(
+        temp.path(),
+        "worker",
+        original_source,
+        "gs://output/release",
+        1,
+    );
+    assert_ne!(source.export_id, first.export_id);
+    assert_ne!(output.export_id, first.export_id);
+    assert_ne!(worker.export_id, first.export_id);
 }
 
 #[test]
@@ -178,6 +291,207 @@ fn standalone_validate_refuses_wrong_release_generation() {
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(stderr.contains("release identity/size/SHA"), "{stderr}");
     assert!(!report_path.exists());
+}
+
+fn evidence_object(uri: &str, version: &str, etag: &str, bytes: &[u8]) -> SourceObject {
+    SourceObject {
+        uri: uri.to_string(),
+        version: version.to_string(),
+        etag: etag.to_string(),
+        size: bytes.len() as u64,
+        crc32c: None,
+        sha256: Some(format!("{:x}", Sha256::digest(bytes))),
+    }
+}
+
+fn successful_evidence_bundle(spec: &SafeExportSpec) -> serde_json::Value {
+    let mut tasks = spec.sealed_part_tasks().unwrap();
+    let task = tasks.remove(0);
+    let output_bytes = b"bounded local parquet evidence";
+    let output_sha = format!("{:x}", Sha256::digest(output_bytes));
+    let output_path =
+        content_addressed_path(&ObjectPath::from("release"), &output_sha, "parquet").unwrap();
+    let output_uri = format!("gs://output/{output_path}");
+    let output = evidence_object(
+        &output_uri,
+        "output-generation",
+        "output-etag",
+        output_bytes,
+    );
+    let staging = build_attempt_staging_location(
+        &spec.output_root_uri,
+        &spec.export_id,
+        &task.task_id,
+        1,
+        "local-mock-lease",
+        "parquet",
+    )
+    .unwrap();
+    let report = ExportPartReport {
+        schema_version: 1,
+        export_id: spec.export_id.clone(),
+        task_id: task.task_id.clone(),
+        partition_index: 0,
+        source_manifest_sha256: spec.source_manifest_sha256.clone(),
+        source_part_file: task.source_part_file.clone(),
+        source_object: task.source_object.clone(),
+        schema_fingerprint_sha256: spec.parquet.schema_fingerprint_sha256.clone(),
+        staging_object: SourceObject {
+            uri: staging.uri,
+            version: "staging-generation".into(),
+            etag: "staging-etag".into(),
+            size: output_bytes.len() as u64,
+            crc32c: None,
+            sha256: Some(output_sha),
+        },
+        byte_size: output_bytes.len() as u64,
+        row_count: 1,
+        row_group_count: 1,
+        decoded_rows_sha256: "d".repeat(64),
+        first_key: Some(genohype_core::codec::LosslessValue::from(
+            &EncodedValue::Binary(b"a".to_vec()),
+        )),
+        last_key: Some(genohype_core::codec::LosslessValue::from(
+            &EncodedValue::Binary(b"a".to_vec()),
+        )),
+        worker_id: "worker-local".into(),
+        worker_git_commit: spec.expected_worker.git_commit.clone(),
+        worker_binary_sha256: spec.expected_worker.binary_sha256.clone(),
+        assignment_attempt: 1,
+        lease_identity_sha256: staging.lease_identity_sha256,
+        started_at: "2026-08-13T12:00:00Z".into(),
+        completed_at: "2026-08-13T12:00:01Z".into(),
+    };
+    let receipt =
+        SafeExportPartReceipt::from_publication(spec, &task, &report, output.clone()).unwrap();
+    let receipt_bytes = receipt.canonical_bytes(spec, &task, &output).unwrap();
+    let receipt_object = evidence_object(
+        &spec.part_receipt_uri(0).unwrap(),
+        "receipt-generation",
+        "receipt-etag",
+        &receipt_bytes,
+    );
+
+    let manifest = SourceManifest::new(spec.source_parts.clone()).unwrap();
+    let mut sidecar = TableReleaseSidecar {
+        schema_version: 1,
+        release_id: spec.export_id.clone(),
+        status: ReleaseStatus::Complete,
+        source: ReleaseSourceSnapshot {
+            canonical_table_uri: spec.canonical_table_uri.clone(),
+            snapshot_timestamp: spec.source_snapshot_timestamp.clone(),
+            manifest,
+            manifest_sha256: spec.source_manifest_sha256.clone(),
+        },
+        table: spec.table.clone(),
+        globals: spec.globals.clone(),
+        tool: spec.tool.clone(),
+        parquet: spec.parquet.clone(),
+        parts: vec![receipt.part],
+        totals: ReleaseTotals {
+            expected_partition_count: 1,
+            completed_partition_count: 1,
+            failed_partition_count: 0,
+            expected_part_count: 1,
+            completed_part_count: 1,
+            failed_part_count: 0,
+            source_row_count: None,
+            output_row_count: 1,
+            output_bytes: output_bytes.len() as u64,
+            aggregate_sha256: String::new(),
+        },
+        receipt_set_sha256: String::new(),
+    };
+    let receipt_set = sidecar.computed_receipt_set_sha256().unwrap();
+    sidecar.receipt_set_sha256 = receipt_set.clone();
+    sidecar.totals.aggregate_sha256 = receipt_set.clone();
+    sidecar.validate_complete().unwrap();
+    let release_bytes = serde_json::to_vec(&sidecar).unwrap();
+    let release_object = evidence_object(
+        &spec.release_uri().unwrap(),
+        "release-generation",
+        "release-etag",
+        &release_bytes,
+    );
+    let success = SafeExportSuccess {
+        schema_version: 1,
+        export_id: spec.export_id.clone(),
+        release_object,
+        receipts: vec![SafeExportReceiptIdentity {
+            partition_index: 0,
+            receipt_object,
+        }],
+        receipt_set_sha256: receipt_set,
+    };
+    let success_bytes = success.canonical_bytes(spec).unwrap();
+
+    serde_json::json!({
+        "schema_version": 1,
+        "objects": [
+            {
+                "path": UrlPath::from_uri(&spec.success_uri().unwrap()),
+                "version": "success-generation",
+                "etag": "success-etag",
+                "bytes_hex": hex(&success_bytes),
+            },
+            {
+                "path": UrlPath::from_uri(&spec.release_uri().unwrap()),
+                "version": "release-generation",
+                "etag": "release-etag",
+                "bytes_hex": hex(&release_bytes),
+            },
+            {
+                "path": UrlPath::from_uri(&spec.part_receipt_uri(0).unwrap()),
+                "version": "receipt-generation",
+                "etag": "receipt-etag",
+                "bytes_hex": hex(&receipt_bytes),
+            },
+            {
+                "path": UrlPath::from_uri(&output.uri),
+                "version": "output-generation",
+                "etag": "output-etag",
+                "bytes_hex": hex(output_bytes),
+            }
+        ]
+    })
+}
+
+#[test]
+fn black_box_validate_accepts_exact_local_evidence_bundle() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = spec();
+    let spec_path = temp.path().join("spec.json");
+    let bundle_path = temp.path().join("bundle.json");
+    let report_path = temp.path().join("report.json");
+    fs::write(&spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
+    fs::write(
+        &bundle_path,
+        serde_json::to_vec(&successful_evidence_bundle(&spec)).unwrap(),
+    )
+    .unwrap();
+
+    let result = run(&[
+        "safe-export",
+        "validate",
+        "--spec",
+        spec_path.to_str().unwrap(),
+        "--evidence-bundle",
+        bundle_path.to_str().unwrap(),
+        "--output",
+        report_path.to_str().unwrap(),
+    ]);
+    assert!(
+        result.status.success(),
+        "validate failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(report_path).unwrap()).unwrap();
+    assert_eq!(report["valid"], true);
+    assert_eq!(report["export_id"], spec.export_id);
+    assert_eq!(report["expected_partition_count"], 1);
+    assert_eq!(report["output_part_count"], 1);
+    assert_eq!(report["output_row_count"], 1);
 }
 
 struct UrlPath;

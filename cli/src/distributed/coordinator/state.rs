@@ -779,6 +779,7 @@ impl CoordinatorData {
         }
         // Sort descending so push_front preserves ascending order
         lost_parts.sort_by(|a, b| b.cmp(a));
+        let mut requeued_standard_task = false;
 
         for part_id in lost_parts {
             match self.clear_safe_export_assignment_for_partition(part_id) {
@@ -816,6 +817,7 @@ impl CoordinatorData {
                     dead_worker_id, part_id, retry_count, self.config.max_retries
                 );
                 self.pending_partitions.push_front(part_id);
+                requeued_standard_task = true;
 
                 // Add REQUEUED event to dashboard
                 self.log_event(JobEvent {
@@ -829,6 +831,12 @@ impl CoordinatorData {
                     ),
                 });
             }
+        }
+        if requeued_standard_task {
+            // The replacement attempt receives a fresh stuck-detection window;
+            // otherwise liveness and stuck checks in one monitor pass can
+            // requeue and immediately terminalize the same safe export.
+            self.last_progress_time = Instant::now();
         }
 
         // 2. Job-specific state requeuing

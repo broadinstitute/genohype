@@ -130,6 +130,70 @@ impl ArrowSchemaDescriptor {
         hasher.update(bytes);
         Ok(format!("{:x}", hasher.finalize()))
     }
+
+    /// Derive the project-owned deterministic descriptor from an Arrow schema
+    /// observed in a file reader. This lets independent Parquet readback prove
+    /// that the bytes themselves carry the schema bound by a release
+    /// fingerprint, rather than merely comparing two release-side declarations.
+    pub fn from_arrow_schema(schema: &Schema) -> Result<Self> {
+        let descriptor = Self {
+            schema_version: ARROW_SCHEMA_DESCRIPTOR_VERSION,
+            root: ArrowTypeDescriptor::Struct {
+                nullable: false,
+                fields: schema
+                    .fields()
+                    .iter()
+                    .map(|field| describe_arrow_field(field))
+                    .collect::<Result<Vec<_>>>()?,
+            },
+        };
+        descriptor.validate()?;
+        Ok(descriptor)
+    }
+}
+
+fn describe_arrow_field(field: &Field) -> Result<ArrowFieldDescriptor> {
+    Ok(ArrowFieldDescriptor {
+        name: field.name().clone(),
+        field_type: describe_arrow_data_type(field.data_type(), field.is_nullable())?,
+        metadata: field
+            .metadata()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    })
+}
+
+fn describe_arrow_data_type(data_type: &DataType, nullable: bool) -> Result<ArrowTypeDescriptor> {
+    let descriptor = match data_type {
+        DataType::Int32 => ArrowTypeDescriptor::Int32 { nullable },
+        DataType::Int64 => ArrowTypeDescriptor::Int64 { nullable },
+        DataType::Float32 => ArrowTypeDescriptor::Float32 { nullable },
+        DataType::Float64 => ArrowTypeDescriptor::Float64 { nullable },
+        DataType::Boolean => ArrowTypeDescriptor::Boolean { nullable },
+        DataType::Utf8 => ArrowTypeDescriptor::Utf8 { nullable },
+        DataType::Binary => ArrowTypeDescriptor::Binary { nullable },
+        DataType::List(element) => ArrowTypeDescriptor::List {
+            nullable,
+            element: Box::new(describe_arrow_data_type(
+                element.data_type(),
+                element.is_nullable(),
+            )?),
+        },
+        DataType::Struct(fields) => ArrowTypeDescriptor::Struct {
+            nullable,
+            fields: fields
+                .iter()
+                .map(|field| describe_arrow_field(field))
+                .collect::<Result<Vec<_>>>()?,
+        },
+        unsupported => {
+            return Err(HailError::InvalidFormat(format!(
+                "unsupported Arrow type in canonical schema descriptor: {unsupported}"
+            )))
+        }
+    };
+    Ok(descriptor)
 }
 
 fn validate_descriptor_type(descriptor: &ArrowTypeDescriptor, path: &str) -> Result<()> {
@@ -691,6 +755,21 @@ mod tests {
 
         let error = pair("+EBaseStruct{x:+EBinary}", "Struct{y:String}").unwrap_err();
         assert!(error.to_string().contains("field mismatch at $"), "{error}");
+    }
+
+    #[test]
+    fn observed_arrow_schema_round_trips_to_the_canonical_fingerprint() {
+        let plan = pair(
+            "+EBaseStruct{x:+EBinary,n:EArray[+EBaseStruct{value:+EInt64}]}",
+            "Struct{x:String,n:Array[Struct{value:Int64}]}",
+        )
+        .unwrap();
+        let observed = ArrowSchemaDescriptor::from_arrow_schema(plan.schema()).unwrap();
+        assert_eq!(observed, plan.descriptor());
+        assert_eq!(
+            observed.fingerprint_sha256().unwrap(),
+            plan.fingerprint_sha256().unwrap()
+        );
     }
 
     #[test]
