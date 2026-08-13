@@ -222,6 +222,20 @@ pub enum PoolCommands {
         zone: Option<String>,
     },
 
+    /// Print durable safe-export status for one exact coordinator job as JSON
+    SafeExportStatus {
+        /// Name of the pool
+        name: String,
+
+        /// Exact coordinator job ID (never inferred from current state)
+        #[arg(long)]
+        job_id: String,
+
+        /// GCP zone where the pool is located (default: from config or us-central1-a)
+        #[arg(long)]
+        zone: Option<String>,
+    },
+
     /// Print durable custom-task receipts for one exact coordinator job as JSON
     Receipts {
         /// Name of the pool

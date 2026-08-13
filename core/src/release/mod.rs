@@ -8,8 +8,9 @@
 mod safe_export;
 
 pub use safe_export::{
-    safe_export_part_receipt_uri, DecodedRowsHasher, ExportPartReport, SafeExportPartReceipt,
-    SafeExportPartTask, SafeExportSpec, SafeExportWorkerIdentity,
+    safe_export_part_receipt_uri, safe_export_release_uri, safe_export_success_uri,
+    DecodedRowsHasher, ExportPartReport, SafeExportPartReceipt, SafeExportPartTask,
+    SafeExportReceiptIdentity, SafeExportSpec, SafeExportSuccess, SafeExportWorkerIdentity,
     SAFE_EXPORT_COMPLETION_SCHEMA_VERSION, SAFE_EXPORT_RECEIPT_SCHEMA_VERSION,
     SAFE_EXPORT_SCHEMA_VERSION, SAFE_EXPORT_SHARDING_RULE_V1,
 };
@@ -63,11 +64,10 @@ pub struct ReleaseSourceSnapshot {
 impl ReleaseSourceSnapshot {
     pub fn validate(&self) -> Result<()> {
         self.manifest.validate()?;
-        if self.canonical_table_uri.is_empty() || self.snapshot_timestamp.is_empty() {
-            return Err(invalid(
-                "source table URI and snapshot timestamp are required",
-            ));
+        if self.canonical_table_uri.is_empty() {
+            return Err(invalid("source table URI is required"));
         }
+        validate_snapshot_timestamp(&self.snapshot_timestamp)?;
         let digest = self.manifest.digest_sha256()?;
         if digest != self.manifest_sha256 {
             return Err(invalid(format!(
@@ -324,6 +324,29 @@ impl GlobalsPayload {
             },
         }
     }
+
+    /// Reconstruct the represented value and verify its canonical digest.
+    pub fn validate_digest(&self) -> Result<()> {
+        let (value, declared) = match self {
+            Self::Empty { digest } => (crate::codec::EncodedValue::Struct(Vec::new()), digest),
+            Self::Null { digest } => (crate::codec::EncodedValue::Null, digest),
+            Self::Value { value, digest } => (
+                crate::codec::EncodedValue::try_from(value)
+                    .map_err(|error| invalid(format!("invalid lossless globals value: {error}")))?,
+                digest,
+            ),
+            Self::Error { message } => {
+                return Err(invalid(format!(
+                    "globals contain a decode error: {message}"
+                )))
+            }
+        };
+        let computed = canonical_digest(&value);
+        if &computed != declared {
+            return Err(invalid("globals canonical digest mismatch"));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -445,9 +468,7 @@ impl TableReleaseSidecar {
             ));
         }
         self.source.validate()?;
-        if matches!(self.globals, GlobalsPayload::Error { .. }) {
-            return Err(invalid("complete release cannot contain a globals error"));
-        }
+        self.globals.validate_digest()?;
 
         let expected: BTreeSet<_> = self
             .table
@@ -542,6 +563,26 @@ impl TableReleaseSidecar {
     }
 }
 
+fn validate_snapshot_timestamp(value: &str) -> Result<()> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'Z'
+        || bytes.iter().enumerate().any(|(index, byte)| {
+            !matches!(index, 4 | 7 | 10 | 13 | 16 | 19) && !byte.is_ascii_digit()
+        })
+    {
+        return Err(invalid(
+            "snapshot timestamp must be canonical UTC YYYY-MM-DDTHH:MM:SSZ",
+        ));
+    }
+    Ok(())
+}
+
 fn invalid(message: impl Into<String>) -> HailError {
     HailError::InvalidFormat(message.into())
 }
@@ -614,7 +655,7 @@ mod tests {
             status: ReleaseStatus::Complete,
             source: ReleaseSourceSnapshot {
                 canonical_table_uri: "gs://bucket/table".into(),
-                snapshot_timestamp: "now".into(),
+                snapshot_timestamp: "2026-08-12T12:00:00Z".into(),
                 manifest,
                 manifest_sha256,
             },
@@ -694,6 +735,27 @@ mod tests {
     }
 
     #[test]
+    fn globals_payload_validates_empty_null_and_value_digests() {
+        let values = [
+            EncodedValue::Struct(Vec::new()),
+            EncodedValue::Null,
+            EncodedValue::Binary(vec![0, 1, 2]),
+        ];
+        for value in values {
+            let valid = GlobalsPayload::from_value(&value);
+            valid.validate_digest().unwrap();
+            let mut broken = valid;
+            match &mut broken {
+                GlobalsPayload::Empty { digest }
+                | GlobalsPayload::Null { digest }
+                | GlobalsPayload::Value { digest, .. } => digest.sha256 = "f".repeat(64),
+                GlobalsPayload::Error { .. } => unreachable!(),
+            }
+            assert!(broken.validate_digest().is_err());
+        }
+    }
+
+    #[test]
     fn descriptor_json_is_strict_and_preserves_logical_distinctions() {
         let sidecar = sidecar();
         let json = serde_json::to_string(&sidecar).unwrap();
@@ -728,6 +790,12 @@ mod tests {
         broken.globals = GlobalsPayload::Error {
             message: "no".into(),
         };
+        assert!(broken.validate_complete().is_err());
+
+        let mut broken = valid.clone();
+        if let GlobalsPayload::Empty { digest } = &mut broken.globals {
+            digest.sha256 = "f".repeat(64);
+        }
         assert!(broken.validate_complete().is_err());
 
         let mut broken = valid;

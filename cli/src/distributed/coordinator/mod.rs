@@ -560,6 +560,130 @@ pub async fn run_coordinator(
                 monitor_state.lock().unwrap().config.job_spec.as_ref(),
                 Some(JobSpec::SafeExport(_))
             );
+
+            // Claim and run the safe finalizer only from the exact in-memory
+            // predicate. SQLite independently rechecks durable coverage and
+            // transitions running->finalizing before cloud I/O begins.
+            let safe_finalize = if is_safe_export
+                && total > 0
+                && completed == total
+                && failed == 0
+                && processing == 0
+                && pending == 0
+            {
+                let data = monitor_state.lock().unwrap();
+                let candidate = match (data.current_job_id.clone(), data.config.job_spec.as_ref()) {
+                    (Some(job_id), Some(JobSpec::SafeExport(spec)))
+                        if data.safe_export_assignments.is_empty()
+                            && data.completed_tasks.len() == total
+                            && (0..total).all(|index| data.completed_tasks.contains(&index)) =>
+                    {
+                        Some((job_id, spec.clone(), data.metrics_db.clone()))
+                    }
+                    _ => None,
+                };
+                match candidate {
+                    Some((job_id, spec, db)) => {
+                        match db.claim_safe_export_finalization(&job_id, &spec.export_id, total) {
+                            Ok(()) => Some((job_id, spec, db)),
+                            Err(error) => {
+                                eprintln!("Safe-export final predicate rejected: {error}");
+                                None
+                            }
+                        }
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+
+            if let Some((job_id, spec, db)) = safe_finalize {
+                let finalize_db = db.clone();
+                let finalize_spec = spec.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    services::safe_export::finalize_claimed(&finalize_spec, &finalize_db)
+                })
+                .await;
+                match result {
+                    Ok(Ok(finalized)) => {
+                        if let Err(error) = db.complete_safe_export_finalization(
+                            &job_id,
+                            &spec.export_id,
+                            &finalized,
+                            CoordinatorData::now_ms(),
+                        ) {
+                            eprintln!(
+                                "Safe-export completion DB commit failed; immutable evidence will be retried: {error}"
+                            );
+                            continue;
+                        }
+                        let mut data = monitor_state.lock().unwrap();
+                        if data.current_job_id.as_deref() == Some(job_id.as_str()) {
+                            data.pending_partitions.clear();
+                            data.processing_partitions.clear();
+                            data.completed_tasks.clear();
+                            data.failed_partitions.clear();
+                            data.retry_counts.clear();
+                            data.safe_export_assignment_attempts.clear();
+                            data.safe_export_assignments.clear();
+                            data.total_rows = 0;
+                            data.idle = true;
+                        }
+                        println!(
+                            "Safe export completed after verified _SUCCESS publication: {}",
+                            spec.export_id
+                        );
+                        continue;
+                    }
+                    Ok(Err(error)) => {
+                        let lower = error.to_ascii_lowercase();
+                        let integrity = [
+                            "conflict",
+                            "mismatch",
+                            "invalid",
+                            "does not match",
+                            "disagree",
+                            "requires exact complete",
+                            "exceeds",
+                            "not found",
+                            "precondition",
+                        ]
+                        .iter()
+                        .any(|needle| lower.contains(needle));
+                        if integrity {
+                            if let Err(terminal_error) = db.terminalize_safe_export(
+                                &job_id,
+                                "failed",
+                                Some(&error),
+                                CoordinatorData::now_ms(),
+                            ) {
+                                eprintln!(
+                                    "Safe-export integrity failure could not be terminalized: {terminal_error}"
+                                );
+                            } else {
+                                let mut data = monitor_state.lock().unwrap();
+                                data.safe_export_assignments.clear();
+                                data.processing_partitions.clear();
+                                data.pending_partitions.clear();
+                                data.idle = true;
+                            }
+                        } else {
+                            eprintln!(
+                                "Transient safe-export finalization error; finalizing run will retry: {error}"
+                            );
+                        }
+                        continue;
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "Safe-export finalizer task failed; finalizing run will retry: {error}"
+                        );
+                        continue;
+                    }
+                }
+            }
+
             // For batch/Manhattan: use the phase flag; for standard jobs: check partition counts.
             let partition_work_finished =
                 total > 0 && (completed + failed) == total && processing == 0 && pending == 0;
@@ -675,13 +799,24 @@ pub async fn run_coordinator(
                         let summary = build_dashboard_summary(&data);
                         let summary_json = serde_json::to_string(&summary).ok();
                         let terminal_status = terminal_job_status(failed);
-                        if let Err(e) = data.metrics_db.update_job_status(
+                        if is_safe_export {
+                            if let Err(error) = data.metrics_db.terminalize_safe_export(
+                                job_id,
+                                terminal_status,
+                                Some("safe-export partition attempts were exhausted"),
+                                end_time_ms,
+                            ) {
+                                eprintln!(
+                                    "Warning: failed to terminalize safe-export job: {error}"
+                                );
+                            }
+                        } else if let Err(error) = data.metrics_db.update_job_status(
                             job_id,
                             terminal_status,
                             Some(end_time_ms),
                             summary_json.as_deref(),
                         ) {
-                            eprintln!("Warning: failed to update job status in DB: {}", e);
+                            eprintln!("Warning: failed to update job status in DB: {error}");
                         }
                     }
 
@@ -819,6 +954,10 @@ pub async fn run_coordinator(
             "/api/jobs/:job_id/custom-receipts",
             get(api::jobs::get_custom_receipts),
         )
+        .route(
+            "/api/jobs/:job_id/safe-export",
+            get(api::jobs::get_safe_export_status),
+        )
         .route("/api/binary", get(api::jobs::serve_binary))
         .route("/api/export-metrics", post(api::jobs::export_metrics))
         .route("/api/events", get(api::jobs::get_events))
@@ -901,16 +1040,6 @@ fn safe_export_incompatibility(
     })
 }
 
-fn safe_export_dispatch_gate(
-    request: &WorkRequest,
-    expected: &genohype_core::release::SafeExportWorkerIdentity,
-) -> WorkResponse {
-    safe_export_incompatibility(request, expected).unwrap_or_else(|| WorkResponse::Incompatible {
-        required_protocol_version: SAFE_EXPORT_WORKER_PROTOCOL_VERSION,
-        message: "safe-export part receipt authority is installed; terminal resume/finalization is not yet installed".to_string(),
-    })
-}
-
 /// Handler for POST /work - worker requests work.
 async fn get_work(
     axum::extract::State(state): axum::extract::State<SharedState>,
@@ -919,11 +1048,9 @@ async fn get_work(
     let mut data = state.lock().unwrap();
 
     if let Some(JobSpec::SafeExport(spec)) = &data.config.job_spec {
-        // Stage 5a can durably converge part publication and receipts, but the
-        // Stage 5b resume/finalizer is still the only terminal authority. Do
-        // not publicly dispatch a job that cannot yet publish `_SUCCESS` and
-        // transition to completed.
-        return axum::Json(safe_export_dispatch_gate(&req, &spec.expected_worker));
+        if let Some(response) = safe_export_incompatibility(&req, &spec.expected_worker) {
+            return axum::Json(response);
+        }
     }
 
     // Custom tasks require workers that understand lease/session fencing. Reject
@@ -2226,16 +2353,40 @@ async fn get_status(
             )
         }
         JobExecutionState::Standard => {
-            let failed = data.failed_partitions.len();
-            let completed = data.completed_tasks.len();
-            let is_complete = (completed + failed) == data.config.total_tasks;
-            (
-                data.pending_partitions.len(),
-                data.processing_partitions.len(),
-                completed,
-                data.config.total_tasks,
-                is_complete,
-            )
+            if matches!(data.config.job_spec, Some(JobSpec::SafeExport(_))) {
+                let durable = data
+                    .current_job_id
+                    .as_deref()
+                    .and_then(|job_id| data.metrics_db.get_safe_export_status(job_id).ok());
+                if let Some(status) = durable {
+                    (
+                        status.missing_part_count,
+                        status.current_assignment_count,
+                        status.accepted_part_count,
+                        status.expected_part_count,
+                        status.complete,
+                    )
+                } else {
+                    (
+                        data.pending_partitions.len(),
+                        data.processing_partitions.len(),
+                        data.completed_tasks.len(),
+                        data.config.total_tasks,
+                        false,
+                    )
+                }
+            } else {
+                let failed = data.failed_partitions.len();
+                let completed = data.completed_tasks.len();
+                let is_complete = (completed + failed) == data.config.total_tasks;
+                (
+                    data.pending_partitions.len(),
+                    data.processing_partitions.len(),
+                    completed,
+                    data.config.total_tasks,
+                    is_complete,
+                )
+            }
         }
     };
 
@@ -3492,7 +3643,7 @@ mod lease_coordinator_tests {
     }
 
     #[test]
-    fn compatible_safe_export_worker_remains_fenced_until_terminal_finalizer() {
+    fn compatible_safe_export_worker_passes_terminal_protocol_gate() {
         let expected = genohype_core::release::SafeExportWorkerIdentity {
             git_commit: "sealed-commit".to_string(),
             build_identity: "sealed-build".to_string(),
@@ -3508,11 +3659,6 @@ mod lease_coordinator_tests {
             capabilities: vec!["safe_export_v1".to_string()],
         };
         assert!(safe_export_incompatibility(&request, &expected).is_none());
-        assert!(matches!(
-            safe_export_dispatch_gate(&request, &expected),
-            WorkResponse::Incompatible { message, .. }
-                if message.contains("terminal resume/finalization")
-        ));
 
         let mut wrong = request;
         wrong.binary_sha256 = Some("b".repeat(64));
@@ -3845,6 +3991,7 @@ mod lease_coordinator_tests {
                 None,
                 Vec::new(),
                 Vec::new(),
+                None,
             )
             .unwrap();
             assert!(data.custom_assignments.is_empty());
@@ -3872,6 +4019,7 @@ mod lease_coordinator_tests {
                 None,
                 Vec::new(),
                 Vec::new(),
+                None,
             )
             .unwrap();
             data.current_job_id.clone().unwrap()

@@ -295,6 +295,7 @@ pub(crate) async fn process_catalog_api(
             None,
             vec![],
             vec![],
+            None,
         ) {
             return Json(serde_json::json!({ "success": false, "error": e }));
         }

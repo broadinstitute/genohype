@@ -41,6 +41,9 @@ pub struct SafeExportSpec {
     pub canonical_table_uri: String,
     pub source_manifest_uri: String,
     pub source_manifest_sha256: String,
+    /// Stable inventory/snapshot time sealed into the export identity. It must
+    /// never be synthesized by a finalizer.
+    pub source_snapshot_timestamp: String,
     pub output_root_uri: String,
     /// Exact row-part object identities in source partition order.
     pub source_parts: Vec<SourceObject>,
@@ -82,6 +85,24 @@ pub struct SafeExportPartReceipt {
     pub task_id: String,
     pub partition_index: usize,
     pub part: PartReceipt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SafeExportReceiptIdentity {
+    pub partition_index: usize,
+    pub receipt_object: SourceObject,
+}
+
+/// Deterministic root of trust published only after `release.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SafeExportSuccess {
+    pub schema_version: u32,
+    pub export_id: String,
+    pub release_object: SourceObject,
+    pub receipts: Vec<SafeExportReceiptIdentity>,
+    pub receipt_set_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -298,6 +319,16 @@ impl SafeExportSpec {
         safe_export_part_receipt_uri(&self.output_root_uri, &self.export_id, partition_index)
     }
 
+    pub fn release_uri(&self) -> Result<String> {
+        self.validate()?;
+        safe_export_release_uri(&self.output_root_uri, &self.export_id)
+    }
+
+    pub fn success_uri(&self) -> Result<String> {
+        self.validate()?;
+        safe_export_success_uri(&self.output_root_uri, &self.export_id)
+    }
+
     fn validate_intent(&self) -> Result<()> {
         require_version("safe-export spec", self.schema_version)?;
         if self.receipt_schema_version != SAFE_EXPORT_RECEIPT_SCHEMA_VERSION
@@ -311,6 +342,7 @@ impl SafeExportSpec {
         validate_canonical_gcs_uri("source manifest URI", &self.source_manifest_uri, false)?;
         validate_canonical_gcs_uri("output root URI", &self.output_root_uri, false)?;
         validate_sha256("source manifest SHA-256", &self.source_manifest_sha256)?;
+        validate_canonical_timestamp("source snapshot timestamp", &self.source_snapshot_timestamp)?;
         validate_worker(&self.expected_worker)?;
         validate_tool(&self.tool)?;
         if self.expected_worker.git_commit != self.tool.git_commit
@@ -321,9 +353,7 @@ impl SafeExportSpec {
                 "expected worker identity must exactly match the release tool identity",
             ));
         }
-        if matches!(self.globals, GlobalsPayload::Error { .. }) {
-            return Err(invalid("safe-export globals cannot contain a decode error"));
-        }
+        self.globals.validate_digest()?;
         validate_parquet(&self.parquet, &self.table)?;
         validate_table(&self.table)?;
         if self.source_parts.len() != self.table.partitions.len() {
@@ -516,6 +546,53 @@ impl SafeExportPartReceipt {
         self.validate_against(spec, task, output_object)?;
         serde_json::to_vec(self)
             .map_err(|error| invalid(format!("failed to encode safe-export receipt: {error}")))
+    }
+}
+
+impl SafeExportSuccess {
+    pub fn validate_against(&self, spec: &SafeExportSpec) -> Result<()> {
+        spec.validate()?;
+        if self.schema_version != SAFE_EXPORT_COMPLETION_SCHEMA_VERSION
+            || self.schema_version != spec.completion_schema_version
+            || self.export_id != spec.export_id
+        {
+            return Err(invalid("safe-export success identity/version mismatch"));
+        }
+        validate_sha256("success receipt-set SHA-256", &self.receipt_set_sha256)?;
+        validate_source_object("release object", &self.release_object, false)?;
+        if self.release_object.uri != spec.release_uri()?
+            || self.release_object.sha256.as_deref().is_none()
+        {
+            return Err(invalid("safe-export success release object mismatch"));
+        }
+        if self.receipts.len() != spec.table.partitions.len() {
+            return Err(invalid("safe-export success receipt count mismatch"));
+        }
+        for (expected, identity) in self.receipts.iter().enumerate() {
+            validate_source_object("success receipt object", &identity.receipt_object, false)?;
+            if identity.partition_index != expected
+                || identity.receipt_object.uri != spec.part_receipt_uri(expected)?
+                || identity.receipt_object.sha256.as_deref().is_none()
+            {
+                return Err(invalid(
+                    "safe-export success receipts are not complete and canonically ordered",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn canonical_bytes(&self, spec: &SafeExportSpec) -> Result<Vec<u8>> {
+        self.validate_against(spec)?;
+        serde_json::to_vec(self)
+            .map_err(|error| invalid(format!("failed to encode safe-export success: {error}")))
+    }
+
+    pub fn from_json(data: &[u8], spec: &SafeExportSpec) -> Result<Self> {
+        let value: Self = serde_json::from_slice(data)
+            .map_err(|error| invalid(format!("invalid safe-export success JSON: {error}")))?;
+        value.validate_against(spec)?;
+        Ok(value)
     }
 }
 
@@ -1064,6 +1141,22 @@ pub fn safe_export_part_receipt_uri(
     ))
 }
 
+pub fn safe_export_release_uri(output_root_uri: &str, export_id: &str) -> Result<String> {
+    validate_canonical_gcs_uri("output root URI", output_root_uri, false)?;
+    validate_sha256("release export ID", export_id)?;
+    Ok(format!(
+        "{output_root_uri}/_genohype/exports/{export_id}/release.json"
+    ))
+}
+
+pub fn safe_export_success_uri(output_root_uri: &str, export_id: &str) -> Result<String> {
+    validate_canonical_gcs_uri("output root URI", output_root_uri, false)?;
+    validate_sha256("success export ID", export_id)?;
+    Ok(format!(
+        "{output_root_uri}/_genohype/exports/{export_id}/_SUCCESS"
+    ))
+}
+
 fn content_addressed_parquet_uri(output_root_uri: &str, sha256: &str) -> Result<String> {
     validate_canonical_gcs_uri("output root URI", output_root_uri, false)?;
     validate_sha256("published output SHA-256", sha256)?;
@@ -1201,6 +1294,7 @@ mod tests {
             canonical_table_uri: "gs://source/table.ht".into(),
             source_manifest_uri: "gs://authority/manifests/a.json".into(),
             source_manifest_sha256: source_manifest().digest_sha256().unwrap(),
+            source_snapshot_timestamp: "2026-08-12T12:00:00Z".into(),
             output_root_uri: "gs://output/release".into(),
             source_parts: source_manifest().objects,
             parquet: ParquetDescriptor {
@@ -1248,13 +1342,7 @@ mod tests {
                     output_part_ids: vec!["part-00000000".into()],
                 }],
             },
-            globals: GlobalsPayload::Empty {
-                digest: crate::codec::ValueDigest {
-                    canonical_encoding: "genohype-encoded-value-v1".into(),
-                    canonical_bytes: 1,
-                    sha256: "a".repeat(64),
-                },
-            },
+            globals: GlobalsPayload::from_value(&EncodedValue::Struct(Vec::new())),
             tool: ToolIdentity {
                 package_version: "0.1".into(),
                 git_commit: "commit-a".into(),
@@ -1358,6 +1446,9 @@ mod tests {
         let mut changed = first.clone();
         changed.expected_worker.binary_sha256 = "f".repeat(64);
         changed.tool.binary_sha256 = "f".repeat(64);
+        assert_ne!(changed.computed_export_id().unwrap(), first.export_id);
+        let mut changed = first.clone();
+        changed.source_snapshot_timestamp = "2026-08-12T12:00:01Z".into();
         assert_ne!(changed.computed_export_id().unwrap(), first.export_id);
         let mut changed = first;
         changed.source_parts[0].version = "8".into();
@@ -1463,6 +1554,50 @@ mod tests {
             .unwrap()
             .insert("unknown".into(), Value::Null);
         assert!(serde_json::from_value::<SafeExportPartReceipt>(value).is_err());
+    }
+
+    #[test]
+    fn safe_export_success_is_deterministic_strict_and_timestamp_free() {
+        let spec = spec();
+        let task = task(&spec);
+        let report = report(&spec, &task);
+        let output = published_object(&spec, &report);
+        let receipt =
+            SafeExportPartReceipt::from_publication(&spec, &task, &report, output).unwrap();
+        let receipt_bytes = serde_json::to_vec(&receipt).unwrap();
+        let receipt_sha = format!("{:x}", Sha256::digest(&receipt_bytes));
+        let release_sha = "9".repeat(64);
+        let success = SafeExportSuccess {
+            schema_version: SAFE_EXPORT_COMPLETION_SCHEMA_VERSION,
+            export_id: spec.export_id.clone(),
+            release_object: object(&spec.release_uri().unwrap(), 123, Some(&release_sha)),
+            receipts: vec![SafeExportReceiptIdentity {
+                partition_index: 0,
+                receipt_object: object(
+                    &spec.part_receipt_uri(0).unwrap(),
+                    receipt_bytes.len() as u64,
+                    Some(&receipt_sha),
+                ),
+            }],
+            receipt_set_sha256: "8".repeat(64),
+        };
+        let bytes = success.canonical_bytes(&spec).unwrap();
+        assert_eq!(
+            SafeExportSuccess::from_json(&bytes, &spec).unwrap(),
+            success
+        );
+        assert!(!String::from_utf8(bytes).unwrap().contains("timestamp"));
+        assert_eq!(
+            spec.success_uri().unwrap(),
+            format!(
+                "{}/_genohype/exports/{}/_SUCCESS",
+                spec.output_root_uri, spec.export_id
+            )
+        );
+
+        let mut broken = success;
+        broken.receipts[0].partition_index = 1;
+        assert!(broken.validate_against(&spec).is_err());
     }
 
     #[test]

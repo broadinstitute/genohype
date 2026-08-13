@@ -43,6 +43,16 @@ pub struct PublishedObject {
     pub disposition: PublicationDisposition,
 }
 
+/// Bytes and exact identity returned by a HEAD-bound conditioned read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConditionedRead {
+    pub path: Path,
+    pub bytes: bytes::Bytes,
+    pub byte_count: u64,
+    pub sha256: String,
+    pub put_result: PutResult,
+}
+
 /// Build a fresh staging location beneath a cloud output prefix.
 pub fn build_attempt_staging_location(
     output_prefix_uri: &str,
@@ -225,6 +235,145 @@ pub fn put_immutable(
             }
             Err(error) => Err(error.into()),
         }
+    })
+}
+
+/// HEAD an exact path, then read exactly that observed generation/ETag while
+/// hashing all bytes. Prefix listing is never used.
+pub fn read_conditioned(
+    store: Arc<dyn ObjectStore>,
+    path: &Path,
+    max_bytes: u64,
+) -> Result<ConditionedRead> {
+    let path = path.clone();
+    IO_RUNTIME.block_on(async move {
+        let head = store.head(&path).await?;
+        let head_size = u64::try_from(head.size)
+            .map_err(|_| conflict(format!("object {path} size exceeds u64")))?;
+        if head_size > max_bytes {
+            return Err(conflict(format!(
+                "object {path} exceeds conditioned-read limit {max_bytes}"
+            )));
+        }
+        if head.e_tag.is_none() && head.version.is_none() {
+            return Err(conflict(format!(
+                "object {path} has no identity for a conditioned read"
+            )));
+        }
+        let result = store
+            .get_opts(
+                &path,
+                GetOptions {
+                    if_match: head.e_tag.clone(),
+                    version: head.version.clone(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        validate_meta_identity("conditioned read", &head, &result.meta)?;
+        if result.meta.size != head.size {
+            return Err(conflict(format!(
+                "object {path} size changed during conditioned read"
+            )));
+        }
+        let identity = metadata_identity(&result.meta);
+        let mut stream = result.into_stream();
+        let mut digest = Sha256::new();
+        let mut bytes = Vec::with_capacity(head.size);
+        let mut observed = 0_u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            observed = observed
+                .checked_add(
+                    u64::try_from(chunk.len())
+                        .map_err(|_| conflict(format!("object {path} chunk size exceeds u64")))?,
+                )
+                .ok_or_else(|| conflict(format!("object {path} byte count overflow")))?;
+            if observed > head_size || observed > max_bytes {
+                return Err(conflict(format!(
+                    "object {path} exceeded its conditioned size"
+                )));
+            }
+            digest.update(&chunk);
+            bytes.extend_from_slice(&chunk);
+        }
+        if observed != head_size {
+            return Err(conflict(format!(
+                "object {path} returned {observed} bytes, expected {head_size}"
+            )));
+        }
+        Ok(ConditionedRead {
+            path,
+            bytes: bytes.into(),
+            byte_count: observed,
+            sha256: format!("{:x}", digest.finalize()),
+            put_result: identity,
+        })
+    })
+}
+
+/// Conditioned streaming HEAD/GET validation for a potentially large object.
+/// Unlike [`read_conditioned`], this retains no payload bytes.
+pub fn hash_conditioned(
+    store: Arc<dyn ObjectStore>,
+    path: &Path,
+    max_bytes: u64,
+) -> Result<PublishedObject> {
+    let path = path.clone();
+    IO_RUNTIME.block_on(async move {
+        let head = store.head(&path).await?;
+        let head_size = u64::try_from(head.size)
+            .map_err(|_| conflict(format!("object {path} size exceeds u64")))?;
+        if head_size > max_bytes || (head.e_tag.is_none() && head.version.is_none()) {
+            return Err(conflict(format!(
+                "object {path} is too large or lacks conditioned-read identity"
+            )));
+        }
+        let result = store
+            .get_opts(
+                &path,
+                GetOptions {
+                    if_match: head.e_tag.clone(),
+                    version: head.version.clone(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        validate_meta_identity("conditioned hash", &head, &result.meta)?;
+        if result.meta.size != head.size {
+            return Err(conflict(format!(
+                "object {path} size changed during conditioned hash"
+            )));
+        }
+        let identity = metadata_identity(&result.meta);
+        let mut stream = result.into_stream();
+        let mut digest = Sha256::new();
+        let mut observed = 0_u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            observed = observed
+                .checked_add(
+                    u64::try_from(chunk.len())
+                        .map_err(|_| conflict(format!("object {path} chunk size exceeds u64")))?,
+                )
+                .ok_or_else(|| conflict(format!("object {path} byte count overflow")))?;
+            if observed > head_size {
+                return Err(conflict(format!("object {path} exceeded its HEAD size")));
+            }
+            digest.update(&chunk);
+        }
+        if observed != head_size {
+            return Err(conflict(format!(
+                "object {path} returned {observed} bytes, expected {head_size}"
+            )));
+        }
+        Ok(PublishedObject {
+            path,
+            byte_count: observed,
+            sha256: format!("{:x}", digest.finalize()),
+            put_result: identity,
+            disposition: PublicationDisposition::ExistingIdentical,
+        })
     })
 }
 
@@ -808,6 +957,28 @@ mod tests {
         assert!(
             put_immutable(store, &path, bytes::Bytes::from_static(b"{\"receipt\":1}")).is_err()
         );
+    }
+
+    #[test]
+    fn conditioned_read_and_streaming_hash_reject_mutation() {
+        let concrete = Arc::new(TestStore::new(0));
+        let store: Arc<dyn ObjectStore> = concrete.clone();
+        let path = Path::from("receipts/readback.json");
+        let bytes = bytes::Bytes::from_static(b"{\"receipt\":1}");
+        IO_RUNTIME
+            .block_on(store.put(&path, bytes.clone().into()))
+            .unwrap();
+
+        let read = read_conditioned(store.clone(), &path, 1024).unwrap();
+        assert_eq!(read.bytes, bytes);
+        let hashed = hash_conditioned(store.clone(), &path, 1024).unwrap();
+        assert_eq!(hashed.sha256, read.sha256);
+        assert_eq!(hashed.byte_count, read.byte_count);
+
+        concrete
+            .mutate_conditioned_get
+            .store(true, Ordering::SeqCst);
+        assert!(read_conditioned(store, &path, 1024).is_err());
     }
 
     #[test]

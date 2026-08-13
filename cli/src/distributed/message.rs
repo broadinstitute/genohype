@@ -53,6 +53,32 @@ pub struct CustomReceiptSet {
     pub error: Option<String>,
 }
 
+/// Exact-job durable safe-export state. `complete` is true only after the
+/// conditioned `_SUCCESS` readback and atomic SQLite completion commit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SafeExportStatusResponse {
+    pub schema_version: u32,
+    pub job_id: String,
+    pub job_found: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub export_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    pub complete: bool,
+    pub expected_part_count: usize,
+    pub imported_part_count: usize,
+    pub accepted_part_count: usize,
+    pub missing_part_count: usize,
+    pub current_assignment_count: usize,
+    pub failed_attempt_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_object: Option<genohype_core::io::SourceObject>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub success_object: Option<genohype_core::io::SourceObject>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 // ============================================================================
 // Domain-Specific Task Types
 // ============================================================================

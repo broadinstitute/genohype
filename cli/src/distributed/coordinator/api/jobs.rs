@@ -10,7 +10,7 @@ use crate::distributed::coordinator::state::{
 use crate::distributed::message::{
     CancelRequest, CancelResponse, CustomReceiptSet, EventsResponse, ExportMetricsRequest,
     ExportMetricsResponse, FailuresResponse, JobConfigRequest, JobConfigResponse,
-    JobResultResponse, JobSpec, UpdateFleetRequest,
+    JobResultResponse, JobSpec, SafeExportStatusResponse, UpdateFleetRequest,
 };
 
 /// Query parameters for incremental GET endpoints
@@ -116,6 +116,45 @@ pub(crate) async fn submit_job(
         }
     }
 
+    // Safe registration performs cloud HEAD/conditioned GET work outside the
+    // coordinator mutex. Admission is checked both before and after preflight.
+    let safe_registration = if let JobSpec::SafeExport(spec) = &req.job_spec {
+        {
+            let data = state.lock().unwrap();
+            if !data.idle {
+                return axum::Json(JobConfigResponse {
+                    acknowledged: false,
+                    job_id: None,
+                    error: Some("Coordinator already has a job running.".to_string()),
+                });
+            }
+        }
+        let spec = spec.clone();
+        match tokio::task::spawn_blocking(move || {
+            services::safe_export::prepare_registration(&spec)
+        })
+        .await
+        {
+            Ok(Ok(plan)) => Some(plan),
+            Ok(Err(error)) => {
+                return axum::Json(JobConfigResponse {
+                    acknowledged: false,
+                    job_id: None,
+                    error: Some(format!("safe-export registration failed: {error}")),
+                })
+            }
+            Err(error) => {
+                return axum::Json(JobConfigResponse {
+                    acknowledged: false,
+                    job_id: None,
+                    error: Some(format!("safe-export registration task failed: {error}")),
+                })
+            }
+        }
+    } else {
+        None
+    };
+
     let mut data = state.lock().unwrap();
 
     // R1: Check if workers are available. A custom job may be durably
@@ -127,8 +166,12 @@ pub(crate) async fn submit_job(
         .filter(|w| w.status != WorkerStatus::SuspectedDead)
         .count();
     let zero_worker_custom = active_workers == 0 && matches!(&req.job_spec, JobSpec::Custom { .. });
+    let zero_worker_complete_safe = active_workers == 0
+        && safe_registration
+            .as_ref()
+            .is_some_and(|plan| plan.missing_partitions.is_empty());
 
-    if active_workers == 0 && !zero_worker_custom {
+    if active_workers == 0 && !zero_worker_custom && !zero_worker_complete_safe {
         return axum::Json(JobConfigResponse {
             acknowledged: false,
             job_id: None,
@@ -234,6 +277,7 @@ pub(crate) async fn submit_job(
         req.memory_weight_mb,
         req.filters.clone(),
         req.intervals.clone(),
+        safe_registration,
     ) {
         Ok(job_id) => job_id,
         Err(e) => {
@@ -346,6 +390,7 @@ pub(crate) async fn cancel_job(
     // terminal status and fence removal must commit together before cancellation
     // is acknowledged or any corresponding in-memory state is cleared.
     let is_custom_job = matches!(data.config.job_spec, Some(JobSpec::Custom { .. }));
+    let is_safe_job = matches!(data.config.job_spec, Some(JobSpec::SafeExport(_)));
     if is_custom_job {
         let Some(job_id) = data.current_job_id.as_deref() else {
             return axum::Json(CancelResponse {
@@ -363,9 +408,26 @@ pub(crate) async fn cancel_job(
                 message: format!("Cancellation was not committed: {error}"),
             });
         }
+    } else if is_safe_job {
+        let Some(job_id) = data.current_job_id.as_deref() else {
+            return axum::Json(CancelResponse {
+                success: false,
+                message: "Safe export has no durable job identity".to_string(),
+            });
+        };
+        if let Err(error) = data.metrics_db.terminalize_safe_export(
+            job_id,
+            "cancelled",
+            req.reason.as_deref().or(Some("operator cancellation")),
+            CoordinatorData::now_ms(),
+        ) {
+            return axum::Json(CancelResponse {
+                success: false,
+                message: format!("Cancellation was not committed: {error}"),
+            });
+        }
     } else if let Some(ref job_id) = data.current_job_id {
-        // Preserve the existing best-effort behavior for generic jobs, which do
-        // not use custom assignment receipts as an authorization boundary.
+        // Preserve the existing best-effort behavior for generic jobs.
         let end_time_ms = CoordinatorData::now_ms();
         if let Err(error) =
             data.metrics_db
@@ -416,6 +478,17 @@ pub(crate) async fn get_job_result(
 ) -> axum::Json<JobResultResponse> {
     let data = state.lock().unwrap();
 
+    if matches!(data.config.job_spec, Some(JobSpec::SafeExport(_))) {
+        return axum::Json(JobResultResponse {
+            available: false,
+            result: None,
+            error: Some(
+                "Safe-export completion is available only from the exact safe-export status endpoint after verified _SUCCESS"
+                    .to_string(),
+            ),
+        });
+    }
+
     // Check if the job is complete
     let failed = data.failed_partitions.len();
     let completed = data.completed_tasks.len();
@@ -452,6 +525,33 @@ pub(crate) async fn get_job_result(
 /// Handler for GET /api/jobs/:job_id/custom-receipts.
 /// Reads only exact-job durable SQLite receipts; no live aggregate cache or
 /// temporary result file participates in this response.
+pub(crate) async fn get_safe_export_status(
+    axum::extract::State(state): axum::extract::State<SharedState>,
+    axum::extract::Path(job_id): axum::extract::Path<String>,
+) -> axum::Json<SafeExportStatusResponse> {
+    let data = state.lock().unwrap();
+    match data.metrics_db.get_safe_export_status(&job_id) {
+        Ok(status) => axum::Json(status),
+        Err(error) => axum::Json(SafeExportStatusResponse {
+            schema_version: 1,
+            job_id,
+            job_found: false,
+            export_id: None,
+            phase: None,
+            complete: false,
+            expected_part_count: 0,
+            imported_part_count: 0,
+            accepted_part_count: 0,
+            missing_part_count: 0,
+            current_assignment_count: 0,
+            failed_attempt_count: 0,
+            release_object: None,
+            success_object: None,
+            error: Some(error),
+        }),
+    }
+}
+
 pub(crate) async fn get_custom_receipts(
     axum::extract::State(state): axum::extract::State<SharedState>,
     axum::extract::Path(job_id): axum::extract::Path<String>,

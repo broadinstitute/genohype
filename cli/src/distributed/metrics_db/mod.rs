@@ -2,7 +2,7 @@
 
 use crate::distributed::message::{
     CompleteRequest, CustomReceiptSet, CustomTaskReceipt, FailureRecord, JobEvent, JobRecord,
-    JobSpec, PhenotypeStatus, TelemetrySnapshot,
+    JobSpec, PhenotypeStatus, SafeExportStatusResponse, TelemetrySnapshot,
 };
 use rusqlite::{
     backup::{Backup, StepResult},
@@ -468,6 +468,7 @@ impl MetricsDb {
                 success_etag TEXT,
                 success_size INTEGER,
                 success_sha256 TEXT,
+                error TEXT,
                 created_at_ms INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_safe_export_runs_export
@@ -567,6 +568,18 @@ impl MetricsDb {
             END;
             "#,
         )?;
+
+        let safe_runs_has_error: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('safe_export_runs') WHERE name = 'error'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0)
+            > 0;
+        if !safe_runs_has_error {
+            conn.execute("ALTER TABLE safe_export_runs ADD COLUMN error TEXT", [])?;
+        }
 
         // Add job_id column to telemetry if it doesn't exist
         let has_job_id: bool = conn
@@ -946,6 +959,162 @@ impl MetricsDb {
             return Err(error);
         }
         Ok(())
+    }
+
+    /// Atomically create a fresh safe-export job/run and import only freshly
+    /// conditioned cloud evidence. Existing immutable rows must exact-match.
+    pub(crate) fn register_safe_export_job(
+        &self,
+        job: &JobRecord,
+        spec: &genohype_core::release::SafeExportSpec,
+        plan: &crate::distributed::coordinator::services::safe_export::SafeExportRegistrationPlan,
+    ) -> Result<(), String> {
+        spec.validate().map_err(|error| error.to_string())?;
+        if job.status != "running"
+            || job.total_tasks != spec.table.partitions.len()
+            || plan
+                .imported
+                .len()
+                .checked_add(plan.missing_partitions.len())
+                != Some(job.total_tasks)
+        {
+            return Err("safe-export registration plan/job shape mismatch".to_string());
+        }
+        let expected = i64::try_from(job.total_tasks)
+            .map_err(|_| "safe-export part count exceeds SQLite INTEGER".to_string())?;
+        let imported_count = i64::try_from(plan.imported.len())
+            .map_err(|_| "safe-export imported count exceeds SQLite INTEGER".to_string())?;
+        let job_spec_json = job
+            .job_spec_json
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO jobs (job_id, status, start_time_ms, end_time_ms, job_spec_json,
+                               input_path, total_tasks, job_type)
+             VALUES (?1, 'running', ?2, NULL, ?3, ?4, ?5, ?6)",
+            params![
+                job.job_id,
+                i64::try_from(job.start_time_ms)
+                    .map_err(|_| "job timestamp exceeds SQLite INTEGER".to_string())?,
+                job_spec_json,
+                job.input_path,
+                expected,
+                job.job_type,
+            ],
+        )
+        .map_err(|error| format!("failed to insert safe-export job: {error}"))?;
+        tx.execute(
+            "INSERT INTO safe_export_runs (
+                 job_id, export_id, expected_part_count, imported_part_count,
+                 completed_part_count, phase, created_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?4, 'running', ?5)",
+            params![
+                job.job_id,
+                spec.export_id,
+                expected,
+                imported_count,
+                i64::try_from(job.start_time_ms)
+                    .map_err(|_| "run timestamp exceeds SQLite INTEGER".to_string())?,
+            ],
+        )
+        .map_err(|error| format!("failed to register safe-export run: {error}"))?;
+
+        for imported in &plan.imported {
+            let part = &imported.envelope.part;
+            let receipt_sha = raw_sha256_hex(imported.receipt_json.as_bytes());
+            let receipt_size = i64::try_from(imported.receipt_json.len())
+                .map_err(|_| "receipt size exceeds SQLite INTEGER".to_string())?;
+            let partition = i64::try_from(imported.envelope.partition_index)
+                .map_err(|_| "partition exceeds SQLite INTEGER".to_string())?;
+            let attempt = i64::try_from(part.assignment_attempt)
+                .map_err(|_| "attempt exceeds SQLite INTEGER".to_string())?;
+            let output_size = i64::try_from(part.output_object.size)
+                .map_err(|_| "output size exceeds SQLite INTEGER".to_string())?;
+            let rows = i64::try_from(part.row_count)
+                .map_err(|_| "row count exceeds SQLite INTEGER".to_string())?;
+            let row_groups = i64::try_from(part.row_group_count)
+                .map_err(|_| "row-group count exceeds SQLite INTEGER".to_string())?;
+            tx.execute(
+                "INSERT OR IGNORE INTO safe_export_part_receipts (
+                     export_id, partition_id, task_id, first_job_id, first_assignment_attempt,
+                     receipt_json, receipt_sha256, receipt_uri, receipt_version, receipt_etag,
+                     receipt_size, receipt_object_sha256, output_uri, output_version, output_etag,
+                     output_size, output_sha256, row_count, row_group_count,
+                     schema_fingerprint_sha256, decoded_rows_sha256, accepted_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?7,
+                           ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                params![
+                    spec.export_id,
+                    partition,
+                    imported.envelope.task_id,
+                    job.job_id,
+                    attempt,
+                    imported.receipt_json,
+                    receipt_sha,
+                    imported.receipt_object.uri,
+                    imported.receipt_object.version,
+                    imported.receipt_object.etag,
+                    receipt_size,
+                    part.output_object.uri,
+                    part.output_object.version,
+                    part.output_object.etag,
+                    output_size,
+                    part.sha256,
+                    rows,
+                    row_groups,
+                    part.schema_fingerprint_sha256,
+                    part.decoded_rows_sha256,
+                    i64::try_from(job.start_time_ms)
+                        .map_err(|_| "acceptance timestamp exceeds SQLite INTEGER".to_string())?,
+                ],
+            )
+            .map_err(|error| format!("failed to import safe-export receipt: {error}"))?;
+            let exact: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM safe_export_part_receipts
+                     WHERE export_id=?1 AND partition_id=?2 AND task_id=?3
+                       AND receipt_json=?4 AND receipt_sha256=?5
+                       AND receipt_uri=?6 AND receipt_version=?7 AND receipt_etag=?8
+                       AND receipt_size=?9 AND receipt_object_sha256=?5
+                       AND output_uri=?10 AND output_version=?11 AND output_etag=?12
+                       AND output_size=?13 AND output_sha256=?14 AND row_count=?15
+                       AND row_group_count=?16 AND schema_fingerprint_sha256=?17
+                       AND decoded_rows_sha256=?18",
+                    params![
+                        spec.export_id,
+                        partition,
+                        imported.envelope.task_id,
+                        imported.receipt_json,
+                        receipt_sha,
+                        imported.receipt_object.uri,
+                        imported.receipt_object.version,
+                        imported.receipt_object.etag,
+                        receipt_size,
+                        part.output_object.uri,
+                        part.output_object.version,
+                        part.output_object.etag,
+                        output_size,
+                        part.sha256,
+                        rows,
+                        row_groups,
+                        part.schema_fingerprint_sha256,
+                        part.decoded_rows_sha256,
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            if exact != 1 {
+                return Err(format!(
+                    "conflicting immutable safe-export receipt for partition {}",
+                    imported.envelope.partition_index
+                ));
+            }
+        }
+        tx.commit().map_err(|error| error.to_string())
     }
 
     /// Register the durable run authority after the generic job row exists.
@@ -1695,6 +1864,264 @@ impl MetricsDb {
         Ok(())
     }
 
+    /// Exact durable final predicate and running->finalizing CAS.
+    pub(crate) fn claim_safe_export_finalization(
+        &self,
+        job_id: &str,
+        export_id: &str,
+        expected_parts: usize,
+    ) -> Result<(), String> {
+        if expected_parts == 0 {
+            return Err("safe-export finalization requires nonzero coverage".to_string());
+        }
+        let expected = i64::try_from(expected_parts)
+            .map_err(|_| "safe-export part count exceeds SQLite INTEGER".to_string())?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let exact: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM jobs JOIN safe_export_runs USING(job_id)
+                 WHERE job_id=?1 AND export_id=?2 AND jobs.status='running'
+                   AND safe_export_runs.phase IN ('running','finalizing')
+                   AND expected_part_count=?3 AND completed_part_count=?3",
+                params![job_id, export_id, expected],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let receipts: (i64, Option<i64>, Option<i64>, i64) = tx
+            .query_row(
+                "SELECT COUNT(*), MIN(partition_id), MAX(partition_id), COUNT(DISTINCT task_id)
+                 FROM safe_export_part_receipts WHERE export_id=?1",
+                [export_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .map_err(|error| error.to_string())?;
+        let assignments: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM current_safe_export_assignments WHERE job_id=?1",
+                [job_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let failures: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM safe_export_attempt_receipts
+                 WHERE job_id=?1 AND terminal_status='failed'",
+                [job_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if exact != 1
+            || receipts != (expected, Some(0), Some(expected - 1), expected)
+            || assignments != 0
+            || failures != 0
+        {
+            return Err("safe-export durable final predicate is not satisfied".to_string());
+        }
+        let phase: String = tx
+            .query_row(
+                "SELECT phase FROM safe_export_runs WHERE job_id=?1 AND export_id=?2",
+                params![job_id, export_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if phase == "running" {
+            let changed = tx
+                .execute(
+                    "UPDATE safe_export_runs SET phase='finalizing', error=NULL
+                     WHERE job_id=?1 AND export_id=?2 AND phase='running'",
+                    params![job_id, export_id],
+                )
+                .map_err(|error| error.to_string())?;
+            if changed != 1 {
+                return Err("safe-export finalization claim lost".to_string());
+            }
+        } else if phase != "finalizing" {
+            return Err("safe-export run is not claimable".to_string());
+        }
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn verify_safe_export_finalization_evidence(
+        &self,
+        export_id: &str,
+        plan: &crate::distributed::coordinator::services::safe_export::SafeExportRegistrationPlan,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM safe_export_part_receipts WHERE export_id=?1",
+                [export_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if usize::try_from(count).ok() != Some(plan.imported.len()) {
+            return Err("safe-export SQLite/cloud receipt count mismatch".to_string());
+        }
+        for imported in &plan.imported {
+            let part = &imported.envelope.part;
+            let exact: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM safe_export_part_receipts
+                     WHERE export_id=?1 AND partition_id=?2 AND task_id=?3
+                       AND receipt_json=?4 AND receipt_sha256=?5
+                       AND receipt_uri=?6 AND receipt_version=?7 AND receipt_etag=?8
+                       AND receipt_size=?9 AND receipt_object_sha256=?5
+                       AND output_uri=?10 AND output_version=?11 AND output_etag=?12
+                       AND output_size=?13 AND output_sha256=?14 AND row_count=?15
+                       AND row_group_count=?16 AND schema_fingerprint_sha256=?17
+                       AND decoded_rows_sha256=?18",
+                    params![
+                        export_id,
+                        i64::try_from(imported.envelope.partition_index)
+                            .map_err(|_| "partition exceeds SQLite INTEGER".to_string())?,
+                        imported.envelope.task_id,
+                        imported.receipt_json,
+                        raw_sha256_hex(imported.receipt_json.as_bytes()),
+                        imported.receipt_object.uri,
+                        imported.receipt_object.version,
+                        imported.receipt_object.etag,
+                        i64::try_from(imported.receipt_json.len())
+                            .map_err(|_| "receipt size exceeds SQLite INTEGER".to_string())?,
+                        part.output_object.uri,
+                        part.output_object.version,
+                        part.output_object.etag,
+                        i64::try_from(part.output_object.size)
+                            .map_err(|_| "output size exceeds SQLite INTEGER".to_string())?,
+                        part.sha256,
+                        i64::try_from(part.row_count)
+                            .map_err(|_| "row count exceeds SQLite INTEGER".to_string())?,
+                        i64::try_from(part.row_group_count)
+                            .map_err(|_| "row groups exceed SQLite INTEGER".to_string())?,
+                        part.schema_fingerprint_sha256,
+                        part.decoded_rows_sha256,
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            if exact != 1 {
+                return Err(format!(
+                    "safe-export SQLite/cloud evidence mismatch for partition {}",
+                    imported.envelope.partition_index
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn complete_safe_export_finalization(
+        &self,
+        job_id: &str,
+        export_id: &str,
+        finalized: &crate::distributed::coordinator::services::safe_export::FinalizedSafeExport,
+        end_time_ms: u64,
+    ) -> Result<(), String> {
+        let release_sha = finalized
+            .release_object
+            .sha256
+            .as_deref()
+            .ok_or_else(|| "release identity has no SHA-256".to_string())?;
+        let success_sha = finalized
+            .success_object
+            .sha256
+            .as_deref()
+            .ok_or_else(|| "success identity has no SHA-256".to_string())?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let changed = tx
+            .execute(
+                "UPDATE safe_export_runs SET phase='completed',
+                     release_uri=?3, release_version=?4, release_etag=?5,
+                     release_size=?6, release_sha256=?7,
+                     success_uri=?8, success_version=?9, success_etag=?10,
+                     success_size=?11, success_sha256=?12, error=NULL
+                 WHERE job_id=?1 AND export_id=?2 AND phase='finalizing'
+                   AND completed_part_count=expected_part_count
+                   AND NOT EXISTS (SELECT 1 FROM current_safe_export_assignments WHERE job_id=?1)
+                   AND NOT EXISTS (SELECT 1 FROM safe_export_attempt_receipts
+                                   WHERE job_id=?1 AND terminal_status='failed')",
+                params![
+                    job_id,
+                    export_id,
+                    finalized.release_object.uri,
+                    finalized.release_object.version,
+                    finalized.release_object.etag,
+                    i64::try_from(finalized.release_object.size)
+                        .map_err(|_| "release size exceeds SQLite INTEGER".to_string())?,
+                    release_sha,
+                    finalized.success_object.uri,
+                    finalized.success_object.version,
+                    finalized.success_object.etag,
+                    i64::try_from(finalized.success_object.size)
+                        .map_err(|_| "success size exceeds SQLite INTEGER".to_string())?,
+                    success_sha,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("safe-export completion predicate changed before DB commit".to_string());
+        }
+        let job_changed = tx
+            .execute(
+                "UPDATE jobs SET status='completed', end_time_ms=?2
+                 WHERE job_id=?1 AND status='running'",
+                params![
+                    job_id,
+                    i64::try_from(end_time_ms)
+                        .map_err(|_| "completion timestamp exceeds SQLite INTEGER".to_string())?
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if job_changed != 1 {
+            return Err("safe-export job completion CAS failed".to_string());
+        }
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    /// Atomic safe-export terminal transition and assignment-fence removal.
+    pub(crate) fn terminalize_safe_export(
+        &self,
+        job_id: &str,
+        status: &str,
+        error: Option<&str>,
+        end_time_ms: u64,
+    ) -> Result<(), String> {
+        if !matches!(status, "failed" | "cancelled" | "superseded") {
+            return Err("invalid safe-export terminal status".to_string());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|failure| failure.to_string())?;
+        let changed = tx
+            .execute(
+                "UPDATE safe_export_runs SET phase=?2, error=?3
+                 WHERE job_id=?1
+                   AND (phase='running' OR (?2='failed' AND phase='finalizing'))",
+                params![job_id, status, error],
+            )
+            .map_err(|failure| failure.to_string())?;
+        let job_changed = tx
+            .execute(
+                "UPDATE jobs SET status=?2, end_time_ms=?3
+                 WHERE job_id=?1 AND status='running'",
+                params![
+                    job_id,
+                    status,
+                    i64::try_from(end_time_ms)
+                        .map_err(|_| "terminal timestamp exceeds SQLite INTEGER".to_string())?
+                ],
+            )
+            .map_err(|failure| failure.to_string())?;
+        if changed != 1 || job_changed != 1 {
+            return Err("safe-export terminal transition lost authority".to_string());
+        }
+        tx.execute(
+            "DELETE FROM current_safe_export_assignments WHERE job_id=?1",
+            [job_id],
+        )
+        .map_err(|failure| failure.to_string())?;
+        tx.commit().map_err(|failure| failure.to_string())
+    }
+
     /// Persist a batch of custom assignments before exposing their lease tokens
     /// to a worker. Existing stale assignments may only be replaced by a newer
     /// attempt for the same exact job and task.
@@ -2236,6 +2663,177 @@ impl MetricsDb {
             canonical_sha256,
             receipts,
             error,
+        })
+    }
+
+    pub(crate) fn get_safe_export_status(
+        &self,
+        job_id: &str,
+    ) -> Result<SafeExportStatusResponse, String> {
+        type RunRow = (
+            String,
+            String,
+            String,
+            i64,
+            i64,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+        );
+        let conn = self.conn.lock().unwrap();
+        let run: Option<RunRow> = conn
+            .query_row(
+                "SELECT jobs.status, export_id, phase, expected_part_count,
+                        imported_part_count, completed_part_count,
+                        release_uri, release_version, release_etag, release_size, release_sha256,
+                        success_uri, success_version, success_etag, success_size, success_sha256,
+                        error
+                 FROM jobs JOIN safe_export_runs USING(job_id) WHERE job_id=?1",
+                [job_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                        row.get(12)?,
+                        row.get(13)?,
+                        row.get(14)?,
+                        row.get(15)?,
+                        row.get(16)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((
+            job_status,
+            export_id,
+            phase,
+            expected,
+            imported,
+            accepted,
+            release_uri,
+            release_version,
+            release_etag,
+            release_size,
+            release_sha,
+            success_uri,
+            success_version,
+            success_etag,
+            success_size,
+            success_sha,
+            durable_error,
+        )) = run
+        else {
+            return Ok(SafeExportStatusResponse {
+                schema_version: 1,
+                job_id: job_id.to_string(),
+                job_found: false,
+                export_id: None,
+                phase: None,
+                complete: false,
+                expected_part_count: 0,
+                imported_part_count: 0,
+                accepted_part_count: 0,
+                missing_part_count: 0,
+                current_assignment_count: 0,
+                failed_attempt_count: 0,
+                release_object: None,
+                success_object: None,
+                error: Some(format!("safe-export job {job_id} not found")),
+            });
+        };
+        let current: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM current_safe_export_assignments WHERE job_id=?1",
+                [job_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let failed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM safe_export_attempt_receipts
+                 WHERE job_id=?1 AND terminal_status='failed'",
+                [job_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let make_object = |uri: Option<String>,
+                           version: Option<String>,
+                           etag: Option<String>,
+                           size: Option<i64>,
+                           sha: Option<String>| {
+            match (uri, version, etag, size, sha) {
+                (Some(uri), Some(version), Some(etag), Some(size), Some(sha256)) if size >= 0 => {
+                    Some(genohype_core::io::SourceObject {
+                        uri,
+                        version,
+                        etag,
+                        size: size as u64,
+                        crc32c: None,
+                        sha256: Some(sha256),
+                    })
+                }
+                _ => None,
+            }
+        };
+        let release_object = make_object(
+            release_uri,
+            release_version,
+            release_etag,
+            release_size,
+            release_sha,
+        );
+        let success_object = make_object(
+            success_uri,
+            success_version,
+            success_etag,
+            success_size,
+            success_sha,
+        );
+        let complete = job_status == "completed"
+            && phase == "completed"
+            && success_object.is_some()
+            && accepted == expected
+            && expected > 0;
+        let fail_closed_error = durable_error.or_else(|| {
+            (!complete && phase == "completed")
+                .then(|| "completed phase lacks verified success evidence".to_string())
+        });
+        Ok(SafeExportStatusResponse {
+            schema_version: 1,
+            job_id: job_id.to_string(),
+            job_found: true,
+            export_id: Some(export_id),
+            phase: Some(phase),
+            complete,
+            expected_part_count: expected.max(0) as usize,
+            imported_part_count: imported.max(0) as usize,
+            accepted_part_count: accepted.max(0) as usize,
+            missing_part_count: expected.saturating_sub(accepted).max(0) as usize,
+            current_assignment_count: current.max(0) as usize,
+            failed_attempt_count: failed.max(0) as usize,
+            release_object,
+            success_object,
+            error: fail_closed_error,
         })
     }
 
@@ -3206,6 +3804,79 @@ mod tests {
             .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn safe_export_finalization_claim_and_completion_are_atomic_and_typed() {
+        let db = MetricsDb::in_memory().unwrap();
+        let export_id = "a".repeat(64);
+        let binary = "b".repeat(64);
+        let assignment = DurableSafeExportAssignment {
+            export_id: &export_id,
+            task_id: "part-00000000",
+            partition_id: 0,
+            assignment_attempt: 1,
+            lease_token: "raw-lease",
+            worker_id: "worker-1",
+            worker_git_commit: "commit-1",
+            worker_build_identity: "build-1",
+            worker_binary_sha256: &binary,
+        };
+        insert_safe_run(&db, "safe-job", &export_id, 1);
+        db.persist_safe_export_assignment("safe-job", "session-1", &assignment, 2)
+            .unwrap();
+        let (report, receipt, receipt_uri) = safe_completion_evidence(&assignment);
+        db.begin_safe_export_publication("safe-job", "session-1", &assignment, &report, 3)
+            .unwrap();
+        db.commit_safe_export_completion(
+            "safe-job",
+            "session-1",
+            &assignment,
+            &report,
+            &DurableSafeExportPartEvidence {
+                receipt_json: &receipt,
+                receipt_uri: &receipt_uri,
+                receipt_version: "14",
+                receipt_etag: "receipt-etag",
+            },
+            4,
+        )
+        .unwrap();
+        db.claim_safe_export_finalization("safe-job", &export_id, 1)
+            .unwrap();
+        let status = db.get_safe_export_status("safe-job").unwrap();
+        assert_eq!(status.phase.as_deref(), Some("finalizing"));
+        assert!(!status.complete);
+
+        let object = |uri: String, sha: char| genohype_core::io::SourceObject {
+            uri,
+            version: "20".into(),
+            etag: "etag-20".into(),
+            size: 10,
+            crc32c: None,
+            sha256: Some(sha.to_string().repeat(64)),
+        };
+        let finalized =
+            crate::distributed::coordinator::services::safe_export::FinalizedSafeExport {
+                release_object: object(
+                    format!("gs://bucket/output/_genohype/exports/{export_id}/release.json"),
+                    'c',
+                ),
+                success_object: object(
+                    format!("gs://bucket/output/_genohype/exports/{export_id}/_SUCCESS"),
+                    'd',
+                ),
+            };
+        db.complete_safe_export_finalization("safe-job", &export_id, &finalized, 5)
+            .unwrap();
+        let status = db.get_safe_export_status("safe-job").unwrap();
+        assert!(status.complete);
+        assert_eq!(status.phase.as_deref(), Some("completed"));
+        assert!(status.release_object.is_some());
+        assert!(status.success_object.is_some());
+        assert!(db
+            .terminalize_safe_export("safe-job", "cancelled", None, 6)
+            .is_err());
     }
 
     #[test]

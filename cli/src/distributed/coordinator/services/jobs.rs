@@ -26,11 +26,19 @@ pub(crate) fn start_new_job(
     memory_weight_mb: Option<u64>,
     filters: Vec<String>,
     intervals: Vec<String>,
+    safe_registration: Option<super::safe_export::SafeExportRegistrationPlan>,
 ) -> Result<String, String> {
     // Enrich specs if it's a batch job
     if let JobSpec::ManhattanBatch { ref mut specs, .. } = job_spec {
         super::batch_init::enrich_specs(specs);
     }
+    let safe_imported_rows = safe_registration
+        .as_ref()
+        .map(|plan| {
+            usize::try_from(plan.imported_rows)
+                .map_err(|_| "imported safe-export rows exceed platform usize".to_string())
+        })
+        .transpose()?;
     if let JobSpec::SafeExport(spec) = &job_spec {
         spec.validate()
             .map_err(|error| format!("invalid safe-export spec: {error}"))?;
@@ -49,33 +57,35 @@ pub(crate) fn start_new_job(
     if !data.idle {
         if let Some(ref prior_job_id) = data.current_job_id {
             let prior_is_custom = matches!(data.config.job_spec, Some(JobSpec::Custom { .. }));
-            if let Err(error) = data.metrics_db.update_job_status(
-                prior_job_id,
-                "superseded",
-                Some(CoordinatorData::now_ms()),
-                None,
-            ) {
-                if prior_is_custom {
-                    return Err(format!("failed to persist superseded job state: {error}"));
+            let prior_is_safe = matches!(data.config.job_spec, Some(JobSpec::SafeExport(_)));
+            if prior_is_safe {
+                data.metrics_db.terminalize_safe_export(
+                    prior_job_id,
+                    "superseded",
+                    Some("superseded by a fresh job submission"),
+                    CoordinatorData::now_ms(),
+                )?;
+            } else {
+                if let Err(error) = data.metrics_db.update_job_status(
+                    prior_job_id,
+                    "superseded",
+                    Some(CoordinatorData::now_ms()),
+                    None,
+                ) {
+                    if prior_is_custom {
+                        return Err(format!("failed to persist superseded job state: {error}"));
+                    }
+                    eprintln!("Warning: failed to persist superseded job state: {error}");
                 }
-                eprintln!("Warning: failed to persist superseded job state: {error}");
-            }
-            if let Err(error) = data
-                .metrics_db
-                .clear_current_custom_assignments(prior_job_id)
-            {
-                if prior_is_custom {
-                    return Err(format!("failed to clear superseded assignments: {error}"));
+                if let Err(error) = data
+                    .metrics_db
+                    .clear_current_custom_assignments(prior_job_id)
+                {
+                    if prior_is_custom {
+                        return Err(format!("failed to clear superseded assignments: {error}"));
+                    }
+                    eprintln!("Warning: failed to clear superseded assignments: {error}");
                 }
-                eprintln!("Warning: failed to clear superseded assignments: {error}");
-            }
-            if let Err(error) = data
-                .metrics_db
-                .clear_current_safe_export_assignments(prior_job_id)
-            {
-                return Err(format!(
-                    "failed to clear superseded safe-export assignments: {error}"
-                ));
             }
         }
     }
@@ -132,30 +142,31 @@ pub(crate) fn start_new_job(
         job_type: Some(job_spec.description().to_string()),
     };
 
-    if let Err(e) = data.metrics_db.insert_job(&job_record) {
+    let persistence = if let JobSpec::SafeExport(spec) = &job_spec {
+        let plan = safe_registration.as_ref().ok_or_else(|| {
+            "safe-export submission is missing its conditioned registration plan".to_string()
+        })?;
+        data.metrics_db
+            .register_safe_export_job(&job_record, spec, plan)
+    } else {
+        data.metrics_db
+            .insert_job(&job_record)
+            .map_err(|error| error.to_string())
+    };
+    if let Err(error) = persistence {
         data.current_job_id = None;
         return Err(format!(
-            "jobs require durable coordinator state; failed to persist job: {e}"
+            "jobs require durable coordinator state; failed to persist job: {error}"
         ));
     }
-    if let JobSpec::SafeExport(spec) = &job_spec {
-        if let Err(error) = data.metrics_db.register_safe_export_run(
-            &job_id,
-            &spec.export_id,
-            total_tasks,
-            job_record.start_time_ms,
-        ) {
-            let _ = data.metrics_db.update_job_status(
-                &job_id,
-                "failed",
-                Some(CoordinatorData::now_ms()),
-                Some(&format!("{{\"error\":{}}}", serde_json::json!(error))),
-            );
-            data.current_job_id = None;
-            return Err(format!(
-                "failed to register durable safe-export run: {error}"
-            ));
-        }
+    if let (JobSpec::SafeExport(_), Some(plan)) = (&job_spec, safe_registration.as_ref()) {
+        data.pending_partitions = plan.missing_partitions.iter().copied().collect();
+        data.completed_tasks = plan
+            .imported
+            .iter()
+            .map(|part| part.envelope.partition_index)
+            .collect();
+        data.total_rows = safe_imported_rows.expect("safe registration rows validated above");
     }
 
     // Mark as no longer idle

@@ -408,6 +408,42 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         Ok(())
     }
 
+    /// Print exact durable safe-export status without consulting live aggregate state.
+    pub(crate) fn safe_export_status(&self, name: &str, zone: &str, job_id: &str) -> Result<()> {
+        let instances = self.provider.list_instances(name)?;
+        let coordinator = instances
+            .iter()
+            .find(|instance| instance.name.ends_with("-coordinator"))
+            .ok_or_else(|| {
+                HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("No coordinator found for pool '{name}'"),
+                ))
+            })?;
+        let encoded_job_id: String =
+            url::form_urlencoded::byte_serialize(job_id.as_bytes()).collect();
+        let endpoint = format!("/api/jobs/{encoded_job_id}/safe-export");
+        let json = self.fetch_coordinator_api(coordinator, zone, &endpoint, 3000)?;
+        let response =
+            serde_json::from_str::<crate::distributed::message::SafeExportStatusResponse>(&json)
+                .map_err(|error| {
+                    HailError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("failed to parse safe-export status response: {error}"),
+                    ))
+                })?;
+        println!(
+            "{}",
+            serde_json::to_string(&response).map_err(|error| {
+                HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("failed to serialize safe-export status response: {error}"),
+                ))
+            })?
+        );
+        Ok(())
+    }
+
     /// Print deterministic durable custom-task receipts for one exact job.
     pub(crate) fn custom_receipts(&self, name: &str, zone: &str, job_id: &str) -> Result<()> {
         let instances = self.provider.list_instances(name)?;
