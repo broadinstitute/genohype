@@ -25,19 +25,25 @@
 //! arm the same fair range-pruning the BKD-indexed ES arm already has.
 
 use crate::codec::{EncodedField, EncodedType, EncodedValue};
+use crate::schema::{LogicalField, LogicalType};
 
 /// The materialized column name used by every store.
 pub const XPOS_FIELD: &str = "xpos";
 
-/// Append a non-nullable `xpos` `Int64` field to the end of a struct schema.
+/// Add a non-nullable derived `xpos` `Int64` field only when the source struct
+/// does not already declare one.
 ///
-/// Used by the schema-materializing loaders (ClickHouse `CREATE TABLE`, parquet
-/// Arrow schema) so the stored schema carries the derived column. Appending at the
-/// end keeps the positional row→schema alignment that `build_record_batch` relies
-/// on — [`augment_row_with_xpos`] appends the value in the same position. A no-op
-/// for a non-struct schema.
+/// Existing top-level `xpos` fields are source data: their type, nullability,
+/// position, and values must remain untouched. Otherwise the field is appended so
+/// its position stays aligned with [`augment_row_with_xpos`]. A no-op for a
+/// non-struct schema.
 pub fn augment_type_with_xpos(schema: &EncodedType) -> EncodedType {
     match schema {
+        EncodedType::EBaseStruct { fields, .. }
+            if fields.iter().any(|field| field.name == XPOS_FIELD) =>
+        {
+            schema.clone()
+        }
         EncodedType::EBaseStruct { required, fields } => {
             let mut new_fields = fields.clone();
             new_fields.push(EncodedField {
@@ -56,13 +62,34 @@ pub fn augment_type_with_xpos(schema: &EncodedType) -> EncodedType {
     }
 }
 
-/// Append the computed `xpos` value to the end of a struct row, aligned with the
-/// field [`augment_type_with_xpos`] appends. A row whose coordinates can't be
-/// determined gets `xpos = 0` (kept non-null so it remains a valid sort key); this
-/// never drops or reorders rows, so query *results* are unchanged. A no-op for a
-/// non-struct row.
+/// Keep the Hail logical schema aligned with [`augment_type_with_xpos`].
+/// Existing top-level `xpos` declarations are preserved exactly.
+pub fn augment_logical_type_with_xpos(schema: LogicalType) -> LogicalType {
+    match schema {
+        LogicalType::Struct { fields } if fields.iter().any(|field| field.name == XPOS_FIELD) => {
+            LogicalType::Struct { fields }
+        }
+        LogicalType::Struct { mut fields } => {
+            fields.push(LogicalField {
+                name: XPOS_FIELD.to_string(),
+                logical_type: LogicalType::Int64,
+            });
+            LogicalType::Struct { fields }
+        }
+        other => other,
+    }
+}
+
+/// Add a computed `xpos` value only when the row lacks a top-level source value.
+///
+/// A row whose coordinates cannot be determined gets derived `xpos = 0` (kept
+/// non-null so it remains a valid sort key). An existing `xpos`, including NULL,
+/// is never replaced or duplicated. A no-op for a non-struct row.
 pub fn augment_row_with_xpos(row: EncodedValue) -> EncodedValue {
     match row {
+        EncodedValue::Struct(fields) if fields.iter().any(|(name, _)| name == XPOS_FIELD) => {
+            EncodedValue::Struct(fields)
+        }
         EncodedValue::Struct(mut fields) => {
             let xpos = compute_xpos_for_fields(&fields).unwrap_or(0);
             fields.push((XPOS_FIELD.to_string(), EncodedValue::Int64(xpos)));
@@ -206,5 +233,153 @@ mod tests {
     fn test_compute_xpos_for_row_none_when_no_coords() {
         let row = EncodedValue::Struct(vec![("rsids".to_string(), EncodedValue::Array(vec![]))]);
         assert_eq!(compute_xpos_for_row(&row), None);
+    }
+
+    fn field(name: &str, encoded_type: EncodedType, index: usize) -> EncodedField {
+        EncodedField {
+            name: name.to_string(),
+            encoded_type,
+            index,
+        }
+    }
+
+    #[test]
+    fn absent_xpos_is_appended_to_schema_and_row_with_derived_value() {
+        let schema = EncodedType::EBaseStruct {
+            required: true,
+            fields: vec![field(
+                "variant_id",
+                EncodedType::EBinary { required: true },
+                0,
+            )],
+        };
+        let augmented = augment_type_with_xpos(&schema);
+        let EncodedType::EBaseStruct { fields, .. } = augmented else {
+            panic!("expected struct")
+        };
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[1].name, XPOS_FIELD);
+        assert_eq!(
+            fields[1].encoded_type,
+            EncodedType::EInt64 { required: true }
+        );
+
+        let row = EncodedValue::Struct(vec![(
+            "variant_id".to_string(),
+            EncodedValue::Binary(b"22-16050075-A-G".to_vec()),
+        )]);
+        let EncodedValue::Struct(fields) = augment_row_with_xpos(row) else {
+            panic!("expected struct")
+        };
+        assert_eq!(fields.len(), 2);
+        assert_eq!(
+            fields[1],
+            (XPOS_FIELD.to_string(), EncodedValue::Int64(22_016_050_075))
+        );
+
+        let logical = augment_logical_type_with_xpos(LogicalType::Struct {
+            fields: vec![LogicalField {
+                name: "variant_id".to_string(),
+                logical_type: LogicalType::String,
+            }],
+        });
+        let LogicalType::Struct { fields } = logical else {
+            panic!("expected struct")
+        };
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[1].name, XPOS_FIELD);
+        assert_eq!(fields[1].logical_type, LogicalType::Int64);
+    }
+
+    #[test]
+    fn existing_xpos_schema_and_value_are_preserved_exactly() {
+        let schema = EncodedType::EBaseStruct {
+            required: true,
+            fields: vec![
+                field("xpos", EncodedType::EInt64 { required: false }, 0),
+                field("variant_id", EncodedType::EBinary { required: true }, 1),
+            ],
+        };
+        assert_eq!(augment_type_with_xpos(&schema), schema);
+
+        let logical = LogicalType::Struct {
+            fields: vec![
+                LogicalField {
+                    name: XPOS_FIELD.to_string(),
+                    logical_type: LogicalType::Int64,
+                },
+                LogicalField {
+                    name: "variant_id".to_string(),
+                    logical_type: LogicalType::String,
+                },
+            ],
+        };
+        assert_eq!(augment_logical_type_with_xpos(logical.clone()), logical);
+
+        let row = EncodedValue::Struct(vec![
+            (XPOS_FIELD.to_string(), EncodedValue::Null),
+            (
+                "variant_id".to_string(),
+                EncodedValue::Binary(b"22-16050075-A-G".to_vec()),
+            ),
+        ]);
+        assert_eq!(augment_row_with_xpos(row.clone()), row);
+    }
+
+    #[test]
+    fn existing_xpos_writes_one_independently_readable_parquet_column() {
+        use crate::parquet::ParquetWriter;
+        use crate::schema::{ArrowSchemaPlan, PhysicalBinaryEncoding};
+        use arrow::array::Int64Array;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use std::fs::File;
+        use std::sync::Arc;
+
+        let source = EncodedType::EBaseStruct {
+            required: true,
+            fields: vec![
+                field("variant_id", EncodedType::EBinary { required: true }, 0),
+                field(XPOS_FIELD, EncodedType::EInt64 { required: false }, 1),
+            ],
+        };
+        let schema = augment_type_with_xpos(&source);
+        let plan = Arc::new(
+            ArrowSchemaPlan::physical_only(&schema, PhysicalBinaryEncoding::Utf8).unwrap(),
+        );
+        assert_eq!(
+            plan.schema()
+                .fields()
+                .iter()
+                .filter(|field| field.name() == XPOS_FIELD)
+                .count(),
+            1
+        );
+
+        let row = augment_row_with_xpos(EncodedValue::Struct(vec![
+            (
+                "variant_id".to_string(),
+                EncodedValue::Binary(b"22-16050075-A-G".to_vec()),
+            ),
+            (XPOS_FIELD.to_string(), EncodedValue::Int64(17)),
+        ]));
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap();
+        let mut writer = ParquetWriter::new(path, plan).unwrap();
+        writer.write_row(&row).unwrap();
+        writer.close().unwrap();
+
+        let mut reader = ParquetRecordBatchReaderBuilder::try_new(File::open(path).unwrap())
+            .unwrap()
+            .build()
+            .unwrap();
+        let batch = reader.next().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.schema().fields().len(), 2);
+        let xpos = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(xpos.value(0), 17);
     }
 }

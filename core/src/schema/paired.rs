@@ -245,6 +245,10 @@ impl ArrowSchemaPlan {
                 "root schema must be a struct".to_string(),
             ));
         };
+        // Arrow permits duplicate field names, but downstream readers such as
+        // DuckDB reject them. Validate the project descriptor before any writer is
+        // opened so every Parquet path, including safe export, fails closed.
+        validate_descriptor_type(&describe_type(&root), "$")?;
         let schema = Arc::new(Schema::new(
             fields
                 .iter()
@@ -755,6 +759,17 @@ mod tests {
 
         let error = pair("+EBaseStruct{x:+EBinary}", "Struct{y:String}").unwrap_err();
         assert!(error.to_string().contains("field mismatch at $"), "{error}");
+    }
+
+    #[test]
+    fn duplicate_field_names_fail_during_plan_preflight() {
+        let physical = ETypeParser::parse("+EBaseStruct{xpos:EInt64,xpos:+EInt64}").unwrap();
+        let error =
+            ArrowSchemaPlan::physical_only(&physical, PhysicalBinaryEncoding::Utf8).unwrap_err();
+        assert!(
+            error.to_string().contains("duplicate field at $"),
+            "{error}"
+        );
     }
 
     #[test]

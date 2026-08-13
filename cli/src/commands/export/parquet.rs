@@ -330,8 +330,9 @@ pub fn run_export_parquet(args: ExportParquetArgs) -> Result<()> {
                 );
             }
 
-            // Materialize a scalar `xpos` Int64 column (appended last) and SORT the
-            // rows by it before writing. gnomAD rows arrive locus-sorted but the
+            // Materialize a scalar `xpos` Int64 column when absent (appended last)
+            // and SORT the rows by genomic coordinate before writing. An existing
+            // source `xpos` is preserved exactly. gnomAD rows arrive locus-sorted but the
             // key is `(locus, alleles)` with `locus` a struct, so parquet row-group
             // min/max statistics on the struct can't prune a `position` range scan.
             // A scalar `xpos` column + xpos-sorted row order gives DuckDB usable
@@ -342,16 +343,9 @@ pub fn run_export_parquet(args: ExportParquetArgs) -> Result<()> {
             // the punch-list.
             let row_type = genohype_core::export::xpos::augment_type_with_xpos(&row_type);
             let plan = Arc::new(if let Some(projected_schema) = projected_schema {
-                let logical = match projected_schema.logical {
-                    genohype_core::schema::LogicalType::Struct { mut fields } => {
-                        fields.push(genohype_core::schema::LogicalField {
-                            name: "xpos".to_string(),
-                            logical_type: genohype_core::schema::LogicalType::Int64,
-                        });
-                        genohype_core::schema::LogicalType::Struct { fields }
-                    }
-                    _ => unreachable!("Hail row schema root was validated as a struct"),
-                };
+                let logical = genohype_core::export::xpos::augment_logical_type_with_xpos(
+                    projected_schema.logical,
+                );
                 genohype_core::schema::PairedSchema::new(row_type.clone(), logical)?.arrow_plan()?
             } else {
                 genohype_core::schema::ArrowSchemaPlan::physical_only(
@@ -376,8 +370,8 @@ pub fn run_export_parquet(args: ExportParquetArgs) -> Result<()> {
                 engine.query_iter_with_projection(&where_filters, intervals, decode_projection)?;
 
             // Apply the output projection so each row's top-level fields exactly
-            // match the (narrowed) `row_type`, then append the derived `xpos`
-            // (aligned with the schema augmentation above).
+            // match the (narrowed) `row_type`, then append a derived `xpos` only
+            // when the source lacks one (aligned with the schema augmentation above).
             let width_projection_ref = width_projection.clone();
             let iterator = iterator.map(move |row_result| {
                 row_result.map(|row| {

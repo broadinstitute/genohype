@@ -265,7 +265,8 @@ fn export_single_file(
         None => projected_row_type.clone(),
     };
 
-    // Materialize a scalar `xpos` Int64 column (appended last). The gnomAD key is
+    // Materialize a scalar `xpos` Int64 column when absent (appended last), while
+    // preserving an existing source `xpos` exactly. The gnomAD key is
     // `(locus, alleles)` where `locus` is a ClickHouse `Tuple(contig, position)`;
     // a MergeTree `ORDER BY (locus, alleles)` CANNOT prune `position` range
     // predicates (no index access on `locus.2`). Adding a scalar `xpos` and
@@ -282,14 +283,11 @@ fn export_single_file(
                         logical_type: genohype_core::schema::LogicalType::String,
                     });
                 }
-                fields.push(genohype_core::schema::LogicalField {
-                    name: "xpos".to_string(),
-                    logical_type: genohype_core::schema::LogicalType::Int64,
-                });
                 genohype_core::schema::LogicalType::Struct { fields }
             }
             _ => unreachable!("Hail row schema root was validated as a struct"),
         };
+        let logical = genohype_core::export::xpos::augment_logical_type_with_xpos(logical);
         genohype_core::schema::PairedSchema::new(effective_schema.clone(), logical)?.arrow_plan()?
     } else {
         genohype_core::schema::ArrowSchemaPlan::physical_only(
@@ -392,8 +390,8 @@ fn export_single_file(
             Some(col) => augment_row(row, col, &filename_stem),
             None => row,
         };
-        // Append the derived `xpos` last, aligned with the schema augmentation
-        // above (positional row→schema mapping in `build_record_batch`).
+        // Append the derived `xpos` last only when absent, aligned with the schema
+        // augmentation above (positional row→schema mapping in `build_record_batch`).
         let row = genohype_core::export::xpos::augment_row_with_xpos(row);
         chunk_rows.push(row);
         total_rows += 1;
