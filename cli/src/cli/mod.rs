@@ -6,6 +6,7 @@ pub mod manhattan;
 pub mod manifest;
 pub mod misc;
 pub mod pool;
+pub mod safe_export;
 pub mod shared;
 pub mod vcf;
 
@@ -19,6 +20,7 @@ pub use manhattan::*;
 pub use manifest::*;
 pub use misc::*;
 pub use pool::*;
+pub use safe_export::*;
 pub use shared::*;
 pub use vcf::*;
 
@@ -94,6 +96,12 @@ pub enum Commands {
     Manifest {
         #[command(subcommand)]
         command: ManifestCommands,
+    },
+
+    /// Seal and independently validate publication-safe exports
+    SafeExport {
+        #[command(subcommand)]
+        command: SafeExportCommands,
     },
 
     /// Generate Manhattan plots (PNG + JSON sidecar)

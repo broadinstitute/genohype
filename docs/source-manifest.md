@@ -1,6 +1,6 @@
 # Source-manifest inventory
 
-`genohype manifest inventory` creates a bounded, immutable inventory of the objects Genohype needs to read one Hail table. It is a read-only safety primitive: it does not scan row bodies while planning, modify the table, write cloud objects, or publish exported data.
+`genohype manifest inventory` creates a bounded, immutable inventory of the objects Genohype needs to read one Hail table. It is a read-only safety primitive: it does not scan row bodies while planning, modify the table, write cloud objects, upload the manifest, authorize an export, or publish exported data. Publication-safe export remains pre-production; read the explicit approval gate in the [safe-export runbook](safe-export.md) before any cloud or pool operation.
 
 ```bash
 genohype manifest inventory gs://bucket/path/table.ht \
@@ -47,4 +47,4 @@ Local roots must be absolute directories. Every selected regular file is streame
 
 With the `gcp` feature (enabled by default), GCS roots must be canonical `gs://bucket/nonempty-prefix` locations. Inventory uses Application Default Credentials, including `GOOGLE_APPLICATION_CREDENTIALS`. It paginates the live-object JSON API twice and requires stable generation, size, standard-base64 CRC32C, and JSON listing ETag observations. Each selected generation is then HEADed through the existing `object_store` GCS client; the manifest records that generation and the exact nonempty HEAD ETag used by pinned readers. Planning metadata bodies are read with both generation and ETag preconditions. Row, globals, and index data bodies are not downloaded, and source-body SHA-256 is intentionally absent for GCS objects.
 
-A build without `gcp` fails clearly for GCS input. S3 and HTTP roots remain unsupported by source-manifest inventory v1. Outputs are still local-only: GCS inventory never writes a cloud object.
+A build without `gcp` fails clearly for GCS input. S3 and HTTP roots remain unsupported by source-manifest inventory v1. Outputs are still local-only: GCS inventory never writes a cloud object. If a manifest is later sealed into a safe export, archive its exact bytes and digest; uploading those bytes to the sealed immutable URI and running the export are separate, approval-required operations.

@@ -11,7 +11,7 @@ use crate::distributed::message::{
     JobRecord, JobSpec, WorkRequest, WorkResponse, SAFE_EXPORT_WORKER_PROTOCOL_VERSION,
 };
 use crate::distributed::metrics_db::MetricsDb;
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::Router;
 use bytes::Bytes;
 use futures::stream::BoxStream;
@@ -42,6 +42,7 @@ use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use tower::ServiceExt;
 
 #[derive(Debug)]
 struct VersionedFaultStore {
@@ -757,15 +758,49 @@ async fn source_mutation_and_stale_attempt_cannot_publish() {
         .await
         .0;
     assert!(accepted.acknowledged);
-    let data = state.lock().unwrap();
-    assert_eq!(data.completed_tasks, HashSet::from([0]));
+    let job_id = {
+        let data = state.lock().unwrap();
+        assert_eq!(data.completed_tasks, HashSet::from([0]));
+        let job_id = data.current_job_id.clone().unwrap();
+        assert_eq!(
+            data.metrics_db
+                .get_safe_export_status(&job_id)
+                .unwrap()
+                .failed_attempt_count,
+            1
+        );
+        job_id
+    };
+    let app = Router::new()
+        .route(
+            "/api/jobs/:job_id/safe-export",
+            get(api::jobs::get_safe_export_status),
+        )
+        .with_state(state.clone());
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(format!("/api/jobs/{job_id}/safe-export"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let status: crate::distributed::message::SafeExportStatusResponse =
+        serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(status.job_id, job_id);
     assert_eq!(
-        data.metrics_db
-            .get_safe_export_status(data.current_job_id.as_deref().unwrap())
-            .unwrap()
-            .failed_attempt_count,
-        1
+        status.export_id.as_deref(),
+        Some(fixture.spec.export_id.as_str())
     );
+    assert_eq!(status.phase.as_deref(), Some("running"));
+    assert_eq!(status.accepted_part_count, 1);
+    assert_eq!(status.failed_attempt_count, 1);
+    assert!(!status.complete);
     assert_eq!(fixture.store.list_calls.load(Ordering::SeqCst), 0);
 }
 

@@ -294,6 +294,16 @@ fn validate_receipt_and_output(
     })
 }
 
+/// Resolve the sealed production GCS root and independently verify its exact
+/// completion graph. URI validation and backend resolution remain strict.
+pub(crate) fn verify_success_graph(
+    spec: &SafeExportSpec,
+) -> Result<VerifiedSafeExportSuccessGraph, String> {
+    let (store, output_prefix) = resolve_url_for_write(&spec.output_root_uri)
+        .map_err(|error| format!("failed to resolve safe-export output: {error}"))?;
+    verify_success_graph_with_store(spec, store, output_prefix)
+}
+
 /// Independently verify an existing completion graph without listing storage.
 /// Every path after `_SUCCESS` is first proven against the sealed spec or its
 /// parent object, then read at the exact identity observed by a conditioned

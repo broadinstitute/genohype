@@ -2,6 +2,9 @@
 
 This plan-first harness builds the current x86_64 Linux revision on the host, installs only packaged artifacts on a fresh private Ubuntu driver, runs deterministic core checks, and exercises a private coordinator plus one **on-demand** worker. There is no performance/32-worker mode and no coordinator-driven scaling in this slice.
 
+> [!IMPORTANT]
+> This harness tests legacy distributed Parquet and pool/custom-worker lifecycle behavior, **not publication-safe export**. Safe export is pre-production and only local/mock qualified; no cloud pilot is approved. Adding a separate safe-export cloud scenario requires explicit approval for the exact project, buckets/prefixes, pool, worker artifact, and cleanup plan. Do not turn `core-smoke.sh` into a production-like safe-export write.
+
 The default `pool-lifecycle` scenario exercises the complete requested contract. It is capability-gated: if attested bootstrap or detached job-ID output is unavailable, preflight lists every dependency and exits before creating a pool. It never guesses flags or silently skips assertions.
 
 The lifecycle scenario performs:

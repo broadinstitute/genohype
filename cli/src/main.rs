@@ -54,6 +54,7 @@ use commands::manhattan::{run_loci, run_locus, run_manhattan, run_manhattan_batc
 use commands::manifest::run_manifest_command;
 use commands::pool::run_pool_command;
 use commands::query::run_query;
+use commands::safe_export::run_safe_export_command;
 #[cfg(feature = "validation")]
 use commands::schema::{run_generate_schema, run_validate};
 use commands::service::run_service_command;
@@ -116,6 +117,7 @@ fn main() -> Result<()> {
             ExportCommands::Bigquery(args) => run_export_bigquery(args)?,
         },
         Commands::Manifest { command } => run_manifest_command(command)?,
+        Commands::SafeExport { command } => run_safe_export_command(command)?,
         Commands::Manhattan(args) => run_manhattan(args)?,
         Commands::ManhattanBatch(args) => run_manhattan_batch(args)?,
         Commands::Loci(args) => run_loci(args)?,

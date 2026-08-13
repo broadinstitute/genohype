@@ -20,7 +20,8 @@ The release contains optional VEP feature code, but VEP/LOFTEE annotation remain
 
 | Capability | Current status |
 |---|---|
-| Hail/VCF ingest, querying, export, and GCP pools | Available; derived from production use cases |
+| Hail/VCF ingest, querying, legacy export, and GCP pools | Available; derived from production use cases |
+| Publication-safe Parquet export | Pre-production; local/mock protocol qualification and operator surface available, with no approved production pilot |
 | Reusable Rust crates and server/MCP primitives | Available; pre-1.0 interfaces may change |
 | Reproducible binary releases | Available for macOS and x86-64 Linux |
 | Cross-backend correctness, performance, and cost evidence | Active development |

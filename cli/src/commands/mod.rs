@@ -10,6 +10,7 @@ pub mod manhattan;
 pub mod manifest;
 pub mod pool;
 pub mod query;
+pub mod safe_export;
 #[cfg(feature = "validation")]
 pub mod schema;
 pub mod service;

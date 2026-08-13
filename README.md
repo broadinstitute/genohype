@@ -13,6 +13,8 @@ Genohype is Rust toolkit for streaming genomic data from Hail tables and VCF fil
 
 > [!IMPORTANT]
 > Genohype is pre-1.0 research software. CLI and library interfaces may change, and the [VEP/LOFTEE integration remains experimental](ROADMAP.md#experimental-annotation-status). Full builds support S3 and HTTP data access, but distributed execution currently targets GCP; AWS and HPC execution adapters are not yet available.
+>
+> Publication-safe export is **pre-production**: its protocol is local/mock validated, but no production or public-data pilot is approved. See the mandatory [safe-export operator gate](docs/safe-export.md) before any cloud or pool operation.
 
 ## Capabilities
 
@@ -104,6 +106,8 @@ genohype info "gs://gcp-public-data--gnomad/release/4.1/ht/exomes/gnomad.exomes.
 | `summary` | Scan a dataset to calculate row counts and field statistics |
 | `query` | Stream rows with optional field and interval filters |
 | `manifest inventory` | Create a bounded immutable local or GCS source inventory ([details](docs/source-manifest.md)) |
+| `safe-export seal` | Create-new a local immutable GCS safe-export specification ([pre-production runbook](docs/safe-export.md)) |
+| `safe-export validate` | Independently follow the exact `_SUCCESS` graph without listing or SQLite |
 | `vcf index` | Create a tabix index for a BGZF-compressed VCF |
 | `cache clear` | Clear locally cached Hail metadata |
 
@@ -146,6 +150,7 @@ Database commands are available in published full-featured binaries. Source buil
 |---------|-------------|
 | `pool create`, `pool scale`, `pool destroy`, `pool list` | Manage GCP worker pools |
 | `pool submit`, `pool status`, `pool cancel` | Submit and control distributed jobs |
+| `pool safe-export-status --job-id ID` | Read distinct typed durable status for one exact safe-export job |
 | `pool workers`, `pool events`, `pool failures`, `pool logs` | Inspect workers and job activity |
 | `service` | Run coordinator or worker services directly |
 | `clickhouse` | Manage ClickHouse instances on GCP |

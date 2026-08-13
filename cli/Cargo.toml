@@ -44,6 +44,7 @@ tokio = { version = "1.35", features = ["rt-multi-thread", "sync", "macros"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
+async-trait = "0.1"
 thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
@@ -140,6 +141,6 @@ path = "src/bin/hail-server.rs"
 required-features = ["server"]
 
 [dev-dependencies]
-async-trait = "0.1"
 tempfile = "3.8"
+tower = { version = "0.5", features = ["util"] }
 criterion = "0.5"

@@ -533,9 +533,9 @@ pub(crate) async fn get_job_result(
     })
 }
 
-/// Handler for GET /api/jobs/:job_id/custom-receipts.
-/// Reads only exact-job durable SQLite receipts; no live aggregate cache or
-/// temporary result file participates in this response.
+/// Handler for GET /api/jobs/:job_id/safe-export.
+/// Reads only exact-job durable safe-export state; no live aggregate cache,
+/// generic counters, or custom receipts participate in this response.
 pub(crate) async fn get_safe_export_status(
     axum::extract::State(state): axum::extract::State<SharedState>,
     axum::extract::Path(job_id): axum::extract::Path<String>,
