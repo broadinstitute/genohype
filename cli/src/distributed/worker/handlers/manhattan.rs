@@ -368,10 +368,13 @@ pub fn process_manhattan_aggregate(
 
     let (rows, summary) = run_aggregation(spec)?;
 
-    // Verify expected outputs exist and write to checkpoint
-    if let Err(e) = verify_and_checkpoint(spec) {
-        // Log but don't fail - aggregation succeeded
-        eprintln!("Warning: checkpoint update failed: {}", e);
+    // The narrow gene export intentionally has no Manhattan manifest/checkpoint.
+    if !spec.gene_associations_only {
+        // Verify expected outputs exist and write to checkpoint
+        if let Err(e) = verify_and_checkpoint(spec) {
+            // Log but don't fail - aggregation succeeded
+            eprintln!("Warning: checkpoint update failed: {}", e);
+        }
     }
 
     Ok((rows, summary))

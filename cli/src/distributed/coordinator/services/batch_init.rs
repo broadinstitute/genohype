@@ -106,6 +106,7 @@ pub fn create_aggregate_spec_from_manhattan_spec(spec: &ManhattanSpec) -> Manhat
         exome_results: spec.exome.clone(),
         genome_results: spec.genome.clone(),
         gene_burden: spec.gene_burden.clone(),
+        gene_associations_only: spec.gene_associations_only,
         exome_exp_p: spec.exome_exp_p.clone(),
         genome_exp_p: spec.genome_exp_p.clone(),
         exome_annotations: spec.exome_annotations.clone(),

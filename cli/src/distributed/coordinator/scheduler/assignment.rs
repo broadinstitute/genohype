@@ -876,6 +876,7 @@ pub(crate) fn get_manhattan_work(
                 exome_results: manhattan.original_spec.exome.clone(),
                 genome_results: manhattan.original_spec.genome.clone(),
                 gene_burden: manhattan.original_spec.gene_burden.clone(),
+                gene_associations_only: manhattan.original_spec.gene_associations_only,
                 exome_exp_p: manhattan.original_spec.exome_exp_p.clone(),
                 genome_exp_p: manhattan.original_spec.genome_exp_p.clone(),
                 exome_annotations: manhattan.original_spec.exome_annotations.clone(),

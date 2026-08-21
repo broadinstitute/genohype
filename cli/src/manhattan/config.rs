@@ -143,6 +143,10 @@ pub struct JobSettings {
     /// Start coordinator in idle mode without queueing phenotypes
     #[serde(default)]
     pub idle: bool,
+
+    /// Export only gene_associations.parquet; skip variant scans, loci, QQ, and images.
+    #[serde(default)]
+    pub gene_associations_only: bool,
 }
 
 /// Settings for ClickHouse ingestion.

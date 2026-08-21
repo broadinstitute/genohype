@@ -1,11 +1,33 @@
 //! Ingest commands for loading data into ClickHouse.
 
 use crate::cli::IngestCommands;
-use crate::ingest::manhattan::run_ingest_task;
+use crate::ingest::manhattan::{run_gene_associations_ingest, run_ingest_task};
 use genohype_core::Result;
 
 pub fn run_ingest_command(command: IngestCommands) -> Result<()> {
     match command {
+        IngestCommands::GeneAssociations(args) => {
+            println!("Starting gene-associations-only ingestion");
+            println!("  Input: {}", args.input_dir);
+            println!("  ClickHouse: {}", args.clickhouse_url);
+            println!("  Empty clone target: {}.{}", args.database, args.table);
+            println!("  Concurrency: {}", args.concurrency);
+            println!(
+                "  Safety: this command never creates, drops, replaces, or resumes the target"
+            );
+            println!(
+                "  Retry: after any write failure, drop/recreate the clone outside this command"
+            );
+            let rows = run_gene_associations_ingest(
+                &args.input_dir,
+                &args.clickhouse_url,
+                &args.database,
+                &args.table,
+                args.concurrency,
+            )?;
+            println!("Gene association ingestion complete: {} rows", rows);
+            Ok(())
+        }
         IngestCommands::Manhattan(args) => {
             // For local/non-distributed execution, we run the ingestion directly
             // by parsing the input_dir to discover phenotypes

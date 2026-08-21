@@ -515,6 +515,10 @@ pub struct GeneAssociationRow {
     pub pvalue_skat: Option<f64>,
     pub beta_burden: Option<f64>,
     pub mac: Option<i64>,
+    /// Minor allele count among cases. Missing/absent source fields remain null.
+    pub mac_case: Option<i64>,
+    /// Minor allele count among controls. Missing/absent source fields remain null.
+    pub mac_control: Option<i64>,
 
     // Coordinates (for Manhattan + joins)
     pub contig: String,

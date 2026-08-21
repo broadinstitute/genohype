@@ -146,17 +146,18 @@ impl ClickHouseClient {
             let password = parsed.password().unwrap_or("");
 
             if !username.is_empty() {
-                // Rebuild URL without credentials
-                let mut clean_url = parsed.clone();
+                // Rebuild URL without credentials, preserving its exact path and
+                // query; authentication is sent separately as Basic auth.
+                let auth = Some((username.to_string(), password.to_string()));
+                let mut clean_url = parsed;
                 clean_url.set_username("").ok();
                 clean_url.set_password(None).ok();
-                let clean = clean_url.as_str().trim_end_matches('/').to_string();
-                (clean, Some((username.to_string(), password.to_string())))
+                (clean_url.to_string(), auth)
             } else {
-                (url.trim_end_matches('/').to_string(), None)
+                (parsed.to_string(), None)
             }
         } else {
-            (url.trim_end_matches('/').to_string(), None)
+            (url.to_string(), None)
         };
 
         Self {
@@ -224,6 +225,30 @@ impl ClickHouseClient {
     /// * `table_name` - Target table name
     /// * `data` - Parquet file contents as bytes
     pub fn insert_parquet_bytes(&self, table_name: &str, data: Vec<u8>) -> Result<()> {
+        self.insert_parquet_bytes_into(None, table_name, data)
+    }
+
+    /// Insert Parquet data into an explicitly qualified database and table.
+    ///
+    /// Database and table are accepted separately so callers cannot accidentally
+    /// rely on the server's current database or pass a dotted identifier.
+    pub fn insert_parquet_bytes_qualified(
+        &self,
+        database: &str,
+        table_name: &str,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        validate_clickhouse_identifier(database)?;
+        validate_clickhouse_identifier(table_name)?;
+        self.insert_parquet_bytes_into(Some(database), table_name, data)
+    }
+
+    fn insert_parquet_bytes_into(
+        &self,
+        database: Option<&str>,
+        table_name: &str,
+        data: Vec<u8>,
+    ) -> Result<()> {
         // Per-INSERT server-side memory cap. The deeply-nested gnomAD variant
         // schema (Array(Tuple(...)) columns) makes the Parquet→native conversion
         // memory-hungry; on a small VM where ClickHouse already holds a sizeable
@@ -234,14 +259,15 @@ impl ClickHouseClient {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(4_000_000_000);
-        // Build the insert URL
-        let url = format!(
-            "{}/?input_format_parquet_max_block_size=8192&max_insert_block_size=8192&max_memory_usage={}&query=INSERT%20INTO%20`{}`%20FORMAT%20Parquet",
-            self.base_url, max_memory_usage, table_name
-        );
+        let target = match database {
+            Some(database) => format!("`{}`.`{}`", database, table_name),
+            None => format!("`{}`", table_name),
+        };
+        let query = format!("INSERT INTO {} FORMAT Parquet", target);
+        let url = self.parquet_insert_url(&query, max_memory_usage)?;
 
         let response = self
-            .request(&url)
+            .request(url.as_str())
             .header("Content-Type", "application/octet-stream")
             .body(data)
             .send()?;
@@ -254,6 +280,21 @@ impl ClickHouseClient {
         }
 
         Ok(())
+    }
+
+    fn parquet_insert_url(&self, query: &str, max_memory_usage: u64) -> Result<url::Url> {
+        let mut url = url::Url::parse(&self.base_url).map_err(|error| {
+            ClickHouseError::InvalidSchema(format!(
+                "invalid ClickHouse base URL {:?}: {error}",
+                self.base_url
+            ))
+        })?;
+        url.query_pairs_mut()
+            .append_pair("input_format_parquet_max_block_size", "8192")
+            .append_pair("max_insert_block_size", "8192")
+            .append_pair("max_memory_usage", &max_memory_usage.to_string())
+            .append_pair("query", query);
+        Ok(url)
     }
 
     /// Insert rows supplied as newline-delimited JSON (ClickHouse `JSONEachRow`).
@@ -333,9 +374,84 @@ impl ClickHouseClient {
     }
 }
 
+fn validate_clickhouse_identifier(identifier: &str) -> Result<()> {
+    let mut chars = identifier.chars();
+    let valid_start = chars
+        .next()
+        .map(|c| c == '_' || c.is_ascii_alphabetic())
+        .unwrap_or(false);
+    if !valid_start || !chars.all(|c| c == '_' || c.is_ascii_alphanumeric()) {
+        return Err(ClickHouseError::InvalidSchema(format!(
+            "invalid ClickHouse identifier: {identifier:?}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parquet_insert_url_preserves_base_path_query_and_authority_auth() {
+        let client = ClickHouseClient::new(
+            "http://reader:secret@example.test/clickhouse/proxy/?token=a%2Fb&setting=1",
+        );
+        let url = client
+            .parquet_insert_url(
+                "INSERT INTO `clone`.`gene_associations` FORMAT Parquet",
+                1234,
+            )
+            .unwrap();
+
+        assert_eq!(url.scheme(), "http");
+        assert_eq!(url.host_str(), Some("example.test"));
+        assert_eq!(url.path(), "/clickhouse/proxy/");
+        assert_eq!(
+            client
+                .auth
+                .as_ref()
+                .map(|(user, password)| (user.as_str(), password.as_str())),
+            Some(("reader", "secret"))
+        );
+        let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
+        assert!(pairs.contains(&("token".to_string(), "a/b".to_string())));
+        assert!(pairs.contains(&("setting".to_string(), "1".to_string())));
+        assert!(pairs.contains(&("max_memory_usage".to_string(), "1234".to_string())));
+        assert!(pairs.contains(&(
+            "query".to_string(),
+            "INSERT INTO `clone`.`gene_associations` FORMAT Parquet".to_string()
+        )));
+    }
+
+    #[test]
+    fn parquet_insert_url_does_not_change_root_or_proxy_path() {
+        for (base, expected_path) in [
+            ("http://example.test", "/"),
+            ("http://example.test/", "/"),
+            ("http://example.test/clickhouse", "/clickhouse"),
+            ("http://example.test/clickhouse/", "/clickhouse/"),
+        ] {
+            let client = ClickHouseClient::new(base);
+            let url = client
+                .parquet_insert_url("INSERT INTO `t` FORMAT Parquet", 1)
+                .unwrap();
+            assert_eq!(url.path(), expected_path, "{base}");
+        }
+    }
+
+    #[test]
+    fn qualified_insert_identifiers_reject_dotted_or_unsafe_names() {
+        for valid in ["default", "gene_associations_v2", "_migration"] {
+            validate_clickhouse_identifier(valid).unwrap();
+        }
+        for invalid in ["", "db.table", "gene-associations", "x`; DROP TABLE y"] {
+            assert!(
+                validate_clickhouse_identifier(invalid).is_err(),
+                "{invalid}"
+            );
+        }
+    }
 
     #[test]
     fn test_primitive_type_mapping() {

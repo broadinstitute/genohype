@@ -28,6 +28,8 @@ use std::sync::Arc;
 /// - pvalue_skat: float64 (nullable)
 /// - beta_burden: float64 (nullable)
 /// - mac: int64 (nullable, minor allele count)
+/// - mac_case: int64 (nullable, minor allele count among cases)
+/// - mac_control: int64 (nullable, minor allele count among controls)
 /// - contig: string (chromosome)
 /// - gene_start_position: int32 (TSS for Manhattan)
 /// - xpos: int64 (pre-computed for efficient ordering)
@@ -131,6 +133,8 @@ impl<W: Write + Send> GeneAssociationWriter<W> {
         let mut pvalue_skat = Float64Builder::new();
         let mut beta_burden = Float64Builder::new();
         let mut mac = Int64Builder::new();
+        let mut mac_case = Int64Builder::new();
+        let mut mac_control = Int64Builder::new();
 
         // Location
         let mut contig = StringBuilder::new();
@@ -152,6 +156,8 @@ impl<W: Write + Send> GeneAssociationWriter<W> {
             pvalue_skat.append_option(row.pvalue_skat);
             beta_burden.append_option(row.beta_burden);
             mac.append_option(row.mac);
+            mac_case.append_option(row.mac_case);
+            mac_control.append_option(row.mac_control);
 
             // Location
             contig.append_value(&row.contig);
@@ -171,6 +177,8 @@ impl<W: Write + Send> GeneAssociationWriter<W> {
             Arc::new(pvalue_skat.finish()),
             Arc::new(beta_burden.finish()),
             Arc::new(mac.finish()),
+            Arc::new(mac_case.finish()),
+            Arc::new(mac_control.finish()),
             Arc::new(contig.finish()),
             Arc::new(gene_start_position.finish()),
             Arc::new(xpos.finish()),
@@ -199,9 +207,76 @@ pub fn gene_association_schema() -> Schema {
         Field::new("pvalue_skat", DataType::Float64, true),
         Field::new("beta_burden", DataType::Float64, true),
         Field::new("mac", DataType::Int64, true),
+        Field::new("mac_case", DataType::Int64, true),
+        Field::new("mac_control", DataType::Int64, true),
         // Location (non-nullable)
         Field::new("contig", DataType::Utf8, false),
         Field::new("gene_start_position", DataType::Int32, false),
         Field::new("xpos", DataType::Int64, false),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Array, Int64Array};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use std::io::Cursor;
+
+    fn row(mac_case: Option<i64>, mac_control: Option<i64>) -> GeneAssociationRow {
+        GeneAssociationRow {
+            gene_id: "ENSG000001".to_string(),
+            gene_symbol: "GENE1".to_string(),
+            annotation: "pLoF".to_string(),
+            max_maf: 0.001,
+            phenotype: "1001".to_string(),
+            ancestry: "meta".to_string(),
+            pvalue: Some(0.01),
+            pvalue_burden: None,
+            pvalue_skat: None,
+            beta_burden: None,
+            mac: Some(4),
+            mac_case,
+            mac_control,
+            contig: "chr1".to_string(),
+            gene_start_position: 123,
+            xpos: 1_000_000_123,
+        }
+    }
+
+    #[test]
+    fn gene_mac_parquet_schema_and_values_preserve_zero_and_null() {
+        let mut writer = GeneAssociationWriter::from_writer(Cursor::new(Vec::new())).unwrap();
+        writer.write(row(Some(0), Some(12))).unwrap();
+        writer.write(row(None, None)).unwrap();
+        let bytes = writer.into_inner().unwrap().into_inner();
+
+        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes)).unwrap();
+        let schema = builder.schema();
+        for name in ["mac_case", "mac_control"] {
+            let field = schema.field_with_name(name).unwrap();
+            assert_eq!(field.data_type(), &DataType::Int64);
+            assert!(field.is_nullable());
+        }
+
+        let mut reader = builder.build().unwrap();
+        let batch = reader.next().unwrap().unwrap();
+        let cases = batch
+            .column_by_name("mac_case")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let controls = batch
+            .column_by_name("mac_control")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        assert_eq!(cases.value(0), 0);
+        assert!(cases.is_null(1));
+        assert_eq!(controls.value(0), 12);
+        assert!(controls.is_null(1));
+    }
 }

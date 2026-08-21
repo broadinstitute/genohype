@@ -234,6 +234,10 @@ pub struct ManhattanBatchArgs {
     #[arg(long)]
     pub idle: bool,
 
+    /// Export only gene_associations.parquet (no variant/locus/QQ/image products)
+    #[arg(long, conflicts_with = "scan_only")]
+    pub gene_associations_only: bool,
+
     /// Path to TOML configuration file for styling
     #[arg(long)]
     pub style_config: Option<String>,

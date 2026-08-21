@@ -184,6 +184,36 @@ pub struct StressArgs {
 pub enum IngestCommands {
     /// Ingest Manhattan outputs into ClickHouse
     Manhattan(IngestManhattanArgs),
+    /// Load specialized gene association Parquets into an empty explicit clone target
+    GeneAssociations(IngestGeneAssociationsArgs),
+}
+
+/// Arguments for the empty-clone-only specialized gene association loader.
+///
+/// The loader never creates, drops, replaces, or resumes its target. After any
+/// write failure, drop/recreate the clone outside this command before retrying.
+#[cfg(feature = "clickhouse")]
+#[derive(Args, Debug)]
+pub struct IngestGeneAssociationsArgs {
+    /// Directory tree (or one file) containing gene_associations.parquet files
+    #[arg(long)]
+    pub input_dir: String,
+
+    /// ClickHouse URL (e.g., http://clickhouse:8123)
+    #[arg(long)]
+    pub clickhouse_url: String,
+
+    /// Explicit target database (required; no default)
+    #[arg(long)]
+    pub database: String,
+
+    /// Explicit empty clone table (required; no default)
+    #[arg(long)]
+    pub table: String,
+
+    /// Number of Parquet uploads to run concurrently
+    #[arg(long, default_value_t = 1)]
+    pub concurrency: usize,
 }
 
 /// Arguments for ingesting Manhattan pipeline outputs into ClickHouse.

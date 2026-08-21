@@ -17,6 +17,8 @@ CREATE TABLE IF NOT EXISTS gene_associations (
     pvalue_skat          Nullable(Float64),
     beta_burden          Nullable(Float64),
     mac                  Nullable(Int64),
+    mac_case             Nullable(Int64),
+    mac_control          Nullable(Int64),
 
     -- Coordinates (for gene manhattan)
     contig               LowCardinality(String),

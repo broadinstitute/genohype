@@ -289,6 +289,23 @@ fn encoded_as_f64(val: &EncodedValue) -> Option<f64> {
     }
 }
 
+/// Normalize a present Hail Int32 or Int64 value to i64 without conflating
+/// null/absent with zero. A present non-null value of any other type is source
+/// schema drift and must fail rather than silently becoming a Parquet null.
+fn get_optional_i64(fields: &[(String, EncodedValue)], name: &str) -> Result<Option<i64>> {
+    let Some((_, value)) = fields.iter().find(|(field_name, _)| field_name == name) else {
+        return Ok(None);
+    };
+    match value {
+        EncodedValue::Int32(value) => Ok(Some(i64::from(*value))),
+        EncodedValue::Int64(value) => Ok(Some(*value)),
+        EncodedValue::Null => Ok(None),
+        other => Err(crate::HailError::InvalidFormat(format!(
+            "gene burden field {name} must be Int32, Int64, or null when present; got {other:?}"
+        ))),
+    }
+}
+
 /// Process a gene burden table with compound keys and multiple p-value fields.
 ///
 /// This handles the complex gene burden schema with:
@@ -524,13 +541,6 @@ pub fn scan_gene_burden_to_parquet(
                     .find(|(n, _)| n == k)
                     .and_then(|(_, v)| v.as_i32())
             };
-            let get_i64 = |k: &str| -> Option<i64> {
-                fields
-                    .iter()
-                    .find(|(n, _)| n == k)
-                    .and_then(|(_, v)| v.as_i64())
-            };
-
             // Extract key fields
             let gene_id = get_str("gene_id").unwrap_or_default();
             let gene_symbol = get_str("gene_symbol").unwrap_or_default();
@@ -550,7 +560,9 @@ pub fn scan_gene_burden_to_parquet(
             let pvalue_skat = get_f64("Pvalue_SKAT");
             // Try BETA_Burden first, then META_Stats_Burden (used for META ancestry)
             let beta_burden = get_f64("BETA_Burden").or_else(|| get_f64("META_Stats_Burden"));
-            let mac = get_i64("MAC");
+            let mac = get_optional_i64(&fields, "MAC")?;
+            let mac_case = get_optional_i64(&fields, "MAC_case")?;
+            let mac_control = get_optional_i64(&fields, "MAC_control")?;
 
             // Extract location - try interval first, then CHR/POS
             let (contig, start, end) = extract_gene_location(&fields);
@@ -568,6 +580,8 @@ pub fn scan_gene_burden_to_parquet(
                 pvalue_skat,
                 beta_burden,
                 mac,
+                mac_case,
+                mac_control,
                 contig: normalize_contig_name(&contig),
                 gene_start_position: start,
                 xpos: calculate_xpos(&contig, start),
@@ -882,5 +896,43 @@ impl GeneWriterTrait for CloudGeneWriter {
         })?; // Approximate legacy return value
         cloud_writer.finish()?;
         Ok(bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gene_mac_optional_integer_extraction_accepts_both_widths_and_preserves_missingness() {
+        let fields = vec![
+            ("i32".to_string(), EncodedValue::Int32(17)),
+            ("i64".to_string(), EncodedValue::Int64(9_000_000_000)),
+            ("null".to_string(), EncodedValue::Null),
+            ("zero".to_string(), EncodedValue::Int32(0)),
+        ];
+
+        assert_eq!(get_optional_i64(&fields, "i32").unwrap(), Some(17));
+        assert_eq!(
+            get_optional_i64(&fields, "i64").unwrap(),
+            Some(9_000_000_000)
+        );
+        assert_eq!(get_optional_i64(&fields, "null").unwrap(), None);
+        assert_eq!(get_optional_i64(&fields, "absent").unwrap(), None);
+        assert_eq!(get_optional_i64(&fields, "zero").unwrap(), Some(0));
+    }
+
+    #[test]
+    fn gene_mac_optional_integer_extraction_rejects_present_wrong_types() {
+        for value in [
+            EncodedValue::Float64(12.0),
+            EncodedValue::Boolean(true),
+            EncodedValue::Binary(b"12".to_vec()),
+        ] {
+            let fields = vec![("MAC_case".to_string(), value)];
+            let error = get_optional_i64(&fields, "MAC_case").unwrap_err();
+            assert!(error.to_string().contains("MAC_case"));
+            assert!(error.to_string().contains("Int32, Int64, or null"));
+        }
     }
 }

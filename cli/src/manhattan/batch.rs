@@ -49,6 +49,8 @@ pub struct BatchConfig {
     pub genome_annotations: Option<String>,
     /// Styling configuration for plots
     pub styling: ManhattanConfig,
+    /// Export only the specialized gene association Parquet.
+    pub gene_associations_only: bool,
 }
 
 /// Summary statistics for loaded batch.
@@ -319,6 +321,75 @@ pub fn load_and_group_assets(
     Ok(result)
 }
 
+/// Enforce the clone-oriented gene-only selection contract.
+///
+/// When explicit analysis IDs are supplied they are an exact request in this
+/// mode (not merely guaranteed additions): each unique ID must resolve to one
+/// ancestry-filtered input and that input must have a gene asset. Without
+/// explicit IDs, every input selected by the normal filters must have one.
+pub(crate) fn validate_gene_associations_only_inputs(
+    mut inputs: Vec<PhenotypeInput>,
+    requested_ids: Option<&[String]>,
+) -> Result<Vec<PhenotypeInput>> {
+    if let Some(requested_ids) = requested_ids {
+        let requested: std::collections::HashSet<&str> =
+            requested_ids.iter().map(String::as_str).collect();
+        if requested.len() != requested_ids.len() {
+            return Err(HailError::InvalidFormat(
+                "gene-associations-only analysis_ids must be unique".to_string(),
+            ));
+        }
+
+        // load_and_group_assets treats analysis_ids as guaranteed additions;
+        // gene-only migration treats them as the exact manifest instead.
+        inputs.retain(|input| requested.contains(input.id.as_str()));
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for input in &inputs {
+            *counts.entry(input.id.as_str()).or_default() += 1;
+        }
+        let missing: Vec<&str> = requested
+            .iter()
+            .copied()
+            .filter(|id| !counts.contains_key(id))
+            .collect();
+        let ambiguous: Vec<&str> = requested
+            .iter()
+            .copied()
+            .filter(|id| counts.get(id).copied().unwrap_or_default() != 1)
+            .collect();
+        if !missing.is_empty() || !ambiguous.is_empty() {
+            return Err(HailError::InvalidFormat(format!(
+                "gene-associations-only requested {} phenotype IDs but could not resolve exactly one input per ID (missing: {:?}; non-unique after ancestry filtering: {:?})",
+                requested_ids.len(), missing, ambiguous
+            )));
+        }
+    }
+
+    let without_gene: Vec<String> = inputs
+        .iter()
+        .filter(|input| input.gene_burden_path.is_none())
+        .map(|input| format!("{}:{}", input.ancestry, input.id))
+        .collect();
+    if !without_gene.is_empty() {
+        return Err(HailError::InvalidFormat(format!(
+            "gene-associations-only requires a gene asset for every selected phenotype; {} missing: {}",
+            without_gene.len(),
+            without_gene.join(", ")
+        )));
+    }
+
+    if let Some(requested_ids) = requested_ids {
+        if inputs.len() != requested_ids.len() {
+            return Err(HailError::InvalidFormat(format!(
+                "gene-associations-only requested {} phenotype IDs but produced {} inputs",
+                requested_ids.len(),
+                inputs.len()
+            )));
+        }
+    }
+    Ok(inputs)
+}
+
 /// Convert grouped inputs into ManhattanSpecs.
 pub fn create_specs(inputs: Vec<PhenotypeInput>, config: &BatchConfig) -> Vec<ManhattanSpec> {
     inputs
@@ -338,14 +409,43 @@ pub fn create_specs(inputs: Vec<PhenotypeInput>, config: &BatchConfig) -> Vec<Ma
                 phenotype: Some(input.id.clone()),
                 ancestry: Some(input.ancestry.clone()),
 
-                exome: input.exome_path,
-                exome_annotations: config.exome_annotations.clone(),
-                genome: input.genome_path,
-                genome_annotations: config.genome_annotations.clone(),
+                exome: if config.gene_associations_only {
+                    None
+                } else {
+                    input.exome_path
+                },
+                exome_annotations: if config.gene_associations_only {
+                    None
+                } else {
+                    config.exome_annotations.clone()
+                },
+                genome: if config.gene_associations_only {
+                    None
+                } else {
+                    input.genome_path
+                },
+                genome_annotations: if config.gene_associations_only {
+                    None
+                } else {
+                    config.genome_annotations.clone()
+                },
                 gene_burden: input.gene_burden_path,
-                genes: config.genes_path.clone(),
-                exome_exp_p: input.exome_exp_p_path,
-                genome_exp_p: input.genome_exp_p_path,
+                genes: if config.gene_associations_only {
+                    None
+                } else {
+                    config.genes_path.clone()
+                },
+                exome_exp_p: if config.gene_associations_only {
+                    None
+                } else {
+                    input.exome_exp_p_path
+                },
+                genome_exp_p: if config.gene_associations_only {
+                    None
+                } else {
+                    input.genome_exp_p_path
+                },
+                gene_associations_only: config.gene_associations_only,
 
                 threshold: config.threshold,
                 gene_threshold: config.gene_threshold,
@@ -435,6 +535,50 @@ mod tests {
     }
 
     #[test]
+    fn gene_only_explicit_ids_are_exact_and_require_gene_assets() {
+        let input = |id: &str, gene: bool| PhenotypeInput {
+            ancestry: "meta".to_string(),
+            id: id.to_string(),
+            exome_path: Some(format!("gs://bucket/{id}.ht")),
+            genome_path: None,
+            gene_burden_path: gene.then(|| format!("gs://bucket/{id}-gene.ht")),
+            exome_exp_p_path: None,
+            genome_exp_p_path: None,
+        };
+        let requested = vec!["1001".to_string(), "1002".to_string()];
+
+        let selected = validate_gene_associations_only_inputs(
+            vec![
+                input("1001", true),
+                input("1002", true),
+                input("extra", true),
+            ],
+            Some(&requested),
+        )
+        .unwrap();
+        assert_eq!(selected.len(), requested.len());
+        assert_eq!(
+            selected
+                .iter()
+                .map(|input| input.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1001", "1002"]
+        );
+
+        let error = validate_gene_associations_only_inputs(
+            vec![input("1001", true), input("1002", false)],
+            Some(&requested),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("meta:1002"));
+
+        let error =
+            validate_gene_associations_only_inputs(vec![input("1001", true)], Some(&requested))
+                .unwrap_err();
+        assert!(error.to_string().contains("missing"));
+    }
+
+    #[test]
     fn test_create_specs() {
         let inputs = vec![PhenotypeInput {
             ancestry: "meta".to_string(),
@@ -461,6 +605,7 @@ mod tests {
             exome_annotations: None,
             genome_annotations: None,
             styling: ManhattanConfig::default(),
+            gene_associations_only: false,
         };
 
         let specs = create_specs(inputs, &config);
@@ -472,6 +617,48 @@ mod tests {
         // Verify identity metadata is set
         assert_eq!(specs[0].phenotype, Some("1001".to_string()));
         assert_eq!(specs[0].ancestry, Some("meta".to_string()));
+    }
+
+    #[test]
+    fn gene_associations_only_specs_drop_all_unrelated_inputs() {
+        let inputs = vec![PhenotypeInput {
+            ancestry: "meta".to_string(),
+            id: "1001".to_string(),
+            exome_path: Some("gs://bucket/exome.ht".to_string()),
+            genome_path: Some("gs://bucket/genome.ht".to_string()),
+            gene_burden_path: Some("gs://bucket/gene.ht".to_string()),
+            exome_exp_p_path: Some("gs://bucket/exome-qq.ht".to_string()),
+            genome_exp_p_path: Some("gs://bucket/genome-qq.ht".to_string()),
+        }];
+        let config = BatchConfig {
+            output_dir: "gs://bucket/output".to_string(),
+            threshold: 5e-8,
+            gene_threshold: 2.5e-6,
+            locus_threshold: 0.01,
+            locus_window: 1_000_000,
+            locus_plots: true,
+            min_variants_per_locus: 1,
+            width: 3000,
+            height: 800,
+            y_field: "Pvalue".to_string(),
+            genes_path: Some("gs://bucket/genes.ht".to_string()),
+            exome_annotations: Some("gs://bucket/exome-annotations.ht".to_string()),
+            genome_annotations: Some("gs://bucket/genome-annotations.ht".to_string()),
+            styling: ManhattanConfig::default(),
+            gene_associations_only: true,
+        };
+
+        let specs = create_specs(inputs, &config);
+        let spec = &specs[0];
+        assert!(spec.gene_associations_only);
+        assert_eq!(spec.gene_burden.as_deref(), Some("gs://bucket/gene.ht"));
+        assert!(spec.exome.is_none());
+        assert!(spec.genome.is_none());
+        assert!(spec.exome_exp_p.is_none());
+        assert!(spec.genome_exp_p.is_none());
+        assert!(spec.genes.is_none());
+        assert!(spec.exome_annotations.is_none());
+        assert!(spec.genome_annotations.is_none());
     }
 
     #[test]

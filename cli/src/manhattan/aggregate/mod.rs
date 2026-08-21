@@ -133,6 +133,47 @@ pub fn run_aggregation(spec: &ManhattanAggregateSpec) -> Result<(usize, serde_js
 
     let output_base = spec.output_path.trim_end_matches('/');
 
+    // The production gene refresh deliberately bypasses every unrelated
+    // Manhattan product. This branch writes exactly one specialized Parquet.
+    if spec.gene_associations_only {
+        let gene_burden_path = spec.gene_burden.as_deref().ok_or_else(|| {
+            crate::HailError::InvalidFormat(
+                "gene-associations-only requires a gene burden input".to_string(),
+            )
+        })?;
+        if !is_cloud_path(output_base) {
+            std::fs::create_dir_all(output_base)?;
+        }
+        let phenotype = spec
+            .phenotype_id
+            .clone()
+            .unwrap_or_else(|| extract_phenotype_name(output_base));
+        let ancestry = spec.ancestry.as_deref().unwrap_or("meta");
+        let parquet_path = format!("{}/gene_associations.parquet", output_base);
+        let scan_result = scan_gene_burden_to_parquet(
+            gene_burden_path,
+            &phenotype,
+            ancestry,
+            &parquet_path,
+            spec.gene_threshold,
+            None,
+        )?;
+        println!(
+            "  Exported {} gene association rows (no variant, locus, QQ, or image products)",
+            scan_result.total_rows
+        );
+        return Ok((
+            scan_result.total_rows,
+            serde_json::json!({
+                "mode": "gene_associations_only",
+                "phenotype": phenotype,
+                "ancestry": ancestry,
+                "gene_rows": scan_result.total_rows,
+                "output": parquet_path,
+            }),
+        ));
+    }
+
     // Create plots directory for consolidated output
     let plots_dir = format!("{}/plots", output_base);
     if !is_cloud_path(&plots_dir) {

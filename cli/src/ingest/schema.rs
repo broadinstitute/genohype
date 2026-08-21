@@ -48,6 +48,17 @@ mod tests {
     }
 
     #[test]
+    fn gene_association_schema_has_nullable_int64_mac_splits() {
+        let sql = get_manhattan_schemas()
+            .into_iter()
+            .find(|(name, _)| *name == "gene_associations")
+            .unwrap()
+            .1;
+        assert!(sql.contains("mac_case             Nullable(Int64)"));
+        assert!(sql.contains("mac_control          Nullable(Int64)"));
+    }
+
+    #[test]
     fn test_schemas_are_valid_sql() {
         for (name, sql) in get_manhattan_schemas() {
             // Basic sanity checks

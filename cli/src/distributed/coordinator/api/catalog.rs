@@ -2,7 +2,7 @@ use crate::distributed::coordinator::state::{CoordinatorData, JobExecutionState,
 use crate::distributed::message::{
     CatalogEntry, JobEvent, JobSpec, LoadCatalogRequest, ProcessCatalogRequest,
 };
-use crate::manhattan::batch::BatchConfig;
+use crate::manhattan::batch::{BatchConfig, PhenotypeInput};
 use axum::{extract::State, Json};
 
 pub(crate) async fn load_catalog_api(
@@ -221,6 +221,67 @@ pub(crate) async fn get_config_api(State(state): State<SharedState>) -> Json<ser
     Json(serde_json::json!(null))
 }
 
+fn select_requested_catalog_inputs(
+    inputs: &std::collections::HashMap<(String, String), PhenotypeInput>,
+    requested: &[(String, String)],
+    gene_associations_only: bool,
+) -> std::result::Result<Vec<PhenotypeInput>, String> {
+    if !gene_associations_only {
+        // Preserve the existing best-effort catalog behavior outside the strict
+        // one-time gene-association clone workflow.
+        return Ok(requested
+            .iter()
+            .filter_map(|key| inputs.get(key).cloned())
+            .collect());
+    }
+
+    let unique: std::collections::HashSet<&(String, String)> = requested.iter().collect();
+    if unique.len() != requested.len() {
+        return Err("Requested phenotype/ancestry pairs must be unique".to_string());
+    }
+
+    let missing: Vec<String> = requested
+        .iter()
+        .filter(|key| !inputs.contains_key(*key))
+        .map(|(id, ancestry)| format!("{ancestry}:{id}"))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "Requested {} phenotypes but {} are absent from the catalog: {}",
+            requested.len(),
+            missing.len(),
+            missing.join(", ")
+        ));
+    }
+
+    let selected: Vec<PhenotypeInput> = requested
+        .iter()
+        .filter_map(|key| inputs.get(key).cloned())
+        .collect();
+    if gene_associations_only {
+        let without_gene: Vec<String> = selected
+            .iter()
+            .filter(|input| input.gene_burden_path.is_none())
+            .map(|input| format!("{}:{}", input.ancestry, input.id))
+            .collect();
+        if !without_gene.is_empty() {
+            return Err(format!(
+                "gene-associations-only requires a gene asset for every requested phenotype; {} missing: {}",
+                without_gene.len(),
+                without_gene.join(", ")
+            ));
+        }
+    }
+    if selected.len() != requested.len() {
+        return Err(format!(
+            "Requested {} phenotypes but produced {} inputs",
+            requested.len(),
+            selected.len()
+        ));
+    }
+    Ok(selected)
+}
+
 pub(crate) async fn process_catalog_api(
     State(state): State<SharedState>,
     Json(req): Json<ProcessCatalogRequest>,
@@ -233,19 +294,19 @@ pub(crate) async fn process_catalog_api(
         return Json(serde_json::json!({ "success": false, "error": "Catalog not loaded" }));
     };
 
-    // Extract selected inputs
-    let mut selected_inputs = Vec::new();
-    for pheno in &req.phenotypes {
-        if let Some(input) = catalog.inputs.get(pheno) {
-            selected_inputs.push(input.clone());
+    let selected_inputs = match select_requested_catalog_inputs(
+        &catalog.inputs,
+        &req.phenotypes,
+        catalog.config.job.gene_associations_only,
+    ) {
+        Ok(inputs) if !inputs.is_empty() => inputs,
+        Ok(_) => {
+            return Json(serde_json::json!({ "success": false, "error": "No phenotypes selected" }))
         }
-    }
-
-    if selected_inputs.is_empty() {
-        return Json(
-            serde_json::json!({ "success": false, "error": "No valid phenotypes selected" }),
-        );
-    }
+        Err(error) => {
+            return Json(serde_json::json!({ "success": false, "error": error }));
+        }
+    };
 
     // Build the BatchConfig
     let batch_config = BatchConfig {
@@ -263,10 +324,13 @@ pub(crate) async fn process_catalog_api(
         exome_annotations: catalog.config.job.exome_annotations.clone(),
         genome_annotations: catalog.config.job.genome_annotations.clone(),
         styling: catalog.config.styling(),
+        gene_associations_only: catalog.config.job.gene_associations_only,
     };
 
     let specs = crate::manhattan::batch::create_specs(selected_inputs, &batch_config);
-    let mode = if catalog.config.job.scan_only {
+    let mode = if catalog.config.job.gene_associations_only {
+        crate::distributed::message::ExecutionMode::AggregateOnly
+    } else if catalog.config.job.scan_only {
         crate::distributed::message::ExecutionMode::ScanOnly
     } else if catalog.config.job.aggregate_only {
         crate::distributed::message::ExecutionMode::AggregateOnly
@@ -517,4 +581,46 @@ pub(crate) async fn ingest_catalog_api(
     });
 
     Json(serde_json::json!({ "success": true, "message": "Started ingestion job" }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn input(id: &str, ancestry: &str, gene: bool) -> PhenotypeInput {
+        PhenotypeInput {
+            ancestry: ancestry.to_string(),
+            id: id.to_string(),
+            exome_path: None,
+            genome_path: None,
+            gene_burden_path: gene.then(|| format!("gs://bucket/{ancestry}/{id}/gene.ht")),
+            exome_exp_p_path: None,
+            genome_exp_p_path: None,
+        }
+    }
+
+    #[test]
+    fn gene_only_catalog_selection_is_exact_and_requires_every_gene_asset() {
+        let mut catalog = std::collections::HashMap::new();
+        catalog.insert(
+            ("1001".to_string(), "meta".to_string()),
+            input("1001", "meta", true),
+        );
+        catalog.insert(
+            ("1002".to_string(), "meta".to_string()),
+            input("1002", "meta", false),
+        );
+
+        let requested = vec![("1001".to_string(), "meta".to_string())];
+        let selected = select_requested_catalog_inputs(&catalog, &requested, true).unwrap();
+        assert_eq!(selected.len(), requested.len());
+
+        let missing_gene = vec![("1002".to_string(), "meta".to_string())];
+        let error = select_requested_catalog_inputs(&catalog, &missing_gene, true).unwrap_err();
+        assert!(error.contains("meta:1002"));
+
+        let absent = vec![("9999".to_string(), "meta".to_string())];
+        let error = select_requested_catalog_inputs(&catalog, &absent, true).unwrap_err();
+        assert!(error.contains("absent from the catalog"));
+    }
 }

@@ -2,7 +2,9 @@
 
 use crate::cli::{LociArgs, LocusArgs, ManhattanArgs, ManhattanBatchArgs};
 use crate::commands::utils::progress_style_spinner;
-use crate::manhattan::batch::{load_and_group_assets, BatchSummary};
+use crate::manhattan::batch::{
+    load_and_group_assets, validate_gene_associations_only_inputs, BatchSummary,
+};
 use crate::manhattan::config::ManhattanJobConfig;
 use crate::manhattan::data::{
     extract_plot_data, ManhattanSidecar, SidecarChromosome, SidecarImage, SidecarThreshold,
@@ -506,13 +508,18 @@ pub fn run_manhattan_batch(args: ManhattanBatchArgs) -> Result<()> {
     println!();
 
     // Load and group assets
-    let inputs = load_and_group_assets(
+    let gene_associations_only =
+        args.gene_associations_only || job_config.job.gene_associations_only;
+    let mut inputs = load_and_group_assets(
         &assets_json,
         analysis_ids.as_deref(),
         ancestries.as_deref(),
         sample,
         limit,
     )?;
+    if gene_associations_only {
+        inputs = validate_gene_associations_only_inputs(inputs, analysis_ids.as_deref())?;
+    }
 
     if inputs.is_empty() {
         println!(
@@ -591,9 +598,16 @@ pub fn run_manhattan_batch(args: ManhattanBatchArgs) -> Result<()> {
             args.locus_window.to_string().dimmed()
         );
     }
-    println!("  Image size: {}x{}", args.width, args.height);
+    if gene_associations_only {
+        println!(
+            "  Products: {}",
+            "gene_associations.parquet only".bright_white()
+        );
+    } else {
+        println!("  Image size: {}x{}", args.width, args.height);
+    }
 
-    if args.genes.is_some() {
+    if !gene_associations_only && args.genes.is_some() {
         println!("  Genes table: {}", "specified".green());
     }
     if args.exome_annotations.is_some() {
@@ -605,7 +619,9 @@ pub fn run_manhattan_batch(args: ManhattanBatchArgs) -> Result<()> {
 
     println!();
     println!("{}", "Ready for Submission".green().bold());
-    let mode_flag = if args.scan_only {
+    let mode_flag = if gene_associations_only {
+        " \\\n      --gene-associations-only"
+    } else if args.scan_only {
         " \\\n      --scan-only"
     } else if args.aggregate_only {
         " \\\n      --aggregate-only"

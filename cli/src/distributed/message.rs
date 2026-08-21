@@ -500,6 +500,9 @@ pub struct ManhattanSpec {
     /// Path to gene burden results table
     #[serde(default)]
     pub gene_burden: Option<String>,
+    /// Export only gene_associations.parquet, without other Manhattan products.
+    #[serde(default)]
+    pub gene_associations_only: bool,
     /// Path to gnomAD genes table
     #[serde(default)]
     pub genes: Option<String>,
@@ -676,6 +679,9 @@ pub struct ManhattanAggregateSpec {
     /// Path to gene burden results Hail table
     #[serde(default)]
     pub gene_burden: Option<String>,
+    /// Export only gene_associations.parquet, without other Manhattan products.
+    #[serde(default)]
+    pub gene_associations_only: bool,
     /// Path to exome expected p-values table (for QQ plots)
     #[serde(default)]
     pub exome_exp_p: Option<String>,

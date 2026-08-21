@@ -402,6 +402,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             genome,
             genome_annotations,
             gene_burden,
+            gene_associations_only: false,
             genes,
             exome_exp_p: None,  // Not supported in single-job CLI mode
             genome_exp_p: None, // Not supported in single-job CLI mode
@@ -452,7 +453,10 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         Vec<String>,
     )> {
         use crate::distributed::message::{JobSpec, ManhattanSpec};
-        use crate::manhattan::batch::{create_specs, load_and_group_assets, BatchConfig};
+        use crate::manhattan::batch::{
+            create_specs, load_and_group_assets, validate_gene_associations_only_inputs,
+            BatchConfig,
+        };
         use crate::manhattan::config::ManhattanJobConfig;
 
         // Parse named arguments
@@ -476,6 +480,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         let mut y_field: Option<String> = None;
         let mut scan_only = false;
         let mut aggregate_only = false;
+        let mut gene_associations_only = false;
         let mut idle = false;
 
         let mut i = 0;
@@ -643,6 +648,10 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
                     aggregate_only = true;
                     i += 1;
                 }
+                "--gene-associations-only" => {
+                    gene_associations_only = true;
+                    i += 1;
+                }
                 "--idle" => {
                     idle = true;
                     i += 1;
@@ -709,9 +718,17 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
         let height = height.unwrap_or(job_config.job.height);
         let y_field = y_field.unwrap_or(job_config.job.y_field.clone());
         let styling = job_config.styling();
+        let gene_associations_only =
+            gene_associations_only || job_config.job.gene_associations_only;
+        if gene_associations_only && (scan_only || job_config.job.scan_only) {
+            return Err(HailError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--gene-associations-only cannot be combined with --scan-only",
+            )));
+        }
 
         // Load and group assets
-        let inputs = load_and_group_assets(
+        let mut inputs = load_and_group_assets(
             &assets_json,
             analysis_ids.as_deref(),
             ancestries.as_deref(),
@@ -719,6 +736,9 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             limit,
         )?;
 
+        if gene_associations_only {
+            inputs = validate_gene_associations_only_inputs(inputs, analysis_ids.as_deref())?;
+        }
         if inputs.is_empty() {
             return Err(HailError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -742,6 +762,7 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             exome_annotations,
             genome_annotations,
             styling,
+            gene_associations_only,
         };
 
         // Convert to specs
@@ -757,11 +778,13 @@ impl<P: CloudProvider + Sync> PoolManager<P> {
             .unwrap_or_else(|| "batch".to_string());
 
         let scan_only = scan_only || job_config.job.scan_only;
-        let aggregate_only = aggregate_only || job_config.job.aggregate_only;
+        let aggregate_only =
+            aggregate_only || job_config.job.aggregate_only || gene_associations_only;
         let idle = idle || job_config.job.idle;
 
         let mut job_config = job_config;
         job_config.job.idle = idle;
+        job_config.job.gene_associations_only = gene_associations_only;
 
         if idle {
             // Idle mode: skip asset loading entirely, return empty specs

@@ -140,6 +140,338 @@ pub struct ManifestStatsInfo {
     pub output_dir_size_bytes: Option<u64>,
 }
 
+/// Load only specialized gene association Parquets into one explicit clone target.
+///
+/// This loader never creates, drops, replaces, or resumes a table. It performs a
+/// bounded, sequential preflight of the complete target and every Parquet schema,
+/// then requires the target to be empty immediately before the first INSERT.
+/// After any write-phase failure the clone-only target must be dropped and
+/// recreated by the operator before retrying because an INSERT may have committed.
+pub fn run_gene_associations_ingest(
+    input_dir: &str,
+    clickhouse_url: &str,
+    database: &str,
+    table: &str,
+    concurrency: usize,
+) -> Result<usize> {
+    validate_target_identifier(database)?;
+    validate_target_identifier(table)?;
+    if concurrency == 0 {
+        return Err(crate::HailError::InvalidFormat(
+            "gene association ingest concurrency must be at least 1".to_string(),
+        ));
+    }
+
+    let paths = discover_gene_association_parquets(input_dir)?;
+    if paths.is_empty() {
+        return Err(crate::HailError::InvalidFormat(format!(
+            "no gene_associations.parquet files found under {input_dir}"
+        )));
+    }
+
+    let client = ClickHouseClient::new(clickhouse_url);
+    validate_gene_association_target(&client, database, table)?;
+
+    // Do not retain file bytes across inputs: cloud files may be large, so this
+    // intentionally makes a sequential metadata pass before the parallel writes.
+    let mut preflighted = Vec::with_capacity(paths.len());
+    for path in paths {
+        preflighted.push(preflight_gene_association_parquet(&path)?);
+    }
+
+    require_empty_gene_association_target(&client, database, table)?;
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(concurrency)
+        .build()
+        .map_err(|error| crate::HailError::InvalidFormat(error.to_string()))?;
+    let results = pool.install(|| {
+        use rayon::prelude::*;
+        preflighted
+            .par_iter()
+            .map(|input| insert_preflighted_gene_association(input, database, table, &client))
+            .collect::<Vec<_>>()
+    });
+
+    let mut total_rows = 0;
+    for result in results {
+        match result {
+            Ok(rows) => total_rows += rows,
+            Err(error) => {
+                return Err(crate::HailError::InvalidFormat(format!(
+                    "gene association ingest failed after writes began: {error}. One or more INSERTs may have committed. Do not rerun against this target; DROP and recreate the clone-only target `{database}`.`{table}` outside this loader before retrying. This loader never drops, creates, replaces, or resumes tables"
+                )));
+            }
+        }
+    }
+    Ok(total_rows)
+}
+
+struct PreflightedGeneAssociation {
+    path: String,
+    row_count: usize,
+}
+
+fn preflight_gene_association_parquet(path: &str) -> Result<PreflightedGeneAssociation> {
+    let data = read_file_bytes(path)?;
+    if data.is_empty() {
+        return Err(crate::HailError::InvalidFormat(format!(
+            "gene association Parquet is empty: {path}"
+        )));
+    }
+
+    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(data))?;
+    validate_gene_association_schema(builder.schema().as_ref())?;
+    let row_count =
+        usize::try_from(builder.metadata().file_metadata().num_rows()).map_err(|_| {
+            crate::HailError::InvalidFormat(format!("invalid Parquet row count for {path}"))
+        })?;
+
+    Ok(PreflightedGeneAssociation {
+        path: path.to_string(),
+        row_count,
+    })
+}
+
+fn insert_preflighted_gene_association(
+    input: &PreflightedGeneAssociation,
+    database: &str,
+    table: &str,
+    client: &ClickHouseClient,
+) -> Result<usize> {
+    // This second read keeps the all-input preflight fail-before-write while
+    // bounding memory to the configured number of concurrent uploads.
+    let data = read_file_bytes(&input.path)?;
+    if data.is_empty() {
+        return Err(crate::HailError::InvalidFormat(format!(
+            "preflighted Parquet became empty before insert: {}",
+            input.path
+        )));
+    }
+    client
+        .insert_parquet_bytes_qualified(database, table, data)
+        .map_err(clickhouse_io_error)?;
+    println!("  Ingested {} rows from {}", input.row_count, input.path);
+    Ok(input.row_count)
+}
+
+fn validate_gene_association_schema(schema: &Schema) -> Result<()> {
+    let expected = crate::manhattan::gene_writer::gene_association_schema();
+    if schema.fields().len() != expected.fields().len() {
+        return Err(crate::HailError::InvalidFormat(format!(
+            "gene association Parquet must have exactly {} columns, got {}",
+            expected.fields().len(),
+            schema.fields().len()
+        )));
+    }
+
+    for (position, (actual, expected)) in schema
+        .fields()
+        .iter()
+        .zip(expected.fields().iter())
+        .enumerate()
+    {
+        if actual.name() != expected.name()
+            || actual.data_type() != expected.data_type()
+            || actual.is_nullable() != expected.is_nullable()
+        {
+            return Err(crate::HailError::InvalidFormat(format!(
+                "gene association Parquet column {} must be {} {:?} (nullable={}), got {} {:?} (nullable={})",
+                position + 1,
+                expected.name(),
+                expected.data_type(),
+                expected.is_nullable(),
+                actual.name(),
+                actual.data_type(),
+                actual.is_nullable()
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct ClickHouseDescribeResponse {
+    data: Vec<ClickHouseDescribeColumn>,
+}
+
+#[derive(Deserialize)]
+struct ClickHouseDescribeColumn {
+    name: String,
+    #[serde(rename = "type")]
+    column_type: String,
+}
+
+const EXPECTED_GENE_ASSOCIATION_CLICKHOUSE_COLUMNS: &[(&str, &str)] = &[
+    ("gene_id", "String"),
+    ("gene_symbol", "String"),
+    ("annotation", "LowCardinality(String)"),
+    ("max_maf", "Float64"),
+    ("phenotype", "String"),
+    ("ancestry", "LowCardinality(String)"),
+    ("pvalue", "Nullable(Float64)"),
+    ("pvalue_burden", "Nullable(Float64)"),
+    ("pvalue_skat", "Nullable(Float64)"),
+    ("beta_burden", "Nullable(Float64)"),
+    ("mac", "Nullable(Int64)"),
+    ("mac_case", "Nullable(Int64)"),
+    ("mac_control", "Nullable(Int64)"),
+    ("contig", "LowCardinality(String)"),
+    ("gene_start_position", "Int32"),
+    ("xpos", "Int64"),
+];
+
+fn validate_gene_association_target(
+    client: &ClickHouseClient,
+    database: &str,
+    table: &str,
+) -> Result<()> {
+    let describe = client
+        .execute(&format!(
+            "DESCRIBE TABLE `{database}`.`{table}` FORMAT JSON"
+        ))
+        .map_err(clickhouse_io_error)?;
+    let described: ClickHouseDescribeResponse =
+        serde_json::from_str(&describe).map_err(|error| {
+            crate::HailError::InvalidFormat(format!(
+                "could not parse schema for explicit target `{database}`.`{table}`: {error}"
+            ))
+        })?;
+    let actual: Vec<(&str, &str)> = described
+        .data
+        .iter()
+        .map(|column| (column.name.as_str(), column.column_type.as_str()))
+        .collect();
+    if actual != EXPECTED_GENE_ASSOCIATION_CLICKHOUSE_COLUMNS {
+        return Err(crate::HailError::InvalidFormat(format!(
+            "explicit target `{database}`.`{table}` has the wrong schema: expected {:?}, got {:?}; this loader never creates or replaces tables",
+            EXPECTED_GENE_ASSOCIATION_CLICKHOUSE_COLUMNS, actual
+        )));
+    }
+
+    let engine = client
+        .execute(&format!(
+            "SELECT engine FROM system.tables WHERE database = '{database}' AND name = '{table}' FORMAT TabSeparated"
+        ))
+        .map_err(clickhouse_io_error)?;
+    if engine.trim() != "MergeTree" {
+        return Err(crate::HailError::InvalidFormat(format!(
+            "explicit target `{database}`.`{table}` must use MergeTree, got {:?}; this loader never creates or replaces tables",
+            engine.trim()
+        )));
+    }
+    Ok(())
+}
+
+fn require_empty_gene_association_target(
+    client: &ClickHouseClient,
+    database: &str,
+    table: &str,
+) -> Result<()> {
+    let count = client
+        .execute(&format!("SELECT count() FROM `{database}`.`{table}`"))
+        .map_err(clickhouse_io_error)?;
+    let count: u64 = count.trim().parse().map_err(|error| {
+        crate::HailError::InvalidFormat(format!(
+            "could not parse row count for explicit target `{database}`.`{table}`: {error}"
+        ))
+    })?;
+    if count != 0 {
+        return Err(crate::HailError::InvalidFormat(format!(
+            "explicit clone-only target `{database}`.`{table}` must be empty before any INSERT (found {count} rows). This loader never resumes a partial target: DROP and recreate the clone-only target outside this loader before retrying"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_target_identifier(identifier: &str) -> Result<()> {
+    let mut chars = identifier.chars();
+    let valid_start = chars
+        .next()
+        .map(|c| c == '_' || c.is_ascii_alphabetic())
+        .unwrap_or(false);
+    if !valid_start || !chars.all(|c| c == '_' || c.is_ascii_alphanumeric()) {
+        return Err(crate::HailError::InvalidFormat(format!(
+            "invalid ClickHouse database/table identifier: {identifier:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn discover_gene_association_parquets(input: &str) -> Result<Vec<String>> {
+    if input.ends_with("/gene_associations.parquet")
+        || input == "gene_associations.parquet"
+        || std::path::Path::new(input)
+            .file_name()
+            .and_then(|name| name.to_str())
+            == Some("gene_associations.parquet")
+    {
+        if file_exists(input)? {
+            return Ok(vec![input.to_string()]);
+        }
+    }
+
+    if is_cloud_path(input) {
+        use futures::StreamExt;
+        use genohype_core::io::resolve_url;
+
+        let (store, prefix) = resolve_url(input)?;
+        let parsed = url::Url::parse(input)
+            .map_err(|error| crate::HailError::InvalidFormat(error.to_string()))?;
+        let scheme = parsed.scheme().to_string();
+        let host = parsed.host_str().ok_or_else(|| {
+            crate::HailError::InvalidFormat(format!("cloud input has no bucket/host: {input}"))
+        })?;
+        let runtime = tokio::runtime::Runtime::new()
+            .map_err(|error| crate::HailError::InvalidFormat(error.to_string()))?;
+        let mut paths = runtime.block_on(async {
+            let mut stream = store.list(Some(&prefix));
+            let mut paths = Vec::new();
+            while let Some(item) = stream.next().await {
+                let meta = item.map_err(|error| {
+                    crate::HailError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        error.to_string(),
+                    ))
+                })?;
+                let location = meta.location.to_string();
+                if location.ends_with("/gene_associations.parquet") {
+                    paths.push(format!("{scheme}://{host}/{location}"));
+                }
+            }
+            Ok::<_, crate::HailError>(paths)
+        })?;
+        paths.sort();
+        return Ok(paths);
+    }
+
+    fn visit(directory: &std::path::Path, paths: &mut Vec<String>) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(directory)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                visit(&path, paths)?;
+            } else if path.file_name().and_then(|name| name.to_str())
+                == Some("gene_associations.parquet")
+            {
+                paths.push(path.to_string_lossy().into_owned());
+            }
+        }
+        Ok(())
+    }
+
+    let mut paths = Vec::new();
+    visit(std::path::Path::new(input), &mut paths)?;
+    paths.sort();
+    Ok(paths)
+}
+
+fn clickhouse_io_error(error: impl std::fmt::Display) -> crate::HailError {
+    crate::HailError::Io(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        error.to_string(),
+    ))
+}
+
 /// Run the ingestion task for a single phenotype.
 ///
 /// # Arguments
@@ -893,7 +1225,8 @@ fn ingest_loci_variants(parquet_path: &str, client: &ClickHouseClient) -> Result
 ///
 /// The gene_associations.parquet file is already fully prepared with all columns
 /// (gene_id, gene_symbol, annotation, max_maf, phenotype, ancestry, pvalue,
-/// pvalue_burden, pvalue_skat, beta_burden, mac, contig, gene_start_position, xpos),
+/// pvalue_burden, pvalue_skat, beta_burden, mac, mac_case, mac_control,
+/// contig, gene_start_position, xpos),
 /// so we can upload it directly.
 fn ingest_gene_associations(parquet_path: &str, client: &ClickHouseClient) -> Result<usize> {
     ingest_parquet_direct(parquet_path, "gene_associations", client)
@@ -1006,5 +1339,188 @@ mod tests {
         assert_eq!(ensure_chr_prefix("chr1"), "chr1");
         assert_eq!(ensure_chr_prefix("X"), "chrX");
         assert_eq!(ensure_chr_prefix("chrX"), "chrX");
+    }
+
+    #[test]
+    fn gene_loader_requires_plain_explicit_identifiers() {
+        for valid in ["default", "gene_associations_v2", "_migration"] {
+            validate_target_identifier(valid).unwrap();
+        }
+        for invalid in ["", "db.table", "gene-associations", "x`; DROP TABLE y"] {
+            assert!(validate_target_identifier(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn gene_loader_discovers_only_specialized_parquets() {
+        let directory = tempfile::tempdir().unwrap();
+        let phenotype = directory.path().join("meta/1001");
+        std::fs::create_dir_all(&phenotype).unwrap();
+        std::fs::write(phenotype.join("gene_associations.parquet"), b"fixture").unwrap();
+        std::fs::write(phenotype.join("qq_exome.parquet"), b"unrelated").unwrap();
+
+        let paths = discover_gene_association_parquets(directory.path().to_str().unwrap()).unwrap();
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with("gene_associations.parquet"));
+    }
+
+    #[test]
+    fn gene_loader_schema_requires_the_complete_exact_schema() {
+        let valid = crate::manhattan::gene_writer::gene_association_schema();
+        validate_gene_association_schema(&valid).unwrap();
+
+        let mut wrong_type: Vec<Field> = valid
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect();
+        wrong_type[0] = Field::new("gene_id", DataType::Int64, false);
+        assert!(validate_gene_association_schema(&Schema::new(wrong_type)).is_err());
+
+        let mut wrong_order: Vec<Field> = valid
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect();
+        wrong_order.swap(0, 1);
+        assert!(validate_gene_association_schema(&Schema::new(wrong_order)).is_err());
+    }
+
+    #[test]
+    fn gene_loader_partial_failure_requires_recreated_empty_clone_before_retry() {
+        use crate::manhattan::data::GeneAssociationRow;
+        use crate::manhattan::gene_writer::GeneAssociationWriter;
+        use std::io::{Read, Write};
+
+        fn write_fixture(path: &std::path::Path, phenotype: &str) {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut writer = GeneAssociationWriter::new(path.to_str().unwrap()).unwrap();
+            writer
+                .write(GeneAssociationRow {
+                    gene_id: "ENSG1".to_string(),
+                    gene_symbol: "GENE1".to_string(),
+                    annotation: "pLoF".to_string(),
+                    max_maf: 0.001,
+                    phenotype: phenotype.to_string(),
+                    ancestry: "meta".to_string(),
+                    pvalue: Some(0.01),
+                    pvalue_burden: None,
+                    pvalue_skat: None,
+                    beta_burden: None,
+                    mac: Some(2),
+                    mac_case: Some(1),
+                    mac_control: Some(1),
+                    contig: "chr1".to_string(),
+                    gene_start_position: 10,
+                    xpos: 1_000_000_010,
+                })
+                .unwrap();
+            writer.finish().unwrap();
+        }
+
+        fn serve_responses(responses: Vec<(u16, String)>) -> (String, std::thread::JoinHandle<()>) {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let handle = std::thread::spawn(move || {
+                for (status, body) in responses {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut request = Vec::new();
+                    let mut buffer = [0u8; 8192];
+                    let header_end = loop {
+                        let count = stream.read(&mut buffer).unwrap();
+                        assert!(count > 0);
+                        request.extend_from_slice(&buffer[..count]);
+                        if let Some(position) =
+                            request.windows(4).position(|part| part == b"\r\n\r\n")
+                        {
+                            break position + 4;
+                        }
+                    };
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("content-length: ")
+                                .or_else(|| line.strip_prefix("Content-Length: "))
+                        })
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or_default();
+                    while request.len() - header_end < content_length {
+                        let count = stream.read(&mut buffer).unwrap();
+                        assert!(count > 0);
+                        request.extend_from_slice(&buffer[..count]);
+                    }
+
+                    let reason = if status == 200 {
+                        "OK"
+                    } else {
+                        "Internal Server Error"
+                    };
+                    write!(
+                        stream,
+                        "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .unwrap();
+                }
+            });
+            (format!("http://{address}/clickhouse?token=test"), handle)
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        write_fixture(
+            &directory.path().join("meta/1001/gene_associations.parquet"),
+            "1001",
+        );
+        write_fixture(
+            &directory.path().join("meta/1002/gene_associations.parquet"),
+            "1002",
+        );
+        let describe = serde_json::json!({
+            "data": EXPECTED_GENE_ASSOCIATION_CLICKHOUSE_COLUMNS
+                .iter()
+                .map(|(name, column_type)| serde_json::json!({"name": name, "type": column_type}))
+                .collect::<Vec<_>>()
+        })
+        .to_string();
+        let responses = vec![
+            (200, describe.clone()),
+            (200, "MergeTree\n".to_string()),
+            (200, "0\n".to_string()),
+            (200, String::new()),
+            (500, "simulated ambiguous insert failure".to_string()),
+            (200, describe),
+            (200, "MergeTree\n".to_string()),
+            (200, "1\n".to_string()),
+        ];
+        let (url, server) = serve_responses(responses);
+
+        let error = run_gene_associations_ingest(
+            directory.path().to_str().unwrap(),
+            &url,
+            "clone_db",
+            "gene_associations_clone",
+            1,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("INSERTs may have committed"));
+        assert!(error.to_string().contains("DROP and recreate"));
+
+        let retry_error = run_gene_associations_ingest(
+            directory.path().to_str().unwrap(),
+            &url,
+            "clone_db",
+            "gene_associations_clone",
+            1,
+        )
+        .unwrap_err();
+        assert!(retry_error
+            .to_string()
+            .contains("must be empty before any INSERT"));
+        assert!(retry_error
+            .to_string()
+            .contains("never resumes a partial target"));
+        server.join().unwrap();
     }
 }
