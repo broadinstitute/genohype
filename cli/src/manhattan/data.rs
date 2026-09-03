@@ -184,9 +184,11 @@ pub(crate) fn extract_association_point(
 /// callers. Canonical association consumers use `extract_association_point` and
 /// therefore retain the widened i64 position.
 pub fn extract_plot_data(row: &EncodedValue, y_field: &str) -> Option<PlotPoint> {
+    let original_contig = get_nested_field(row, &["locus", "contig"])?.as_string()?;
     let (point, _) = extract_association_point(row, y_field, 0).ok()?;
     Some(PlotPoint {
-        contig: point.contig,
+        // Preserve the legacy spelling; canonical consumers use `point.contig`.
+        contig: original_contig,
         position: i32::try_from(point.position).ok()?,
         pvalue: point.pvalue,
         neg_log10_p: point.neg_log10_p,
@@ -841,7 +843,7 @@ mod tests {
             vec![("Pvalue_log10", EncodedValue::Float64(400.0))],
         );
         let point = extract_plot_data(&valid, "p").unwrap();
-        assert_eq!(point.contig, "MT");
+        assert_eq!(point.contig, "chrM");
         assert_eq!(point.position, 10);
         assert_eq!(point.pvalue, 0.0);
         assert_eq!(point.neg_log10_p, 400.0);
