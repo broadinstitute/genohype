@@ -7,24 +7,25 @@ use crate::manhattan::batch::{
 };
 use crate::manhattan::config::ManhattanJobConfig;
 use crate::manhattan::data::{
-    extract_plot_data, ManhattanSidecar, SidecarChromosome, SidecarImage, SidecarThreshold,
-    SidecarYAxis, SignificantHit, VariantSource,
+    extract_association_point, extract_plot_data, ManhattanSidecar, SidecarChromosome,
+    SidecarImage, SidecarThreshold, SidecarYAxis, SignificantHit, VariantSource,
 };
 use crate::manhattan::genes::{process_gene_burden, GeneMap};
-use crate::manhattan::layout::{ChromosomeLayout, YScale};
+use crate::manhattan::legacy_manifest::{
+    merge_partition_summaries, source_ordinal, write_manifest, LegacyPartitionSummary,
+};
 use crate::manhattan::pipeline::{
     aggregate_shards_and_render, run_integrated_pipeline, PipelineConfig,
 };
-use crate::manhattan::reference::get_contig_lengths;
 use crate::manhattan::render::ManhattanRenderer;
 use crossbeam_channel::bounded;
+use genohype_association::{canonical_contig, canonical_contig_lengths, Assembly, GenomeLayoutV1};
 use genohype_core::query::QueryEngine;
-use genohype_core::Result;
+use genohype_core::{HailError, Result};
 use indicatif::ProgressBar;
 use owo_colors::OwoColorize;
 use rayon::prelude::*;
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs;
 use std::path::Path;
 use std::thread;
 
@@ -180,16 +181,15 @@ pub fn run_manhattan(args: ManhattanArgs) -> Result<()> {
     let engine = QueryEngine::open_path(table_path)?;
     let num_partitions = engine.num_partitions();
 
-    // 2. Get contig lengths and filter to requested chromosomes
-    let all_contigs = get_contig_lengths(&engine);
-
-    let contigs: Vec<(String, u32)> = if args.chrom == "all" {
+    // 2. Build the canonical GRCh38 layout, filtered only when --chrom requests it.
+    let all_contigs = canonical_contig_lengths(Assembly::Grch38);
+    let contigs: Vec<(String, u64)> = if args.chrom == "all" {
         all_contigs
     } else {
-        let requested: Vec<&str> = args.chrom.split(',').collect();
+        let requested: Vec<String> = args.chrom.split(',').filter_map(canonical_contig).collect();
         all_contigs
             .into_iter()
-            .filter(|(name, _)| requested.contains(&name.as_str()))
+            .filter(|(name, _)| requested.contains(name))
             .collect()
     };
 
@@ -202,181 +202,196 @@ pub fn run_manhattan(args: ManhattanArgs) -> Result<()> {
         std::process::exit(1);
     }
 
-    // 3. Init components
-    let layout = ChromosomeLayout::new(&contigs, args.width, 4);
+    // 3. Initialize canonical geometry while retaining the legacy raster/sidecar files.
+    let layout = GenomeLayoutV1::new(contigs, args.width, args.height, 4)
+        .map_err(|error| HailError::InvalidFormat(error.to_string()))?;
     let mut renderer = ManhattanRenderer::new(args.width, args.height);
     let _annotator = Annotator::new(args.annotate, args.annotate_fields)?;
-
-    // Use log-log scale: linear 0-10, then log 10+
-    // Max of 300 handles extremely significant hits (p ~ 10^-300)
-    let y_scale = YScale::new(args.height, 300.0);
-
-    // Draw threshold line
-    let threshold_y = y_scale.threshold_y(args.threshold);
+    let threshold_y = layout.y_scale.threshold_y(args.threshold).ok_or_else(|| {
+        HailError::InvalidFormat("invalid Manhattan significance threshold".into())
+    })?;
     renderer.render_threshold_line(threshold_y, args.width);
 
     let mut significant_hits: Vec<SignificantHit> = Vec::new();
 
-    // 4. Parallel Scan & Render using producer-consumer pattern
-    // Workers extract data and compute layout, main thread only renders
+    // 4. Scan and render with bounded batches. Partition summaries carry exact counts,
+    // deterministic source identity, warnings, and O(K=100) top hits.
     println!("{}", "Scanning rows (parallel)...".dimmed());
     let pb = ProgressBar::new_spinner();
     pb.set_style(progress_style_spinner());
 
-    /// Batch of render data sent from workers to main thread
     struct RenderBatch {
-        /// Points to render: (x, y, color_idx) - color_idx is 0 or 1 for alternating colors
         points: Vec<(f32, f32, u8)>,
-        /// Significant hits identified
         hits: Vec<SignificantHit>,
-        /// Number of rows processed in this batch
-        row_count: usize,
     }
 
-    // Channel for sending batches from workers to main thread
-    let (tx, rx) = bounded::<Result<RenderBatch>>(100);
+    enum ScanEvent {
+        Render(RenderBatch),
+        Summary(LegacyPartitionSummary),
+    }
 
-    // Clone data for the background thread
+    let (tx, rx) = bounded::<Result<ScanEvent>>(100);
     let table_path_owned = table_path.to_string();
     let y_field = args.y_field.clone();
     let threshold = args.threshold;
     let width = args.width;
     let height = args.height;
     let layout_clone = layout.clone();
-    let y_scale_copy = y_scale;
     let limit = args.limit;
 
-    // Spawn producer thread that drives parallel workers
     let producer_handle = thread::spawn(move || {
-        let result: Result<()> = (|| {
-            // Process partitions in parallel
-            let _ = QueryEngine::open_path(&table_path_owned)?; // Verify path is valid
-            let partitions_to_process: Vec<usize> = (0..num_partitions).collect();
+        let process_partition = |partition_index: usize, row_limit: Option<usize>| -> Result<u64> {
+            let worker_engine = QueryEngine::open_path(&table_path_owned)?;
+            let iter = worker_engine.scan_partition_iter(partition_index, &[])?;
+            let mut summary = LegacyPartitionSummary::new(partition_index)?;
+            let mut batch = RenderBatch {
+                points: Vec::with_capacity(2000),
+                hits: Vec::new(),
+            };
 
-            partitions_to_process.into_par_iter().try_for_each_with(
-                tx.clone(),
-                |sender, partition_idx| -> Result<()> {
-                    // Each worker opens its own engine for thread safety
-                    let worker_engine = QueryEngine::open_path(&table_path_owned)?;
-                    let iter = worker_engine.scan_partition_iter(partition_idx, &[])?;
+            for (row_index, row_result) in iter.enumerate() {
+                if row_limit.is_some_and(|limit| row_index >= limit) {
+                    break;
+                }
+                let row = row_result?;
+                summary.observe_source_row(&row)?;
+                let ordinal = source_ordinal(partition_index, row_index)?;
 
-                    let mut batch = RenderBatch {
+                match extract_association_point(&row, &y_field, ordinal) {
+                    Ok((point, warnings)) => {
+                        let x = layout_clone.x_for(&point.contig, point.position);
+                        let rendered = x.is_some();
+                        let significant = point.pvalue < threshold;
+
+                        if let Some(x) = x {
+                            let y = layout_clone.y_scale.y_for(point.neg_log10_p);
+                            let color_idx =
+                                if layout_clone.color_for(&point.contig) == Some("#404040") {
+                                    0
+                                } else {
+                                    1
+                                };
+                            batch.points.push((x, y, color_idx));
+                            if significant {
+                                batch.hits.push(SignificantHit {
+                                    variant_id: format!("{}:{}", point.contig, point.position),
+                                    pvalue: point.pvalue,
+                                    x_px: x,
+                                    y_px: y,
+                                    x_normalized: x / width as f32,
+                                    y_normalized: y / height as f32,
+                                    annotations: serde_json::Value::Null,
+                                });
+                            }
+                        }
+
+                        summary.observe_valid_point(point, warnings, rendered, significant)?;
+                    }
+                    Err(_) => summary.observe_skipped_row()?,
+                }
+
+                if batch.points.len() >= 2000 {
+                    tx.send(Ok(ScanEvent::Render(batch))).map_err(|_| {
+                        HailError::Io(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "legacy Manhattan render receiver dropped",
+                        ))
+                    })?;
+                    batch = RenderBatch {
                         points: Vec::with_capacity(2000),
                         hits: Vec::new(),
-                        row_count: 0,
                     };
+                }
+            }
 
-                    for row_result in iter {
-                        let row = row_result?;
-                        batch.row_count += 1;
+            if !batch.points.is_empty() || !batch.hits.is_empty() {
+                tx.send(Ok(ScanEvent::Render(batch))).map_err(|_| {
+                    HailError::Io(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "legacy Manhattan render receiver dropped",
+                    ))
+                })?;
+            }
+            let scanned = summary.row_count;
+            tx.send(Ok(ScanEvent::Summary(summary))).map_err(|_| {
+                HailError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "legacy Manhattan summary receiver dropped",
+                ))
+            })?;
+            Ok(scanned)
+        };
 
-                        if let Some(point) = extract_plot_data(&row, &y_field) {
-                            // Normalize contig name (strip "chr" prefix)
-                            let contig_name = if point.contig.starts_with("chr") {
-                                &point.contig[3..]
-                            } else {
-                                &point.contig
-                            };
-
-                            if let Some(x) = layout_clone.get_x(contig_name, point.position) {
-                                let y = y_scale_copy.get_y(point.neg_log10_p);
-
-                                // Get color index (0 or 1) for alternating colors
-                                let color = layout_clone.get_color(contig_name);
-                                let color_idx = if color == "#404040" { 0u8 } else { 1u8 };
-
-                                batch.points.push((x, y, color_idx));
-
-                                if point.pvalue < threshold {
-                                    let hit = SignificantHit {
-                                        variant_id: format!("{}:{}", point.contig, point.position),
-                                        pvalue: point.pvalue,
-                                        x_px: x,
-                                        y_px: y,
-                                        x_normalized: x / width as f32,
-                                        y_normalized: y / height as f32,
-                                        annotations: serde_json::Value::Null,
-                                    };
-                                    batch.hits.push(hit);
-                                }
-                            }
-                        }
-
-                        // Send batch when full
-                        if batch.points.len() >= 2000 {
-                            if sender.send(Ok(batch)).is_err() {
-                                return Err(genohype_core::HailError::Io(std::io::Error::new(
-                                    std::io::ErrorKind::BrokenPipe,
-                                    "Receiver dropped",
-                                )));
-                            }
-                            batch = RenderBatch {
-                                points: Vec::with_capacity(2000),
-                                hits: Vec::new(),
-                                row_count: 0,
-                            };
-                        }
+        let result: Result<()> = if let Some(limit) = limit {
+            // A test limit is a deterministic prefix of partition/row order.
+            let mut remaining = limit;
+            let mut result = Ok(());
+            for partition_index in 0..num_partitions {
+                if remaining == 0 {
+                    break;
+                }
+                match process_partition(partition_index, Some(remaining)) {
+                    Ok(scanned) => remaining = remaining.saturating_sub(scanned as usize),
+                    Err(error) => {
+                        result = Err(error);
+                        break;
                     }
+                }
+            }
+            result
+        } else {
+            (0..num_partitions)
+                .into_par_iter()
+                .try_for_each(|partition_index| {
+                    process_partition(partition_index, None).map(|_| ())
+                })
+        };
 
-                    // Send remaining data
-                    if batch.row_count > 0 {
-                        if sender.send(Ok(batch)).is_err() {
-                            return Err(genohype_core::HailError::Io(std::io::Error::new(
-                                std::io::ErrorKind::BrokenPipe,
-                                "Receiver dropped",
-                            )));
-                        }
-                    }
-
-                    Ok(())
-                },
-            )
-        })();
-
-        if let Err(e) = result {
-            let _ = tx.send(Err(e));
+        if let Err(error) = result {
+            let _ = tx.send(Err(error));
         }
-        // tx drops here, closing the channel
     });
 
-    // Consumer (Main Thread) - only does lightweight rendering
     let colors = ["#404040", "#4682B4"];
-    let mut row_count: usize = 0;
-
-    for batch_result in rx {
-        let batch = batch_result?;
-
-        // Render points (serial, but fast pixel operations)
-        for (x, y, color_idx) in batch.points {
-            renderer.render_point(x, y, colors[color_idx as usize], 0.5);
-        }
-
-        // Aggregate significant hits
-        significant_hits.extend(batch.hits);
-
-        // Update progress
-        row_count += batch.row_count;
-        if row_count % 50_000 < batch.row_count {
-            pb.set_message(format!("{} rows scanned...", row_count));
-        }
-
-        // Check limit (approximate - may process slightly more due to batching)
-        if let Some(lim) = limit {
-            if row_count >= lim {
-                break;
+    let mut partition_summaries = Vec::new();
+    let mut scan_error = None;
+    let mut reported_rows = 0_u64;
+    for event in rx {
+        match event {
+            Ok(ScanEvent::Render(batch)) => {
+                for (x, y, color_idx) in batch.points {
+                    renderer.render_point(x, y, colors[color_idx as usize], 0.5);
+                }
+                significant_hits.extend(batch.hits);
             }
+            Ok(ScanEvent::Summary(summary)) => {
+                reported_rows = reported_rows.saturating_add(summary.row_count);
+                pb.set_message(format!("{} rows scanned...", reported_rows));
+                partition_summaries.push(summary);
+            }
+            Err(error) => scan_error = Some(error),
         }
     }
+    producer_handle.join().map_err(|_| {
+        HailError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "legacy Manhattan producer thread panicked",
+        ))
+    })?;
+    if let Some(error) = scan_error {
+        return Err(error);
+    }
 
-    // Wait for producer to finish (may already be done if limit reached)
-    let _ = producer_handle.join();
-
+    let scan_summary = merge_partition_summaries(partition_summaries)?;
     pb.finish_and_clear();
     println!(
         "{} {} rows, {} significant hits",
         "Scanned:".green(),
-        row_count.to_string().bright_white(),
-        significant_hits.len().to_string().bright_white()
+        scan_summary.row_count.to_string().bright_white(),
+        scan_summary
+            .significant_hit_count
+            .to_string()
+            .bright_white()
     );
 
     // 5. Annotate significant hits (if annotation table provided)
@@ -389,8 +404,7 @@ pub fn run_manhattan(args: ManhattanArgs) -> Result<()> {
 
     let png_data = renderer.encode_png()?;
     let png_path = format!("{}.png", output_base);
-    let mut f = File::create(&png_path)?;
-    f.write_all(&png_data)?;
+    fs::write(&png_path, &png_data)?;
 
     let sidecar = ManhattanSidecar {
         image: SidecarImage {
@@ -398,13 +412,13 @@ pub fn run_manhattan(args: ManhattanArgs) -> Result<()> {
             height: args.height,
         },
         chromosomes: layout
-            .chromosome_info
+            .contigs
             .iter()
-            .map(|ci| SidecarChromosome {
-                name: ci.name.clone(),
-                x_start_px: ci.x_start_px,
-                x_end_px: ci.x_end_px,
-                color: ci.color.clone(),
+            .map(|contig| SidecarChromosome {
+                name: contig.name.clone(),
+                x_start_px: contig.x_start as f32,
+                x_end_px: contig.x_end as f32,
+                color: contig.color.clone(),
             })
             .collect(),
         threshold: SidecarThreshold {
@@ -412,22 +426,32 @@ pub fn run_manhattan(args: ManhattanArgs) -> Result<()> {
             y_px: threshold_y,
         },
         y_axis: SidecarYAxis {
-            log_threshold: 10.0,
-            linear_fraction: 0.6,
-            max_neg_log_p: 300.0,
+            log_threshold: layout.y_scale.log_threshold,
+            linear_fraction: layout.y_scale.linear_fraction,
+            max_neg_log_p: layout.y_scale.max_neg_log_p,
         },
         significant_hits,
     };
 
     let json_path = format!("{}.json", output_base);
-    let mut f = File::create(&json_path)?;
-    serde_json::to_writer_pretty(&mut f, &sidecar)?;
+    let mut sidecar_file = fs::File::create(&json_path)?;
+    serde_json::to_writer_pretty(&mut sidecar_file, &sidecar)?;
+
+    // Publish the manifest last so it never references a missing or partial raster.
+    let manifest_path = write_manifest(
+        &output_base,
+        layout,
+        args.threshold,
+        scan_summary,
+        &png_data,
+    )?;
 
     println!(
-        "{} {} + {}",
+        "{} {} + {} + {}",
         "Saved:".green().bold(),
         png_path.bright_white(),
-        json_path.bright_white()
+        json_path.bright_white(),
+        manifest_path.bright_white()
     );
 
     Ok(())

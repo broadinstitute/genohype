@@ -8,6 +8,7 @@ pub mod data;
 pub mod gene_writer;
 pub mod genes;
 pub mod layout;
+pub(crate) mod legacy_manifest;
 pub mod loci_writer;
 pub mod locus;
 pub mod pipeline;
