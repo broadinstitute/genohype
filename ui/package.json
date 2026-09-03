@@ -2,6 +2,27 @@
   "private": true,
   "name": "@genohype/ui",
   "workspaces": [
-    "packages/*"
-  ]
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present"
+  },
+  "devDependencies": {
+    "@copilotkit/react-core": "1.58.0",
+    "@copilotkit/react-ui": "1.58.0",
+    "@copilotkit/runtime-client-gql": "1.58.0",
+    "@testing-library/dom": "^10.4.1",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.1",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "jsdom": "^28.1.0",
+    "styled-components": "6.4.2",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.18"
+  }
 }

@@ -1,0 +1,24 @@
+{
+  "source": "association/tests/fixtures/association-visualization-v1.json",
+  "review_basis": "Phase 1 Rust geometry plus generic AxAoU raster/axis/marker/table composition; no checked-in AxAoU raster golden exists",
+  "layout_hash": "sha256:3c7ee1a1070d72d6556653ae933790e0f2b36b1daac917e083f73a56fafd4c4a",
+  "axis_ticks": [0, 2, 4, 6, 8, 10, 30, 100, 300, 350],
+  "viewports": [
+    {
+      "width": 100,
+      "height": 50,
+      "hits": [
+        { "key": "1:3:A:G:1", "x": 6.4, "y": 0 },
+        { "key": "2:9:::2", "x": 61.6, "y": 26 }
+      ]
+    },
+    {
+      "width": 1000,
+      "height": 500,
+      "hits": [
+        { "key": "1:3:A:G:1", "x": 64, "y": 0 },
+        { "key": "2:9:::2", "x": 616, "y": 260 }
+      ]
+    }
+  ]
+}
