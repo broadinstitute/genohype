@@ -16,6 +16,36 @@ use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
+const HAIL_BLOCK_SIZE: usize = 64 * 1024;
+const ZSTD_COMPRESSION_LEVEL: i32 = 3;
+
+/// Write encoded bytes using Hail's ZstdBlockBufferSpec framing.
+///
+/// Every decompressed block must fit the `blockSize` declared in metadata.
+/// BlockingOutputBuffer has already established those boundaries, so preserve
+/// them instead of recombining a partition into one oversized Zstd frame.
+fn write_zstd_stream(path: &Path, encoded_blocks: &[Vec<u8>]) -> Result<()> {
+    let file = File::create(path)?;
+    let mut stream_writer = StreamBlockOutputBuffer::new(BufWriter::new(file));
+
+    for encoded_data in encoded_blocks {
+        debug_assert!(encoded_data.len() <= HAIL_BLOCK_SIZE);
+        let compressed = zstd::encode_all(encoded_data.as_slice(), ZSTD_COMPRESSION_LEVEL)?;
+        let mut block_data = Vec::with_capacity(4 + compressed.len());
+        block_data.extend_from_slice(&(encoded_data.len() as i32).to_le_bytes());
+        block_data.extend_from_slice(&compressed);
+        stream_writer.write_block(&block_data)?;
+    }
+
+    // Hail terminates the stream with a valid compressed zero-length block.
+    let empty_compressed = zstd::encode_all(&[][..], ZSTD_COMPRESSION_LEVEL)?;
+    let mut eof_block = Vec::with_capacity(4 + empty_compressed.len());
+    eof_block.extend_from_slice(&0i32.to_le_bytes());
+    eof_block.extend_from_slice(&empty_compressed);
+    stream_writer.write_block(&eof_block)?;
+    stream_writer.flush()
+}
+
 /// Writer for Hail Table (.ht) format
 pub struct HailTableWriter {
     output_path: PathBuf,
@@ -73,27 +103,7 @@ impl HailTableWriter {
         encoded_data.push(1); // present = true (row is present)
         encoded_data.push(0); // empty bitmap (no nullable fields in empty struct)
 
-        // Compress with zstd
-        let compressed = zstd::encode_all(encoded_data.as_slice(), 3)?;
-
-        // Build block with decompressed size prefix: [4-byte decompressed_len][zstd_data]
-        let mut block_data = Vec::with_capacity(4 + compressed.len());
-        block_data.extend_from_slice(&(encoded_data.len() as i32).to_le_bytes());
-        block_data.extend_from_slice(&compressed);
-
-        // Write as stream block
-        let file = File::create(&globals_path)?;
-        let mut stream_writer = StreamBlockOutputBuffer::new(BufWriter::new(file));
-        stream_writer.write_block(&block_data)?;
-
-        // Write EOF marker: a zstd block with decompressed_len=0
-        let empty_compressed = zstd::encode_all(&[][..], 3)?;
-        let mut eof_block = Vec::with_capacity(4 + empty_compressed.len());
-        eof_block.extend_from_slice(&0i32.to_le_bytes()); // decompressed_len = 0
-        eof_block.extend_from_slice(&empty_compressed);
-        stream_writer.write_block(&eof_block)?;
-
-        stream_writer.flush()?;
+        write_zstd_stream(&globals_path, &[encoded_data])?;
 
         // Write globals metadata
         let globals_metadata_path = self.output_path.join("globals/metadata.json.gz");
@@ -115,10 +125,10 @@ impl HailTableWriter {
                     "name": "LEB128BufferSpec",
                     "child": {
                         "name": "BlockingBufferSpec",
-                        "blockSize": 65536,
+                        "blockSize": HAIL_BLOCK_SIZE,
                         "child": {
                             "name": "ZstdBlockBufferSpec",
-                            "blockSize": 65536,
+                            "blockSize": HAIL_BLOCK_SIZE,
                             "child": {
                                 "name": "StreamBlockBufferSpec"
                             }
@@ -162,11 +172,7 @@ impl HailTableWriter {
         let row_count = rows.len();
 
         if rows.is_empty() {
-            // Write empty partition
-            let file = File::create(&part_path)?;
-            let mut stream_writer = StreamBlockOutputBuffer::new(BufWriter::new(file));
-            stream_writer.write_block(&[])?;
-            stream_writer.flush()?;
+            write_zstd_stream(&part_path, &[])?;
         } else {
             // Encode rows with LEB128 buffer stack
             let mut buffer = LEB128OutputBuffer::new(BlockingOutputBuffer::with_default_size());
@@ -182,30 +188,8 @@ impl HailTableWriter {
             buffer.write_bool(false)?;
 
             buffer.flush()?;
-            let encoded_data = buffer.into_inner().into_data();
-
-            // Compress with zstd
-            let compressed = zstd::encode_all(encoded_data.as_slice(), 3)?;
-
-            // Build block with decompressed size prefix: [4-byte decompressed_len][zstd_data]
-            let mut block_data = Vec::with_capacity(4 + compressed.len());
-            block_data.extend_from_slice(&(encoded_data.len() as i32).to_le_bytes());
-            block_data.extend_from_slice(&compressed);
-
-            // Write as stream block
-            let file = File::create(&part_path)?;
-            let mut stream_writer = StreamBlockOutputBuffer::new(BufWriter::new(file));
-            stream_writer.write_block(&block_data)?;
-
-            // Write EOF marker: a zstd block with decompressed_len=0
-            // Format: [4-byte decompLen=0][zstd compressed empty data]
-            let empty_compressed = zstd::encode_all(&[][..], 3)?;
-            let mut eof_block = Vec::with_capacity(4 + empty_compressed.len());
-            eof_block.extend_from_slice(&0i32.to_le_bytes()); // decompressed_len = 0
-            eof_block.extend_from_slice(&empty_compressed);
-            stream_writer.write_block(&eof_block)?;
-
-            stream_writer.flush()?;
+            let encoded_blocks = buffer.into_inner().into_blocks();
+            write_zstd_stream(&part_path, &encoded_blocks)?;
 
             // Track range bounds from first and last rows
             if let (Some(first), Some(last)) = (rows.first(), rows.last()) {
@@ -277,10 +261,10 @@ impl HailTableWriter {
                     "name": "LEB128BufferSpec",
                     "child": {
                         "name": "BlockingBufferSpec",
-                        "blockSize": 65536,
+                        "blockSize": HAIL_BLOCK_SIZE,
                         "child": {
                             "name": "ZstdBlockBufferSpec",
-                            "blockSize": 65536,
+                            "blockSize": HAIL_BLOCK_SIZE,
                             "child": {
                                 "name": "StreamBlockBufferSpec"
                             }
