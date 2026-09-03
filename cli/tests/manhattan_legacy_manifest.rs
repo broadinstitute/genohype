@@ -1,11 +1,67 @@
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use genohype_association::AssociationVisualizationManifestV1;
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../data/test/association/single-variant.ht")
+}
+
+fn copy_tree(source: &Path, destination: &Path) {
+    fs::create_dir_all(destination).unwrap();
+    for entry in fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let target = destination.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+fn rewrite_gzip_json(path: &Path, update: impl FnOnce(&mut serde_json::Value)) {
+    let mut decoded = String::new();
+    GzDecoder::new(fs::File::open(path).unwrap())
+        .read_to_string(&mut decoded)
+        .unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(&decoded).unwrap();
+    update(&mut value);
+    let mut encoder = GzEncoder::new(fs::File::create(path).unwrap(), Compression::default());
+    encoder
+        .write_all(serde_json::to_string(&value).unwrap().as_bytes())
+        .unwrap();
+    encoder.finish().unwrap();
+}
+
+fn two_partition_fixture(destination: &Path) {
+    copy_tree(&fixture_path(), destination);
+    fs::copy(
+        destination.join("rows/parts/part-0"),
+        destination.join("rows/parts/part-1"),
+    )
+    .unwrap();
+    copy_tree(
+        &destination.join("index/part-0.idx"),
+        &destination.join("index/part-1.idx"),
+    );
+    rewrite_gzip_json(&destination.join("metadata.json.gz"), |value| {
+        value["components"]["partition_counts"]["counts"] = serde_json::json!([12, 12]);
+    });
+    rewrite_gzip_json(&destination.join("rows/metadata.json.gz"), |value| {
+        value["_partFiles"] = serde_json::json!(["part-0", "part-1"]);
+        let bound = value["_jRangeBounds"][0].clone();
+        value["_jRangeBounds"] = serde_json::json!([bound.clone(), bound]);
+    });
+}
+
+fn read_manifest(path: impl AsRef<Path>) -> AssociationVisualizationManifestV1 {
+    serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
 }
 
 #[test]
@@ -116,4 +172,85 @@ fn legacy_manhattan_writes_canonical_manifest_and_keeps_sidecar() {
         manifest.source_fingerprint
     );
     assert_eq!(second_manifest.top_hits, manifest.top_hits);
+}
+
+#[test]
+fn integrated_multi_partition_identity_matches_legacy_and_is_deterministic() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = temp.path().join("two-partition.ht");
+    two_partition_fixture(&fixture);
+
+    let legacy_stem = temp.path().join("legacy");
+    let legacy = Command::new(env!("CARGO_BIN_EXE_genohype"))
+        .args([
+            "manhattan",
+            "--table",
+            fixture.to_str().unwrap(),
+            "--output",
+            legacy_stem.to_str().unwrap(),
+            "--width",
+            "800",
+            "--height",
+            "400",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        legacy.status.success(),
+        "{}",
+        String::from_utf8_lossy(&legacy.stderr)
+    );
+    let legacy_manifest = read_manifest(format!("{}.manifest.json", legacy_stem.display()));
+
+    let mut integrated_manifests = Vec::new();
+    let mut integrated_rasters = Vec::new();
+    for run in ["integrated-a", "integrated-b"] {
+        let output = temp.path().join(run);
+        let result = Command::new(env!("CARGO_BIN_EXE_genohype"))
+            .args([
+                "manhattan",
+                "--exome",
+                fixture.to_str().unwrap(),
+                "--output",
+                output.to_str().unwrap(),
+                "--width",
+                "800",
+                "--height",
+                "400",
+                "--scan-only",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        integrated_manifests.push(read_manifest(
+            output.join("plots/exome_manhattan.manifest.json"),
+        ));
+        integrated_rasters.push(fs::read(output.join("plots/exome_manhattan.png")).unwrap());
+    }
+
+    for manifest in &integrated_manifests {
+        assert_eq!(manifest.row_count, 24);
+        assert_eq!(
+            manifest.source_fingerprint,
+            legacy_manifest.source_fingerprint
+        );
+        assert_eq!(manifest.top_hits, legacy_manifest.top_hits);
+        assert!(manifest
+            .top_hits
+            .iter()
+            .any(|point| point.source_ordinal >> 32 == 1));
+    }
+    assert_eq!(
+        integrated_manifests[0].top_hits,
+        integrated_manifests[1].top_hits
+    );
+    assert_eq!(
+        integrated_manifests[0].source_fingerprint,
+        integrated_manifests[1].source_fingerprint
+    );
+    assert_eq!(integrated_rasters[0], integrated_rasters[1]);
 }

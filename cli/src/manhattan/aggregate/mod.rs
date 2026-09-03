@@ -13,7 +13,7 @@ pub mod merge;
 pub mod utils;
 
 use crate::distributed::manhattan::{
-    merge_partition_reduction_receipts, ManhattanPartitionReductionReceiptV1,
+    merge_partition_reduction_receipts_in_order, ManhattanPartitionReductionReceiptV1,
     ManhattanReductionSourceV1,
 };
 use crate::distributed::message::ManhattanAggregateSpec;
@@ -25,6 +25,7 @@ use crate::manhattan::data::{
 use crate::manhattan::genes::{render_gene_manhattan_styled, scan_gene_burden_to_parquet};
 use crate::manhattan::layout::ChromosomeLayout;
 use crate::manhattan::legacy_manifest::{write_manifest, LegacyScanSummary};
+use crate::manhattan::pipeline::composite::composite_partial_pngs_with_style_for_partitions;
 use crate::manhattan::pipeline::composite_partial_pngs_with_style;
 use crate::manhattan::qq::scan_qq_to_parquet;
 use genohype_core::error::Result;
@@ -222,6 +223,11 @@ pub fn run_aggregation(spec: &ManhattanAggregateSpec) -> Result<(usize, serde_js
             spec.threshold,
             &exome_style.background,
             reduction,
+            expected_partition_count(
+                spec.exome_partitions,
+                spec.exome_results.as_deref().unwrap(),
+                "exome",
+            )?,
         )?
     } else {
         0
@@ -236,6 +242,11 @@ pub fn run_aggregation(spec: &ManhattanAggregateSpec) -> Result<(usize, serde_js
             spec.threshold,
             &genome_style.background,
             reduction,
+            expected_partition_count(
+                spec.genome_partitions,
+                spec.genome_results.as_deref().unwrap(),
+                "genome",
+            )?,
         )?
     } else {
         0
@@ -676,30 +687,38 @@ fn load_source_reduction(
 ) -> Result<LegacyScanSummary> {
     let source_dir = format!("{output_base}/{source_name}");
     let paths = list_files(&source_dir, "-reduction.json")?;
-    let mut receipts = Vec::with_capacity(paths.len());
-
-    // Read and parse every discovered receipt before checking cardinality, so an
-    // extra duplicate or corrupt receipt cannot hide behind a count mismatch.
-    for path in paths {
-        let bytes = read_file_bytes(&path)?;
-        let receipt: ManhattanPartitionReductionReceiptV1 = serde_json::from_slice(&bytes)
-            .map_err(|error| {
-                crate::HailError::InvalidFormat(format!(
-                    "invalid Manhattan reduction receipt {path}: {error}"
-                ))
-            })?;
+    if paths.len() != expected_partition_count {
+        return Err(crate::HailError::InvalidFormat(format!(
+            "expected {expected_partition_count} Manhattan partition reduction receipts, found {}",
+            paths.len()
+        )));
+    }
+    let receipts = paths.into_iter().enumerate().map(|(index, path)| {
         let name = path.rsplit('/').next().unwrap_or_default();
-        let canonical_name = format!("part-{:05}-reduction.json", receipt.partition_index);
-        if name != canonical_name {
+        if name != format!("part-{index:05}-reduction.json") {
             return Err(crate::HailError::InvalidFormat(format!(
-                "Manhattan reduction receipt filename {name:?} does not match partition {}",
-                receipt.partition_index
+                "unexpected Manhattan reduction receipt {name:?}"
             )));
         }
-        receipts.push(receipt);
-    }
-
-    merge_partition_reduction_receipts(source, expected_partition_count, receipts)
+        let size = if is_cloud_path(&path) {
+            genohype_core::io::get_file_size(&path)?
+        } else {
+            std::fs::metadata(&path)?.len()
+        };
+        const MAX_RECEIPT_BYTES: u64 = 1_048_576;
+        if size > MAX_RECEIPT_BYTES {
+            return Err(crate::HailError::InvalidFormat(format!(
+                "Manhattan reduction receipt exceeds {MAX_RECEIPT_BYTES} byte limit: {path}"
+            )));
+        }
+        let bytes = read_file_bytes(&path)?;
+        serde_json::from_slice::<ManhattanPartitionReductionReceiptV1>(&bytes).map_err(|error| {
+            crate::HailError::InvalidFormat(format!(
+                "invalid Manhattan reduction receipt {path}: {error}"
+            ))
+        })
+    });
+    merge_partition_reduction_receipts_in_order(source, expected_partition_count, receipts)
 }
 
 fn read_file_bytes(path: &str) -> Result<Vec<u8>> {
@@ -724,6 +743,7 @@ fn composite_source_pngs(
     threshold: f64,
     background: &BackgroundStyle,
     reduction: LegacyScanSummary,
+    expected_partition_count: usize,
 ) -> Result<u64> {
     let parts_dir = format!("{output_base}/{source}");
     let output_stem = format!("{output_base}/plots/{source}_manhattan");
@@ -732,13 +752,14 @@ fn composite_source_pngs(
 
     // The transparent scan shards contain points only; draw the configured threshold
     // while producing the final whole-genome raster.
-    composite_partial_pngs_with_style(
+    composite_partial_pngs_with_style_for_partitions(
         &parts_dir,
         &output_path,
         width,
         height,
         threshold,
         background,
+        expected_partition_count,
     )?;
     let raster = read_file_bytes(&output_path)?;
     let layout = genohype_association::GenomeLayoutV1::new(

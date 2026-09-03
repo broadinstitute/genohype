@@ -181,6 +181,55 @@ fn aggregate_rejects_missing_duplicate_and_corrupt_receipts() {
 }
 
 #[test]
+fn aggregation_requires_exact_raster_partition_inventory_and_bounded_receipts() {
+    for case in ["missing-png", "extra-png", "oversized-receipt"] {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join(format!("manhattans/meta/{case}"));
+        scan(&output, ManhattanSource::Exome);
+        match case {
+            "missing-png" => fs::remove_file(output.join("exome/part-00000.png")).unwrap(),
+            "extra-png" => {
+                fs::copy(
+                    output.join("exome/part-00000.png"),
+                    output.join("exome/part-00001.png"),
+                )
+                .unwrap();
+            }
+            "oversized-receipt" => fs::write(
+                output.join("exome/part-00000-reduction.json"),
+                vec![b' '; 1_048_577],
+            )
+            .unwrap(),
+            _ => unreachable!(),
+        }
+        let error = run_aggregation(&aggregate_spec(&output, true, false)).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("partial PNG")
+                || message.contains("No part-*.png")
+                || message.contains("byte limit"),
+            "{case}: {message}"
+        );
+        assert!(!output.join("plots/exome_manhattan.manifest.json").exists());
+    }
+}
+
+#[test]
+fn failed_rerun_invalidates_prior_completion_marker_before_aggregation() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("manhattans/meta/rerun");
+    scan(&output, ManhattanSource::Exome);
+    let spec = aggregate_spec(&output, true, false);
+    process_manhattan_aggregate(&spec).unwrap();
+    let marker = temp.path().join("manhattans/.completed_phenos/meta_rerun");
+    assert!(marker.is_file());
+
+    fs::remove_file(output.join("exome/part-00000-reduction.json")).unwrap();
+    assert!(process_manhattan_aggregate(&spec).is_err());
+    assert!(!marker.exists());
+}
+
+#[test]
 fn completion_verification_is_fail_closed_for_manifests_rasters_and_marker_writes() {
     let temp = tempfile::tempdir().unwrap();
     let output = temp.path().join("manhattans/meta/verify");
@@ -191,7 +240,10 @@ fn completion_verification_is_fail_closed_for_manifests_rasters_and_marker_write
 
     let marker_dir = temp.path().join("manhattans/.completed_phenos");
     let marker = marker_dir.join("meta_verify");
-    fs::remove_file(&marker).unwrap();
+    assert!(
+        marker.is_file(),
+        "regression must begin with a stale success marker"
+    );
     let manifest_path = output.join("plots/exome_manhattan.manifest.json");
     let raster_path = output.join("plots/exome_manhattan.png");
     let original_manifest = fs::read(&manifest_path).unwrap();
@@ -220,6 +272,34 @@ fn completion_verification_is_fail_closed_for_manifests_rasters_and_marker_write
     assert!(verify_and_checkpoint(&spec).is_err());
     assert!(!marker.exists());
     fs::write(&manifest_path, &original_manifest).unwrap();
+
+    let root_manifest_path = output.join("manifest.json");
+    let original_root = fs::read(&root_manifest_path).unwrap();
+    fs::write(&root_manifest_path, b"{}").unwrap();
+    assert!(verify_and_checkpoint(&spec).is_err());
+    assert!(!marker.exists());
+    fs::write(&root_manifest_path, original_root).unwrap();
+
+    let mut wrong_media: serde_json::Value = serde_json::from_slice(&original_manifest).unwrap();
+    wrong_media["resources"]["raster"]["media_type"] = serde_json::json!("image/jpeg");
+    fs::write(&manifest_path, serde_json::to_vec(&wrong_media).unwrap()).unwrap();
+    assert!(verify_and_checkpoint(&spec).is_err());
+    assert!(!marker.exists());
+
+    let wrong_dimensions = tiny_skia::Pixmap::new(10, 10)
+        .unwrap()
+        .encode_png()
+        .unwrap();
+    let mut wrong_geometry: serde_json::Value = serde_json::from_slice(&original_manifest).unwrap();
+    wrong_geometry["resources"]["raster"]["byte_size"] = serde_json::json!(wrong_dimensions.len());
+    wrong_geometry["resources"]["raster"]["checksum"] =
+        serde_json::json!(format!("sha256:{:x}", Sha256::digest(&wrong_dimensions)));
+    fs::write(&manifest_path, serde_json::to_vec(&wrong_geometry).unwrap()).unwrap();
+    fs::write(&raster_path, wrong_dimensions).unwrap();
+    assert!(verify_and_checkpoint(&spec).is_err());
+    assert!(!marker.exists());
+    fs::write(&manifest_path, &original_manifest).unwrap();
+    fs::write(&raster_path, &original_raster).unwrap();
 
     fs::remove_dir(&marker_dir).unwrap();
     fs::write(&marker_dir, b"blocks checkpoint directory").unwrap();

@@ -47,6 +47,46 @@ pub fn composite_partial_pngs_with_style(
     threshold: f64,
     background: &BackgroundStyle,
 ) -> Result<()> {
+    composite_partial_pngs_impl(
+        parts_dir,
+        output_path,
+        width,
+        height,
+        threshold,
+        background,
+        None,
+    )
+}
+
+pub(crate) fn composite_partial_pngs_with_style_for_partitions(
+    parts_dir: &str,
+    output_path: &str,
+    width: u32,
+    height: u32,
+    threshold: f64,
+    background: &BackgroundStyle,
+    expected_partition_count: usize,
+) -> Result<()> {
+    composite_partial_pngs_impl(
+        parts_dir,
+        output_path,
+        width,
+        height,
+        threshold,
+        background,
+        Some(expected_partition_count),
+    )
+}
+
+fn composite_partial_pngs_impl(
+    parts_dir: &str,
+    output_path: &str,
+    width: u32,
+    height: u32,
+    threshold: f64,
+    background: &BackgroundStyle,
+    expected_partition_count: Option<usize>,
+) -> Result<()> {
     let start_time = Instant::now();
 
     println!("Compositing partial PNGs from: {}", parts_dir);
@@ -66,6 +106,23 @@ pub fn composite_partial_pngs_with_style(
             std::io::ErrorKind::NotFound,
             format!("No part-*.png files found in {}", parts_dir),
         )));
+    }
+
+    if let Some(expected) = expected_partition_count {
+        if png_files.len() != expected {
+            return Err(HailError::InvalidFormat(format!(
+                "expected {expected} Manhattan partial PNGs, found {}",
+                png_files.len()
+            )));
+        }
+        for (index, path) in png_files.iter().enumerate() {
+            let name = path.rsplit('/').next().unwrap_or_default();
+            if name != format!("part-{index:05}.png") {
+                return Err(HailError::InvalidFormat(format!(
+                    "unexpected Manhattan partial PNG {name:?}"
+                )));
+            }
+        }
     }
 
     // Download all PNGs in parallel
@@ -139,6 +196,15 @@ pub fn composite_partial_pngs_with_style(
                 format!("Failed to decode PNG {}: {}", png_files[i], e),
             ))
         })?;
+
+        if partial.width() != width || partial.height() != height {
+            return Err(HailError::InvalidFormat(format!(
+                "Manhattan partial PNG {} has dimensions {}x{}, expected {width}x{height}",
+                png_files[i],
+                partial.width(),
+                partial.height()
+            )));
+        }
 
         // Draw partial onto canvas with proper alpha blending (handled by tiny_skia)
         canvas.draw_pixmap(0, 0, partial.as_ref(), &paint, transform, None);

@@ -690,12 +690,6 @@ impl<W: Write + Send> SignificantHitSink for SigHitWriter<W> {
     }
 }
 
-fn sequential_ordinal(index: usize) -> Result<u64> {
-    u64::try_from(index).map_err(|_| {
-        crate::HailError::InvalidFormat("integrated scan row ordinal overflowed".into())
-    })
-}
-
 /// Scan a variant table (with optional annotation join), render Manhattan, and buffer variants.
 #[allow(clippy::too_many_arguments)]
 fn scan_variant_table(
@@ -713,7 +707,7 @@ fn scan_variant_table(
 ) -> Result<IntegratedScanSummary> {
     let results_engine = QueryEngine::open_path(results_path)?;
     let mut renderer = ManhattanRenderer::new(config.width, config.height);
-    let mut scan_summary = LegacyPartitionSummary::new(0)?;
+    let mut partition_summaries = Vec::with_capacity(results_engine.num_partitions());
 
     // Per-chromosome renderers/layouts for local run
     let mut chrom_renderers: HashMap<String, ManhattanRenderer> = HashMap::new();
@@ -748,105 +742,115 @@ fn scan_variant_table(
     let variant_threshold = config.threshold;
 
     if let Some(annot_path) = annotations_path {
-        // Merge-join with annotations
+        // Scan physical result partitions separately so source identity and ordinals
+        // exactly match legacy/distributed execution. Restarting the annotation stream
+        // is slower but stays streaming and remains correct across unlike partitioning.
         let annot_engine = QueryEngine::open_path(annot_path)?;
-
         let keys = vec!["locus".to_string(), "alleles".to_string()];
-        // Use sorted iterators for merge-join (sequential partition iteration)
-        let results_iter = results_engine.query_iter_sorted(&[])?;
-        let annot_iter = annot_engine.query_iter_sorted(&[])?;
-        let join_iter = SortedMergeIterator::new(results_iter, annot_iter, keys);
-
         let mut matched = 0usize;
         let mut unmatched = 0usize;
-        for (i, join_res) in join_iter.enumerate() {
-            let row = join_res?;
-
-            // Track match status
-            if row.right.is_some() {
-                matched += 1;
-            } else {
-                unmatched += 1;
-            }
-
-            let ordinal = sequential_ordinal(i)?;
-            scan_summary.observe_source_row(&row.left)?;
-            match extract_association_point(&row.left, y_field, ordinal) {
-                Ok((point, warnings)) => {
-                    let variant = extract_variant_fields(&row.left, &point)?;
-                    let significant = point.pvalue < variant_threshold;
-                    let rendered = process_joined_row(
-                        &row,
-                        &point,
-                        variant,
-                        source,
-                        layout,
-                        compatibility_layout,
-                        compatibility_y_scale,
-                        locus_threshold,
-                        variant_threshold,
-                        interest_regions,
-                        buffer,
-                        sig_writer,
-                        &mut renderer,
-                        &contig_lengths,
-                        &mut chrom_renderers,
-                        &mut chrom_layouts,
-                        config.width,
-                        config.height,
-                    )?;
-                    scan_summary.observe_valid_point(point, warnings, rendered, significant)?;
+        let mut scanned = 0_u64;
+        for partition_index in 0..results_engine.num_partitions() {
+            let mut scan_summary = LegacyPartitionSummary::new(partition_index)?;
+            let results_iter = results_engine.scan_partition_iter(partition_index, &[])?;
+            let annot_iter = annot_engine.query_iter_sorted(&[])?;
+            let join_iter = SortedMergeIterator::new(results_iter, annot_iter, keys.clone());
+            for (row_index, join_res) in join_iter.enumerate() {
+                let row = join_res?;
+                if row.right.is_some() {
+                    matched += 1;
+                } else {
+                    unmatched += 1;
                 }
-                Err(_) => scan_summary.observe_skipped_row()?,
+                let ordinal =
+                    crate::manhattan::legacy_manifest::source_ordinal(partition_index, row_index)?;
+                scan_summary.observe_source_row(&row.left)?;
+                match extract_association_point(&row.left, y_field, ordinal) {
+                    Ok((point, warnings)) => {
+                        let variant = extract_variant_fields(&row.left, &point)?;
+                        let significant = point.pvalue < variant_threshold;
+                        let rendered = process_joined_row(
+                            &row,
+                            &point,
+                            variant,
+                            source,
+                            layout,
+                            compatibility_layout,
+                            compatibility_y_scale,
+                            locus_threshold,
+                            variant_threshold,
+                            interest_regions,
+                            buffer,
+                            sig_writer,
+                            &mut renderer,
+                            &contig_lengths,
+                            &mut chrom_renderers,
+                            &mut chrom_layouts,
+                            config.width,
+                            config.height,
+                        )?;
+                        scan_summary.observe_valid_point(point, warnings, rendered, significant)?;
+                    }
+                    Err(_) => scan_summary.observe_skipped_row()?,
+                }
+                scanned = scanned.checked_add(1).ok_or_else(|| {
+                    crate::HailError::InvalidFormat("integrated scan row count overflowed".into())
+                })?;
+                if scanned % 10_000 == 0 {
+                    pb.set_position(scanned);
+                }
             }
-
-            if i % 10_000 == 0 {
-                pb.set_position(ordinal);
-            }
+            partition_summaries.push(scan_summary);
         }
         println!(
             "  Merge complete: {} matched, {} unmatched",
             matched, unmatched
         );
     } else {
-        // No annotations - just scan results
-        let results_iter = results_engine.query_iter(&[])?;
-
-        for (i, row_res) in results_iter.enumerate() {
-            let row = row_res?;
-            let ordinal = sequential_ordinal(i)?;
-            scan_summary.observe_source_row(&row)?;
-            match extract_association_point(&row, y_field, ordinal) {
-                Ok((point, warnings)) => {
-                    let variant = extract_variant_fields(&row, &point)?;
-                    let significant = point.pvalue < variant_threshold;
-                    let rendered = process_single_row(
-                        &point,
-                        variant,
-                        source,
-                        layout,
-                        compatibility_layout,
-                        compatibility_y_scale,
-                        locus_threshold,
-                        variant_threshold,
-                        interest_regions,
-                        buffer,
-                        sig_writer,
-                        &mut renderer,
-                        &contig_lengths,
-                        &mut chrom_renderers,
-                        &mut chrom_layouts,
-                        config.width,
-                        config.height,
-                    )?;
-                    scan_summary.observe_valid_point(point, warnings, rendered, significant)?;
+        let mut scanned = 0_u64;
+        for partition_index in 0..results_engine.num_partitions() {
+            let mut scan_summary = LegacyPartitionSummary::new(partition_index)?;
+            let results_iter = results_engine.scan_partition_iter(partition_index, &[])?;
+            for (row_index, row_res) in results_iter.enumerate() {
+                let row = row_res?;
+                let ordinal =
+                    crate::manhattan::legacy_manifest::source_ordinal(partition_index, row_index)?;
+                scan_summary.observe_source_row(&row)?;
+                match extract_association_point(&row, y_field, ordinal) {
+                    Ok((point, warnings)) => {
+                        let variant = extract_variant_fields(&row, &point)?;
+                        let significant = point.pvalue < variant_threshold;
+                        let rendered = process_single_row(
+                            &point,
+                            variant,
+                            source,
+                            layout,
+                            compatibility_layout,
+                            compatibility_y_scale,
+                            locus_threshold,
+                            variant_threshold,
+                            interest_regions,
+                            buffer,
+                            sig_writer,
+                            &mut renderer,
+                            &contig_lengths,
+                            &mut chrom_renderers,
+                            &mut chrom_layouts,
+                            config.width,
+                            config.height,
+                        )?;
+                        scan_summary.observe_valid_point(point, warnings, rendered, significant)?;
+                    }
+                    Err(_) => scan_summary.observe_skipped_row()?,
                 }
-                Err(_) => scan_summary.observe_skipped_row()?,
+                scanned = scanned.checked_add(1).ok_or_else(|| {
+                    crate::HailError::InvalidFormat("integrated scan row count overflowed".into())
+                })?;
+                if scanned % 10_000 == 0 {
+                    pb.set_position(scanned);
+                }
             }
-
-            if i % 10_000 == 0 {
-                pb.set_position(ordinal);
-            }
+            partition_summaries.push(scan_summary);
         }
     }
 
@@ -876,7 +880,7 @@ fn scan_variant_table(
         fs::write(chrom_dir.join(file_name), data)?;
     }
 
-    let scan = merge_partition_summaries(vec![scan_summary])?;
+    let scan = merge_partition_summaries(partition_summaries)?;
     Ok(IntegratedScanSummary::from_scan(
         scan,
         png_data,

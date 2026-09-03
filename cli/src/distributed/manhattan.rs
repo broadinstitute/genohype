@@ -113,14 +113,16 @@ impl ManhattanPartitionReductionReceiptV1 {
         if self.significant_hit_count > self.valid_row_count {
             return Err("significant_hit_count cannot exceed valid_row_count".into());
         }
-        if self.top_hits.len() > MANHATTAN_PARTITION_TOP_HITS_MAX_V1 {
+        let expected_top_hits =
+            self.valid_row_count
+                .min(MANHATTAN_PARTITION_TOP_HITS_MAX_V1 as u64) as usize;
+        if self.top_hits.len() != expected_top_hits {
             return Err(format!(
-                "top_hits exceeds the {} point bound",
-                MANHATTAN_PARTITION_TOP_HITS_MAX_V1
+                "top_hits must contain exactly min(valid_row_count, {}) = {} points, found {}",
+                MANHATTAN_PARTITION_TOP_HITS_MAX_V1,
+                expected_top_hits,
+                self.top_hits.len()
             ));
-        }
-        if self.top_hits.len() as u64 > self.valid_row_count {
-            return Err("top_hits cannot exceed valid_row_count".into());
         }
         let partition = u32::try_from(self.partition_index)
             .map_err(|_| "partition index exceeds source ordinal capacity".to_string())?;
@@ -267,32 +269,19 @@ impl ManhattanPartitionReductionAccumulatorV1 {
 ///
 /// The result uses the same source fingerprint construction as local/integrated
 /// scans and retains at most the canonical top 100 points.
-pub(crate) fn merge_partition_reduction_receipts(
+pub(crate) fn merge_partition_reduction_receipts_in_order<I>(
     expected_source: ManhattanReductionSourceV1,
     expected_partition_count: usize,
-    mut receipts: Vec<ManhattanPartitionReductionReceiptV1>,
-) -> Result<LegacyScanSummary> {
+    receipts: I,
+) -> Result<LegacyScanSummary>
+where
+    I: IntoIterator<Item = Result<ManhattanPartitionReductionReceiptV1>>,
+{
     if expected_partition_count == 0 {
         return Err(HailError::InvalidFormat(
             "distributed Manhattan source has no expected partitions".into(),
         ));
     }
-    receipts.sort_by_key(|receipt| receipt.partition_index);
-    if receipts
-        .windows(2)
-        .any(|pair| pair[0].partition_index == pair[1].partition_index)
-    {
-        return Err(HailError::InvalidFormat(
-            "duplicate Manhattan partition reduction receipt".into(),
-        ));
-    }
-    if receipts.len() != expected_partition_count {
-        return Err(HailError::InvalidFormat(format!(
-            "expected {expected_partition_count} Manhattan partition reduction receipts, found {}",
-            receipts.len()
-        )));
-    }
-
     let mut row_count = 0_u64;
     let mut valid_row_count = 0_u64;
     let mut skipped_row_count = 0_u64;
@@ -305,7 +294,10 @@ pub(crate) fn merge_partition_reduction_receipts(
     source_hasher.update(b"genohype.association.source.v1\0");
     source_hasher.update((expected_partition_count as u64).to_be_bytes());
 
+    let mut receipt_count = 0usize;
     for (expected_index, receipt) in receipts.into_iter().enumerate() {
+        receipt_count = expected_index + 1;
+        let receipt = receipt?;
         receipt.validate().map_err(HailError::InvalidFormat)?;
         if receipt.source != expected_source {
             return Err(HailError::InvalidFormat(format!(
@@ -348,6 +340,11 @@ pub(crate) fn merge_partition_reduction_receipts(
         source_hasher.update(parse_source_digest(&receipt.source_digest)?);
     }
 
+    if receipt_count != expected_partition_count {
+        return Err(HailError::InvalidFormat(format!(
+            "expected {expected_partition_count} Manhattan partition reduction receipts, found {receipt_count}"
+        )));
+    }
     if valid_row_count.checked_add(skipped_row_count) != Some(row_count) {
         return Err(HailError::InvalidFormat(
             "distributed Manhattan scan counts are inconsistent".into(),
@@ -364,6 +361,27 @@ pub(crate) fn merge_partition_reduction_receipts(
         warnings: warnings.into_iter().collect(),
         source_fingerprint: format!("sha256:{:x}", source_hasher.finalize()),
     })
+}
+
+pub(crate) fn merge_partition_reduction_receipts(
+    expected_source: ManhattanReductionSourceV1,
+    expected_partition_count: usize,
+    mut receipts: Vec<ManhattanPartitionReductionReceiptV1>,
+) -> Result<LegacyScanSummary> {
+    receipts.sort_by_key(|receipt| receipt.partition_index);
+    if receipts
+        .windows(2)
+        .any(|pair| pair[0].partition_index == pair[1].partition_index)
+    {
+        return Err(HailError::InvalidFormat(
+            "duplicate Manhattan partition reduction receipt".into(),
+        ));
+    }
+    merge_partition_reduction_receipts_in_order(
+        expected_source,
+        expected_partition_count,
+        receipts.into_iter().map(Ok),
+    )
 }
 
 fn parse_source_digest(digest: &str) -> Result<[u8; 32]> {
@@ -600,7 +618,44 @@ mod tests {
             serde_json::from_value::<ManhattanPartitionReductionReceiptV1>(value)
                 .unwrap_err()
                 .to_string()
-                .contains("100 point bound")
+                .contains("exactly")
+        );
+    }
+
+    #[test]
+    fn deserialization_rejects_truncated_and_noncanonical_top_hits() {
+        let mut accumulator =
+            ManhattanPartitionReductionAccumulatorV1::new(0, ManhattanSource::Exome).unwrap();
+        for row in 0..3 {
+            accumulator
+                .observe_source_row(&EncodedValue::Int32(row))
+                .unwrap();
+            accumulator
+                .observe_valid_point(
+                    point(row as u64, 1e-9 * f64::from(row + 1)),
+                    vec![],
+                    true,
+                    true,
+                )
+                .unwrap();
+        }
+        let receipt = accumulator.finish().unwrap();
+        let mut truncated = serde_json::to_value(&receipt).unwrap();
+        truncated["top_hits"].as_array_mut().unwrap().pop();
+        assert!(
+            serde_json::from_value::<ManhattanPartitionReductionReceiptV1>(truncated)
+                .unwrap_err()
+                .to_string()
+                .contains("exactly")
+        );
+
+        let mut unordered = serde_json::to_value(receipt).unwrap();
+        unordered["top_hits"].as_array_mut().unwrap().swap(0, 2);
+        assert!(
+            serde_json::from_value::<ManhattanPartitionReductionReceiptV1>(unordered)
+                .unwrap_err()
+                .to_string()
+                .contains("canonical order")
         );
     }
 }

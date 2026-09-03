@@ -15,6 +15,16 @@ use std::io::Write;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+fn canonical_scan_layout(width: u32, height: u32) -> Result<genohype_association::GenomeLayoutV1> {
+    genohype_association::GenomeLayoutV1::new(
+        genohype_association::canonical_contig_lengths(genohype_association::Assembly::Grch38),
+        width,
+        height,
+        4,
+    )
+    .map_err(|error| crate::HailError::InvalidFormat(error.to_string()))
+}
+
 enum ScanSigHitWriter {
     Local(crate::manhattan::sig_writer::SigHitWriter<std::fs::File>),
     Cloud(crate::manhattan::sig_writer::SigHitWriter<genohype_core::io::CloudWriter>),
@@ -132,8 +142,11 @@ pub fn process_manhattan_scan_v2(
         source_name
     );
 
-    let layout = &spec.layout;
-    let y_scale = &spec.y_scale;
+    // Whole-genome shards use the exact canonical geometry later carried by
+    // the V1 manifest. Legacy wire fields remain for compatibility products.
+    let canonical_layout = canonical_scan_layout(spec.width, spec.height)?;
+    let compatibility_layout = &spec.layout;
+    let compatibility_y_scale = &spec.y_scale;
     let table_path = &spec.table_path;
 
     let engine = if let Some((cached_path, cached_eng)) = cached_engine {
@@ -223,20 +236,26 @@ pub fn process_manhattan_scan_v2(
                 let significant = point.pvalue < threshold;
 
                 // A point is counted as rendered only when it appears in the whole-genome layout.
-                let rendered = if let Some(x) = layout.get_x(contig_for_layout, position) {
-                    let y = y_scale.get_y(point.neg_log10_p);
-                    let color = layout.get_color(contig_for_layout);
-                    renderer.render_point_with_radius(
-                        x,
-                        y,
-                        color,
-                        style.point_alpha,
-                        style.point_radius,
-                    );
-                    true
-                } else {
-                    false
-                };
+                let rendered =
+                    if let Some(x) = canonical_layout.x_for(&point.contig, point.position) {
+                        let y = canonical_layout.y_scale.y_for(point.neg_log10_p);
+                        let color = canonical_layout.color_for(&point.contig).ok_or_else(|| {
+                            crate::HailError::InvalidFormat(format!(
+                                "canonical Manhattan layout has no color for {:?}",
+                                point.contig
+                            ))
+                        })?;
+                        renderer.render_point_with_radius(
+                            x,
+                            y,
+                            color,
+                            style.point_alpha,
+                            style.point_radius,
+                        );
+                        true
+                    } else {
+                        false
+                    };
 
                 // Compatibility per-chromosome partials remain transparent and keep their
                 // existing output names and scales.
@@ -254,8 +273,8 @@ pub fn process_manhattan_scan_v2(
                         .entry(normalized_contig.clone())
                         .or_insert_with(|| ManhattanRenderer::new_transparent(width, height));
                     if let Some(x) = chrom_layout.get_x(contig_for_layout, position) {
-                        let y = y_scale.get_y(point.neg_log10_p);
-                        let color = layout.get_color(contig_for_layout);
+                        let y = compatibility_y_scale.get_y(point.neg_log10_p);
+                        let color = compatibility_layout.get_color(contig_for_layout);
                         chrom_renderer.render_point_with_radius(
                             x,
                             y,
@@ -421,6 +440,60 @@ pub fn extract_sig_hit_fields(
     (ref_allele, alt_allele, beta, se, af)
 }
 
+fn completion_marker_url(spec: &ManhattanAggregateSpec) -> Result<String> {
+    let output_base = spec.output_path.trim_end_matches('/');
+    let parts: Vec<&str> = output_base.rsplitn(3, '/').collect();
+    if parts.len() < 3 || parts.iter().any(|part| part.is_empty()) {
+        return Err(crate::HailError::InvalidFormat(format!(
+            "cannot derive completion checkpoint from output path {output_base:?}"
+        )));
+    }
+    Ok(format!(
+        "{}/.completed_phenos/{}_{}",
+        parts[2], parts[1], parts[0]
+    ))
+}
+
+fn clear_completion_marker(spec: &ManhattanAggregateSpec) -> Result<()> {
+    let marker = completion_marker_url(spec)?;
+    if !genohype_core::io::is_cloud_path(&marker) {
+        return match std::fs::remove_file(&marker) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        };
+    }
+
+    #[cfg(feature = "gcp")]
+    {
+        use object_store::path::Path as ObjectPath;
+        use object_store::ObjectStore;
+        let url = url::Url::parse(&marker)
+            .map_err(|error| crate::HailError::InvalidFormat(error.to_string()))?;
+        if url.scheme() != "gs" {
+            return Err(crate::HailError::InvalidFormat(format!(
+                "unsupported completion marker URL: {marker}"
+            )));
+        }
+        let bucket = url.host_str().ok_or_else(|| {
+            crate::HailError::InvalidFormat(format!("completion marker has no bucket: {marker}"))
+        })?;
+        let location = ObjectPath::from(url.path().trim_start_matches('/'));
+        let store = genohype_core::io::get_gcs_client(bucket)?;
+        let runtime = tokio::runtime::Runtime::new()?;
+        match runtime.block_on(store.delete(&location)) {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(error) => Err(crate::HailError::ObjectStore(error)),
+        }
+    }
+    #[cfg(not(feature = "gcp"))]
+    {
+        Err(crate::HailError::InvalidFormat(
+            "cloud completion marker removal requires the gcp feature".into(),
+        ))
+    }
+}
+
 /// Process Manhattan aggregate phase (V2 pipeline).
 ///
 /// This is the Phase 2 worker task. It:
@@ -435,6 +508,9 @@ pub fn process_manhattan_aggregate(
 ) -> Result<(usize, serde_json::Value)> {
     use crate::manhattan::aggregate::run_aggregation;
 
+    if !spec.gene_associations_only {
+        clear_completion_marker(spec)?;
+    }
     let (rows, summary) = run_aggregation(spec)?;
 
     // The narrow gene export intentionally has no Manhattan manifest/checkpoint.
@@ -450,6 +526,7 @@ pub fn process_manhattan_aggregate(
 /// writing the completion marker. Any missing, malformed, or mismatched resource
 /// fails the aggregate task and leaves completion unmarked.
 pub fn verify_and_checkpoint(spec: &ManhattanAggregateSpec) -> Result<()> {
+    use crate::manhattan::data::Manifest;
     use genohype_association::{
         canonical_contig_lengths, Assembly, AssociationVisualizationManifestV1, GenomeLayoutV1,
         PlotKindV1,
@@ -464,18 +541,54 @@ pub fn verify_and_checkpoint(spec: &ManhattanAggregateSpec) -> Result<()> {
             })?;
             genohype_core::io::range_read(path, 0, size)
         } else {
-            Ok(std::fs::read(path)?)
+            std::fs::read(path).map_err(|error| {
+                crate::HailError::Io(std::io::Error::new(
+                    error.kind(),
+                    format!("failed to read required output {path}: {error}"),
+                ))
+            })
         }
     }
 
+    // Also invalidate when this verifier is called directly against an existing run.
+    clear_completion_marker(spec)?;
+
     let output_base = spec.output_path.trim_end_matches('/');
     let root_manifest_path = format!("{output_base}/manifest.json");
-    let root_manifest = read_all(&root_manifest_path)?;
-    serde_json::from_slice::<serde_json::Value>(&root_manifest).map_err(|error| {
+    let root_manifest_bytes = read_all(&root_manifest_path)?;
+    let root: Manifest = serde_json::from_slice(&root_manifest_bytes).map_err(|error| {
         crate::HailError::InvalidFormat(format!(
             "invalid compatibility manifest {root_manifest_path}: {error}"
         ))
     })?;
+    if root.inputs.exome_results != spec.exome_results
+        || root.inputs.genome_results != spec.genome_results
+        || root.inputs.gene_burden != spec.gene_burden
+        || root.manhattans.exome.is_some() != spec.exome_results.is_some()
+        || root.manhattans.genome.is_some() != spec.genome_results.is_some()
+        || root.manhattans.gene.is_some() != spec.gene_burden.is_some()
+    {
+        return Err(crate::HailError::InvalidFormat(format!(
+            "compatibility manifest source inventory mismatch: {root_manifest_path}"
+        )));
+    }
+
+    let verify_png = |path: &str, expected_width: u32, expected_height: u32| -> Result<Vec<u8>> {
+        let bytes = read_all(path)?;
+        let pixmap = tiny_skia::Pixmap::decode_png(&bytes).map_err(|error| {
+            crate::HailError::InvalidFormat(format!("invalid PNG {path}: {error}"))
+        })?;
+        if pixmap.width() != expected_width || pixmap.height() != expected_height {
+            return Err(crate::HailError::InvalidFormat(format!(
+                "PNG dimensions mismatch for {path}: {}x{}, expected {}x{}",
+                pixmap.width(),
+                pixmap.height(),
+                expected_width,
+                expected_height
+            )));
+        }
+        Ok(bytes)
+    };
 
     let expected_layout = GenomeLayoutV1::new(
         canonical_contig_lengths(Assembly::Grch38),
@@ -520,6 +633,30 @@ pub fn verify_and_checkpoint(spec: &ManhattanAggregateSpec) -> Result<()> {
                 "canonical manifest identity or threshold mismatch: {manifest_path}"
             )));
         }
+        let compatibility_entry = match source {
+            "exome" => root.manhattans.exome.as_ref(),
+            "genome" => root.manhattans.genome.as_ref(),
+            _ => unreachable!(),
+        }
+        .ok_or_else(|| {
+            crate::HailError::InvalidFormat(format!(
+                "compatibility manifest is missing {source} Manhattan entry"
+            ))
+        })?;
+        let expected_compatibility_png = format!("{output_base}/plots/{raster_name}");
+        if compatibility_entry.png != expected_compatibility_png
+            || compatibility_entry.count != manifest.rendered_point_count
+        {
+            return Err(crate::HailError::InvalidFormat(format!(
+                "compatibility {source} raster/count does not match canonical manifest"
+            )));
+        }
+        if manifest.resources.raster.media_type != "image/png" {
+            return Err(crate::HailError::InvalidFormat(format!(
+                "canonical raster media type is not image/png: {manifest_path}"
+            )));
+        }
+
         let fingerprint = manifest
             .source_fingerprint
             .strip_prefix("sha256:")
@@ -535,7 +672,7 @@ pub fn verify_and_checkpoint(spec: &ManhattanAggregateSpec) -> Result<()> {
         }
 
         let raster_path = format!("{output_base}/plots/{raster_name}");
-        let raster = read_all(&raster_path)?;
+        let raster = verify_png(&raster_path, manifest.layout.width, manifest.layout.height)?;
         let actual_size = u64::try_from(raster.len()).map_err(|_| {
             crate::HailError::InvalidFormat(format!("raster is too large: {raster_path}"))
         })?;
@@ -549,18 +686,81 @@ pub fn verify_and_checkpoint(spec: &ManhattanAggregateSpec) -> Result<()> {
         }
     }
 
-    // output_path: gs://bucket/manhattans/meta/1234
-    // checkpoint:  gs://bucket/manhattans/.completed_phenos/meta_1234
-    let parts: Vec<&str> = output_base.rsplitn(3, '/').collect();
-    if parts.len() < 3 || parts.iter().any(|part| part.is_empty()) {
-        return Err(crate::HailError::InvalidFormat(format!(
-            "cannot derive completion checkpoint from output path {output_base:?}"
-        )));
+    // Validate every remaining compatibility artifact referenced by the root.
+    if let Some(gene) = root.manhattans.gene.as_ref() {
+        let expected = format!("{output_base}/plots/gene_manhattan.png");
+        if gene.png != expected {
+            return Err(crate::HailError::InvalidFormat(
+                "compatibility gene Manhattan path mismatch".into(),
+            ));
+        }
+        verify_png(&gene.png, spec.width, spec.height)?;
     }
-    let id = parts[0];
-    let ancestry = parts[1];
-    let base_dir = parts[2];
-    let marker_url = format!("{base_dir}/.completed_phenos/{ancestry}_{id}");
+    for (chrom, entries) in &root.chrom_manhattans {
+        for (source, entry, enabled) in [
+            (
+                "exome",
+                entries.exome.as_ref(),
+                spec.exome_results.is_some(),
+            ),
+            (
+                "genome",
+                entries.genome.as_ref(),
+                spec.genome_results.is_some(),
+            ),
+            ("gene", entries.gene.as_ref(), spec.gene_burden.is_some()),
+        ] {
+            if let Some(entry) = entry {
+                if !enabled || entry.count != 0 {
+                    return Err(crate::HailError::InvalidFormat(format!(
+                        "invalid compatibility chromosome inventory for {chrom}/{source}"
+                    )));
+                }
+                let expected = format!("{output_base}/chroms/{chrom}/{source}_manhattan.png");
+                if entry.png != expected {
+                    return Err(crate::HailError::InvalidFormat(format!(
+                        "compatibility chromosome raster path mismatch: {}",
+                        entry.png
+                    )));
+                }
+                verify_png(&entry.png, spec.width, spec.height)?;
+            }
+        }
+    }
+    for (source, hit, enabled) in [
+        (
+            "exome",
+            root.significant_hits.exome.as_ref(),
+            spec.exome_results.is_some(),
+        ),
+        (
+            "genome",
+            root.significant_hits.genome.as_ref(),
+            spec.genome_results.is_some(),
+        ),
+        (
+            "gene",
+            root.significant_hits.gene.as_ref(),
+            spec.gene_burden.is_some(),
+        ),
+    ] {
+        if let Some(hit) = hit {
+            if !enabled || hit.count == 0 {
+                return Err(crate::HailError::InvalidFormat(format!(
+                    "invalid compatibility significant-hit inventory for {source}"
+                )));
+            }
+            read_all(&hit.path)?;
+        }
+    }
+    for locus in &root.loci {
+        if let Some(plot) = locus.plot.as_deref() {
+            verify_png(plot, spec.width, spec.height)?;
+        }
+    }
+
+    let marker_url = completion_marker_url(spec)?;
+    let marker_name = marker_url.rsplit('/').next().unwrap_or_default();
 
     if genohype_core::io::is_cloud_path(&marker_url) {
         use genohype_core::io::CloudWriter;
@@ -572,10 +772,39 @@ pub fn verify_and_checkpoint(spec: &ManhattanAggregateSpec) -> Result<()> {
         writer.write_all(b"")?;
         writer.finish()?;
     } else {
-        let marker_dir = format!("{base_dir}/.completed_phenos");
-        std::fs::create_dir_all(&marker_dir)?;
-        std::fs::write(&marker_url, b"")?;
+        let marker_path = std::path::Path::new(&marker_url);
+        let marker_dir = marker_path.parent().ok_or_else(|| {
+            crate::HailError::InvalidFormat(format!(
+                "completion marker has no parent: {marker_url}"
+            ))
+        })?;
+        std::fs::create_dir_all(marker_dir)?;
+        std::fs::write(marker_path, b"")?;
     }
-    println!("  Checkpoint: added {ancestry}_{id} to .completed_phenos");
+    println!("  Checkpoint: added {marker_name} to .completed_phenos");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::canonical_scan_layout;
+
+    #[test]
+    fn distributed_whole_genome_geometry_uses_canonical_one_based_boundaries() {
+        let layout = canonical_scan_layout(1_000, 400).unwrap();
+        let contig = layout
+            .contigs
+            .iter()
+            .find(|contig| contig.name == "1")
+            .unwrap();
+        assert_eq!(layout.x_for("chr1", 1), Some(contig.x_start as f32));
+        let expected_end = contig.x_start
+            + (contig.length - 1) as f64 / contig.length as f64 * (contig.x_end - contig.x_start);
+        assert_eq!(
+            layout.x_for("1", contig.length as i64),
+            Some(expected_end as f32)
+        );
+        assert_eq!(layout.x_for("1", 0), None);
+        assert_eq!(layout.x_for("1", contig.length as i64 + 1), None);
+    }
 }
