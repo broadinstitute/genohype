@@ -40,6 +40,7 @@
 //! ```
 
 pub mod coordinator;
+pub mod manhattan;
 pub mod message;
 pub mod metrics_db;
 pub mod pool_wrappers;

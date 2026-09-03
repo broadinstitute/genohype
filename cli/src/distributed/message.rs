@@ -611,6 +611,7 @@ pub enum ManhattanSource {
 /// Workers receive this spec to scan partitions and output:
 /// - Partial PNG (transparent background, for later compositing)
 /// - Significant hits Parquet (variants below threshold)
+/// - Bounded partition reduction JSON receipt
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManhattanScanSpec {
     // Identity metadata (for significant hits Parquet)

@@ -2,36 +2,118 @@
 //!
 //! Processes Manhattan scan (Phase 1) and aggregate (Phase 2) jobs.
 
+use crate::distributed::manhattan::{
+    ManhattanPartitionReductionAccumulatorV1, ManhattanPartitionReductionReceiptV1,
+};
 use crate::distributed::message::{
     CoreTaskInfo, ManhattanAggregateSpec, ManhattanScanSpec, ManhattanSource,
 };
 use crate::distributed::worker::telemetry::{CoreTaskGuard, TelemetryState};
 use crate::Result;
 use genohype_core::query::QueryEngine;
+use std::io::Write;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+
+enum ScanSigHitWriter {
+    Local(crate::manhattan::sig_writer::SigHitWriter<std::fs::File>),
+    Cloud(crate::manhattan::sig_writer::SigHitWriter<genohype_core::io::CloudWriter>),
+}
+
+impl ScanSigHitWriter {
+    fn new(path: &str) -> Result<Self> {
+        if genohype_core::io::is_cloud_path(path) {
+            let writer = genohype_core::io::CloudWriter::new(path)?;
+            Ok(Self::Cloud(
+                crate::manhattan::sig_writer::SigHitWriter::from_writer(writer)?,
+            ))
+        } else {
+            Ok(Self::Local(
+                crate::manhattan::sig_writer::SigHitWriter::new(path)?,
+            ))
+        }
+    }
+
+    fn write(&mut self, row: crate::manhattan::data::SigHitRow) -> Result<()> {
+        match self {
+            Self::Local(writer) => writer.write(row),
+            Self::Cloud(writer) => writer.write(row),
+        }
+    }
+
+    fn finish(self) -> Result<()> {
+        match self {
+            Self::Local(writer) => {
+                writer.finish()?;
+            }
+            Self::Cloud(writer) => {
+                writer.into_inner()?.finish()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn write_partition_reduction_receipt(
+    path: &str,
+    receipt: &ManhattanPartitionReductionReceiptV1,
+) -> Result<()> {
+    let bytes = receipt.to_json_bytes()?;
+    if genohype_core::io::is_cloud_path(path) {
+        let mut writer = genohype_core::io::StreamingCloudWriter::new(path)?;
+        writer.write_all(&bytes)?;
+        writer.finish()?;
+        return Ok(());
+    }
+
+    let path = std::path::Path::new(path);
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            crate::HailError::InvalidFormat("reduction receipt has no UTF-8 basename".into())
+        })?;
+    let temporary = parent.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| -> Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
 
 /// Process partitions for Manhattan scan phase (V2 pipeline).
 ///
 /// This is the Phase 1 worker task. For each partition, it:
 /// 1. Renders plot points to a partial PNG (transparent background)
 /// 2. Writes significant hits (below threshold) to a Parquet file
+/// 3. Publishes a bounded reduction receipt after all partition artifacts succeed
 ///
 /// Output structure:
 /// - {output_path}/{source}/part-{id}.png
 /// - {output_path}/{source}/part-{id}-sig.parquet
+/// - {output_path}/{source}/part-{id}-reduction.json
 pub fn process_manhattan_scan_v2(
     cached_engine: Option<(String, QueryEngine)>,
     partitions: &[usize],
     spec: &ManhattanScanSpec,
     telemetry: Option<Arc<TelemetryState>>,
 ) -> Result<(usize, Option<(String, QueryEngine)>)> {
-    use crate::manhattan::data::{extract_plot_data, SigHitRow};
+    use crate::manhattan::data::{extract_association_point, SigHitRow};
     use crate::manhattan::layout::ChromosomeLayout;
     use crate::manhattan::reference::{calculate_xpos, normalize_contig_name};
     use crate::manhattan::render::ManhattanRenderer;
-    use crate::manhattan::sig_writer::SigHitWriter;
-    use genohype_core::io::{is_cloud_path, CloudWriter, StreamingCloudWriter};
+    use genohype_core::io::{is_cloud_path, StreamingCloudWriter};
     use rayon::prelude::*;
     use std::collections::HashMap;
     use std::io::Write;
@@ -101,36 +183,80 @@ pub fn process_manhattan_scan_v2(
 
             let iter = engine_ref.scan_partition_iter(partition_id, &[])?;
 
-            // Each thread has its own renderer with transparent background
+            // Each thread has its own renderer with transparent background.
             let mut renderer = ManhattanRenderer::new_transparent(width, height);
-
-            // Per-chromosome renderers (lazy init)
             let mut chrom_renderers: HashMap<String, ManhattanRenderer> = HashMap::new();
-            // Per-chromosome layouts (lazy init)
             let mut chrom_layouts: HashMap<String, ChromosomeLayout> = HashMap::new();
+            let mut reduction =
+                ManhattanPartitionReductionAccumulatorV1::new(partition_id, spec.source)?;
 
-            let mut rows = 0usize;
+            // Significant rows are streamed in bounded batches rather than retained in memory.
+            let sig_file = format!("{}/part-{:05}-sig.parquet", output_base, partition_id);
+            if !is_cloud_path(&sig_file) {
+                std::fs::create_dir_all(&output_base)?;
+            }
+            let mut sig_writer = ScanSigHitWriter::new(&sig_file)?;
 
-            // Collect significant hits for this partition
-            let mut sig_hits: Vec<SigHitRow> = Vec::new();
-
-            for row_result in iter {
+            for (row_index, row_result) in iter.enumerate() {
                 let row = row_result?;
-                rows += 1;
+                let ordinal =
+                    crate::manhattan::legacy_manifest::source_ordinal(partition_id, row_index)?;
+                reduction.observe_source_row(&row)?;
 
-                if let Some(point) = extract_plot_data(&row, y_field) {
-                    // For layout lookups, strip "chr" prefix if present
-                    let contig_for_layout = if point.contig.starts_with("chr") {
-                        &point.contig[3..]
-                    } else {
-                        &point.contig
-                    };
+                let (point, warnings) = match extract_association_point(&row, y_field, ordinal) {
+                    Ok(adapted) => adapted,
+                    Err(_) => {
+                        reduction.observe_skipped_row()?;
+                        continue;
+                    }
+                };
 
-                    // 1. Whole Genome Plot: Map to pixel coordinates and render
-                    if let Some(x) = layout.get_x(contig_for_layout, point.position) {
+                // Legacy raster and Parquet formats use i32 positions. This matches the
+                // integrated path and fails rather than silently narrowing a valid point.
+                let position = i32::try_from(point.position).map_err(|_| {
+                    crate::HailError::InvalidFormat(format!(
+                        "position {} cannot be represented by distributed Manhattan outputs",
+                        point.position
+                    ))
+                })?;
+                let contig_for_layout = point.contig.as_str();
+                let significant = point.pvalue < threshold;
+
+                // A point is counted as rendered only when it appears in the whole-genome layout.
+                let rendered = if let Some(x) = layout.get_x(contig_for_layout, position) {
+                    let y = y_scale.get_y(point.neg_log10_p);
+                    let color = layout.get_color(contig_for_layout);
+                    renderer.render_point_with_radius(
+                        x,
+                        y,
+                        color,
+                        style.point_alpha,
+                        style.point_radius,
+                    );
+                    true
+                } else {
+                    false
+                };
+
+                // Compatibility per-chromosome partials remain transparent and keep their
+                // existing output names and scales.
+                let normalized_contig = normalize_contig_name(&point.contig);
+                if let Some(&len) = contig_lengths
+                    .get(contig_for_layout)
+                    .or_else(|| contig_lengths.get(&normalized_contig))
+                {
+                    let chrom_layout = chrom_layouts
+                        .entry(normalized_contig.clone())
+                        .or_insert_with(|| {
+                            ChromosomeLayout::new(&[(contig_for_layout.to_string(), len)], width, 0)
+                        });
+                    let chrom_renderer = chrom_renderers
+                        .entry(normalized_contig.clone())
+                        .or_insert_with(|| ManhattanRenderer::new_transparent(width, height));
+                    if let Some(x) = chrom_layout.get_x(contig_for_layout, position) {
                         let y = y_scale.get_y(point.neg_log10_p);
                         let color = layout.get_color(contig_for_layout);
-                        renderer.render_point_with_radius(
+                        chrom_renderer.render_point_with_radius(
                             x,
                             y,
                             color,
@@ -138,78 +264,31 @@ pub fn process_manhattan_scan_v2(
                             style.point_radius,
                         );
                     }
-
-                    // 2. Per-Chromosome Plot
-                    // Use normalized contig name for file/map keys (e.g., "chr1")
-                    let normalized_contig = normalize_contig_name(&point.contig);
-
-                    // Look up length using short name (e.g., "1") because that's what we have in map
-                    if let Some(&len) = contig_lengths
-                        .get(contig_for_layout)
-                        .or_else(|| contig_lengths.get(&normalized_contig))
-                    {
-                        // Initialize renderer and layout for this chromosome if needed
-                        let chrom_layout = chrom_layouts
-                            .entry(normalized_contig.clone())
-                            .or_insert_with(|| {
-                                // Create a layout where this single chromosome fills the width
-                                ChromosomeLayout::new(
-                                    &[(contig_for_layout.to_string(), len)],
-                                    width,
-                                    0,
-                                )
-                            });
-
-                        let chrom_renderer = chrom_renderers
-                            .entry(normalized_contig.clone())
-                            .or_insert_with(|| ManhattanRenderer::new_transparent(width, height));
-
-                        if let Some(x) = chrom_layout.get_x(contig_for_layout, point.position) {
-                            let y = y_scale.get_y(point.neg_log10_p);
-                            // Use same color scheme as WG plot
-                            let color = layout.get_color(contig_for_layout);
-                            chrom_renderer.render_point_with_radius(
-                                x,
-                                y,
-                                color,
-                                style.point_alpha,
-                                style.point_radius,
-                            );
-                        }
-                    }
-
-                    // Check significance threshold
-                    if point.pvalue < threshold {
-                        // Extract additional fields for significant hit
-                        let (ref_allele, alt_allele, beta, se, af) = extract_sig_hit_fields(&row);
-
-                        // Normalize contig to chr-prefixed format for output
-                        let contig_normalized = normalize_contig_name(&point.contig);
-                        // Calculate xpos for efficient ordering
-                        let xpos = calculate_xpos(&point.contig, point.position);
-
-                        sig_hits.push(SigHitRow {
-                            phenotype: phenotype.clone(),
-                            ancestry: ancestry.clone(),
-                            sequencing_type: sequencing_type.clone(),
-                            contig: contig_normalized,
-                            position: point.position,
-                            ref_allele,
-                            alt_allele,
-                            xpos,
-                            pvalue: point.pvalue,
-                            beta,
-                            se,
-                            af,
-                            // Case/control and association fields not available in distributed scan phase
-                            ac_cases: None,
-                            ac_controls: None,
-                            af_cases: None,
-                            af_controls: None,
-                            association_ac: None,
-                        });
-                    }
                 }
+
+                if significant {
+                    sig_writer.write(SigHitRow {
+                        phenotype: phenotype.clone(),
+                        ancestry: ancestry.clone(),
+                        sequencing_type: sequencing_type.clone(),
+                        contig: normalized_contig,
+                        position,
+                        ref_allele: point.ref_allele.clone().unwrap_or_default(),
+                        alt_allele: point.alt_allele.clone().unwrap_or_default(),
+                        xpos: calculate_xpos(&point.contig, position),
+                        pvalue: point.pvalue,
+                        beta: point.beta,
+                        se: point.standard_error,
+                        af: point.allele_frequency,
+                        ac_cases: None,
+                        ac_controls: None,
+                        af_cases: None,
+                        af_controls: None,
+                        association_ac: point.allele_count,
+                    })?;
+                }
+
+                reduction.observe_valid_point(point, warnings, rendered, significant)?;
             }
 
             // Encode WG PNG
@@ -248,26 +327,16 @@ pub fn process_manhattan_scan_v2(
                 }
             }
 
-            // Write significant hits Parquet (even if empty - consistent output)
-            let sig_file = format!("{}/part-{:05}-sig.parquet", output_base, partition_id);
-            if is_cloud_path(&sig_file) {
-                let cloud_writer = CloudWriter::new(&sig_file)?;
-                let mut writer = SigHitWriter::from_writer(cloud_writer)?;
-                for hit in sig_hits {
-                    writer.write(hit)?;
-                }
-                // Get back the cloud writer and finish to trigger the upload
-                let cloud_writer = writer.into_inner()?;
-                cloud_writer.finish()?;
-            } else {
-                let mut writer = SigHitWriter::new(&sig_file)?;
-                for hit in sig_hits {
-                    writer.write(hit)?;
-                }
-                writer.finish()?;
-            }
+            // Finalize Parquet before publishing the receipt. Any writer error aborts the
+            // partition and leaves no successful reduction receipt behind.
+            sig_writer.finish()?;
+            let receipt = reduction.finish()?;
+            let receipt_file = format!("{}/part-{:05}-reduction.json", output_base, partition_id);
+            write_partition_reduction_receipt(&receipt_file, &receipt)?;
 
-            Ok(rows)
+            usize::try_from(receipt.row_count).map_err(|_| {
+                crate::HailError::InvalidFormat("partition row count exceeds usize".into())
+            })
         })
         .collect();
 

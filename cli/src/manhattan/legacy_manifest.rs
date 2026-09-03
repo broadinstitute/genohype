@@ -28,9 +28,7 @@ pub(crate) struct LegacyPartitionSummary {
 
 impl LegacyPartitionSummary {
     pub fn new(partition_index: usize) -> Result<Self> {
-        let mut source_hasher = Sha256::new();
-        source_hasher.update(b"genohype.association.source-partition.v1\0");
-        source_hasher.update((partition_index as u64).to_be_bytes());
+        let source_hasher = source_partition_hasher(partition_index);
         Ok(Self {
             partition_index,
             row_count: 0,
@@ -250,7 +248,14 @@ fn invalid_format(error: impl std::fmt::Display) -> HailError {
     HailError::InvalidFormat(error.to_string())
 }
 
-fn hash_encoded_value(hasher: &mut Sha256, value: &EncodedValue) {
+pub(crate) fn source_partition_hasher(partition_index: usize) -> Sha256 {
+    let mut source_hasher = Sha256::new();
+    source_hasher.update(b"genohype.association.source-partition.v1\0");
+    source_hasher.update((partition_index as u64).to_be_bytes());
+    source_hasher
+}
+
+pub(crate) fn hash_encoded_value(hasher: &mut Sha256, value: &EncodedValue) {
     match value {
         EncodedValue::Null => hasher.update([0]),
         EncodedValue::Binary(bytes) => {
