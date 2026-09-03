@@ -79,6 +79,60 @@ describe('association manifest V1 parser', () => {
     expect(() => parseAssociationVisualizationManifest(oversizedWidth)).toThrow(/layout.width/i);
   });
 
+  it('rejects oversized top_hits before traversing malformed tail entries', () => {
+    const input = clone();
+    let traversedTail = false;
+    const topHits = Array.from(
+      { length: 1_001 },
+      () => ({ ...input.top_hits[0] }),
+    );
+    Object.defineProperty(topHits, 1_000, {
+      configurable: true,
+      get() {
+        traversedTail = true;
+        throw new Error('malformed tail was traversed');
+      },
+    });
+    input.top_hits = topHits;
+
+    expect(() => parseAssociationVisualizationManifest(input)).toThrow(
+      /top_hits cannot contain more than 1000 points/,
+    );
+    expect(traversedTail).toBe(false);
+  });
+
+  it('accepts the JSON-safe integer boundary and rejects the next integer', () => {
+    const boundary = clone();
+    boundary.row_count = Number.MAX_SAFE_INTEGER;
+    boundary.valid_row_count = Number.MAX_SAFE_INTEGER;
+    boundary.skipped_row_count = 0;
+    boundary.top_hits[0].position = Number.MAX_SAFE_INTEGER;
+    boundary.top_hits[0].source_ordinal = Number.MAX_SAFE_INTEGER;
+    boundary.resources.raster.byte_size = Number.MAX_SAFE_INTEGER;
+    expect(parseAssociationVisualizationManifest(boundary).row_count)
+      .toBe(Number.MAX_SAFE_INTEGER);
+
+    for (const mutate of [
+      (input: Json) => { input.row_count = Number.MAX_SAFE_INTEGER + 1; },
+      (input: Json) => { input.valid_row_count = Number.MAX_SAFE_INTEGER + 1; },
+      (input: Json) => { input.skipped_row_count = Number.MAX_SAFE_INTEGER + 1; },
+      (input: Json) => { input.rendered_point_count = Number.MAX_SAFE_INTEGER + 1; },
+      (input: Json) => { input.significant_hit_count = Number.MAX_SAFE_INTEGER + 1; },
+      (input: Json) => { input.top_hits[0].position = Number.MAX_SAFE_INTEGER + 1; },
+      (input: Json) => { input.top_hits[0].source_ordinal = Number.MAX_SAFE_INTEGER + 1; },
+      (input: Json) => { input.layout.contigs[0].length = Number.MAX_SAFE_INTEGER + 1; },
+      (input: Json) => { input.resources.raster.byte_size = Number.MAX_SAFE_INTEGER + 1; },
+      (input: Json) => { input.layout.width = 0x1_0000_0000; },
+      (input: Json) => { input.layout.height = 0x1_0000_0000; },
+      (input: Json) => { input.layout.contig_gap = 0x1_0000_0000; },
+      (input: Json) => { input.layout.y_scale.height = 0x1_0000_0000; },
+    ]) {
+      const input = clone();
+      mutate(input);
+      expect(() => parseAssociationVisualizationManifest(input)).toThrow(/safe integer/i);
+    }
+  });
+
   it('safely resolves resources relative to the fetched manifest', () => {
     const manifest = parseAssociationVisualizationManifest(clone());
     expect(resolveAssociationResourceUrl(

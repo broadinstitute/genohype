@@ -5,6 +5,7 @@ use std::fmt;
 
 use crate::layout::canonical_contig;
 use crate::scale::MAX_NEG_LOG_P;
+use crate::JSON_SAFE_INTEGER_MAX;
 
 /// Stable warning codes emitted during association normalization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -94,7 +95,7 @@ pub fn normalize_pvalue(
 pub struct AssociationPointV1 {
     #[schemars(length(min = 1))]
     pub contig: String,
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 9007199254740991_u64))]
     pub position: i64,
     pub ref_allele: Option<String>,
     pub alt_allele: Option<String>,
@@ -111,6 +112,7 @@ pub struct AssociationPointV1 {
     pub gene_symbol: Option<String>,
     pub consequence: Option<String>,
     pub series: Option<String>,
+    #[schemars(range(max = 9007199254740991_u64))]
     pub source_ordinal: u64,
 }
 
@@ -119,6 +121,12 @@ impl AssociationPointV1 {
     pub fn normalize(mut self) -> Result<(Self, Vec<WarningCode>), ValidationError> {
         if self.position < 1 {
             return Err(ValidationError::InvalidPosition);
+        }
+        if self.position as u64 > JSON_SAFE_INTEGER_MAX {
+            return Err(ValidationError::BrowserUnsafeInteger("position"));
+        }
+        if self.source_ordinal > JSON_SAFE_INTEGER_MAX {
+            return Err(ValidationError::BrowserUnsafeInteger("source_ordinal"));
         }
         let contig = canonical_contig(&self.contig).ok_or(ValidationError::InvalidContig)?;
         let normalized = normalize_pvalue(self.pvalue, Some(self.neg_log10_p))?;
@@ -157,6 +165,7 @@ pub enum ValidationError {
     InvalidAlleleFrequency,
     InvalidAlleleCount,
     NonFiniteOptionalStatistic,
+    BrowserUnsafeInteger(&'static str),
     InvalidPvalue(PValueError),
 }
 
@@ -174,6 +183,9 @@ impl fmt::Display for ValidationError {
             Self::InvalidAlleleFrequency => write!(f, "allele_frequency must be in 0..=1"),
             Self::InvalidAlleleCount => write!(f, "allele_count must be non-negative"),
             Self::NonFiniteOptionalStatistic => write!(f, "optional statistics must be finite"),
+            Self::BrowserUnsafeInteger(field) => {
+                write!(f, "{field} exceeds the browser-safe integer maximum")
+            }
             Self::InvalidPvalue(error) => error.fmt(f),
         }
     }
@@ -184,10 +196,15 @@ impl Error for ValidationError {}
 /// Canonical counts and warnings accumulated while scanning a dataset.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AssociationDatasetSummaryV1 {
+    #[schemars(range(max = 9007199254740991_u64))]
     pub row_count: u64,
+    #[schemars(range(max = 9007199254740991_u64))]
     pub valid_row_count: u64,
+    #[schemars(range(max = 9007199254740991_u64))]
     pub skipped_row_count: u64,
+    #[schemars(range(max = 9007199254740991_u64))]
     pub rendered_point_count: u64,
+    #[schemars(range(max = 9007199254740991_u64))]
     pub significant_hit_count: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
@@ -195,6 +212,18 @@ pub struct AssociationDatasetSummaryV1 {
 
 impl AssociationDatasetSummaryV1 {
     pub fn validate(&self) -> Result<(), &'static str> {
+        if [
+            self.row_count,
+            self.valid_row_count,
+            self.skipped_row_count,
+            self.rendered_point_count,
+            self.significant_hit_count,
+        ]
+        .into_iter()
+        .any(|count| count > JSON_SAFE_INTEGER_MAX)
+        {
+            return Err("association counts must be browser-safe integers");
+        }
         if self.valid_row_count + self.skipped_row_count != self.row_count {
             return Err("valid_row_count + skipped_row_count must equal row_count");
         }
@@ -289,6 +318,38 @@ mod tests {
         assert_eq!(
             invalid.normalize().unwrap_err(),
             ValidationError::InvalidAlleleFrequency
+        );
+    }
+
+    #[test]
+    fn wire_integer_boundaries_are_browser_safe() {
+        let summary = AssociationDatasetSummaryV1 {
+            row_count: JSON_SAFE_INTEGER_MAX + 1,
+            valid_row_count: JSON_SAFE_INTEGER_MAX + 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            summary.validate(),
+            Err("association counts must be browser-safe integers")
+        );
+
+        let mut maximum = point();
+        maximum.position = JSON_SAFE_INTEGER_MAX as i64;
+        maximum.source_ordinal = JSON_SAFE_INTEGER_MAX;
+        assert!(maximum.normalize().is_ok());
+
+        let mut position = point();
+        position.position = JSON_SAFE_INTEGER_MAX as i64 + 1;
+        assert_eq!(
+            position.normalize().unwrap_err(),
+            ValidationError::BrowserUnsafeInteger("position")
+        );
+
+        let mut ordinal = point();
+        ordinal.source_ordinal = JSON_SAFE_INTEGER_MAX + 1;
+        assert_eq!(
+            ordinal.normalize().unwrap_err(),
+            ValidationError::BrowserUnsafeInteger("source_ordinal")
         );
     }
 }

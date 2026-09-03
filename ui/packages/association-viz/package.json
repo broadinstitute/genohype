@@ -15,9 +15,11 @@
   },
   "files": ["dist"],
   "scripts": {
-    "build": "tsc && cp src/styles.css dist/styles.css && node scripts/verify-build.mjs",
-    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
-    "test": "vitest run"
+    "contracts:generate": "node scripts/generate-contracts.mjs",
+    "contracts:check": "node scripts/generate-contracts.mjs --check",
+    "build": "npm run contracts:check && tsc && cp src/styles.css dist/styles.css && node scripts/verify-build.mjs",
+    "typecheck": "npm run contracts:check && tsc --noEmit && tsc -p tsconfig.test.json",
+    "test": "npm run contracts:check && vitest run"
   },
   "peerDependencies": {
     "react": "^18.0.0 || ^19.0.0",

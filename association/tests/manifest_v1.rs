@@ -1,5 +1,6 @@
 use genohype_association::{
-    AssociationVisualizationManifestV1, ManifestError, COORDINATE_CONVENTION_V1, SCHEMA_VERSION_V1,
+    AssociationVisualizationManifestV1, ManifestError, COORDINATE_CONVENTION_V1,
+    JSON_SAFE_INTEGER_MAX, SCHEMA_VERSION_V1,
 };
 use serde_json::{json, Value};
 
@@ -55,6 +56,25 @@ fn layouts_must_be_the_exact_canonical_derivation_even_with_a_matching_hash() {
         manifest.validate(),
         Err(ManifestError::InvalidLayout(_))
     ));
+}
+
+#[test]
+fn manifest_validation_rejects_browser_unsafe_wire_integers() {
+    let mut count: AssociationVisualizationManifestV1 =
+        serde_json::from_value(fixture_value()).unwrap();
+    count.row_count = JSON_SAFE_INTEGER_MAX + 1;
+    assert_eq!(
+        count.validate(),
+        Err(ManifestError::BrowserUnsafeInteger("row_count"))
+    );
+
+    let mut bytes: AssociationVisualizationManifestV1 =
+        serde_json::from_value(fixture_value()).unwrap();
+    bytes.resources.raster.byte_size = Some(JSON_SAFE_INTEGER_MAX + 1);
+    assert_eq!(
+        bytes.validate(),
+        Err(ManifestError::BrowserUnsafeInteger("resource byte_size"))
+    );
 }
 
 #[test]

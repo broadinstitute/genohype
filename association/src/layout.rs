@@ -7,6 +7,7 @@ use std::error::Error;
 use std::fmt;
 
 use crate::scale::YScale;
+use crate::JSON_SAFE_INTEGER_MAX;
 
 const GRCH38_LENGTHS: [u64; 25] = [
     248_956_422,
@@ -151,7 +152,7 @@ pub fn canonical_contig_cmp(left: &str, right: &str) -> Ordering {
 pub struct ContigLayoutV1 {
     #[schemars(length(min = 1))]
     pub name: String,
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 9007199254740991_u64))]
     pub length: u64,
     #[schemars(range(min = 0.0))]
     pub x_start: f64,
@@ -164,10 +165,11 @@ pub struct ContigLayoutV1 {
 /// Canonical genome-wide geometry. Public coordinates are 1-based inclusive.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct GenomeLayoutV1 {
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 4294967295_u32))]
     pub width: u32,
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 4294967295_u32))]
     pub height: u32,
+    #[schemars(range(max = 4294967295_u32))]
     pub contig_gap: u32,
     pub contigs: Vec<ContigLayoutV1>,
     pub y_scale: YScale,
@@ -195,6 +197,9 @@ impl GenomeLayoutV1 {
             let name = canonical_contig(&original).ok_or(LayoutError::InvalidContig)?;
             if length == 0 {
                 return Err(LayoutError::ZeroContigLength(name));
+            }
+            if length > JSON_SAFE_INTEGER_MAX {
+                return Err(LayoutError::BrowserUnsafeContigLength(name));
             }
             if !names.insert(name.clone()) {
                 return Err(LayoutError::DuplicateContig(name));
@@ -323,6 +328,7 @@ pub enum LayoutError {
     NoContigs,
     InvalidContig,
     ZeroContigLength(String),
+    BrowserUnsafeContigLength(String),
     DuplicateContig(String),
     GapsExceedWidth,
     DimensionsOverflow,
@@ -337,6 +343,12 @@ impl fmt::Display for LayoutError {
             Self::NoContigs => write!(f, "layout requires at least one contig"),
             Self::InvalidContig => write!(f, "contig cannot be empty"),
             Self::ZeroContigLength(name) => write!(f, "contig {name} has zero length"),
+            Self::BrowserUnsafeContigLength(name) => {
+                write!(
+                    f,
+                    "contig {name} length exceeds the browser-safe integer maximum"
+                )
+            }
             Self::DuplicateContig(name) => write!(f, "duplicate canonical contig {name}"),
             Self::GapsExceedWidth => write!(f, "contig gaps consume the full layout width"),
             Self::DimensionsOverflow => write!(f, "layout dimensions overflowed"),
@@ -385,6 +397,15 @@ mod tests {
     fn aliases_cannot_create_duplicate_layout_entries() {
         let error = GenomeLayoutV1::new([("1", 10), ("chr1", 10)], 100, 50, 4).unwrap_err();
         assert_eq!(error, LayoutError::DuplicateContig("1".into()));
+    }
+
+    #[test]
+    fn contig_lengths_must_round_trip_through_browser_json() {
+        assert!(GenomeLayoutV1::new([("1", JSON_SAFE_INTEGER_MAX)], 100, 50, 0,).is_ok());
+        assert_eq!(
+            GenomeLayoutV1::new([("1", JSON_SAFE_INTEGER_MAX + 1)], 100, 50, 0,).unwrap_err(),
+            LayoutError::BrowserUnsafeContigLength("1".into())
+        );
     }
 
     #[test]

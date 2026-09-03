@@ -1,41 +1,31 @@
 /**
- * TypeScript binding for association/schema/association-visualization-v1.schema.json.
- * Keep field names and optionality aligned with the committed Rust-generated schema.
- * V1 minor additions are intentionally represented by the index signatures.
+ * GENERATED FILE — DO NOT EDIT.
+ * Source: association/schema/association-visualization-v1.schema.json
+ * Schema SHA-256: d77ee42ae265bb0ff058abb73df752ac6d4463b3f825a9e148cc3bfbb3c3bb8c
+ * Regenerate with: npm run contracts:generate -w @genohype/association-viz
  */
 
-export type PlotKindV1 = 'manhattan' | 'locus';
-
 export interface AssociationPointV1 {
-  contig: string;
-  position: number;
-  pvalue: number;
-  neg_log10_p: number;
-  source_ordinal: number;
-  ref_allele?: string | null;
+  allele_count?: number | null;
+  allele_frequency?: number | null;
   alt_allele?: string | null;
   beta?: number | null;
-  standard_error?: number | null;
-  allele_frequency?: number | null;
-  allele_count?: number | null;
-  gene_symbol?: string | null;
   consequence?: string | null;
+  contig: string;
+  gene_symbol?: string | null;
+  neg_log10_p: number;
+  position: number;
+  pvalue: number;
+  ref_allele?: string | null;
   series?: string | null;
+  source_ordinal: number;
+  standard_error?: number | null;
   [minorField: string]: unknown;
 }
 
 export interface AssociationThresholdV1 {
   name: string;
   pvalue: number;
-  [minorField: string]: unknown;
-}
-
-export interface ResourceDescriptorV1 {
-  url: string;
-  media_type: string;
-  byte_size?: number | null;
-  checksum?: string | null;
-  expires_at?: string | null;
   [minorField: string]: unknown;
 }
 
@@ -47,53 +37,64 @@ export interface AssociationVisualizationResourcesV1 {
 }
 
 export interface ContigLayoutV1 {
-  name: string;
-  length: number;
-  x_start: number;
-  x_end: number;
   color: string;
+  length: number;
+  name: string;
+  x_end: number;
+  x_start: number;
+  [minorField: string]: unknown;
+}
+
+export interface GenomeLayoutV1 {
+  contig_gap: number;
+  contigs: ContigLayoutV1[];
+  height: number;
+  width: number;
+  y_scale: YScaleV1;
+  [minorField: string]: unknown;
+}
+
+export type PlotKindV1 = "manhattan" | "locus";
+
+export interface ResourceDescriptorV1 {
+  byte_size?: number | null;
+  checksum?: string | null;
+  expires_at?: string | null;
+  media_type: string;
+  url: string;
   [minorField: string]: unknown;
 }
 
 export interface YScaleV1 {
   height: number;
-  log_threshold: number;
   linear_fraction: number;
+  log_threshold: number;
   max_neg_log_p: number;
   [minorField: string]: unknown;
 }
 
-export interface GenomeLayoutV1 {
-  width: number;
-  height: number;
-  contig_gap: number;
-  contigs: ContigLayoutV1[];
-  y_scale: YScaleV1;
-  [minorField: string]: unknown;
-}
-
 export interface AssociationVisualizationManifestV1 {
-  schema_version: string;
-  plot_id: string;
-  kind: PlotKindV1;
-  title: string;
   assembly: string;
   coordinate_convention: string;
-  source_fingerprint: string;
-  genohype_version: string;
   created_at: string;
+  genohype_version: string;
+  kind: PlotKindV1;
   layout: GenomeLayoutV1;
   layout_hash: string;
-  thresholds: AssociationThresholdV1[];
-  row_count: number;
-  valid_row_count: number;
-  skipped_row_count: number;
+  plot_id: string;
   rendered_point_count: number;
-  significant_hit_count: number;
-  top_hits: AssociationPointV1[];
-  warnings: string[];
   resources: AssociationVisualizationResourcesV1;
+  row_count: number;
+  schema_version: string;
+  significant_hit_count: number;
+  skipped_row_count: number;
+  source_fingerprint: string;
+  thresholds: AssociationThresholdV1[];
+  title: string;
+  top_hits: AssociationPointV1[];
+  valid_row_count: number;
+  warnings: string[];
   [minorField: string]: unknown;
 }
 
-export type AssociationResourceName = 'raster' | 'region_api' | 'table_api';
+export type AssociationResourceName = "raster" | "region_api" | "table_api";

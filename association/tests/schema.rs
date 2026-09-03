@@ -1,4 +1,4 @@
-use genohype_association::generate_manifest_schema;
+use genohype_association::{generate_manifest_schema, JSON_SAFE_INTEGER_MAX};
 use jsonschema::Validator;
 use serde_json::{json, Value};
 
@@ -19,6 +19,35 @@ fn checked_in_schema_matches_schemars_output() {
         generated["properties"]["schema_version"]["pattern"],
         "^1\\.[0-9]+$"
     );
+    for pointer in [
+        "/properties/row_count/maximum",
+        "/properties/valid_row_count/maximum",
+        "/properties/skipped_row_count/maximum",
+        "/properties/rendered_point_count/maximum",
+        "/properties/significant_hit_count/maximum",
+        "/$defs/AssociationPointV1/properties/position/maximum",
+        "/$defs/AssociationPointV1/properties/source_ordinal/maximum",
+        "/$defs/ContigLayoutV1/properties/length/maximum",
+        "/$defs/ResourceDescriptorV1/properties/byte_size/maximum",
+    ] {
+        assert_eq!(
+            generated.pointer(pointer),
+            Some(&json!(JSON_SAFE_INTEGER_MAX)),
+            "missing browser-safe maximum at {pointer}"
+        );
+    }
+    for pointer in [
+        "/$defs/GenomeLayoutV1/properties/width/maximum",
+        "/$defs/GenomeLayoutV1/properties/height/maximum",
+        "/$defs/GenomeLayoutV1/properties/contig_gap/maximum",
+        "/$defs/YScale/properties/height/maximum",
+    ] {
+        assert_eq!(
+            generated.pointer(pointer),
+            Some(&json!(u32::MAX)),
+            "missing u32 wire maximum at {pointer}"
+        );
+    }
 }
 
 #[test]
@@ -44,6 +73,44 @@ fn schema_rejects_invalid_domain_values_before_cross_language_consumption() {
         assert!(
             !validator.is_valid(&candidate),
             "schema unexpectedly accepted invalid value at {pointer}"
+        );
+    }
+
+    for pointer in [
+        "/row_count",
+        "/valid_row_count",
+        "/skipped_row_count",
+        "/rendered_point_count",
+        "/significant_hit_count",
+        "/top_hits/0/position",
+        "/top_hits/0/source_ordinal",
+        "/layout/contigs/0/length",
+        "/resources/raster/byte_size",
+    ] {
+        let mut boundary = fixture.clone();
+        *boundary.pointer_mut(pointer).unwrap() = json!(JSON_SAFE_INTEGER_MAX);
+        assert!(
+            validator.is_valid(&boundary),
+            "schema unexpectedly rejected browser-safe boundary at {pointer}"
+        );
+        *boundary.pointer_mut(pointer).unwrap() = json!(JSON_SAFE_INTEGER_MAX + 1);
+        assert!(
+            !validator.is_valid(&boundary),
+            "schema unexpectedly accepted an unsafe integer at {pointer}"
+        );
+    }
+
+    for pointer in [
+        "/layout/width",
+        "/layout/height",
+        "/layout/contig_gap",
+        "/layout/y_scale/height",
+    ] {
+        let mut boundary = fixture.clone();
+        *boundary.pointer_mut(pointer).unwrap() = json!(u64::from(u32::MAX) + 1);
+        assert!(
+            !validator.is_valid(&boundary),
+            "schema unexpectedly accepted a value outside u32 at {pointer}"
         );
     }
 }

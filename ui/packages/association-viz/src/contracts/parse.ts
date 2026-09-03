@@ -223,8 +223,9 @@ export function parseAssociationVisualizationManifest(input: unknown): Associati
     fail(error instanceof Error ? error.message : 'invalid layout', 'layout');
   }
 
-  const topHits = array(source.top_hits, 'top_hits').map(parsePoint);
-  if (topHits.length > 1_000) fail('top_hits cannot contain more than 1000 points');
+  const rawTopHits = array(source.top_hits, 'top_hits');
+  if (rawTopHits.length > 1_000) fail('top_hits cannot contain more than 1000 points');
+  const topHits = rawTopHits.map(parsePoint);
   if (!topHits.slice(1).every((point, index) => comparePoints(topHits[index], point) <= 0)) {
     fail('top_hits are not in canonical order');
   }

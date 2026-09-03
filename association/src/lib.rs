@@ -11,6 +11,9 @@ pub mod reduction;
 pub mod render;
 pub mod scale;
 
+/// Largest integer that can round-trip exactly through a JavaScript JSON consumer.
+pub const JSON_SAFE_INTEGER_MAX: u64 = 9_007_199_254_740_991;
+
 pub use layout::{
     canonical_assembly, canonical_contig, canonical_contig_cmp, canonical_contig_lengths, Assembly,
     ContigLayoutV1, GenomeLayoutV1, LayoutError,

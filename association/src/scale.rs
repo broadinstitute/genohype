@@ -8,7 +8,7 @@ pub const MAX_NEG_LOG_P: f64 = 350.0;
 /// Canonical hybrid linear/logarithmic Manhattan y scale.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct YScale {
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 4294967295_u32))]
     pub height: u32,
     #[schemars(range(min = 10.0, max = 10.0))]
     pub log_threshold: f64,

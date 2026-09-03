@@ -14,5 +14,10 @@ describe('package isolation contract', () => {
       expect(dependencyNames).not.toContain(forbidden);
     }
     expect(pkg.exports['./styles.css']).toBe('./dist/styles.css');
+    expect(pkg.scripts['contracts:generate']).toBe('node scripts/generate-contracts.mjs');
+    expect(pkg.scripts['contracts:check']).toBe('node scripts/generate-contracts.mjs --check');
+    for (const lifecycle of ['build', 'typecheck', 'test']) {
+      expect(pkg.scripts[lifecycle]).toContain('npm run contracts:check');
+    }
   });
 });

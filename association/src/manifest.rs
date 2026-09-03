@@ -1,6 +1,7 @@
 use crate::layout::{canonical_assembly, GenomeLayoutV1};
 use crate::model::AssociationPointV1;
 use crate::reduction::{compare_association_points, MAX_TOP_K};
+use crate::JSON_SAFE_INTEGER_MAX;
 use schemars::{schema_for, JsonSchema, Schema};
 use serde::{de, Deserialize, Deserializer, Serialize};
 use std::error::Error;
@@ -34,6 +35,7 @@ pub struct ResourceDescriptorV1 {
     #[schemars(length(min = 1))]
     pub media_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(max = 9007199254740991_u64))]
     pub byte_size: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checksum: Option<String>,
@@ -60,6 +62,12 @@ impl ResourceDescriptorV1 {
         }
         if self.media_type.trim().is_empty() {
             return Err(ManifestError::MissingMediaType);
+        }
+        if self
+            .byte_size
+            .is_some_and(|size| size > JSON_SAFE_INTEGER_MAX)
+        {
+            return Err(ManifestError::BrowserUnsafeInteger("resource byte_size"));
         }
         Ok(())
     }
@@ -96,10 +104,15 @@ pub struct AssociationVisualizationManifestV1 {
     pub layout: GenomeLayoutV1,
     pub layout_hash: String,
     pub thresholds: Vec<AssociationThresholdV1>,
+    #[schemars(range(max = 9007199254740991_u64))]
     pub row_count: u64,
+    #[schemars(range(max = 9007199254740991_u64))]
     pub valid_row_count: u64,
+    #[schemars(range(max = 9007199254740991_u64))]
     pub skipped_row_count: u64,
+    #[schemars(range(max = 9007199254740991_u64))]
     pub rendered_point_count: u64,
+    #[schemars(range(max = 9007199254740991_u64))]
     pub significant_hit_count: u64,
     #[schemars(length(max = 1_000))]
     pub top_hits: Vec<AssociationPointV1>,
@@ -123,6 +136,17 @@ impl AssociationVisualizationManifestV1 {
             return Err(ManifestError::UnsupportedCoordinateConvention(
                 self.coordinate_convention.clone(),
             ));
+        }
+        for (field, value) in [
+            ("row_count", self.row_count),
+            ("valid_row_count", self.valid_row_count),
+            ("skipped_row_count", self.skipped_row_count),
+            ("rendered_point_count", self.rendered_point_count),
+            ("significant_hit_count", self.significant_hit_count),
+        ] {
+            if value > JSON_SAFE_INTEGER_MAX {
+                return Err(ManifestError::BrowserUnsafeInteger(field));
+            }
         }
         if self.valid_row_count.checked_add(self.skipped_row_count) != Some(self.row_count) {
             return Err(ManifestError::InconsistentCounts);
@@ -228,6 +252,7 @@ pub enum ManifestError {
     InvalidLayout(String),
     LayoutHashMismatch { expected: String, actual: String },
     InvalidThreshold,
+    BrowserUnsafeInteger(&'static str),
     UnsafeResourceUrl(String),
     MissingMediaType,
 }
@@ -262,6 +287,9 @@ impl fmt::Display for ManifestError {
                 write!(f, "layout hash mismatch: expected {expected}, got {actual}")
             }
             Self::InvalidThreshold => write!(f, "threshold names and p-values must be valid"),
+            Self::BrowserUnsafeInteger(field) => {
+                write!(f, "{field} exceeds the browser-safe integer maximum")
+            }
             Self::UnsafeResourceUrl(url) => {
                 write!(f, "resource URL must be safe and relative: {url}")
             }

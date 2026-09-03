@@ -31,6 +31,7 @@
     "rendered_point_count": {
       "type": "integer",
       "format": "uint64",
+      "maximum": 9007199254740991,
       "minimum": 0
     },
     "resources": {
@@ -39,6 +40,7 @@
     "row_count": {
       "type": "integer",
       "format": "uint64",
+      "maximum": 9007199254740991,
       "minimum": 0
     },
     "schema_version": {
@@ -48,11 +50,13 @@
     "significant_hit_count": {
       "type": "integer",
       "format": "uint64",
+      "maximum": 9007199254740991,
       "minimum": 0
     },
     "skipped_row_count": {
       "type": "integer",
       "format": "uint64",
+      "maximum": 9007199254740991,
       "minimum": 0
     },
     "source_fingerprint": {
@@ -77,6 +81,7 @@
     "valid_row_count": {
       "type": "integer",
       "format": "uint64",
+      "maximum": 9007199254740991,
       "minimum": 0
     },
     "warnings": {
@@ -167,6 +172,7 @@
         "position": {
           "type": "integer",
           "format": "int64",
+          "maximum": 9007199254740991,
           "minimum": 1
         },
         "pvalue": {
@@ -190,6 +196,7 @@
         "source_ordinal": {
           "type": "integer",
           "format": "uint64",
+          "maximum": 9007199254740991,
           "minimum": 0
         },
         "standard_error": {
@@ -271,6 +278,7 @@
         "length": {
           "type": "integer",
           "format": "uint64",
+          "maximum": 9007199254740991,
           "minimum": 1
         },
         "name": {
@@ -303,6 +311,7 @@
         "contig_gap": {
           "type": "integer",
           "format": "uint32",
+          "maximum": 4294967295,
           "minimum": 0
         },
         "contigs": {
@@ -314,11 +323,13 @@
         "height": {
           "type": "integer",
           "format": "uint32",
+          "maximum": 4294967295,
           "minimum": 1
         },
         "width": {
           "type": "integer",
           "format": "uint32",
+          "maximum": 4294967295,
           "minimum": 1
         },
         "y_scale": {
@@ -351,6 +362,7 @@
             "null"
           ],
           "format": "uint64",
+          "maximum": 9007199254740991,
           "minimum": 0
         },
         "checksum": {
@@ -386,6 +398,7 @@
         "height": {
           "type": "integer",
           "format": "uint32",
+          "maximum": 4294967295,
           "minimum": 1
         },
         "linear_fraction": {
