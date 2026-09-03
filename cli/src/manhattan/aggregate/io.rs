@@ -16,8 +16,8 @@ use std::sync::Arc;
 // Parquet File Listing
 // =============================================================================
 
-/// List parquet files matching a suffix in a local directory.
-pub(crate) fn list_local_parquet_files(dir: &str, suffix: &str) -> Result<Vec<String>> {
+/// List files matching a suffix in a local directory.
+pub(crate) fn list_local_files(dir: &str, suffix: &str) -> Result<Vec<String>> {
     let mut files = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -32,8 +32,8 @@ pub(crate) fn list_local_parquet_files(dir: &str, suffix: &str) -> Result<Vec<St
     Ok(files)
 }
 
-/// List parquet files matching a suffix in a cloud directory.
-pub(crate) fn list_cloud_parquet_files(dir: &str, suffix: &str) -> Result<Vec<String>> {
+/// List files matching a suffix under a cloud directory prefix.
+pub(crate) fn list_cloud_files(dir: &str, suffix: &str) -> Result<Vec<String>> {
     use crate::HailError;
     use object_store::path::Path as ObjPath;
     use object_store::ObjectStore;
@@ -49,10 +49,10 @@ pub(crate) fn list_cloud_parquet_files(dir: &str, suffix: &str) -> Result<Vec<St
                 let bucket = url.host_str().ok_or_else(|| {
                     HailError::InvalidFormat("Missing bucket in GCS URL".to_string())
                 })?;
-                let path = url.path().trim_start_matches('/');
+                let path = url.path().trim_start_matches('/').trim_end_matches('/');
                 (
                     genohype_core::io::get_gcs_client(bucket)?,
-                    ObjPath::from(path),
+                    ObjPath::from(format!("{path}/")),
                     format!("gs://{}/", bucket),
                 )
             }
@@ -61,7 +61,7 @@ pub(crate) fn list_cloud_parquet_files(dir: &str, suffix: &str) -> Result<Vec<St
                 let bucket = url.host_str().ok_or_else(|| {
                     HailError::InvalidFormat("Missing bucket in S3 URL".to_string())
                 })?;
-                let path = url.path().trim_start_matches('/');
+                let path = url.path().trim_start_matches('/').trim_end_matches('/');
                 let s3 = object_store::aws::AmazonS3Builder::new()
                     .with_bucket_name(bucket)
                     .build()
@@ -70,7 +70,7 @@ pub(crate) fn list_cloud_parquet_files(dir: &str, suffix: &str) -> Result<Vec<St
                     })?;
                 (
                     Arc::new(s3),
-                    ObjPath::from(path),
+                    ObjPath::from(format!("{path}/")),
                     format!("s3://{}/", bucket),
                 )
             }
@@ -90,21 +90,39 @@ pub(crate) fn list_cloud_parquet_files(dir: &str, suffix: &str) -> Result<Vec<St
         use futures::StreamExt;
         let results: Vec<_> = stream.collect().await;
         for result in results {
-            if let Ok(meta) = result {
-                let path = meta.location.to_string();
-                if path.ends_with(suffix) {
-                    // Reconstruct full URL
-                    let full_path = format!("{}{}", base_url, path);
-                    files.push(full_path);
-                }
+            let meta = result.map_err(|error| {
+                crate::HailError::InvalidFormat(format!("cloud listing failed: {error}"))
+            })?;
+            let path = meta.location.to_string();
+            if path.ends_with(suffix) {
+                // Reconstruct full URL
+                let full_path = format!("{}{}", base_url, path);
+                files.push(full_path);
             }
         }
-        files
-    });
+        Ok::<_, crate::HailError>(files)
+    })?;
 
     let mut files = list_result;
     files.sort();
     Ok(files)
+}
+
+pub(crate) fn list_files(dir: &str, suffix: &str) -> Result<Vec<String>> {
+    if is_cloud_path(dir) {
+        list_cloud_files(dir, suffix)
+    } else {
+        list_local_files(dir, suffix)
+    }
+}
+
+// Compatibility wrappers keep the established significant-hit merge call sites explicit.
+pub(crate) fn list_local_parquet_files(dir: &str, suffix: &str) -> Result<Vec<String>> {
+    list_local_files(dir, suffix)
+}
+
+pub(crate) fn list_cloud_parquet_files(dir: &str, suffix: &str) -> Result<Vec<String>> {
+    list_cloud_files(dir, suffix)
 }
 
 // =============================================================================

@@ -1235,14 +1235,16 @@ EOF
         // For Manhattan jobs, compute the layout and partition counts for all tables
         if let crate::distributed::message::JobSpec::Manhattan { ref mut spec, .. } = job_spec {
             use crate::manhattan::layout::{ChromosomeLayout, YScale};
-            use crate::manhattan::reference::get_contig_lengths;
 
             println!("  {} Computing chromosome layout...", "Setup:".cyan());
-            let contigs = get_contig_lengths(engine.as_ref().unwrap());
+            let contigs: Vec<(String, u32)> = genohype_association::canonical_contig_lengths(
+                genohype_association::Assembly::Grch38,
+            )
+            .into_iter()
+            .map(|(name, length)| (name, length as u32))
+            .collect();
             let layout = ChromosomeLayout::new(&contigs, spec.width, 4);
-            // Use a reasonable max -log10(p) for initial Y scale (will cover most GWAS hits)
-            // Use high max to avoid cutting off extreme p-values (height can have -log10(p) > 100)
-            let y_scale = YScale::new(spec.height, 300.0);
+            let y_scale = YScale::new(spec.height, 350.0);
             spec.layout = Some(layout);
             spec.y_scale = Some(y_scale);
             // Add contig lengths for per-chromosome plot generation

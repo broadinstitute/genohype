@@ -80,13 +80,17 @@ pub fn init_batch_state(specs: &[ManhattanSpec], mode: ExecutionMode) -> BatchSt
 /// was submitted (CLI or UI). Without a layout, `layout.get_x()` returns `None` for
 /// every variant, producing blank plots.
 pub fn enrich_specs(specs: &mut [ManhattanSpec]) {
-    let contigs = crate::manhattan::reference::get_default_contig_lengths();
+    let contigs: Vec<(String, u32)> =
+        genohype_association::canonical_contig_lengths(genohype_association::Assembly::Grch38)
+            .into_iter()
+            .map(|(name, length)| (name, length as u32))
+            .collect();
     let contig_map: HashMap<String, u32> = contigs.iter().cloned().collect();
 
     for spec in specs.iter_mut() {
         if spec.layout.is_none() {
             let layout = ChromosomeLayout::new(&contigs, spec.width, 4);
-            let y_scale = YScale::new(spec.height, 300.0);
+            let y_scale = YScale::new(spec.height, 350.0);
 
             spec.layout = Some(layout);
             spec.y_scale = Some(y_scale);
@@ -105,6 +109,8 @@ pub fn create_aggregate_spec_from_manhattan_spec(spec: &ManhattanSpec) -> Manhat
         ancestry: spec.ancestry.clone(),
         exome_results: spec.exome.clone(),
         genome_results: spec.genome.clone(),
+        exome_partitions: spec.exome_partitions,
+        genome_partitions: spec.genome_partitions,
         gene_burden: spec.gene_burden.clone(),
         gene_associations_only: spec.gene_associations_only,
         exome_exp_p: spec.exome_exp_p.clone(),

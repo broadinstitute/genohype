@@ -79,6 +79,7 @@ impl LegacyPartitionSummary {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct LegacyScanSummary {
     pub row_count: u64,
     pub valid_row_count: u64,
@@ -173,25 +174,21 @@ pub(crate) fn source_ordinal(partition_index: usize, row_index: usize) -> Result
     Ok((u64::from(partition) << 32) | u64::from(row))
 }
 
-pub(crate) fn write_manifest(
+pub(crate) fn build_manifest(
     output_base: &str,
     layout: GenomeLayoutV1,
     threshold: f64,
     scan: LegacyScanSummary,
     png_bytes: &[u8],
-) -> Result<String> {
-    let raster_path = format!("{output_base}.png");
-    let raster_url = Path::new(&raster_path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| HailError::InvalidFormat("output raster has no UTF-8 basename".into()))?
-        .to_string();
-    let plot_id = Path::new(output_base)
-        .file_name()
-        .and_then(|name| name.to_str())
+) -> Result<AssociationVisualizationManifestV1> {
+    let output_base = output_base.trim_end_matches('/');
+    let plot_id = output_base
+        .rsplit('/')
+        .next()
         .filter(|name| !name.is_empty())
-        .ok_or_else(|| HailError::InvalidFormat("output prefix has no UTF-8 basename".into()))?
+        .ok_or_else(|| HailError::InvalidFormat("output prefix has no basename".into()))?
         .to_string();
+    let raster_url = format!("{plot_id}.png");
     let layout_hash = layout.layout_hash("GRCh38");
     let raster_checksum = format!("sha256:{:x}", Sha256::digest(png_bytes));
 
@@ -231,11 +228,35 @@ pub(crate) fn write_manifest(
         },
     };
     manifest.validate().map_err(invalid_format)?;
+    Ok(manifest)
+}
 
-    let mut bytes = serde_json::to_vec_pretty(&manifest).map_err(invalid_format)?;
+pub(crate) fn manifest_json_bytes(
+    manifest: &AssociationVisualizationManifestV1,
+) -> Result<Vec<u8>> {
+    manifest.validate().map_err(invalid_format)?;
+    let mut bytes = serde_json::to_vec_pretty(manifest).map_err(invalid_format)?;
     bytes.push(b'\n');
+    Ok(bytes)
+}
+
+pub(crate) fn write_manifest(
+    output_base: &str,
+    layout: GenomeLayoutV1,
+    threshold: f64,
+    scan: LegacyScanSummary,
+    png_bytes: &[u8],
+) -> Result<String> {
+    let manifest = build_manifest(output_base, layout, threshold, scan, png_bytes)?;
+    let bytes = manifest_json_bytes(&manifest)?;
     let manifest_path = format!("{output_base}.manifest.json");
-    atomic_write(Path::new(&manifest_path), &bytes)?;
+    if genohype_core::io::is_cloud_path(&manifest_path) {
+        let mut writer = genohype_core::io::CloudWriter::new(&manifest_path)?;
+        writer.write_all(&bytes)?;
+        writer.finish()?;
+    } else {
+        atomic_write(Path::new(&manifest_path), &bytes)?;
+    }
     Ok(manifest_path)
 }
 

@@ -276,6 +276,11 @@ pub(crate) fn complete_batch_work(
                         ancestry: original.ancestry.clone(),
                         exome_results: original.exome.clone(),
                         genome_results: original.genome.clone(),
+                        exome_partitions: original.exome.as_ref().map(|_| state.exome_total_tasks),
+                        genome_partitions: original
+                            .genome
+                            .as_ref()
+                            .map(|_| state.genome_total_tasks),
                         gene_burden: original.gene_burden.clone(),
                         gene_associations_only: original.gene_associations_only,
                         exome_exp_p: original.exome_exp_p.clone(),
@@ -910,6 +915,8 @@ mod tests {
                     ancestry: None,
                     exome_results: None,
                     genome_results: None,
+                    exome_partitions: None,
+                    genome_partitions: None,
                     gene_burden: None,
                     gene_associations_only: false,
                     exome_exp_p: None,

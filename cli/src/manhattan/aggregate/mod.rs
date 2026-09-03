@@ -12,6 +12,10 @@ pub mod locus;
 pub mod merge;
 pub mod utils;
 
+use crate::distributed::manhattan::{
+    merge_partition_reduction_receipts, ManhattanPartitionReductionReceiptV1,
+    ManhattanReductionSourceV1,
+};
 use crate::distributed::message::ManhattanAggregateSpec;
 use crate::manhattan::config::{BackgroundStyle, PlotType};
 use crate::manhattan::data::{
@@ -20,6 +24,7 @@ use crate::manhattan::data::{
 };
 use crate::manhattan::genes::{render_gene_manhattan_styled, scan_gene_burden_to_parquet};
 use crate::manhattan::layout::ChromosomeLayout;
+use crate::manhattan::legacy_manifest::{write_manifest, LegacyScanSummary};
 use crate::manhattan::pipeline::composite_partial_pngs_with_style;
 use crate::manhattan::qq::scan_qq_to_parquet;
 use genohype_core::error::Result;
@@ -30,7 +35,7 @@ use std::time::Instant;
 
 use io::{
     cleanup_chrom_intermediates, cleanup_intermediates, discover_chromosomes, has_partial_pngs,
-    write_locus_file,
+    list_files, write_locus_file,
 };
 use locus::{generate_loci_from_parquet, generate_locus_plots};
 use merge::{merge_and_combine_hits, merge_significant_hits};
@@ -184,33 +189,60 @@ pub fn run_aggregation(spec: &ManhattanAggregateSpec) -> Result<(usize, serde_js
     let exome_style = spec.styling.resolve(PlotType::Exome);
     let genome_style = spec.styling.resolve(PlotType::Genome);
 
-    // Step 1: Composite PNGs
+    // Step 1: Validate and merge every expected receipt before publishing a final raster.
+    let exome_reduction = if let Some(source_path) = spec.exome_results.as_deref() {
+        Some(load_source_reduction(
+            output_base,
+            "exome",
+            ManhattanReductionSourceV1::Exome,
+            expected_partition_count(spec.exome_partitions, source_path, "exome")?,
+        )?)
+    } else {
+        None
+    };
+    let genome_reduction = if let Some(source_path) = spec.genome_results.as_deref() {
+        Some(load_source_reduction(
+            output_base,
+            "genome",
+            ManhattanReductionSourceV1::Genome,
+            expected_partition_count(spec.genome_partitions, source_path, "genome")?,
+        )?)
+    } else {
+        None
+    };
+
+    // Composite each whole-genome raster, then publish its canonical sibling manifest last.
     println!("  Compositing partial PNGs...");
-    let exome_count = if spec.exome_results.is_some() {
+    let exome_count = if let Some(reduction) = exome_reduction {
         composite_source_pngs(
             output_base,
             "exome",
             spec.width,
             spec.height,
+            spec.threshold,
             &exome_style.background,
+            reduction,
         )?
     } else {
         0
     };
 
-    let genome_count = if spec.genome_results.is_some() {
+    let genome_count = if let Some(reduction) = genome_reduction {
         composite_source_pngs(
             output_base,
             "genome",
             spec.width,
             spec.height,
+            spec.threshold,
             &genome_style.background,
+            reduction,
         )?
     } else {
         0
     };
 
-    // Step 1b: Composite Per-Chromosome PNGs
+    // Step 1b: Composite compatibility-only per-chromosome PNGs. They intentionally do
+    // not claim canonical manifests because their geometry is not genome-wide.
     println!("  Compositing per-chromosome PNGs...");
     let chroms_dir = format!("{}/chroms", output_base);
     let mut chrom_manhattans: HashMap<String, ManifestManhattans> = HashMap::new();
@@ -619,23 +651,104 @@ pub fn run_aggregation(spec: &ManhattanAggregateSpec) -> Result<(usize, serde_js
     Ok(((exome_count + genome_count) as usize, summary))
 }
 
-/// Composite partial PNGs for a source (exome or genome).
+fn expected_partition_count(
+    declared: Option<usize>,
+    source_path: &str,
+    source: &str,
+) -> Result<usize> {
+    let count = match declared {
+        Some(count) => count,
+        None => QueryEngine::open_path(source_path)?.num_partitions(),
+    };
+    if count == 0 {
+        return Err(crate::HailError::InvalidFormat(format!(
+            "distributed Manhattan {source} source has no partitions"
+        )));
+    }
+    Ok(count)
+}
+
+fn load_source_reduction(
+    output_base: &str,
+    source_name: &str,
+    source: ManhattanReductionSourceV1,
+    expected_partition_count: usize,
+) -> Result<LegacyScanSummary> {
+    let source_dir = format!("{output_base}/{source_name}");
+    let paths = list_files(&source_dir, "-reduction.json")?;
+    let mut receipts = Vec::with_capacity(paths.len());
+
+    // Read and parse every discovered receipt before checking cardinality, so an
+    // extra duplicate or corrupt receipt cannot hide behind a count mismatch.
+    for path in paths {
+        let bytes = read_file_bytes(&path)?;
+        let receipt: ManhattanPartitionReductionReceiptV1 = serde_json::from_slice(&bytes)
+            .map_err(|error| {
+                crate::HailError::InvalidFormat(format!(
+                    "invalid Manhattan reduction receipt {path}: {error}"
+                ))
+            })?;
+        let name = path.rsplit('/').next().unwrap_or_default();
+        let canonical_name = format!("part-{:05}-reduction.json", receipt.partition_index);
+        if name != canonical_name {
+            return Err(crate::HailError::InvalidFormat(format!(
+                "Manhattan reduction receipt filename {name:?} does not match partition {}",
+                receipt.partition_index
+            )));
+        }
+        receipts.push(receipt);
+    }
+
+    merge_partition_reduction_receipts(source, expected_partition_count, receipts)
+}
+
+fn read_file_bytes(path: &str) -> Result<Vec<u8>> {
+    if is_cloud_path(path) {
+        let size = genohype_core::io::get_file_size(path)?;
+        let size = usize::try_from(size).map_err(|_| {
+            crate::HailError::InvalidFormat(format!("file is too large to verify: {path}"))
+        })?;
+        genohype_core::io::range_read(path, 0, size)
+    } else {
+        Ok(std::fs::read(path)?)
+    }
+}
+
+/// Composite partial PNGs for a source (exome or genome) and publish its
+/// canonical manifest only after the complete raster can be read and digested.
 fn composite_source_pngs(
     output_base: &str,
     source: &str,
     width: u32,
     height: u32,
+    threshold: f64,
     background: &BackgroundStyle,
+    reduction: LegacyScanSummary,
 ) -> Result<u64> {
-    let parts_dir = format!("{}/{}", output_base, source);
-    // Output to plots/ subdirectory
-    let output_path = format!("{}/plots/{}_manhattan.png", output_base, source);
+    let parts_dir = format!("{output_base}/{source}");
+    let output_stem = format!("{output_base}/plots/{source}_manhattan");
+    let output_path = format!("{output_stem}.png");
+    let rendered_point_count = reduction.rendered_point_count;
 
-    // Use existing composite function with background style
-    // Note: threshold is not used for compositing, pass 0.0
-    composite_partial_pngs_with_style(&parts_dir, &output_path, width, height, 0.0, background)?;
+    // The transparent scan shards contain points only; draw the configured threshold
+    // while producing the final whole-genome raster.
+    composite_partial_pngs_with_style(
+        &parts_dir,
+        &output_path,
+        width,
+        height,
+        threshold,
+        background,
+    )?;
+    let raster = read_file_bytes(&output_path)?;
+    let layout = genohype_association::GenomeLayoutV1::new(
+        genohype_association::canonical_contig_lengths(genohype_association::Assembly::Grch38),
+        width,
+        height,
+        4,
+    )
+    .map_err(|error| crate::HailError::InvalidFormat(error.to_string()))?;
+    write_manifest(&output_stem, layout, threshold, reduction, &raster)?;
 
-    // Count total variants by counting files (rough estimate)
-    // TODO: Track actual counts during scan phase
-    Ok(0)
+    Ok(rendered_point_count)
 }

@@ -439,89 +439,143 @@ pub fn process_manhattan_aggregate(
 
     // The narrow gene export intentionally has no Manhattan manifest/checkpoint.
     if !spec.gene_associations_only {
-        // Verify expected outputs exist and write to checkpoint
-        if let Err(e) = verify_and_checkpoint(spec) {
-            // Log but don't fail - aggregation succeeded
-            eprintln!("Warning: checkpoint update failed: {}", e);
-        }
+        // Canonical publication and the completion marker are one fail-closed contract.
+        verify_and_checkpoint(spec)?;
     }
 
     Ok((rows, summary))
 }
 
-/// Verify expected outputs exist and write checkpoint marker.
-#[allow(unused_variables)]
-fn verify_and_checkpoint(spec: &ManhattanAggregateSpec) -> Result<()> {
-    let output_base = spec.output_path.trim_end_matches('/');
+/// Verify the compatibility inventory and every canonical raster manifest before
+/// writing the completion marker. Any missing, malformed, or mismatched resource
+/// fails the aggregate task and leaves completion unmarked.
+pub fn verify_and_checkpoint(spec: &ManhattanAggregateSpec) -> Result<()> {
+    use genohype_association::{
+        canonical_contig_lengths, Assembly, AssociationVisualizationManifestV1, GenomeLayoutV1,
+        PlotKindV1,
+    };
+    use sha2::{Digest, Sha256};
 
-    // Build list of expected files
-    let mut expected = vec!["manifest.json"];
-    if spec.exome_results.is_some() {
-        expected.push("plots/exome_manhattan.png");
-    }
-    if spec.genome_results.is_some() {
-        expected.push("plots/genome_manhattan.png");
-    }
-
-    // Verify expected files exist (log warnings instead of failing)
-    for file in &expected {
-        let file_url = format!("{}/{}", output_base, file);
-        if genohype_core::io::is_cloud_path(&file_url) {
-            if let Err(e) = genohype_core::io::get_file_size(&file_url) {
-                eprintln!(
-                    "  Warning: Expected output file missing or inaccessible: {} ({})",
-                    file_url, e
-                );
-            }
-        } else if !std::path::Path::new(&file_url).exists() {
-            eprintln!("  Warning: Expected output file missing: {}", file_url);
+    fn read_all(path: &str) -> Result<Vec<u8>> {
+        if genohype_core::io::is_cloud_path(path) {
+            let size = genohype_core::io::get_file_size(path)?;
+            let size = usize::try_from(size).map_err(|_| {
+                crate::HailError::InvalidFormat(format!("output is too large to verify: {path}"))
+            })?;
+            genohype_core::io::range_read(path, 0, size)
+        } else {
+            Ok(std::fs::read(path)?)
         }
     }
 
-    // Derive checkpoint path and relative phenotype path
+    let output_base = spec.output_path.trim_end_matches('/');
+    let root_manifest_path = format!("{output_base}/manifest.json");
+    let root_manifest = read_all(&root_manifest_path)?;
+    serde_json::from_slice::<serde_json::Value>(&root_manifest).map_err(|error| {
+        crate::HailError::InvalidFormat(format!(
+            "invalid compatibility manifest {root_manifest_path}: {error}"
+        ))
+    })?;
+
+    let expected_layout = GenomeLayoutV1::new(
+        canonical_contig_lengths(Assembly::Grch38),
+        spec.width,
+        spec.height,
+        4,
+    )
+    .map_err(|error| crate::HailError::InvalidFormat(error.to_string()))?;
+
+    for source in [
+        spec.exome_results.as_ref().map(|_| "exome"),
+        spec.genome_results.as_ref().map(|_| "genome"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let plot_id = format!("{source}_manhattan");
+        let raster_name = format!("{plot_id}.png");
+        let manifest_path = format!("{output_base}/plots/{plot_id}.manifest.json");
+        let manifest_bytes = read_all(&manifest_path)?;
+        let manifest: AssociationVisualizationManifestV1 = serde_json::from_slice(&manifest_bytes)
+            .map_err(|error| {
+                crate::HailError::InvalidFormat(format!(
+                    "invalid canonical manifest {manifest_path}: {error}"
+                ))
+            })?;
+        manifest.validate().map_err(|error| {
+            crate::HailError::InvalidFormat(format!(
+                "invalid canonical manifest {manifest_path}: {error}"
+            ))
+        })?;
+        if manifest.plot_id != plot_id
+            || manifest.kind != PlotKindV1::Manhattan
+            || manifest.assembly != "GRCh38"
+            || manifest.layout != expected_layout
+            || manifest.resources.raster.url != raster_name
+            || manifest.thresholds.len() != 1
+            || manifest.thresholds[0].name != "genome_wide_significance"
+            || manifest.thresholds[0].pvalue.to_bits() != spec.threshold.to_bits()
+        {
+            return Err(crate::HailError::InvalidFormat(format!(
+                "canonical manifest identity or threshold mismatch: {manifest_path}"
+            )));
+        }
+        let fingerprint = manifest
+            .source_fingerprint
+            .strip_prefix("sha256:")
+            .unwrap_or_default();
+        if fingerprint.len() != 64
+            || !fingerprint
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(crate::HailError::InvalidFormat(format!(
+                "invalid source fingerprint in {manifest_path}"
+            )));
+        }
+
+        let raster_path = format!("{output_base}/plots/{raster_name}");
+        let raster = read_all(&raster_path)?;
+        let actual_size = u64::try_from(raster.len()).map_err(|_| {
+            crate::HailError::InvalidFormat(format!("raster is too large: {raster_path}"))
+        })?;
+        let actual_checksum = format!("sha256:{:x}", Sha256::digest(&raster));
+        if manifest.resources.raster.byte_size != Some(actual_size)
+            || manifest.resources.raster.checksum.as_deref() != Some(actual_checksum.as_str())
+        {
+            return Err(crate::HailError::InvalidFormat(format!(
+                "canonical raster size or checksum mismatch: {raster_path}"
+            )));
+        }
+    }
+
     // output_path: gs://bucket/manhattans/meta/1234
     // checkpoint:  gs://bucket/manhattans/.completed_phenos/meta_1234
     let parts: Vec<&str> = output_base.rsplitn(3, '/').collect();
-    if parts.len() < 3 {
-        return Ok(()); // Can't determine checkpoint path
+    if parts.len() < 3 || parts.iter().any(|part| part.is_empty()) {
+        return Err(crate::HailError::InvalidFormat(format!(
+            "cannot derive completion checkpoint from output path {output_base:?}"
+        )));
     }
-
     let id = parts[0];
     let ancestry = parts[1];
     let base_dir = parts[2];
+    let marker_url = format!("{base_dir}/.completed_phenos/{ancestry}_{id}");
 
-    let marker_url = format!("{}/.completed_phenos/{}_{}", base_dir, ancestry, id);
-
-    // Write the marker using the unified CloudWriter (uses global IO_RUNTIME)
     if genohype_core::io::is_cloud_path(&marker_url) {
         use genohype_core::io::CloudWriter;
-        use std::io::Write;
-
-        let mut writer = CloudWriter::new(&marker_url).map_err(|e| {
-            crate::HailError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to create CloudWriter for marker: {}", e),
-            ))
+        let mut writer = CloudWriter::new(&marker_url).map_err(|error| {
+            crate::HailError::Io(std::io::Error::other(format!(
+                "failed to create completion marker: {error}"
+            )))
         })?;
-
         writer.write_all(b"")?;
         writer.finish()?;
-
-        println!(
-            "  Checkpoint: added {}_{} to .completed_phenos",
-            ancestry, id
-        );
     } else {
-        // Local file system fallback
-        let marker_dir = format!("{}/.completed_phenos", base_dir);
+        let marker_dir = format!("{base_dir}/.completed_phenos");
         std::fs::create_dir_all(&marker_dir)?;
-        let marker_path = format!("{}/{}_{}", marker_dir, ancestry, id);
-        std::fs::write(&marker_path, b"")?;
-        println!(
-            "  Checkpoint: added {}_{} to .completed_phenos",
-            ancestry, id
-        );
+        std::fs::write(&marker_url, b"")?;
     }
-
+    println!("  Checkpoint: added {ancestry}_{id} to .completed_phenos");
     Ok(())
 }

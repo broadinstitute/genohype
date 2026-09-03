@@ -2,7 +2,7 @@
 
 use crate::distributed::message::ManhattanSource;
 use crate::manhattan::legacy_manifest::{
-    hash_encoded_value, source_ordinal, source_partition_hasher,
+    hash_encoded_value, source_ordinal, source_partition_hasher, LegacyScanSummary,
 };
 use genohype_association::{
     compare_association_points, AssociationPointV1, TopK, WarningCode, DEFAULT_TOP_K,
@@ -263,10 +263,135 @@ impl ManhattanPartitionReductionAccumulatorV1 {
     }
 }
 
-fn checked_add(value: u64, name: &str) -> Result<u64> {
-    value
-        .checked_add(1)
+/// Merge a complete set of bounded partition receipts in stable partition order.
+///
+/// The result uses the same source fingerprint construction as local/integrated
+/// scans and retains at most the canonical top 100 points.
+pub(crate) fn merge_partition_reduction_receipts(
+    expected_source: ManhattanReductionSourceV1,
+    expected_partition_count: usize,
+    mut receipts: Vec<ManhattanPartitionReductionReceiptV1>,
+) -> Result<LegacyScanSummary> {
+    if expected_partition_count == 0 {
+        return Err(HailError::InvalidFormat(
+            "distributed Manhattan source has no expected partitions".into(),
+        ));
+    }
+    receipts.sort_by_key(|receipt| receipt.partition_index);
+    if receipts
+        .windows(2)
+        .any(|pair| pair[0].partition_index == pair[1].partition_index)
+    {
+        return Err(HailError::InvalidFormat(
+            "duplicate Manhattan partition reduction receipt".into(),
+        ));
+    }
+    if receipts.len() != expected_partition_count {
+        return Err(HailError::InvalidFormat(format!(
+            "expected {expected_partition_count} Manhattan partition reduction receipts, found {}",
+            receipts.len()
+        )));
+    }
+
+    let mut row_count = 0_u64;
+    let mut valid_row_count = 0_u64;
+    let mut skipped_row_count = 0_u64;
+    let mut rendered_point_count = 0_u64;
+    let mut significant_hit_count = 0_u64;
+    let mut top_hits =
+        TopK::new(DEFAULT_TOP_K).map_err(|error| HailError::InvalidFormat(error.to_string()))?;
+    let mut warnings = BTreeSet::new();
+    let mut source_hasher = Sha256::new();
+    source_hasher.update(b"genohype.association.source.v1\0");
+    source_hasher.update((expected_partition_count as u64).to_be_bytes());
+
+    for (expected_index, receipt) in receipts.into_iter().enumerate() {
+        receipt.validate().map_err(HailError::InvalidFormat)?;
+        if receipt.source != expected_source {
+            return Err(HailError::InvalidFormat(format!(
+                "Manhattan partition {} has wrong source identity",
+                receipt.partition_index
+            )));
+        }
+        if receipt.partition_index != expected_index as u64 {
+            return Err(HailError::InvalidFormat(format!(
+                "missing Manhattan partition reduction receipt {expected_index}"
+            )));
+        }
+
+        row_count = checked_sum(row_count, receipt.row_count, "source row count")?;
+        valid_row_count = checked_sum(valid_row_count, receipt.valid_row_count, "valid row count")?;
+        skipped_row_count = checked_sum(
+            skipped_row_count,
+            receipt.skipped_row_count,
+            "skipped row count",
+        )?;
+        rendered_point_count = checked_sum(
+            rendered_point_count,
+            receipt.rendered_point_count,
+            "rendered point count",
+        )?;
+        significant_hit_count = checked_sum(
+            significant_hit_count,
+            receipt.significant_hit_count,
+            "significant hit count",
+        )?;
+        warnings.extend(receipt.warnings);
+        for point in receipt.top_hits {
+            top_hits
+                .insert(point)
+                .map_err(|error| HailError::InvalidFormat(error.to_string()))?;
+        }
+
+        source_hasher.update(receipt.partition_index.to_be_bytes());
+        source_hasher.update(receipt.row_count.to_be_bytes());
+        source_hasher.update(parse_source_digest(&receipt.source_digest)?);
+    }
+
+    if valid_row_count.checked_add(skipped_row_count) != Some(row_count) {
+        return Err(HailError::InvalidFormat(
+            "distributed Manhattan scan counts are inconsistent".into(),
+        ));
+    }
+
+    Ok(LegacyScanSummary {
+        row_count,
+        valid_row_count,
+        skipped_row_count,
+        rendered_point_count,
+        significant_hit_count,
+        top_hits: top_hits.into_sorted_vec(),
+        warnings: warnings.into_iter().collect(),
+        source_fingerprint: format!("sha256:{:x}", source_hasher.finalize()),
+    })
+}
+
+fn parse_source_digest(digest: &str) -> Result<[u8; 32]> {
+    let hex = digest.strip_prefix("sha256:").ok_or_else(|| {
+        HailError::InvalidFormat("source_digest must use the sha256: prefix".into())
+    })?;
+    if hex.len() != 64 {
+        return Err(HailError::InvalidFormat(
+            "source_digest must contain 64 hexadecimal digits".into(),
+        ));
+    }
+    let mut bytes = [0_u8; 32];
+    for (index, pair) in hex.as_bytes().chunks_exact(2).enumerate() {
+        let text = std::str::from_utf8(pair)
+            .map_err(|error| HailError::InvalidFormat(error.to_string()))?;
+        bytes[index] = u8::from_str_radix(text, 16)
+            .map_err(|_| HailError::InvalidFormat("invalid source_digest hexadecimal".into()))?;
+    }
+    Ok(bytes)
+}
+
+fn checked_sum(left: u64, right: u64, name: &str) -> Result<u64> {
+    left.checked_add(right)
         .ok_or_else(|| HailError::InvalidFormat(format!("{name} overflowed")))
+}
+
+fn checked_add(value: u64, name: &str) -> Result<u64> {
+    checked_sum(value, 1, name)
 }
 
 #[cfg(test)]
@@ -342,6 +467,105 @@ mod tests {
             .top_hits
             .windows(2)
             .all(|pair| !compare_association_points(&pair[0], &pair[1]).is_gt()));
+    }
+
+    #[test]
+    fn complete_receipts_merge_deterministically_with_exact_counts() {
+        let receipt = |partition_index: u64, pvalues: &[f64]| {
+            let mut top_hits = pvalues
+                .iter()
+                .enumerate()
+                .map(|(row, &pvalue)| point((partition_index << 32) | row as u64, pvalue))
+                .collect::<Vec<_>>();
+            top_hits.sort_by(compare_association_points);
+            ManhattanPartitionReductionReceiptV1 {
+                schema_version: MANHATTAN_PARTITION_REDUCTION_SCHEMA_V1.into(),
+                partition_index,
+                source: ManhattanReductionSourceV1::Exome,
+                row_count: top_hits.len() as u64 + 1,
+                valid_row_count: top_hits.len() as u64,
+                skipped_row_count: 1,
+                rendered_point_count: top_hits.len() as u64,
+                significant_hit_count: pvalues.iter().filter(|&&p| p < 5e-8).count() as u64,
+                top_hits,
+                warnings: vec!["pvalue_underflow".into()],
+                source_digest: format!("sha256:{:064x}", partition_index + 1),
+            }
+        };
+        let first = receipt(0, &[1e-6, 1e-12]);
+        let second = receipt(1, &[1e-12, 1e-9]);
+
+        let forward = merge_partition_reduction_receipts(
+            ManhattanReductionSourceV1::Exome,
+            2,
+            vec![first.clone(), second.clone()],
+        )
+        .unwrap();
+        let reverse = merge_partition_reduction_receipts(
+            ManhattanReductionSourceV1::Exome,
+            2,
+            vec![second, first],
+        )
+        .unwrap();
+
+        assert_eq!(forward.source_fingerprint, reverse.source_fingerprint);
+        assert_eq!(forward.top_hits, reverse.top_hits);
+        assert_eq!(forward.row_count, 6);
+        assert_eq!(forward.valid_row_count, 4);
+        assert_eq!(forward.skipped_row_count, 2);
+        assert_eq!(forward.rendered_point_count, 4);
+        assert_eq!(forward.significant_hit_count, 3);
+        assert_eq!(forward.warnings, ["pvalue_underflow"]);
+        assert_eq!(
+            forward
+                .top_hits
+                .iter()
+                .map(|hit| hit.source_ordinal)
+                .collect::<Vec<_>>(),
+            [1, 1_u64 << 32, (1_u64 << 32) | 1, 0]
+        );
+    }
+
+    #[test]
+    fn receipt_merge_rejects_missing_duplicate_and_wrong_source() {
+        let receipt = |partition_index, source| ManhattanPartitionReductionReceiptV1 {
+            schema_version: MANHATTAN_PARTITION_REDUCTION_SCHEMA_V1.into(),
+            partition_index,
+            source,
+            row_count: 0,
+            valid_row_count: 0,
+            skipped_row_count: 0,
+            rendered_point_count: 0,
+            significant_hit_count: 0,
+            top_hits: vec![],
+            warnings: vec![],
+            source_digest: format!("sha256:{:064x}", partition_index + 1),
+        };
+        let zero = receipt(0, ManhattanReductionSourceV1::Exome);
+        assert!(merge_partition_reduction_receipts(
+            ManhattanReductionSourceV1::Exome,
+            2,
+            vec![zero.clone()]
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("expected 2"));
+        assert!(merge_partition_reduction_receipts(
+            ManhattanReductionSourceV1::Exome,
+            2,
+            vec![zero.clone(), zero.clone()]
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("duplicate"));
+        assert!(merge_partition_reduction_receipts(
+            ManhattanReductionSourceV1::Genome,
+            1,
+            vec![zero]
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("wrong source"));
     }
 
     #[test]

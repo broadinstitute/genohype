@@ -677,6 +677,14 @@ pub struct ManhattanAggregateSpec {
     /// Path to Genome results Hail table
     #[serde(default)]
     pub genome_results: Option<String>,
+    /// Exact Phase 1 exome partition count. Older payloads may omit this and
+    /// aggregation will recover it from Hail metadata.
+    #[serde(default)]
+    pub exome_partitions: Option<usize>,
+    /// Exact Phase 1 genome partition count. Older payloads may omit this and
+    /// aggregation will recover it from Hail metadata.
+    #[serde(default)]
+    pub genome_partitions: Option<usize>,
     /// Path to gene burden results Hail table
     #[serde(default)]
     pub gene_burden: Option<String>,
