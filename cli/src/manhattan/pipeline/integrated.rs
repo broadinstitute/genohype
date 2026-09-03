@@ -8,26 +8,33 @@
 //! 5. Generate locus plots and JSON exports
 
 use crate::manhattan::data::{
-    BufferedVariant, LocusDefinitionRow, LocusVariantRow, ManifestLocus, ManifestLocusVariants,
-    ManifestRegion, SigHitRow, VariantSource,
+    extract_association_point, BufferedVariant, LocusDefinitionRow, LocusVariantRow, ManifestLocus,
+    ManifestLocusVariants, ManifestRegion, SigHitRow, VariantSource,
 };
 use crate::manhattan::genes::{
     render_gene_manhattan, scan_gene_burden_to_parquet, GeneMap, SignificantGene,
 };
 use crate::manhattan::layout::{ChromosomeLayout, YScale};
+use crate::manhattan::legacy_manifest::{
+    merge_partition_summaries, write_manifest, LegacyPartitionSummary, LegacyScanSummary,
+};
 use crate::manhattan::loci_writer::{LocusDefinitionWriter, LocusVariantWriter};
 use crate::manhattan::locus::{LocusPlotConfig, LocusRenderer, RenderVariant};
 use crate::manhattan::reference::{calculate_xpos, get_contig_lengths, normalize_contig_name};
 use crate::manhattan::render::ManhattanRenderer;
 use crate::manhattan::sig_writer::SigHitWriter;
 use crate::Result;
+use genohype_association::{
+    canonical_contig_lengths, Assembly, AssociationPointV1, GenomeLayoutV1,
+};
 use genohype_core::codec::EncodedValue;
 use genohype_core::query::join::{JoinedRow, SortedMergeIterator};
 use genohype_core::query::{IntervalList, QueryEngine};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 /// Configuration for the integrated pipeline.
 ///
@@ -173,35 +180,44 @@ pub fn run_integrated_pipeline(config: &PipelineConfig) -> Result<()> {
     let mut exome_buffer: Vec<BufferedVariant> = Vec::new();
     let mut genome_buffer: Vec<BufferedVariant> = Vec::new();
 
-    // Writers for consolidated output
+    // Aggregate-only consumes the scan artifact and must never truncate it.
     let sig_path = output_base.join("significant.parquet");
-    let mut sig_writer = SigHitWriter::new(sig_path.to_str().unwrap())?;
+    let mut sig_writer = if run_scan {
+        Some(SigHitWriter::new(sig_path.to_str().unwrap())?)
+    } else {
+        None
+    };
 
     let mut locus_definitions = Vec::new();
     let mut locus_variants = Vec::new();
     let mut manifest_loci = Vec::new();
 
-    // We need at least one table to establish layout
-    let layout_path = config.exome.as_ref().or(config.genome.as_ref());
-
-    let (chrom_layout, y_scale) = if let Some(path) = layout_path {
-        let layout_engine = QueryEngine::open_path(path)?;
-        let all_contigs = get_contig_lengths(&layout_engine);
-
-        // Filter to standard chromosomes
-        let contigs: Vec<(String, u32)> = all_contigs
-            .into_iter()
-            .filter(|(name, _)| name.len() <= 5)
-            .collect();
-
-        let layout = ChromosomeLayout::new(&contigs, config.width, 4);
-        let scale = YScale::new(config.height, 350.0); // Support p-values down to ~1e-350
-        (layout, scale)
-    } else {
+    if config.exome.is_none() && config.genome.is_none() {
         return Err(crate::HailError::InvalidFormat(
             "No variant tables provided".into(),
         ));
-    };
+    }
+
+    // V1 whole-genome rasters have one assembly-defined geometry regardless of which
+    // table was supplied. Legacy gene/per-chromosome outputs retain their old renderer.
+    let canonical_contigs = canonical_contig_lengths(Assembly::Grch38);
+    let association_layout =
+        GenomeLayoutV1::new(canonical_contigs.clone(), config.width, config.height, 4)
+            .map_err(|error| crate::HailError::InvalidFormat(error.to_string()))?;
+    let compatibility_contigs: Vec<(String, u32)> = canonical_contigs
+        .iter()
+        .map(|(name, length)| {
+            u32::try_from(*length)
+                .map(|length| (name.clone(), length))
+                .map_err(|_| {
+                    crate::HailError::InvalidFormat(format!(
+                        "canonical contig {name} exceeds compatibility layout capacity"
+                    ))
+                })
+        })
+        .collect::<Result<_>>()?;
+    let chrom_layout = ChromosomeLayout::new(&compatibility_contigs, config.width, 4);
+    let y_scale = YScale::new(config.height, 350.0);
 
     // 2b. Render Gene Manhattan plot (now that we have the layout)
     if run_aggregate && !gene_plot_points.is_empty() {
@@ -236,41 +252,44 @@ pub fn run_integrated_pipeline(config: &PipelineConfig) -> Result<()> {
         }
     }
 
-    // 3. Scan Exomes (if provided) - NO annotations during main scan for speed
+    // Every successful local whole-genome raster gets a canonical sibling manifest.
     if run_scan {
         if let Some(res_path) = &config.exome {
             println!("Scanning Exome variants: {}", res_path);
-
-            scan_variant_table(
+            let scan = scan_variant_table(
                 res_path,
-                None, // Skip annotations during main scan
+                None, // Keep the fast scan; buffered hits are enriched below.
                 VariantSource::Exome,
+                &association_layout,
                 &chrom_layout,
                 &y_scale,
                 config,
                 &interest_regions,
                 &mut exome_buffer,
-                &mut sig_writer,
-                plots_dir.join("exome_manhattan.png").to_str().unwrap(),
+                sig_writer.as_mut().expect("scan writer is initialized"),
+                &plots_dir.join("exome_manhattan.png"),
             )?;
+            report_scan_summary("Exome", &scan);
+            publish_scan_manifest(&scan, &association_layout, config.threshold)?;
         }
 
-        // 4. Scan Genomes (if provided) - NO annotations during main scan for speed
         if let Some(res_path) = &config.genome {
             println!("Scanning Genome variants: {}", res_path);
-
-            scan_variant_table(
+            let scan = scan_variant_table(
                 res_path,
-                None, // Skip annotations during main scan
+                None, // Keep the fast scan; buffered hits are enriched below.
                 VariantSource::Genome,
+                &association_layout,
                 &chrom_layout,
                 &y_scale,
                 config,
                 &interest_regions,
                 &mut genome_buffer,
-                &mut sig_writer,
-                plots_dir.join("genome_manhattan.png").to_str().unwrap(),
+                sig_writer.as_mut().expect("scan writer is initialized"),
+                &plots_dir.join("genome_manhattan.png"),
             )?;
+            report_scan_summary("Genome", &scan);
+            publish_scan_manifest(&scan, &association_layout, config.threshold)?;
         }
     }
 
@@ -294,12 +313,20 @@ pub fn run_integrated_pipeline(config: &PipelineConfig) -> Result<()> {
         }
     }
 
-    // Finish significant hits writer
-    let sig_count = sig_writer.finish()?;
-    println!(
-        "Wrote {} significant hits to significant.parquet",
-        sig_count
-    );
+    // Finish scan output, or inspect the pre-existing scan artifact without replacing it.
+    let sig_count = if let Some(writer) = sig_writer {
+        let count = writer.finish()?;
+        println!("Wrote {} significant hits to significant.parquet", count);
+        count
+    } else {
+        use crate::manhattan::aggregate::extract_sig_positions;
+        let count = extract_sig_positions(sig_path.to_str().unwrap())?.len();
+        println!(
+            "Aggregate-only mode found {} existing significant hits",
+            count
+        );
+        count
+    };
 
     if run_aggregate {
         // 5. Compute Locus Regions
@@ -558,22 +585,135 @@ pub fn run_integrated_pipeline(config: &PipelineConfig) -> Result<()> {
     Ok(())
 }
 
+/// Bounded canonical result of one integrated association scan.
+///
+/// PNG bytes are retained so the sibling manifest describes the exact raster bytes
+/// written by this scan without a second read.
+#[derive(Debug)]
+pub(crate) struct IntegratedScanSummary {
+    pub row_count: u64,
+    pub valid_row_count: u64,
+    pub skipped_row_count: u64,
+    pub rendered_point_count: u64,
+    pub significant_hit_count: u64,
+    /// Canonically ordered best 100 points.
+    pub top_hits: Vec<AssociationPointV1>,
+    /// Stable warning codes, deduplicated and lexically ordered.
+    pub warnings: Vec<String>,
+    /// SHA-256 over decoded source rows only; input paths are not included.
+    pub source_hash: String,
+    pub png_bytes: Vec<u8>,
+    pub png_path: PathBuf,
+}
+
+impl IntegratedScanSummary {
+    fn from_scan(scan: LegacyScanSummary, png_bytes: Vec<u8>, png_path: PathBuf) -> Self {
+        Self {
+            row_count: scan.row_count,
+            valid_row_count: scan.valid_row_count,
+            skipped_row_count: scan.skipped_row_count,
+            rendered_point_count: scan.rendered_point_count,
+            significant_hit_count: scan.significant_hit_count,
+            top_hits: scan.top_hits,
+            warnings: scan.warnings,
+            source_hash: scan.source_fingerprint,
+            png_bytes,
+            png_path,
+        }
+    }
+
+    fn legacy_summary(&self) -> LegacyScanSummary {
+        LegacyScanSummary {
+            row_count: self.row_count,
+            valid_row_count: self.valid_row_count,
+            skipped_row_count: self.skipped_row_count,
+            rendered_point_count: self.rendered_point_count,
+            significant_hit_count: self.significant_hit_count,
+            top_hits: self.top_hits.clone(),
+            warnings: self.warnings.clone(),
+            source_fingerprint: self.source_hash.clone(),
+        }
+    }
+}
+
+/// Publish only after `scan_variant_table` has successfully written the whole-genome PNG.
+fn publish_scan_manifest(
+    scan: &IntegratedScanSummary,
+    layout: &GenomeLayoutV1,
+    threshold: f64,
+) -> Result<()> {
+    let output_base = scan.png_path.with_extension("");
+    let output_base = output_base.to_str().ok_or_else(|| {
+        crate::HailError::InvalidFormat("Manhattan output path is not valid UTF-8".into())
+    })?;
+    let manifest_path = write_manifest(
+        output_base,
+        layout.clone(),
+        threshold,
+        scan.legacy_summary(),
+        &scan.png_bytes,
+    )?;
+    println!("Saved: {manifest_path}");
+    Ok(())
+}
+
+fn report_scan_summary(label: &str, scan: &IntegratedScanSummary) {
+    println!(
+        "  {label} scan: {} rows, {} valid, {} skipped, {} rendered, {} significant, {} top hits",
+        scan.row_count,
+        scan.valid_row_count,
+        scan.skipped_row_count,
+        scan.rendered_point_count,
+        scan.significant_hit_count,
+        scan.top_hits.len()
+    );
+    println!(
+        "  Source: {}; raster: {} bytes at {}; warnings: {}",
+        scan.source_hash,
+        scan.png_bytes.len(),
+        scan.png_path.display(),
+        if scan.warnings.is_empty() {
+            "none".to_string()
+        } else {
+            scan.warnings.join(", ")
+        }
+    );
+}
+
+trait SignificantHitSink {
+    fn write_hit(&mut self, row: SigHitRow) -> Result<()>;
+}
+
+impl<W: Write + Send> SignificantHitSink for SigHitWriter<W> {
+    fn write_hit(&mut self, row: SigHitRow) -> Result<()> {
+        self.write(row)
+    }
+}
+
+fn sequential_ordinal(index: usize) -> Result<u64> {
+    u64::try_from(index).map_err(|_| {
+        crate::HailError::InvalidFormat("integrated scan row ordinal overflowed".into())
+    })
+}
+
 /// Scan a variant table (with optional annotation join), render Manhattan, and buffer variants.
 #[allow(clippy::too_many_arguments)]
 fn scan_variant_table(
     results_path: &str,
     annotations_path: Option<&str>,
     source: VariantSource,
-    layout: &ChromosomeLayout,
-    y_scale: &YScale,
+    layout: &GenomeLayoutV1,
+    compatibility_layout: &ChromosomeLayout,
+    compatibility_y_scale: &YScale,
     config: &PipelineConfig,
     interest_regions: &IntervalList,
     buffer: &mut Vec<BufferedVariant>,
     sig_writer: &mut SigHitWriter<std::fs::File>,
-    output_png: &str,
-) -> Result<()> {
+    output_png: &Path,
+) -> Result<IntegratedScanSummary> {
     let results_engine = QueryEngine::open_path(results_path)?;
     let mut renderer = ManhattanRenderer::new(config.width, config.height);
+    let mut scan_summary = LegacyPartitionSummary::new(0)?;
 
     // Per-chromosome renderers/layouts for local run
     let mut chrom_renderers: HashMap<String, ManhattanRenderer> = HashMap::new();
@@ -583,8 +723,13 @@ fn scan_variant_table(
     let contigs = get_contig_lengths(&results_engine);
     let contig_lengths: HashMap<String, u32> = contigs.iter().cloned().collect();
 
-    // Render threshold line
-    renderer.render_threshold_line(y_scale.threshold_y(config.threshold), config.width);
+    let threshold_y = layout
+        .y_scale
+        .threshold_y(config.threshold)
+        .ok_or_else(|| {
+            crate::HailError::InvalidFormat("invalid Manhattan significance threshold".into())
+        })?;
+    renderer.render_threshold_line(threshold_y, config.width);
 
     // Progress bar
     let pb = ProgressBar::new_spinner();
@@ -624,27 +769,39 @@ fn scan_variant_table(
                 unmatched += 1;
             }
 
-            process_joined_row(
-                &row,
-                source,
-                layout,
-                y_scale,
-                y_field,
-                locus_threshold,
-                variant_threshold,
-                interest_regions,
-                buffer,
-                sig_writer,
-                &mut renderer,
-                &contig_lengths,
-                &mut chrom_renderers,
-                &mut chrom_layouts,
-                config.width,
-                config.height,
-            );
+            let ordinal = sequential_ordinal(i)?;
+            scan_summary.observe_source_row(&row.left)?;
+            match extract_association_point(&row.left, y_field, ordinal) {
+                Ok((point, warnings)) => {
+                    let variant = extract_variant_fields(&row.left, &point)?;
+                    let significant = point.pvalue < variant_threshold;
+                    let rendered = process_joined_row(
+                        &row,
+                        &point,
+                        variant,
+                        source,
+                        layout,
+                        compatibility_layout,
+                        compatibility_y_scale,
+                        locus_threshold,
+                        variant_threshold,
+                        interest_regions,
+                        buffer,
+                        sig_writer,
+                        &mut renderer,
+                        &contig_lengths,
+                        &mut chrom_renderers,
+                        &mut chrom_layouts,
+                        config.width,
+                        config.height,
+                    )?;
+                    scan_summary.observe_valid_point(point, warnings, rendered, significant)?;
+                }
+                Err(_) => scan_summary.observe_skipped_row()?,
+            }
 
             if i % 10_000 == 0 {
-                pb.set_position(i as u64);
+                pb.set_position(ordinal);
             }
         }
         println!(
@@ -657,209 +814,196 @@ fn scan_variant_table(
 
         for (i, row_res) in results_iter.enumerate() {
             let row = row_res?;
-            process_single_row(
-                &row,
-                source,
-                layout,
-                y_scale,
-                y_field,
-                locus_threshold,
-                variant_threshold,
-                interest_regions,
-                buffer,
-                sig_writer,
-                &mut renderer,
-                &contig_lengths,
-                &mut chrom_renderers,
-                &mut chrom_layouts,
-                config.width,
-                config.height,
-            );
+            let ordinal = sequential_ordinal(i)?;
+            scan_summary.observe_source_row(&row)?;
+            match extract_association_point(&row, y_field, ordinal) {
+                Ok((point, warnings)) => {
+                    let variant = extract_variant_fields(&row, &point)?;
+                    let significant = point.pvalue < variant_threshold;
+                    let rendered = process_single_row(
+                        &point,
+                        variant,
+                        source,
+                        layout,
+                        compatibility_layout,
+                        compatibility_y_scale,
+                        locus_threshold,
+                        variant_threshold,
+                        interest_regions,
+                        buffer,
+                        sig_writer,
+                        &mut renderer,
+                        &contig_lengths,
+                        &mut chrom_renderers,
+                        &mut chrom_layouts,
+                        config.width,
+                        config.height,
+                    )?;
+                    scan_summary.observe_valid_point(point, warnings, rendered, significant)?;
+                }
+                Err(_) => scan_summary.observe_skipped_row()?,
+            }
 
             if i % 10_000 == 0 {
-                pb.set_position(i as u64);
+                pb.set_position(ordinal);
             }
         }
     }
 
     pb.finish_with_message("complete");
 
-    // Save WG Manhattan PNG
+    // The manifest is published by the caller only after this whole-genome raster exists.
     let png_data = renderer.encode_png()?;
-    fs::write(output_png, png_data)?;
-    println!("Saved: {}", output_png);
+    fs::write(output_png, &png_data)?;
+    println!("Saved: {}", output_png.display());
 
-    // Save Per-Chromosome PNGs
-    let output_dir = Path::new(output_png).parent().unwrap();
-    let file_name = Path::new(output_png).file_name().unwrap().to_str().unwrap();
-
+    // Compatibility-only per-chromosome outputs retain their historical scale and names.
+    let output_dir = output_png.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = output_png
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            crate::HailError::InvalidFormat("Manhattan output has no UTF-8 basename".into())
+        })?;
     for (chrom, mut chrom_renderer) in chrom_renderers {
-        // Draw threshold line on per-chrom plot
-        chrom_renderer.render_threshold_line(y_scale.threshold_y(config.threshold), config.width);
-
+        chrom_renderer.render_threshold_line(
+            compatibility_y_scale.threshold_y(config.threshold),
+            config.width,
+        );
         let data = chrom_renderer.encode_png()?;
         let chrom_dir = output_dir.join("chroms").join(&chrom);
         fs::create_dir_all(&chrom_dir)?;
-        let out_path = chrom_dir.join(file_name);
-        fs::write(&out_path, data)?;
+        fs::write(chrom_dir.join(file_name), data)?;
     }
 
-    Ok(())
+    let scan = merge_partition_summaries(vec![scan_summary])?;
+    Ok(IntegratedScanSummary::from_scan(
+        scan,
+        png_data,
+        output_png.to_path_buf(),
+    ))
 }
 
-/// Process a joined row (results + annotations).
+/// Process a joined row (results + annotations) that was already canonically validated.
 #[allow(clippy::too_many_arguments)]
-fn process_joined_row(
+fn process_joined_row<S: SignificantHitSink>(
     row: &JoinedRow,
+    point: &AssociationPointV1,
+    variant: ExtractedVariant,
     source: VariantSource,
-    layout: &ChromosomeLayout,
-    y_scale: &YScale,
-    y_field: &str,
+    layout: &GenomeLayoutV1,
+    compatibility_layout: &ChromosomeLayout,
+    compatibility_y_scale: &YScale,
     locus_threshold: f64,
     variant_threshold: f64,
     interest_regions: &IntervalList,
     buffer: &mut Vec<BufferedVariant>,
-    sig_writer: &mut SigHitWriter<std::fs::File>,
+    sig_writer: &mut S,
     renderer: &mut ManhattanRenderer,
-    // Per-chromosome rendering support
     contig_lengths: &HashMap<String, u32>,
     chrom_renderers: &mut HashMap<String, ManhattanRenderer>,
     chrom_layouts: &mut HashMap<String, ChromosomeLayout>,
     width: u32,
     height: u32,
-) {
-    // Extract from left (results)
-    let v = match extract_variant_fields(&row.left, y_field) {
-        Some(v) => v,
-        None => return,
-    };
-
-    // Extract from right (annotations) if present
-    let (gene_symbol, consequence) = if let Some(ref annot) = row.right {
-        extract_annotation_fields(annot)
-    } else {
-        (None, None)
-    };
-
-    // Render point to WG
-    render_variant(
-        &v.contig,
-        v.position,
-        v.neg_log10_p,
+) -> Result<bool> {
+    let annotation = row
+        .right
+        .as_ref()
+        .map(extract_annotation_fields)
+        .unwrap_or((None, None));
+    process_result_row(
+        point,
+        variant,
+        source,
+        annotation,
         layout,
-        y_scale,
+        compatibility_layout,
+        compatibility_y_scale,
+        locus_threshold,
+        variant_threshold,
+        interest_regions,
+        buffer,
+        sig_writer,
         renderer,
-    );
-
-    // Render point to per-chromosome plot
-    render_variant_per_chrom(
-        &v.contig,
-        v.position,
-        v.neg_log10_p,
-        layout,
-        y_scale,
         contig_lengths,
         chrom_renderers,
         chrom_layouts,
         width,
         height,
-    );
-
-    // Check significance
-    if v.pvalue < variant_threshold {
-        // Write to parquet
-        let _ = sig_writer.write(SigHitRow {
-            phenotype: "local_run".to_string(),
-            ancestry: "meta".to_string(),
-            sequencing_type: match source {
-                VariantSource::Exome => "exome".to_string(),
-                VariantSource::Genome => "genome".to_string(),
-            },
-            xpos: calculate_xpos(&v.contig, v.position),
-            contig: normalize_contig_name(&v.contig),
-            position: v.position,
-            ref_allele: v.alleles.first().cloned().unwrap_or_default(),
-            alt_allele: v.alleles.get(1).cloned().unwrap_or_default(),
-            pvalue: v.pvalue,
-            beta: v.beta,
-            se: v.se,
-            af: v.af,
-            ac_cases: v.ac_cases,
-            ac_controls: v.ac_controls,
-            af_cases: v.af_cases,
-            af_controls: v.af_controls,
-            association_ac: v.association_ac,
-        });
-    }
-
-    // Buffer if interesting
-    let should_buffer =
-        v.pvalue < locus_threshold || interest_regions.contains(&v.contig, v.position);
-
-    if should_buffer {
-        buffer.push(BufferedVariant {
-            contig: v.contig,
-            position: v.position,
-            alleles: v.alleles,
-            pvalue: v.pvalue,
-            beta: v.beta,
-            se: v.se,
-            af: v.af,
-            source,
-            gene_symbol,
-            consequence,
-            ac_cases: v.ac_cases,
-            ac_controls: v.ac_controls,
-            af_cases: v.af_cases,
-            af_controls: v.af_controls,
-            association_ac: v.association_ac,
-        });
-    }
+    )
 }
 
-/// Process a single row (no annotations).
+/// Process a single row (no annotations) that was already canonically validated.
 #[allow(clippy::too_many_arguments)]
-fn process_single_row(
-    row: &EncodedValue,
+fn process_single_row<S: SignificantHitSink>(
+    point: &AssociationPointV1,
+    variant: ExtractedVariant,
     source: VariantSource,
-    layout: &ChromosomeLayout,
-    y_scale: &YScale,
-    y_field: &str,
+    layout: &GenomeLayoutV1,
+    compatibility_layout: &ChromosomeLayout,
+    compatibility_y_scale: &YScale,
     locus_threshold: f64,
     variant_threshold: f64,
     interest_regions: &IntervalList,
     buffer: &mut Vec<BufferedVariant>,
-    sig_writer: &mut SigHitWriter<std::fs::File>,
+    sig_writer: &mut S,
     renderer: &mut ManhattanRenderer,
-    // Per-chromosome rendering support
     contig_lengths: &HashMap<String, u32>,
     chrom_renderers: &mut HashMap<String, ManhattanRenderer>,
     chrom_layouts: &mut HashMap<String, ChromosomeLayout>,
     width: u32,
     height: u32,
-) {
-    let v = match extract_variant_fields(row, y_field) {
-        Some(v) => v,
-        None => return,
-    };
-
-    // Render point to WG
-    render_variant(
-        &v.contig,
-        v.position,
-        v.neg_log10_p,
+) -> Result<bool> {
+    process_result_row(
+        point,
+        variant,
+        source,
+        (None, None),
         layout,
-        y_scale,
+        compatibility_layout,
+        compatibility_y_scale,
+        locus_threshold,
+        variant_threshold,
+        interest_regions,
+        buffer,
+        sig_writer,
         renderer,
-    );
+        contig_lengths,
+        chrom_renderers,
+        chrom_layouts,
+        width,
+        height,
+    )
+}
 
-    // Render point to per-chromosome plot
+#[allow(clippy::too_many_arguments)]
+fn process_result_row<S: SignificantHitSink>(
+    point: &AssociationPointV1,
+    v: ExtractedVariant,
+    source: VariantSource,
+    annotation: (Option<String>, Option<String>),
+    layout: &GenomeLayoutV1,
+    compatibility_layout: &ChromosomeLayout,
+    compatibility_y_scale: &YScale,
+    locus_threshold: f64,
+    variant_threshold: f64,
+    interest_regions: &IntervalList,
+    buffer: &mut Vec<BufferedVariant>,
+    sig_writer: &mut S,
+    renderer: &mut ManhattanRenderer,
+    contig_lengths: &HashMap<String, u32>,
+    chrom_renderers: &mut HashMap<String, ManhattanRenderer>,
+    chrom_layouts: &mut HashMap<String, ChromosomeLayout>,
+    width: u32,
+    height: u32,
+) -> Result<bool> {
+    let rendered = render_variant(point, layout, renderer);
     render_variant_per_chrom(
         &v.contig,
         v.position,
         v.neg_log10_p,
-        layout,
-        y_scale,
+        compatibility_layout,
+        compatibility_y_scale,
         contig_lengths,
         chrom_renderers,
         chrom_layouts,
@@ -867,10 +1011,8 @@ fn process_single_row(
         height,
     );
 
-    // Check significance
     if v.pvalue < variant_threshold {
-        // Write to parquet
-        let _ = sig_writer.write(SigHitRow {
+        sig_writer.write_hit(SigHitRow {
             phenotype: "local_run".to_string(),
             ancestry: "meta".to_string(),
             sequencing_type: match source {
@@ -891,14 +1033,10 @@ fn process_single_row(
             af_cases: v.af_cases,
             af_controls: v.af_controls,
             association_ac: v.association_ac,
-        });
+        })?;
     }
 
-    // Buffer if interesting
-    let should_buffer =
-        v.pvalue < locus_threshold || interest_regions.contains(&v.contig, v.position);
-
-    if should_buffer {
+    if v.pvalue < locus_threshold || interest_regions.contains(&v.contig, v.position) {
         buffer.push(BufferedVariant {
             contig: v.contig,
             position: v.position,
@@ -908,8 +1046,8 @@ fn process_single_row(
             se: v.se,
             af: v.af,
             source,
-            gene_symbol: None,
-            consequence: None,
+            gene_symbol: annotation.0,
+            consequence: annotation.1,
             ac_cases: v.ac_cases,
             ac_controls: v.ac_controls,
             af_cases: v.af_cases,
@@ -917,29 +1055,24 @@ fn process_single_row(
             association_ac: v.association_ac,
         });
     }
+
+    Ok(rendered)
 }
 
 /// Render a single variant point on the Manhattan plot.
 fn render_variant(
-    contig: &str,
-    position: i32,
-    neg_log10_p: f64,
-    layout: &ChromosomeLayout,
-    y_scale: &YScale,
+    point: &AssociationPointV1,
+    layout: &GenomeLayoutV1,
     renderer: &mut ManhattanRenderer,
-) {
-    // Normalize contig (strip chr prefix)
-    let contig_name = if contig.starts_with("chr") {
-        &contig[3..]
-    } else {
-        contig
+) -> bool {
+    let Some(x) = layout.x_for(&point.contig, point.position) else {
+        return false;
     };
-
-    if let Some(x) = layout.get_x(contig_name, position) {
-        let y = y_scale.get_y(neg_log10_p);
-        let color = layout.get_color(contig_name);
-        renderer.render_point(x, y, color, 0.6);
-    }
+    let Some(color) = layout.color_for(&point.contig) else {
+        return false;
+    };
+    renderer.render_point(x, layout.y_scale.y_for(point.neg_log10_p), color, 0.6);
+    true
 }
 
 /// Render a variant to its per-chromosome plot.
@@ -992,9 +1125,6 @@ fn render_variant_per_chrom(
     }
 }
 
-/// Maximum -log10(p) for display (caps underflowed p-values)
-const MAX_NEG_LOG10_P: f64 = 350.0;
-
 /// Extracted variant fields from a Hail table row.
 #[derive(Debug, Clone)]
 struct ExtractedVariant {
@@ -1013,134 +1143,73 @@ struct ExtractedVariant {
     association_ac: Option<f64>,
 }
 
-/// Extract variant fields from a row.
-fn extract_variant_fields(row: &EncodedValue, y_field: &str) -> Option<ExtractedVariant> {
-    if let EncodedValue::Struct(fields) = row {
-        // Helper to extract optional float
-        let get_float = |name: &str| -> Option<f64> {
-            fields
-                .iter()
-                .find(|(n, _)| n == name)
-                .and_then(|(_, v)| match v {
-                    EncodedValue::Float64(f) => Some(*f),
-                    EncodedValue::Float32(f) => Some(*f as f64),
-                    _ => None,
-                })
-        };
-
-        // Extract locus
-        let locus = fields.iter().find(|(n, _)| n == "locus").map(|(_, v)| v)?;
-
-        let (contig, position) = if let EncodedValue::Struct(locus_fields) = locus {
-            let contig = locus_fields
-                .iter()
-                .find(|(n, _)| n == "contig")
-                .and_then(|(_, v)| v.as_string())?;
-            let pos = locus_fields
-                .iter()
-                .find(|(n, _)| n == "position")
-                .and_then(|(_, v)| v.as_i32())?;
-            (contig, pos)
-        } else {
-            return None;
-        };
-
-        // Extract p-value
-        let pvalue = fields
+/// Add legacy-only fields to an already canonicalized association point.
+fn extract_variant_fields(
+    row: &EncodedValue,
+    point: &AssociationPointV1,
+) -> Result<ExtractedVariant> {
+    let position = i32::try_from(point.position).map_err(|_| {
+        crate::HailError::InvalidFormat(format!(
+            "position {} cannot be represented by legacy Manhattan outputs",
+            point.position
+        ))
+    })?;
+    let fields = match row {
+        EncodedValue::Struct(fields) => fields,
+        _ => {
+            return Err(crate::HailError::InvalidFormat(
+                "canonical association row is not a struct".into(),
+            ))
+        }
+    };
+    let get_float = |name: &str| -> Option<f64> {
+        fields
             .iter()
-            .find(|(n, _)| n == y_field)
-            .and_then(|(_, v)| match v {
-                EncodedValue::Float64(f) => Some(*f),
-                EncodedValue::Float32(f) => Some(*f as f64),
+            .find(|(field, _)| field == name)
+            .and_then(|(_, value)| match value {
+                EncodedValue::Float64(value) => Some(*value),
+                EncodedValue::Float32(value) => Some(*value as f64),
                 _ => None,
-            })?;
+            })
+    };
 
-        // Try to get pre-computed Pvalue_log10 from source (preserves precision)
-        let pvalue_log10_field = format!("{}_log10", y_field);
-        let source_neg_log10_p = get_float(&pvalue_log10_field)
-            .or_else(|| get_float("Pvalue_log10"))
-            .filter(|v| v.is_finite());
-
-        // Compute neg_log10_p: prefer source field, fallback to computing
-        let neg_log10_p = match source_neg_log10_p {
-            Some(v) => v,
-            None => {
-                if pvalue <= 0.0 {
-                    // P-value underflowed to 0 - cap at max displayable value
-                    MAX_NEG_LOG10_P
-                } else if pvalue > 1.0 || !pvalue.is_finite() {
-                    // Truly invalid p-value
-                    return None;
-                } else {
-                    -pvalue.log10()
-                }
-            }
-        };
-
-        // Extract beta (optional) - try BETA first, then beta
-        let beta = get_float("BETA").or_else(|| get_float("beta"));
-
-        // Extract SE (optional) - try SE first, then se
-        let se = get_float("SE").or_else(|| get_float("se"));
-
-        // Extract AF (optional) - try AF_Allele2 first, then AF, then af
-        let af = get_float("AF_Allele2")
-            .or_else(|| get_float("AF"))
-            .or_else(|| get_float("af"));
-
-        // Extract case/control fields
-        let ac_cases = get_float("AC_case").or_else(|| get_float("ac_case"));
-        let ac_controls = get_float("AC_ctrl").or_else(|| get_float("ac_ctrl"));
-        let af_cases = get_float("AF_case").or_else(|| get_float("af_case"));
-        let af_controls = get_float("AF_ctrl").or_else(|| get_float("af_ctrl"));
-
-        // Extract association allele count (AC_Allele2) - can be int or float
-        let association_ac = get_float("AC_Allele2").or_else(|| {
-            fields
+    let alleles = fields
+        .iter()
+        .find(|(field, _)| field == "alleles")
+        .and_then(|(_, value)| match value {
+            EncodedValue::Array(values) => Some(
+                values
+                    .iter()
+                    .filter_map(EncodedValue::as_string)
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        })
+        .filter(|alleles| !alleles.is_empty())
+        .unwrap_or_else(|| {
+            point
+                .ref_allele
                 .iter()
-                .find(|(n, _)| n == "AC_Allele2")
-                .and_then(|(_, v)| match v {
-                    EncodedValue::Int64(i) => Some(*i as f64),
-                    EncodedValue::Int32(i) => Some(*i as f64),
-                    _ => None,
-                })
+                .chain(point.alt_allele.iter())
+                .cloned()
+                .collect()
         });
 
-        // Extract alleles
-        let alleles = fields
-            .iter()
-            .find(|(n, _)| n == "alleles")
-            .and_then(|(_, v)| {
-                if let EncodedValue::Array(arr) = v {
-                    Some(
-                        arr.iter()
-                            .filter_map(|a| a.as_string())
-                            .collect::<Vec<String>>(),
-                    )
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default();
-
-        Some(ExtractedVariant {
-            contig,
-            position,
-            pvalue,
-            neg_log10_p,
-            beta,
-            se,
-            af,
-            alleles,
-            ac_cases,
-            ac_controls,
-            af_cases,
-            af_controls,
-            association_ac,
-        })
-    } else {
-        None
-    }
+    Ok(ExtractedVariant {
+        contig: point.contig.clone(),
+        position,
+        pvalue: point.pvalue,
+        neg_log10_p: point.neg_log10_p,
+        beta: point.beta,
+        se: point.standard_error,
+        af: point.allele_frequency,
+        alleles,
+        ac_cases: get_float("AC_case").or_else(|| get_float("ac_case")),
+        ac_controls: get_float("AC_ctrl").or_else(|| get_float("ac_ctrl")),
+        af_cases: get_float("AF_case").or_else(|| get_float("af_case")),
+        af_controls: get_float("AF_ctrl").or_else(|| get_float("af_ctrl")),
+        association_ac: point.allele_count,
+    })
 }
 
 /// Extract annotation fields from an annotation row.
@@ -1274,4 +1343,151 @@ fn enrich_variants_with_annotations(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn association_row(position: i32, pvalue: f64) -> EncodedValue {
+        EncodedValue::Struct(vec![
+            (
+                "locus".into(),
+                EncodedValue::Struct(vec![
+                    ("contig".into(), EncodedValue::Binary(b"1".to_vec())),
+                    ("position".into(), EncodedValue::Int32(position)),
+                ]),
+            ),
+            (
+                "alleles".into(),
+                EncodedValue::Array(vec![
+                    EncodedValue::Binary(b"A".to_vec()),
+                    EncodedValue::Binary(b"C".to_vec()),
+                ]),
+            ),
+            ("Pvalue".into(), EncodedValue::Float64(pvalue)),
+        ])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn process_test_row<S: SignificantHitSink>(
+        row: &EncodedValue,
+        ordinal: u64,
+        writer: &mut S,
+        summary: &mut LegacyPartitionSummary,
+        buffer: &mut Vec<BufferedVariant>,
+        renderer: &mut ManhattanRenderer,
+        chrom_renderers: &mut HashMap<String, ManhattanRenderer>,
+        chrom_layouts: &mut HashMap<String, ChromosomeLayout>,
+    ) -> Result<()> {
+        let layout = GenomeLayoutV1::new([("1", 1_000)], 100, 50, 4)
+            .map_err(|error| crate::HailError::InvalidFormat(error.to_string()))?;
+        let compatibility_layout = ChromosomeLayout::new(&[("1".into(), 1_000)], 100, 4);
+        let compatibility_y_scale = YScale::new(50, 350.0);
+        let contig_lengths = HashMap::from([("1".into(), 1_000)]);
+        let intervals = IntervalList::new();
+        summary.observe_source_row(row)?;
+        match extract_association_point(row, "Pvalue", ordinal) {
+            Ok((point, warnings)) => {
+                let variant = extract_variant_fields(row, &point)?;
+                let significant = point.pvalue < 5e-8;
+                let rendered = process_single_row(
+                    &point,
+                    variant,
+                    VariantSource::Exome,
+                    &layout,
+                    &compatibility_layout,
+                    &compatibility_y_scale,
+                    0.01,
+                    5e-8,
+                    &intervals,
+                    buffer,
+                    writer,
+                    renderer,
+                    &contig_lengths,
+                    chrom_renderers,
+                    chrom_layouts,
+                    100,
+                    50,
+                )?;
+                summary.observe_valid_point(point, warnings, rendered, significant)
+            }
+            Err(_) => summary.observe_skipped_row(),
+        }
+    }
+
+    #[test]
+    fn canonical_summary_counts_skips_and_preserves_zero_pvalue() {
+        let rows = [
+            association_row(10, 0.0),
+            association_row(20, -1.0),
+            association_row(30, 0.5),
+        ];
+        let mut writer = SigHitWriter::from_writer(Vec::new()).unwrap();
+        let mut summary = LegacyPartitionSummary::new(0).unwrap();
+        let mut buffer = Vec::new();
+        let mut renderer = ManhattanRenderer::new(100, 50);
+        let mut chrom_renderers = HashMap::new();
+        let mut chrom_layouts = HashMap::new();
+
+        for (ordinal, row) in rows.iter().enumerate() {
+            process_test_row(
+                row,
+                ordinal as u64,
+                &mut writer,
+                &mut summary,
+                &mut buffer,
+                &mut renderer,
+                &mut chrom_renderers,
+                &mut chrom_layouts,
+            )
+            .unwrap();
+        }
+        let summary = merge_partition_summaries(vec![summary]).unwrap();
+
+        assert_eq!(summary.row_count, 3);
+        assert_eq!(summary.valid_row_count, 2);
+        assert_eq!(summary.skipped_row_count, 1);
+        assert_eq!(summary.rendered_point_count, 2);
+        assert_eq!(summary.significant_hit_count, 1);
+        assert_eq!(summary.top_hits.len(), 2);
+        assert_eq!(summary.top_hits[0].pvalue, 0.0);
+        assert_eq!(summary.top_hits[0].source_ordinal, 0);
+        assert_eq!(buffer.len(), 1);
+        assert_eq!(buffer[0].pvalue, 0.0);
+        assert_eq!(summary.warnings, vec!["pvalue_underflow"]);
+    }
+
+    struct FailingSink;
+
+    impl SignificantHitSink for FailingSink {
+        fn write_hit(&mut self, _row: SigHitRow) -> Result<()> {
+            Err(crate::HailError::InvalidFormat(
+                "injected significant-hit write failure".into(),
+            ))
+        }
+    }
+
+    #[test]
+    fn significant_writer_errors_propagate_from_row_processing() {
+        let mut writer = FailingSink;
+
+        let mut summary = LegacyPartitionSummary::new(0).unwrap();
+        let mut buffer = Vec::new();
+        let mut renderer = ManhattanRenderer::new(100, 50);
+        let mut chrom_renderers = HashMap::new();
+        let mut chrom_layouts = HashMap::new();
+        let result = process_test_row(
+            &association_row(10, 1e-9),
+            0,
+            &mut writer,
+            &mut summary,
+            &mut buffer,
+            &mut renderer,
+            &mut chrom_renderers,
+            &mut chrom_layouts,
+        );
+
+        assert!(result.is_err());
+    }
 }
