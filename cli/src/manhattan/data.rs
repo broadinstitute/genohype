@@ -162,9 +162,9 @@ pub(crate) fn extract_association_point(
         alt_allele,
         pvalue: normalized_pvalue.pvalue,
         neg_log10_p: normalized_pvalue.neg_log10_p,
-        beta: optional_float(row, &["BETA", "beta"]),
-        standard_error: optional_float(row, &["SE", "se"]),
-        allele_frequency: optional_float(row, &["AF_Allele2", "af"]),
+        beta: optional_float(row, &["BETA", "beta", "Beta"]),
+        standard_error: optional_float(row, &["SE", "se", "Se", "standard_error"]),
+        allele_frequency: optional_float(row, &["AF_Allele2", "AF", "af", "allele_frequency"]),
         allele_count: optional_number(row, &["AC_Allele2", "association_ac"]),
         gene_symbol: optional_string(row, &["gene_symbol"]),
         consequence: optional_string(row, &["consequence"]),
@@ -173,10 +173,9 @@ pub(crate) fn extract_association_point(
     };
 
     // Canonical point validation also normalizes contig aliases and validates all
-    // optional statistics. P-value warnings match `normalized_pvalue` because the
-    // same normalized pair is passed through unchanged.
-    let (point, _) = point.normalize()?;
-    Ok((point, normalized_pvalue.warnings))
+    // optional statistics.
+    let (point, warnings) = point.normalize()?;
+    Ok((point, warnings))
 }
 
 /// Extract a compatibility `PlotPoint` through canonical row validation.
@@ -766,11 +765,20 @@ mod tests {
 
         assert_eq!(point.neg_log10_p, 350.0);
         assert_eq!(warnings, vec![WarningCode::PvalueUnderflow]);
+        assert_eq!(point.ref_allele, None);
+        assert_eq!(point.alt_allele, None);
+        assert_eq!(point.beta, None);
+        assert_eq!(point.standard_error, None);
+        assert_eq!(point.allele_frequency, None);
+        assert_eq!(point.allele_count, None);
+        assert_eq!(point.gene_symbol, None);
+        assert_eq!(point.consequence, None);
+        assert_eq!(point.series, None);
     }
 
     #[test]
     fn invalid_raw_pvalue_is_skipped_even_with_finite_supplied_log() {
-        for pvalue in [-0.1, f64::NAN, f64::INFINITY, 1.000_001] {
+        for pvalue in [-0.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1.000_001] {
             let row = row_with_fields(
                 EncodedValue::Int32(1),
                 "p",
@@ -788,15 +796,55 @@ mod tests {
     }
 
     #[test]
+    fn invalid_supplied_log_and_optional_statistics_are_skipped() {
+        let invalid_log = row_with_fields(
+            EncodedValue::Int32(10),
+            "p",
+            0.1,
+            vec![("p_log10", EncodedValue::Float64(f64::NAN))],
+        );
+        assert_eq!(
+            extract_association_point(&invalid_log, "p", 0),
+            Err(AssociationRowSkipReason::Validation(
+                ValidationError::InvalidPvalue(PValueError::InvalidNegLog10P)
+            ))
+        );
+
+        let invalid_af = row_with_fields(
+            EncodedValue::Int32(10),
+            "p",
+            0.1,
+            vec![("AF_Allele2", EncodedValue::Float64(1.1))],
+        );
+        assert_eq!(
+            extract_association_point(&invalid_af, "p", 0),
+            Err(AssociationRowSkipReason::Validation(
+                ValidationError::InvalidAlleleFrequency
+            ))
+        );
+    }
+
+    #[test]
     fn compatibility_extractor_uses_canonical_pvalue_validation() {
-        let row = row_with_fields(
+        let invalid = row_with_fields(
             EncodedValue::Int32(10),
             "p",
             -0.1,
             vec![("Pvalue_log10", EncodedValue::Float64(100.0))],
         );
+        assert!(extract_plot_data(&invalid, "p").is_none());
 
-        assert_eq!(extract_plot_data(&row, "p"), None);
+        let valid = row_with_fields(
+            EncodedValue::Int32(10),
+            "p",
+            0.0,
+            vec![("Pvalue_log10", EncodedValue::Float64(400.0))],
+        );
+        let point = extract_plot_data(&valid, "p").unwrap();
+        assert_eq!(point.contig, "MT");
+        assert_eq!(point.position, 10);
+        assert_eq!(point.pvalue, 0.0);
+        assert_eq!(point.neg_log10_p, 400.0);
     }
 
     #[test]
@@ -820,197 +868,5 @@ mod tests {
                 "p".to_string()
             ))
         );
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use genohype_association::{PValueError, ValidationError};
-
-    fn string(value: &str) -> EncodedValue {
-        EncodedValue::Binary(value.as_bytes().to_vec())
-    }
-
-    fn row_with_pvalue(pvalue: f64, supplied_log: Option<f64>) -> EncodedValue {
-        let mut fields = vec![
-            (
-                "locus".into(),
-                EncodedValue::Struct(vec![
-                    ("contig".into(), string("chr1")),
-                    ("position".into(), EncodedValue::Int32(123)),
-                ]),
-            ),
-            ("Pvalue".into(), EncodedValue::Float64(pvalue)),
-        ];
-        if let Some(log) = supplied_log {
-            fields.push(("Pvalue_log10".into(), EncodedValue::Float64(log)));
-        }
-        EncodedValue::Struct(fields)
-    }
-
-    #[test]
-    fn adapts_complete_hail_row_and_widens_position() {
-        let row = EncodedValue::Struct(vec![
-            (
-                "locus".into(),
-                EncodedValue::Struct(vec![
-                    ("contig".into(), string("chrX")),
-                    ("position".into(), EncodedValue::Int32(i32::MAX)),
-                ]),
-            ),
-            (
-                "alleles".into(),
-                EncodedValue::Array(vec![string("A"), string("G")]),
-            ),
-            ("Pvalue".into(), EncodedValue::Float64(1e-8)),
-            ("Pvalue_log10".into(), EncodedValue::Float64(8.25)),
-            ("BETA".into(), EncodedValue::Float64(-0.5)),
-            ("SE".into(), EncodedValue::Float32(0.25)),
-            ("AF_Allele2".into(), EncodedValue::Float64(0.125)),
-            ("AC_Allele2".into(), EncodedValue::Int64(42)),
-            ("gene_symbol".into(), string("PCSK9")),
-            ("consequence".into(), string("missense_variant")),
-            ("series".into(), string("genome")),
-        ]);
-
-        let (point, warnings) = extract_association_point(&row, "Pvalue", 77).unwrap();
-        assert!(warnings.is_empty());
-        assert_eq!(point.contig, "X");
-        assert_eq!(point.position, i64::from(i32::MAX));
-        assert_eq!(point.ref_allele.as_deref(), Some("A"));
-        assert_eq!(point.alt_allele.as_deref(), Some("G"));
-        assert_eq!(point.pvalue, 1e-8);
-        assert_eq!(point.neg_log10_p, 8.25);
-        assert_eq!(point.beta, Some(-0.5));
-        assert_eq!(point.standard_error, Some(0.25));
-        assert_eq!(point.allele_frequency, Some(0.125));
-        assert_eq!(point.allele_count, Some(42.0));
-        assert_eq!(point.gene_symbol.as_deref(), Some("PCSK9"));
-        assert_eq!(point.consequence.as_deref(), Some("missense_variant"));
-        assert_eq!(point.series.as_deref(), Some("genome"));
-        assert_eq!(point.source_ordinal, 77);
-    }
-
-    #[test]
-    fn accepts_compatibility_aliases_and_i64_position() {
-        let row = EncodedValue::Struct(vec![
-            (
-                "locus".into(),
-                EncodedValue::Struct(vec![
-                    ("contig".into(), string("x")),
-                    ("position".into(), EncodedValue::Int64(3_000_000_000)),
-                ]),
-            ),
-            ("p_value".into(), EncodedValue::Float32(0.01)),
-            ("p_value_log10".into(), EncodedValue::Float64(2.0)),
-            ("beta".into(), EncodedValue::Float64(0.5)),
-            ("se".into(), EncodedValue::Float64(0.1)),
-            ("AF".into(), EncodedValue::Float64(0.2)),
-            ("ac".into(), EncodedValue::Int32(9)),
-            ("symbol".into(), string("GENE1")),
-            ("most_severe_consequence".into(), string("intron_variant")),
-            ("sequencing_type".into(), string("exome")),
-        ]);
-
-        let (point, warnings) = extract_association_point(&row, "p_value", 5).unwrap();
-        assert!(warnings.is_empty());
-        assert_eq!(point.contig, "X");
-        assert_eq!(point.position, 3_000_000_000);
-        assert_eq!(point.beta, Some(0.5));
-        assert_eq!(point.standard_error, Some(0.1));
-        assert_eq!(point.allele_frequency, Some(0.2));
-        assert_eq!(point.allele_count, Some(9.0));
-        assert_eq!(point.gene_symbol.as_deref(), Some("GENE1"));
-        assert_eq!(point.consequence.as_deref(), Some("intron_variant"));
-        assert_eq!(point.series.as_deref(), Some("exome"));
-    }
-
-    #[test]
-    fn missing_optional_fields_remain_none() {
-        let (point, warnings) =
-            extract_association_point(&row_with_pvalue(0.5, None), "Pvalue", 0).unwrap();
-        assert!(warnings.is_empty());
-        assert_eq!(point.ref_allele, None);
-        assert_eq!(point.alt_allele, None);
-        assert_eq!(point.beta, None);
-        assert_eq!(point.standard_error, None);
-        assert_eq!(point.allele_frequency, None);
-        assert_eq!(point.allele_count, None);
-        assert_eq!(point.gene_symbol, None);
-        assert_eq!(point.consequence, None);
-        assert_eq!(point.series, None);
-    }
-
-    #[test]
-    fn invalid_raw_pvalues_are_rejected_even_with_supplied_log() {
-        for pvalue in [-0.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1.000_001] {
-            assert_eq!(
-                extract_association_point(&row_with_pvalue(pvalue, Some(12.0)), "Pvalue", 0),
-                Err(AssociationRowError::Validation(
-                    ValidationError::InvalidPvalue(PValueError::InvalidPvalue)
-                ))
-            );
-        }
-    }
-
-    #[test]
-    fn invalid_supplied_log_values_are_rejected() {
-        for supplied_log in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            assert_eq!(
-                extract_association_point(&row_with_pvalue(0.01, Some(supplied_log)), "Pvalue", 0),
-                Err(AssociationRowError::Validation(
-                    ValidationError::InvalidPvalue(PValueError::InvalidNegLog10P)
-                ))
-            );
-        }
-    }
-
-    #[test]
-    fn zero_pvalue_uses_default_or_preserves_supplied_significance() {
-        let (defaulted, warnings) =
-            extract_association_point(&row_with_pvalue(0.0, None), "Pvalue", 0).unwrap();
-        assert_eq!(defaulted.neg_log10_p, 350.0);
-        assert_eq!(warnings, vec![WarningCode::PvalueUnderflow]);
-
-        let (preserved, warnings) =
-            extract_association_point(&row_with_pvalue(0.0, Some(999.0)), "Pvalue", 0).unwrap();
-        assert_eq!(preserved.neg_log10_p, 999.0);
-        assert_eq!(
-            warnings,
-            vec![
-                WarningCode::PvalueUnderflow,
-                WarningCode::NegLog10PDisplayCapped
-            ]
-        );
-    }
-
-    #[test]
-    fn canonical_validation_rejects_invalid_optional_statistics() {
-        let cases = [
-            ("AF_Allele2", EncodedValue::Float64(1.1)),
-            ("AC_Allele2", EncodedValue::Float64(-1.0)),
-            ("BETA", EncodedValue::Float64(f64::NAN)),
-            ("SE", EncodedValue::Float64(f64::INFINITY)),
-        ];
-        for (name, value) in cases {
-            let EncodedValue::Struct(mut fields) = row_with_pvalue(0.5, None) else {
-                unreachable!()
-            };
-            fields.push((name.into(), value));
-            assert!(matches!(
-                extract_association_point(&EncodedValue::Struct(fields), "Pvalue", 0),
-                Err(AssociationRowError::Validation(_))
-            ));
-        }
-    }
-
-    #[test]
-    fn compatibility_plot_extraction_uses_canonical_pvalue_validation() {
-        assert!(extract_plot_data(&row_with_pvalue(-0.1, Some(10.0)), "Pvalue").is_none());
-        let point = extract_plot_data(&row_with_pvalue(0.0, Some(400.0)), "Pvalue").unwrap();
-        assert_eq!(point.contig, "1");
-        assert_eq!(point.position, 123);
-        assert_eq!(point.neg_log10_p, 400.0);
     }
 }
