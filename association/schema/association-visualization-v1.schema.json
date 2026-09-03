@@ -1,0 +1,418 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AssociationVisualizationManifestV1",
+  "description": "Canonical, bounded association visualization manifest.\n\nUnknown fields are intentionally accepted by Serde so compatible V1 minor\nadditions do not break readers. The schema-version deserializer rejects any\nunsupported major version before the value reaches consumers.",
+  "type": "object",
+  "properties": {
+    "assembly": {
+      "type": "string"
+    },
+    "coordinate_convention": {
+      "type": "string"
+    },
+    "created_at": {
+      "type": "string"
+    },
+    "genohype_version": {
+      "type": "string"
+    },
+    "kind": {
+      "$ref": "#/$defs/PlotKindV1"
+    },
+    "layout": {
+      "$ref": "#/$defs/GenomeLayoutV1"
+    },
+    "layout_hash": {
+      "type": "string"
+    },
+    "plot_id": {
+      "type": "string"
+    },
+    "rendered_point_count": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "resources": {
+      "$ref": "#/$defs/AssociationVisualizationResourcesV1"
+    },
+    "row_count": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "schema_version": {
+      "type": "string",
+      "pattern": "^1\\.[0-9]+$"
+    },
+    "significant_hit_count": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "skipped_row_count": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "source_fingerprint": {
+      "type": "string"
+    },
+    "thresholds": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AssociationThresholdV1"
+      }
+    },
+    "title": {
+      "type": "string"
+    },
+    "top_hits": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AssociationPointV1"
+      },
+      "maxItems": 1000
+    },
+    "valid_row_count": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "schema_version",
+    "plot_id",
+    "kind",
+    "title",
+    "assembly",
+    "coordinate_convention",
+    "source_fingerprint",
+    "genohype_version",
+    "created_at",
+    "layout",
+    "layout_hash",
+    "thresholds",
+    "row_count",
+    "valid_row_count",
+    "skipped_row_count",
+    "rendered_point_count",
+    "significant_hit_count",
+    "top_hits",
+    "warnings",
+    "resources"
+  ],
+  "$defs": {
+    "AssociationPointV1": {
+      "description": "Canonical normalized single-variant association row.",
+      "type": "object",
+      "properties": {
+        "allele_count": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "minimum": 0.0
+        },
+        "allele_frequency": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "maximum": 1.0,
+          "minimum": 0.0
+        },
+        "alt_allele": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "beta": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "consequence": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "contig": {
+          "type": "string",
+          "minLength": 1
+        },
+        "gene_symbol": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "neg_log10_p": {
+          "type": "number",
+          "format": "double",
+          "minimum": 0.0
+        },
+        "position": {
+          "type": "integer",
+          "format": "int64",
+          "minimum": 1
+        },
+        "pvalue": {
+          "type": "number",
+          "format": "double",
+          "maximum": 1.0,
+          "minimum": 0.0
+        },
+        "ref_allele": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "series": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_ordinal": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "standard_error": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        }
+      },
+      "required": [
+        "contig",
+        "position",
+        "pvalue",
+        "neg_log10_p",
+        "source_ordinal"
+      ]
+    },
+    "AssociationThresholdV1": {
+      "description": "One named p-value threshold shown on a visualization.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "pvalue": {
+          "type": "number",
+          "format": "double",
+          "maximum": 1.0,
+          "minimum": 0.0
+        }
+      },
+      "required": [
+        "name",
+        "pvalue"
+      ]
+    },
+    "AssociationVisualizationResourcesV1": {
+      "description": "Resources associated with one visualization.",
+      "type": "object",
+      "properties": {
+        "raster": {
+          "$ref": "#/$defs/ResourceDescriptorV1"
+        },
+        "region_api": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResourceDescriptorV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "table_api": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResourceDescriptorV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "raster"
+      ]
+    },
+    "ContigLayoutV1": {
+      "description": "One contig's raw-coordinate and pixel extent in a Manhattan layout.",
+      "type": "object",
+      "properties": {
+        "color": {
+          "type": "string",
+          "pattern": "^#[0-9A-Fa-f]{6}$"
+        },
+        "length": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "x_end": {
+          "type": "number",
+          "format": "double",
+          "minimum": 0.0
+        },
+        "x_start": {
+          "type": "number",
+          "format": "double",
+          "minimum": 0.0
+        }
+      },
+      "required": [
+        "name",
+        "length",
+        "x_start",
+        "x_end",
+        "color"
+      ]
+    },
+    "GenomeLayoutV1": {
+      "description": "Canonical genome-wide geometry. Public coordinates are 1-based inclusive.",
+      "type": "object",
+      "properties": {
+        "contig_gap": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "contigs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ContigLayoutV1"
+          }
+        },
+        "height": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "width": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "y_scale": {
+          "$ref": "#/$defs/YScale"
+        }
+      },
+      "required": [
+        "width",
+        "height",
+        "contig_gap",
+        "contigs",
+        "y_scale"
+      ]
+    },
+    "PlotKindV1": {
+      "description": "Visualization kinds defined by schema major version 1.",
+      "type": "string",
+      "enum": [
+        "manhattan",
+        "locus"
+      ]
+    },
+    "ResourceDescriptorV1": {
+      "description": "Browser-fetchable artifact or API route. URLs must be relative and credential-free.",
+      "type": "object",
+      "properties": {
+        "byte_size": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "checksum": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expires_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "media_type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "url": {
+          "type": "string",
+          "pattern": "^[^/\\\\?:#@%][^\\\\?:#@%]*$"
+        }
+      },
+      "required": [
+        "url",
+        "media_type"
+      ]
+    },
+    "YScale": {
+      "description": "Canonical hybrid linear/logarithmic Manhattan y scale.",
+      "type": "object",
+      "properties": {
+        "height": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "linear_fraction": {
+          "type": "number",
+          "format": "double",
+          "maximum": 0.6,
+          "minimum": 0.6
+        },
+        "log_threshold": {
+          "type": "number",
+          "format": "double",
+          "maximum": 10.0,
+          "minimum": 10.0
+        },
+        "max_neg_log_p": {
+          "type": "number",
+          "format": "double",
+          "maximum": 350.0,
+          "minimum": 350.0
+        }
+      },
+      "required": [
+        "height",
+        "log_threshold",
+        "linear_fraction",
+        "max_neg_log_p"
+      ]
+    }
+  }
+}

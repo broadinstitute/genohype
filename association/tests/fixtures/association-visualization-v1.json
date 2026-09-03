@@ -1,0 +1,105 @@
+{
+  "schema_version": "1.0",
+  "plot_id": "height-genome",
+  "kind": "manhattan",
+  "title": "Height genome-wide associations",
+  "assembly": "GRCh38",
+  "coordinate_convention": "1-based-inclusive",
+  "source_fingerprint": "sha256:fixture",
+  "genohype_version": "0.1.0-test",
+  "created_at": "2026-09-03T12:00:00Z",
+  "layout": {
+    "width": 100,
+    "height": 50,
+    "contig_gap": 4,
+    "contigs": [
+      {
+        "name": "1",
+        "length": 10,
+        "x_start": 0.0,
+        "x_end": 32.0,
+        "color": "#404040"
+      },
+      {
+        "name": "2",
+        "length": 20,
+        "x_start": 36.0,
+        "x_end": 100.0,
+        "color": "#4682B4"
+      }
+    ],
+    "y_scale": {
+      "height": 50,
+      "log_threshold": 10.0,
+      "linear_fraction": 0.6,
+      "max_neg_log_p": 350.0
+    }
+  },
+  "layout_hash": "sha256:3c7ee1a1070d72d6556653ae933790e0f2b36b1daac917e083f73a56fafd4c4a",
+  "thresholds": [
+    {
+      "name": "genome_wide",
+      "pvalue": 5e-8
+    }
+  ],
+  "row_count": 3,
+  "valid_row_count": 2,
+  "skipped_row_count": 1,
+  "rendered_point_count": 2,
+  "significant_hit_count": 1,
+  "top_hits": [
+    {
+      "contig": "1",
+      "position": 3,
+      "ref_allele": "A",
+      "alt_allele": "G",
+      "pvalue": 0.0,
+      "neg_log10_p": 400.0,
+      "beta": 0.2,
+      "standard_error": 0.01,
+      "allele_frequency": 0.25,
+      "allele_count": 10.0,
+      "gene_symbol": "GENE1",
+      "consequence": "missense_variant",
+      "series": "genome",
+      "source_ordinal": 1
+    },
+    {
+      "contig": "2",
+      "position": 9,
+      "ref_allele": null,
+      "alt_allele": null,
+      "pvalue": 1e-8,
+      "neg_log10_p": 8.0,
+      "beta": null,
+      "standard_error": null,
+      "allele_frequency": null,
+      "allele_count": null,
+      "gene_symbol": null,
+      "consequence": null,
+      "series": "genome",
+      "source_ordinal": 2
+    }
+  ],
+  "warnings": [
+    "pvalue_underflow",
+    "neg_log10_p_display_capped"
+  ],
+  "resources": {
+    "raster": {
+      "url": "height-genome.png",
+      "media_type": "image/png",
+      "byte_size": 1234,
+      "checksum": "sha256:raster"
+    },
+    "region_api": {
+      "url": "api/height-genome/region",
+      "media_type": "application/json"
+    },
+    "table_api": {
+      "url": "api/height-genome/hits",
+      "media_type": "application/json",
+      "expires_at": "2026-09-04T12:00:00Z"
+    }
+  }
+}
