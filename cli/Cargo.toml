@@ -36,6 +36,9 @@ full = ["gcp", "aws", "http", "validation", "clickhouse", "elasticsearch", "post
 # Core library
 genohype-core = { path = "../core" }
 
+# Domain contracts for association visualizations
+genohype-association = { path = "../association" }
+
 # Pool library (distributed worker infrastructure)
 genohype-pool = { path = "../pool" }
 

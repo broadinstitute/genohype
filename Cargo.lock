@@ -1791,6 +1791,7 @@ dependencies = [
  "fastvep-io",
  "flate2",
  "futures",
+ "genohype-association",
  "genohype-core",
  "genohype-pool",
  "glob",
