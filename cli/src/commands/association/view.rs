@@ -1,7 +1,9 @@
 use crate::association_sources::delimited::DelimitedAssociationSource;
 use crate::association_sources::mapping::load_mapping;
 use crate::association_sources::{detect_source, DetectedAssociationSource};
-use crate::cli::AssociationViewArgs;
+use crate::cli::{
+    association_retention_duration, validate_association_raster_dimensions, AssociationViewArgs,
+};
 use crate::{HailError, Result};
 use std::path::Path;
 
@@ -15,6 +17,8 @@ struct PreparedAssociationView {
 }
 
 pub fn run(args: AssociationViewArgs) -> Result<()> {
+    validate_association_raster_dimensions(args.width, args.height).map_err(invalid)?;
+    association_retention_duration(args.retention_hours).map_err(invalid)?;
     if !args.threshold.is_finite() || args.threshold <= 0.0 || args.threshold > 1.0 {
         return Err(HailError::InvalidFormat(
             "--threshold must be finite and in 0 < P <= 1".into(),
@@ -93,13 +97,36 @@ mod tests {
     }
 
     #[test]
-    fn invalid_mapping_or_threshold_fails_before_handoff() {
+    fn invalid_mapping_threshold_dimensions_or_retention_fail_before_handoff() {
         let mut invalid_threshold = args("input.tsv".into());
         invalid_threshold.threshold = 0.0;
         assert!(run(invalid_threshold)
             .unwrap_err()
             .to_string()
             .contains("threshold"));
+
+        let mut invalid_dimensions = args("input.tsv".into());
+        invalid_dimensions.width = 16_384;
+        invalid_dimensions.height = 16_384;
+        assert!(run(invalid_dimensions)
+            .unwrap_err()
+            .to_string()
+            .contains("pixels"));
+
+        let mut invalid_width = args("input.tsv".into());
+        invalid_width.width = genohype_association::MAX_RASTER_DIMENSION + 1;
+        invalid_width.height = 1;
+        assert!(run(invalid_width)
+            .unwrap_err()
+            .to_string()
+            .contains("width and height"));
+
+        let mut invalid_retention = args("input.tsv".into());
+        invalid_retention.retention_hours = 0;
+        assert!(run(invalid_retention)
+            .unwrap_err()
+            .to_string()
+            .contains("retention"));
 
         let mut invalid_mapping = args("input.tsv".into());
         invalid_mapping.mapping.mappings.clear();

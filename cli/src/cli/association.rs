@@ -1,8 +1,13 @@
 //! Generalized association input command arguments.
 
 use clap::{Args, Subcommand, ValueEnum};
+use genohype_association::{validate_raster_dimensions, MAX_RASTER_DIMENSION};
 use std::fmt;
 use std::path::PathBuf;
+use std::time::Duration;
+
+pub const MAX_ASSOCIATION_RETENTION_HOURS: u64 = 8_760;
+const SECONDS_PER_HOUR: u64 = 60 * 60;
 
 #[derive(Subcommand, Debug)]
 pub enum AssociationCommands {
@@ -94,11 +99,11 @@ pub struct AssociationViewArgs {
     pub top_hits: usize,
 
     /// Raster width in pixels
-    #[arg(long, default_value_t = 3000, value_parser = clap::value_parser!(u32).range(1..))]
+    #[arg(long, default_value_t = 3000, value_parser = parse_raster_dimension)]
     pub width: u32,
 
     /// Raster height in pixels
-    #[arg(long, default_value_t = 800, value_parser = clap::value_parser!(u32).range(1..))]
+    #[arg(long, default_value_t = 800, value_parser = parse_raster_dimension)]
     pub height: u32,
 
     /// Do not open a browser automatically
@@ -118,12 +123,52 @@ pub struct AssociationViewArgs {
     pub ephemeral: bool,
 
     /// Retain a completed session for this many hours
-    #[arg(long, default_value_t = 168)]
+    #[arg(long, default_value_t = 168, value_parser = parse_retention_hours)]
     pub retention_hours: u64,
 
     /// Remove expired and incomplete unlocked association sessions first
     #[arg(long)]
     pub cleanup_expired: bool,
+}
+
+pub fn validate_association_raster_dimensions(width: u32, height: u32) -> Result<(), String> {
+    validate_raster_dimensions(width, height).map_err(|_| {
+        format!(
+            "association raster width and height must each be in 1..={MAX_RASTER_DIMENSION} and their product must not exceed {} pixels",
+            genohype_association::MAX_RASTER_PIXELS
+        )
+    })
+}
+
+pub fn association_retention_duration(hours: u64) -> Result<Duration, String> {
+    if hours == 0 || hours > MAX_ASSOCIATION_RETENTION_HOURS {
+        return Err(format!(
+            "retention hours must be in 1..={MAX_ASSOCIATION_RETENTION_HOURS}"
+        ));
+    }
+    let seconds = hours
+        .checked_mul(SECONDS_PER_HOUR)
+        .ok_or_else(|| "retention duration exceeds the supported range".to_string())?;
+    Ok(Duration::from_secs(seconds))
+}
+
+fn parse_raster_dimension(value: &str) -> Result<u32, String> {
+    let value = value
+        .parse::<u32>()
+        .map_err(|_| "raster dimensions must be positive integers".to_string())?;
+    if value == 0 || value > MAX_RASTER_DIMENSION {
+        return Err(format!(
+            "raster dimensions must be in 1..={MAX_RASTER_DIMENSION}"
+        ));
+    }
+    Ok(value)
+}
+
+fn parse_retention_hours(value: &str) -> Result<u64, String> {
+    let value = value
+        .parse::<u64>()
+        .map_err(|_| "retention hours must be a positive integer".to_string())?;
+    association_retention_duration(value).map(|_| value)
 }
 
 fn parse_top_hits(value: &str) -> Result<usize, String> {
@@ -246,6 +291,39 @@ mod tests {
             "1001"
         ])
         .is_err());
+        assert!(Cli::try_parse_from([
+            "genohype",
+            "association",
+            "view",
+            "results.tsv",
+            "--build",
+            "GRCh38",
+            "--width",
+            "16385"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "genohype",
+            "association",
+            "view",
+            "results.tsv",
+            "--build",
+            "GRCh38",
+            "--retention-hours",
+            "8761"
+        ])
+        .is_err());
+        assert!(validate_association_raster_dimensions(4096, 4096).is_ok());
+        assert!(validate_association_raster_dimensions(4097, 4096).is_err());
+        assert!(validate_association_raster_dimensions(MAX_RASTER_DIMENSION, 1).is_ok());
+        assert!(validate_association_raster_dimensions(MAX_RASTER_DIMENSION + 1, 1).is_err());
+        assert!(association_retention_duration(1).is_ok());
+        let maximum = association_retention_duration(MAX_ASSOCIATION_RETENTION_HOURS).unwrap();
+        assert_eq!(maximum.as_secs(), MAX_ASSOCIATION_RETENTION_HOURS * 60 * 60);
+        assert!(std::time::SystemTime::now().checked_add(maximum).is_some());
+        assert!(association_retention_duration(0).is_err());
+        assert!(association_retention_duration(MAX_ASSOCIATION_RETENTION_HOURS + 1).is_err());
+        assert!(association_retention_duration(u64::MAX).is_err());
     }
 
     #[test]

@@ -1,15 +1,25 @@
-use super::delimited::{decode_record, mapped_indexes, DelimitedRecordReader};
+use super::delimited::{
+    decode_record, mapped_indexes, MAX_DELIMITED_HEADER_BYTES, MAX_DELIMITED_HEADER_FIELDS,
+    MAX_DELIMITED_RECORD_BYTES,
+};
 use super::hail::{inspect_hail_schema, HailAssociationSource};
 use super::mapping::{mapping_pairs, LogicalField, MappingInput, LOGICAL_FIELDS};
 use super::DetectedAssociationSource;
 use csv::ByteRecord;
+use flate2::read::MultiGzDecoder;
 use genohype_association::{
     AssociationSource, AssociationSourceError, AssociationSourceItem, NormalizedFieldMappingV1,
     RejectionDiagnostics,
 };
+use genohype_core::codec::EncodedValue;
+use genohype_core::projection::{FieldPath, ProjectionTree};
+use genohype_core::query::QueryEngine;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
+use std::io::{BufReader, Read};
 use std::path::Path;
+use std::sync::Arc;
 
 pub const MAX_INSPECT_RECORDS: u64 = 100;
 pub const MAX_INSPECT_DECODED_BYTES: usize = 1024 * 1024;
@@ -56,32 +66,14 @@ pub fn inspect_delimited(
     if sample_rows == 0 || sample_rows > MAX_INSPECT_RECORDS {
         return Err(format!("sample rows must be in 1..={MAX_INSPECT_RECORDS}"));
     }
-    let mut reader = DelimitedRecordReader::open(Path::new(source), detected)
-        .map_err(|error| error.to_string())?;
-    validate_explicit_headers(reader.headers(), explicit)?;
+    let (headers, samples, decoded_sample_bytes) =
+        read_bounded_delimited_samples(Path::new(source), detected, sample_rows as usize)?;
+    validate_explicit_headers(&headers, explicit)?;
 
-    let mut samples = Vec::new();
-    let mut decoded_sample_bytes = 0_usize;
-    let mut record = ByteRecord::new();
-    while samples.len() < sample_rows as usize {
-        if !reader
-            .next_record(&mut record)
-            .map_err(|error| error.to_string())?
-        {
-            break;
-        }
-        let record_bytes = decoded_record_size(&record);
-        if record_bytes > MAX_INSPECT_DECODED_BYTES.saturating_sub(decoded_sample_bytes) {
-            break;
-        }
-        decoded_sample_bytes += record_bytes;
-        samples.push(record.clone());
-    }
-
-    let types = infer_types(reader.headers(), &samples);
+    let types = infer_types(&headers, &samples);
     let mut resolved = explicit.clone();
     let mut ambiguities = BTreeMap::new();
-    infer_mappings(reader.headers(), &types, &mut resolved, &mut ambiguities);
+    infer_mappings(&headers, &types, &mut resolved, &mut ambiguities);
     resolved
         .validate_partial()
         .map_err(|error| error.to_string())?;
@@ -93,7 +85,7 @@ pub fn inspect_delimited(
         None
     };
     let invalid_reasons = if let Some(mapping) = &normalized {
-        inspect_invalid_rows(reader.headers(), mapping, &samples)?
+        inspect_invalid_rows(&headers, mapping, &samples)?
     } else {
         BTreeMap::new()
     };
@@ -123,8 +115,7 @@ pub fn inspect_delimited(
         inspected_records: samples.len() as u64,
         decoded_sample_bytes,
         declared_logical_assemblies: Vec::new(),
-        fields: reader
-            .headers()
+        fields: headers
             .iter()
             .zip(types)
             .map(|(name, data_type)| InspectFieldReport {
@@ -142,6 +133,317 @@ pub fn inspect_delimited(
         runnable_view_command,
         resolution_commands,
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InspectQuoteState {
+    FieldStart,
+    Unquoted,
+    Quoted,
+    QuoteClosed,
+}
+
+/// Read only complete logical records that fit in the aggregate decoded sample
+/// budget. The in-progress record shares that budget with retained records, so
+/// inspection never allocates or validates the remainder of an over-budget
+/// record. Raw decoded input is independently capped before each allocation.
+fn read_bounded_delimited_samples(
+    path: &Path,
+    detected: DetectedAssociationSource,
+    sample_rows: usize,
+) -> Result<(Vec<String>, Vec<ByteRecord>, usize), String> {
+    let DetectedAssociationSource::Delimited { delimiter, gzip } = detected else {
+        return Err("delimited inspection requires a CSV or TSV source".into());
+    };
+    let file =
+        File::open(path).map_err(|error| format!("could not open delimited source: {error}"))?;
+    let input: Box<dyn Read> = if gzip {
+        Box::new(MultiGzDecoder::new(file))
+    } else {
+        Box::new(file)
+    };
+    let mut input = BufReader::new(input);
+    let mut byte = [0_u8; 1];
+    let mut state = InspectQuoteState::FieldStart;
+    let mut previous_was_record_cr = false;
+    let mut record_index = 0_u64;
+    let mut raw_record_bytes = 0_usize;
+    let mut logical_record_bytes = 0_usize;
+    let mut field = Vec::new();
+    let mut record = ByteRecord::new();
+    let mut headers: Option<Vec<String>> = None;
+    let mut samples = Vec::new();
+    let mut decoded_sample_bytes = 0_usize;
+
+    loop {
+        let read = input
+            .read(&mut byte)
+            .map_err(|error| format!("could not decode delimited source: {error}"))?;
+        if read == 0 {
+            if state == InspectQuoteState::Quoted {
+                return Err(format!(
+                    "invalid_csv_framing: unterminated quoted field at EOF in record {record_index}"
+                ));
+            }
+            if raw_record_bytes != 0 {
+                finish_inspect_record(
+                    &mut record,
+                    &mut field,
+                    record_index,
+                    logical_record_bytes,
+                    &mut headers,
+                    &mut samples,
+                    &mut decoded_sample_bytes,
+                )?;
+            }
+            break;
+        }
+        let byte = byte[0];
+        if previous_was_record_cr && byte == b'\n' {
+            previous_was_record_cr = false;
+            continue;
+        }
+        previous_was_record_cr = false;
+
+        raw_record_bytes = raw_record_bytes
+            .checked_add(1)
+            .ok_or_else(|| "delimited record size overflow".to_string())?;
+        let raw_limit = if record_index == 0 {
+            MAX_DELIMITED_HEADER_BYTES
+        } else {
+            MAX_DELIMITED_RECORD_BYTES
+        };
+        if raw_record_bytes > raw_limit {
+            let kind = if record_index == 0 {
+                "header"
+            } else {
+                "record"
+            };
+            return Err(format!(
+                "{kind}_too_large: record {record_index} exceeds {raw_limit} decoded bytes"
+            ));
+        }
+
+        let remaining = MAX_INSPECT_DECODED_BYTES - decoded_sample_bytes;
+        let can_add_decoded_byte = record_index == 0 || logical_record_bytes < remaining;
+        let mut finish = false;
+        let mut finish_with_cr = false;
+        match state {
+            InspectQuoteState::FieldStart => match byte {
+                b'"' => state = InspectQuoteState::Quoted,
+                value if value == delimiter => {
+                    if !can_add_decoded_byte {
+                        break;
+                    }
+                    logical_record_bytes += 1;
+                    push_inspect_field(&mut record, &mut field, headers.as_deref())?;
+                }
+                b'\n' => finish = true,
+                b'\r' => {
+                    finish = true;
+                    finish_with_cr = true;
+                }
+                _ => {
+                    if !can_add_decoded_byte {
+                        break;
+                    }
+                    logical_record_bytes += 1;
+                    field.push(byte);
+                    state = InspectQuoteState::Unquoted;
+                }
+            },
+            InspectQuoteState::Unquoted => match byte {
+                b'\n' => finish = true,
+                b'\r' => {
+                    finish = true;
+                    finish_with_cr = true;
+                }
+                value if value == delimiter => {
+                    if !can_add_decoded_byte {
+                        break;
+                    }
+                    logical_record_bytes += 1;
+                    push_inspect_field(&mut record, &mut field, headers.as_deref())?;
+                    state = InspectQuoteState::FieldStart;
+                }
+                b'"' if !can_add_decoded_byte => break,
+                b'"' => {
+                    return Err(format!(
+                        "invalid_csv_framing: quote inside an unquoted field in record {record_index}"
+                    ));
+                }
+                _ => {
+                    if !can_add_decoded_byte {
+                        break;
+                    }
+                    logical_record_bytes += 1;
+                    field.push(byte);
+                }
+            },
+            InspectQuoteState::Quoted => match byte {
+                b'"' => state = InspectQuoteState::QuoteClosed,
+                _ => {
+                    if !can_add_decoded_byte {
+                        break;
+                    }
+                    logical_record_bytes += 1;
+                    field.push(byte);
+                }
+            },
+            InspectQuoteState::QuoteClosed => match byte {
+                b'"' => {
+                    if !can_add_decoded_byte {
+                        break;
+                    }
+                    logical_record_bytes += 1;
+                    field.push(b'"');
+                    state = InspectQuoteState::Quoted;
+                }
+                value if value == delimiter => {
+                    if !can_add_decoded_byte {
+                        break;
+                    }
+                    logical_record_bytes += 1;
+                    push_inspect_field(&mut record, &mut field, headers.as_deref())?;
+                    state = InspectQuoteState::FieldStart;
+                }
+                b'\n' => finish = true,
+                b'\r' => {
+                    finish = true;
+                    finish_with_cr = true;
+                }
+                _ if !can_add_decoded_byte => break,
+                _ => {
+                    return Err(format!(
+                        "invalid_csv_framing: characters after a closing quote in record {record_index}"
+                    ));
+                }
+            },
+        }
+
+        if finish {
+            finish_inspect_record(
+                &mut record,
+                &mut field,
+                record_index,
+                logical_record_bytes,
+                &mut headers,
+                &mut samples,
+                &mut decoded_sample_bytes,
+            )?;
+            record_index = record_index
+                .checked_add(1)
+                .ok_or_else(|| "delimited source contains too many records".to_string())?;
+            raw_record_bytes = 0;
+            logical_record_bytes = 0;
+            state = InspectQuoteState::FieldStart;
+            previous_was_record_cr = finish_with_cr;
+            if samples.len() >= sample_rows {
+                break;
+            }
+        }
+    }
+
+    let headers = headers.ok_or_else(|| "missing_header: delimited source is empty".to_string())?;
+    Ok((headers, samples, decoded_sample_bytes))
+}
+
+fn push_inspect_field(
+    record: &mut ByteRecord,
+    field: &mut Vec<u8>,
+    headers: Option<&[String]>,
+) -> Result<(), String> {
+    if let Some(headers) = headers {
+        if record.len() >= headers.len() {
+            return Err(
+                "invalid_record_width: delimited record width does not match the header".into(),
+            );
+        }
+    }
+    record.push_field(field);
+    *field = Vec::new();
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_inspect_record(
+    record: &mut ByteRecord,
+    field: &mut Vec<u8>,
+    record_index: u64,
+    logical_record_bytes: usize,
+    headers: &mut Option<Vec<String>>,
+    samples: &mut Vec<ByteRecord>,
+    decoded_sample_bytes: &mut usize,
+) -> Result<(), String> {
+    push_inspect_field(record, field, headers.as_deref())?;
+    if record_index == 0 {
+        *headers = Some(validate_inspect_headers(record)?);
+        *record = ByteRecord::new();
+    } else {
+        let expected = headers
+            .as_ref()
+            .expect("header precedes data records")
+            .len();
+        if record.len() != expected {
+            return Err(
+                "invalid_record_width: delimited record width does not match the header".into(),
+            );
+        }
+        *decoded_sample_bytes = decoded_sample_bytes
+            .checked_add(logical_record_bytes)
+            .ok_or_else(|| "decoded sample size overflow".to_string())?;
+        debug_assert!(*decoded_sample_bytes <= MAX_INSPECT_DECODED_BYTES);
+        samples.push(std::mem::take(record));
+    }
+    Ok(())
+}
+
+fn validate_inspect_headers(record: &ByteRecord) -> Result<Vec<String>, String> {
+    const UTF8_BOM: &[u8] = b"\xef\xbb\xbf";
+    if record.is_empty() {
+        return Err("missing_header: delimited source header is empty".into());
+    }
+    if record.len() > MAX_DELIMITED_HEADER_FIELDS {
+        return Err(format!(
+            "too_many_header_fields: header exceeds {MAX_DELIMITED_HEADER_FIELDS} fields"
+        ));
+    }
+    let mut headers = Vec::with_capacity(record.len());
+    let mut unique = BTreeSet::new();
+    for (index, raw) in record.iter().enumerate() {
+        let raw = if index == 0 {
+            raw.strip_prefix(UTF8_BOM).unwrap_or(raw)
+        } else {
+            raw
+        };
+        let header = std::str::from_utf8(raw)
+            .map_err(|_| "invalid_header_utf8: header must be valid UTF-8".to_string())?;
+        if header.is_empty() {
+            return Err(format!("empty_header: header field {} is empty", index + 1));
+        }
+        if header.len() > 256 {
+            return Err(format!(
+                "header_field_too_long: header field {} exceeds 256 UTF-8 bytes",
+                index + 1
+            ));
+        }
+        if header
+            .chars()
+            .any(|character| matches!(character, '\0' | '\n' | '\r'))
+        {
+            return Err(format!(
+                "invalid_header: header field {} contains a control character",
+                index + 1
+            ));
+        }
+        if !unique.insert(header.to_string()) {
+            return Err(format!(
+                "duplicate_header: header field {header:?} is repeated"
+            ));
+        }
+        headers.push(header.to_string());
+    }
+    Ok(headers)
 }
 
 pub fn inspect_hail(
@@ -207,22 +509,17 @@ pub fn inspect_hail(
             .expect("a complete inspection mapping has an assembly");
         let mut hail = HailAssociationSource::open(source, mapping.clone(), assembly.as_str())
             .map_err(inspect_source_error)?;
-        while inspected_records < sample_rows {
-            let Some(item) = hail.next_item().map_err(inspect_source_error)? else {
-                break;
-            };
-            let size = match &item {
-                AssociationSourceItem::Point { point, warnings } => {
-                    serde_json::to_vec(&(point, warnings))
-                }
-                AssociationSourceItem::Rejected(rejection) => serde_json::to_vec(rejection),
-            }
-            .map_err(|error| error.to_string())?
-            .len();
-            if size > MAX_INSPECT_DECODED_BYTES.saturating_sub(decoded_sample_bytes) {
-                break;
-            }
-            decoded_sample_bytes += size;
+        // Size the exact decode-time projection before normalization can shrink
+        // a mapped value into a bounded rejection diagnostic.
+        let projected_sizes = bounded_hail_projected_sizes(source, mapping, sample_rows as usize)?;
+        for projected_size in projected_sizes {
+            let item = hail
+                .next_item()
+                .map_err(inspect_source_error)?
+                .ok_or_else(|| "Hail source changed while it was being inspected".to_string())?;
+            decoded_sample_bytes = decoded_sample_bytes
+                .checked_add(projected_size)
+                .ok_or_else(|| "decoded Hail sample size overflow".to_string())?;
             inspected_records += 1;
             if let AssociationSourceItem::Rejected(rejection) = item {
                 diagnostics.record(&rejection);
@@ -284,6 +581,74 @@ pub fn inspect_hail(
         ready: normalized.is_some(),
         runnable_view_command,
         resolution_commands,
+    })
+}
+
+fn bounded_hail_projected_sizes(
+    source: &str,
+    mapping: &NormalizedFieldMappingV1,
+    sample_rows: usize,
+) -> Result<Vec<usize>, String> {
+    let projections = mapping_pairs(mapping)
+        .into_iter()
+        .map(|(logical, source)| {
+            FieldPath::parse(source).map_err(|error| {
+                format!("invalid mapped Hail path {source:?} for {logical}: {error}")
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let engine = QueryEngine::open_path(source).map_err(|error| format!("open_hail: {error}"))?;
+    let rows = engine
+        .query_iter_deterministic_with_projection(
+            &[],
+            None,
+            Some(Arc::new(ProjectionTree::from_fields(&projections))),
+        )
+        .map_err(|error| format!("hail_query: {error}"))?
+        .map(|row| row.map_err(|error| format!("hail_decode: {error}")));
+    collect_bounded_hail_projected_sizes(rows, sample_rows)
+}
+
+fn collect_bounded_hail_projected_sizes(
+    rows: impl Iterator<Item = Result<EncodedValue, String>>,
+    sample_rows: usize,
+) -> Result<Vec<usize>, String> {
+    let mut sizes = Vec::new();
+    let mut decoded_bytes = 0_usize;
+    for row in rows.take(sample_rows) {
+        let size = hail_projected_value_bytes(&row?)?;
+        if size > MAX_INSPECT_DECODED_BYTES - decoded_bytes {
+            break;
+        }
+        decoded_bytes = decoded_bytes
+            .checked_add(size)
+            .ok_or_else(|| "decoded Hail sample size overflow".to_string())?;
+        sizes.push(size);
+    }
+    Ok(sizes)
+}
+
+fn hail_projected_value_bytes(value: &EncodedValue) -> Result<usize, String> {
+    match value {
+        EncodedValue::Null => Ok(0),
+        EncodedValue::Binary(bytes) => Ok(bytes.len()),
+        EncodedValue::Int32(_) | EncodedValue::Float32(_) => Ok(4),
+        EncodedValue::Int64(_) | EncodedValue::Float64(_) => Ok(8),
+        EncodedValue::Boolean(_) => Ok(1),
+        EncodedValue::Struct(fields) => {
+            sum_hail_projected_value_bytes(fields.iter().map(|(_, value)| value))
+        }
+        EncodedValue::Array(values) => sum_hail_projected_value_bytes(values.iter()),
+    }
+}
+
+fn sum_hail_projected_value_bytes<'a>(
+    values: impl Iterator<Item = &'a EncodedValue>,
+) -> Result<usize, String> {
+    values.fold(Ok(0_usize), |total, value| {
+        total?
+            .checked_add(hail_projected_value_bytes(value)?)
+            .ok_or_else(|| "decoded Hail projected value size overflow".to_string())
     })
 }
 
@@ -378,14 +743,6 @@ fn validate_explicit_headers(headers: &[String], explicit: &MappingInput) -> Res
         }
     }
     Ok(())
-}
-
-fn decoded_record_size(record: &ByteRecord) -> usize {
-    record
-        .iter()
-        .map(|field| field.len())
-        .sum::<usize>()
-        .saturating_add(record.len().saturating_sub(1))
 }
 
 fn infer_types(headers: &[String], samples: &[ByteRecord]) -> Vec<String> {
@@ -657,21 +1014,49 @@ fn build_command(
         arguments.push("--build".to_string());
         arguments.push(assembly.to_string());
     }
-    if !fields.is_empty() {
-        arguments.push("--map".to_string());
-        arguments.push(
-            fields
-                .into_iter()
-                .map(|(logical, source)| format!("{logical}={source}"))
-                .collect::<Vec<_>>()
-                .join(","),
-        );
+
+    // Clap comma-splits --map values and the mapping parser reserves the first
+    // '=' as the logical/source separator. Use ordinary repeated arguments when
+    // they are exact, and a strict inline TOML mapping on stdin otherwise.
+    let needs_mapping_file = fields
+        .iter()
+        .any(|(_, source)| source.contains(',') || source.contains('='));
+    let mapping_file = needs_mapping_file.then(|| inline_mapping_file(&fields));
+    if needs_mapping_file {
+        arguments.push("--mapping-file".to_string());
+        arguments.push("/dev/stdin".to_string());
+    } else {
+        for (logical, source) in fields {
+            arguments.push("--map".to_string());
+            arguments.push(format!("{logical}={source}"));
+        }
     }
-    arguments
+    let command = arguments
         .into_iter()
         .map(|argument| shell_quote(&argument))
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" ");
+    match mapping_file {
+        Some(mapping_file) => format!("printf %s {} | {command}", shell_quote(&mapping_file)),
+        None => command,
+    }
+}
+
+#[derive(Serialize)]
+struct InlineMappingFile {
+    schema_version: &'static str,
+    fields: BTreeMap<String, String>,
+}
+
+fn inline_mapping_file(fields: &[(LogicalField, String)]) -> String {
+    toml::to_string(&InlineMappingFile {
+        schema_version: "1.0",
+        fields: fields
+            .iter()
+            .map(|(logical, source)| (logical.to_string(), source.clone()))
+            .collect(),
+    })
+    .expect("string-only inline association mapping is TOML serializable")
 }
 
 fn shell_quote(value: &str) -> String {
@@ -740,6 +1125,42 @@ mod tests {
     }
 
     #[test]
+    fn hail_budget_charges_large_projected_strings_before_diagnostic_bounding() {
+        let first_size = 700_000;
+        let second_size = MAX_INSPECT_DECODED_BYTES - first_size + 1;
+        let rows = vec![
+            Ok(EncodedValue::Struct(vec![
+                (
+                    "mapped_large_string".into(),
+                    EncodedValue::Binary(vec![b'x'; first_size]),
+                ),
+                (
+                    "unmapped_names_are_not_charged".repeat(100),
+                    EncodedValue::Null,
+                ),
+            ])),
+            Ok(EncodedValue::Struct(vec![(
+                "mapped_large_string".into(),
+                EncodedValue::Binary(vec![b'y'; second_size]),
+            )])),
+        ];
+        let sizes = collect_bounded_hail_projected_sizes(rows.into_iter(), 100).unwrap();
+        assert_eq!(sizes, [first_size]);
+        assert_eq!(sizes.iter().sum::<usize>(), first_size);
+
+        let exact = collect_bounded_hail_projected_sizes(
+            vec![Ok(EncodedValue::Binary(vec![
+                b'z';
+                MAX_INSPECT_DECODED_BYTES
+            ]))]
+            .into_iter(),
+            100,
+        )
+        .unwrap();
+        assert_eq!(exact, [MAX_INSPECT_DECODED_BYTES]);
+    }
+
+    #[test]
     fn inference_retains_exact_spelling_and_never_infers_assembly() {
         let report = inspect(
             b"Chromosome\tBase-Pair Location\tP_VALUE\tBETA\nchr1\t1\t0.5\t1.0\n",
@@ -779,7 +1200,10 @@ mod tests {
         let command = report.runnable_view_command.unwrap();
         assert!(command.starts_with("genohype association view "));
         assert!(command.contains("--build GRCh38"));
-        assert!(command.contains("contig=CHR,position=POS,pvalue=P,beta=BETA"));
+        assert!(command.contains("--map contig=CHR"));
+        assert!(command.contains("--map position=POS"));
+        assert!(command.contains("--map pvalue=P"));
+        assert!(command.contains("--map beta=BETA"));
     }
 
     #[test]
@@ -813,6 +1237,148 @@ mod tests {
         let report = inspect(&rows, input);
         assert_eq!(report.inspected_records, 100);
         assert!(report.decoded_sample_bytes <= MAX_INSPECT_DECODED_BYTES);
+    }
+
+    #[test]
+    fn decoded_sample_budget_is_exact_and_does_not_observe_the_next_record() {
+        let mut input = MappingInput::default();
+        input.assembly = Some(AssociationBuildArg::Grch38);
+
+        let first_extra = 700_000;
+        let first_size = 11 + first_extra;
+        let remaining = MAX_INSPECT_DECODED_BYTES - first_size;
+        let mut rows = b"CHR\tPOS\tP\tEXTRA\nchr1\t1\t0.5\t".to_vec();
+        rows.extend(std::iter::repeat_n(b'x', first_extra));
+        rows.extend_from_slice(b"\nchr2\t2\t0.4\t");
+        rows.extend(std::iter::repeat_n(b'y', remaining - 11));
+        // This quote is a framing error if the second record is decoded. It is
+        // the first byte beyond the remaining aggregate sample budget.
+        rows.extend_from_slice(b"\"after-budget\n");
+        let report = inspect(&rows, input);
+        assert_eq!(report.inspected_records, 1);
+        assert_eq!(report.decoded_sample_bytes, first_size);
+
+        let first_extra = 500_000;
+        let second_extra = MAX_INSPECT_DECODED_BYTES - (11 + first_extra) - 11;
+        let mut exact = b"CHR\tPOS\tP\tEXTRA\nchr1\t1\t0.5\t".to_vec();
+        exact.extend(std::iter::repeat_n(b'x', first_extra));
+        exact.extend_from_slice(b"\nchr2\t2\t0.4\t");
+        exact.extend(std::iter::repeat_n(b'y', second_extra));
+        let report = inspect(&exact, MappingInput::default());
+        assert_eq!(report.inspected_records, 2);
+        assert_eq!(report.decoded_sample_bytes, MAX_INSPECT_DECODED_BYTES);
+    }
+
+    #[test]
+    fn delimited_inspect_preserves_the_independent_record_cap() {
+        let mut rows = b"CHR\tPOS\tP\tEXTRA\nchr1\t1\t0.5\t".to_vec();
+        rows.extend(std::iter::repeat_n(b'x', MAX_DELIMITED_RECORD_BYTES));
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("oversized.tsv");
+        std::fs::write(&path, rows).unwrap();
+        let error = inspect_delimited(
+            path.to_str().unwrap(),
+            DetectedAssociationSource::Delimited {
+                delimiter: b'\t',
+                gzip: false,
+            },
+            &MappingInput::default(),
+            100,
+        )
+        .unwrap_err();
+        assert!(error.contains("record_too_large"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn emitted_command_round_trips_punctuation_through_shell_clap_and_mapping_load() {
+        use crate::association_sources::mapping::load_mapping;
+        use crate::cli::{AssociationCommands, Cli, Commands};
+        use clap::Parser;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let fields = vec![
+            (LogicalField::Contig, "CHR".to_string()),
+            (LogicalField::Position, "POS=raw".to_string()),
+            (LogicalField::Pvalue, "P,VAL".to_string()),
+            (LogicalField::Beta, "effect size".to_string()),
+            (LogicalField::Gene, "Gene's \"label\"".to_string()),
+        ];
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source file's.csv");
+        std::fs::write(
+            &source,
+            b"CHR,\"POS=raw\",\"P,VAL\",\"effect size\",\"Gene's \"\"label\"\"\"\nchr1,1,0.5,1,G\n",
+        )
+        .unwrap();
+        let mut input = MappingInput::default();
+        input.assembly = Some(AssociationBuildArg::Grch38);
+        input
+            .fields
+            .insert(LogicalField::Position, "POS=raw".into());
+        input
+            .fields
+            .insert(LogicalField::Gene, "Gene's \"label\"".into());
+        let report = inspect_delimited(
+            source.to_str().unwrap(),
+            DetectedAssociationSource::Delimited {
+                delimiter: b',',
+                gzip: false,
+            },
+            &input,
+            100,
+        )
+        .unwrap();
+        assert!(report.ready);
+        let command = report.runnable_view_command.unwrap();
+        assert!(command.contains("--mapping-file /dev/stdin"));
+
+        let executable = temp.path().join("genohype");
+        let captured_args = temp.path().join("args");
+        let captured_stdin = temp.path().join("stdin");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CAPTURE_ARGS\"\ncat > \"$CAPTURE_STDIN\"\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        let path = format!(
+            "{}:{}",
+            temp.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .env("PATH", path)
+            .env("CAPTURE_ARGS", &captured_args)
+            .env("CAPTURE_STDIN", &captured_stdin)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let arguments = std::fs::read_to_string(&captured_args).unwrap();
+        let cli =
+            Cli::try_parse_from(std::iter::once("genohype").chain(arguments.lines())).unwrap();
+        let Commands::Association { command } = cli.command else {
+            panic!("expected association command");
+        };
+        let AssociationCommands::View(mut args) = command else {
+            panic!("expected view command");
+        };
+        assert_eq!(args.source, source.to_str().unwrap());
+        assert_eq!(
+            args.mapping.mapping_file.as_deref(),
+            Some(Path::new("/dev/stdin"))
+        );
+        args.mapping.mapping_file = Some(captured_stdin);
+        let loaded = load_mapping(&args.mapping, Some(args.build)).unwrap();
+        for (logical, source) in fields {
+            assert_eq!(loaded.fields[&logical], source);
+        }
     }
 
     #[test]
