@@ -1,5 +1,6 @@
-use crate::association_sources::inspect::{inspect_delimited, print_human_report};
+use crate::association_sources::inspect::{inspect_delimited, inspect_hail, print_human_report};
 use crate::association_sources::mapping::load_mapping;
+use crate::association_sources::vcf::inspect_vcf;
 use crate::association_sources::{detect_source, DetectedAssociationSource};
 use crate::cli::AssociationInspectArgs;
 use crate::{HailError, Result};
@@ -13,16 +14,10 @@ pub fn run(args: AssociationInspectArgs) -> Result<()> {
                 .map_err(invalid)?
         }
         DetectedAssociationSource::Hail => {
-            return Err(HailError::InvalidFormat(
-                "bounded Hail association inspection belongs to the projected Hail adapter slice and is not available in this build"
-                    .into(),
-            ));
+            inspect_hail(&args.source, &mapping, args.sample_rows).map_err(invalid)?
         }
-        DetectedAssociationSource::Vcf => {
-            return Err(HailError::InvalidFormat(
-                "bounded VCF association inspection belongs to the INFO-aware VCF adapter slice and is not available in this build"
-                    .into(),
-            ));
+        detected @ DetectedAssociationSource::Vcf => {
+            inspect_vcf(&args.source, detected, &mapping, args.sample_rows).map_err(invalid)?
         }
     };
     if args.json {

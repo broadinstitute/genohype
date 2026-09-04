@@ -1,6 +1,8 @@
 pub mod delimited;
+pub mod hail;
 pub mod inspect;
 pub mod mapping;
+pub mod vcf;
 
 use genohype_association::AssociationSourceKindV1;
 use std::fmt;

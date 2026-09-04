@@ -1,8 +1,12 @@
 use super::delimited::{decode_record, mapped_indexes, DelimitedRecordReader};
+use super::hail::{inspect_hail_schema, HailAssociationSource};
 use super::mapping::{mapping_pairs, LogicalField, MappingInput, LOGICAL_FIELDS};
 use super::DetectedAssociationSource;
 use csv::ByteRecord;
-use genohype_association::{NormalizedFieldMappingV1, RejectionDiagnostics};
+use genohype_association::{
+    AssociationSource, AssociationSourceError, AssociationSourceItem, NormalizedFieldMappingV1,
+    RejectionDiagnostics,
+};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -27,6 +31,8 @@ pub struct AssociationInspectReport {
     pub source_kind: String,
     pub inspected_records: u64,
     pub decoded_sample_bytes: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declared_logical_assemblies: Vec<String>,
     pub fields: Vec<InspectFieldReport>,
     pub explicit_mappings: BTreeMap<String, String>,
     pub inferred_mappings: BTreeMap<String, String>,
@@ -116,6 +122,7 @@ pub fn inspect_delimited(
         source_kind: detected.label().to_string(),
         inspected_records: samples.len() as u64,
         decoded_sample_bytes,
+        declared_logical_assemblies: Vec::new(),
         fields: reader
             .headers()
             .iter()
@@ -137,8 +144,157 @@ pub fn inspect_delimited(
     })
 }
 
+pub fn inspect_hail(
+    source: &str,
+    explicit: &MappingInput,
+    sample_rows: u64,
+) -> Result<AssociationInspectReport, String> {
+    if sample_rows == 0 || sample_rows > MAX_INSPECT_RECORDS {
+        return Err(format!("sample rows must be in 1..={MAX_INSPECT_RECORDS}"));
+    }
+
+    let inspection = inspect_hail_schema(source).map_err(inspect_source_error)?;
+    let headers: Vec<String> = inspection
+        .fields
+        .iter()
+        .map(|field| field.name.clone())
+        .collect();
+    let types: Vec<String> = inspection
+        .fields
+        .iter()
+        .map(|field| field.data_type.clone().unwrap_or_else(|| "unknown".into()))
+        .collect();
+    validate_explicit_headers(&headers, explicit)?;
+
+    let mut resolved = explicit.clone();
+    let mut ambiguities = BTreeMap::new();
+    infer_hail_mappings(&headers, &types, &mut resolved, &mut ambiguities);
+    resolved
+        .validate_partial()
+        .map_err(|error| error.to_string())?;
+
+    // Logical locus metadata is informative only. It never fills --build, but
+    // an explicit conflict must fail before any row is scanned.
+    if let Some(build) = resolved.assembly {
+        let uses_logical_locus = [LogicalField::Contig, LogicalField::Position]
+            .into_iter()
+            .filter_map(|field| resolved.fields.get(&field))
+            .any(|path| path.starts_with("locus."));
+        if uses_logical_locus
+            && inspection.reference_genomes.len() == 1
+            && inspection.reference_genomes[0] != build.as_str()
+        {
+            return Err(format!(
+                "--build {build} conflicts with mapped Hail locus assembly {}",
+                inspection.reference_genomes[0]
+            ));
+        }
+    }
+
+    let unresolved = resolved.unresolved_required();
+    let normalized = if unresolved.is_empty() && ambiguities.is_empty() {
+        Some(resolved.complete().map_err(|error| error.to_string())?)
+    } else {
+        None
+    };
+
+    let mut inspected_records = 0_u64;
+    let mut decoded_sample_bytes = 0_usize;
+    let mut diagnostics = RejectionDiagnostics::default();
+    if let Some(mapping) = &normalized {
+        let assembly = resolved
+            .assembly
+            .expect("a complete inspection mapping has an assembly");
+        let mut hail = HailAssociationSource::open(source, mapping.clone(), assembly.as_str())
+            .map_err(inspect_source_error)?;
+        while inspected_records < sample_rows {
+            let Some(item) = hail.next_item().map_err(inspect_source_error)? else {
+                break;
+            };
+            let size = match &item {
+                AssociationSourceItem::Point { point, warnings } => {
+                    serde_json::to_vec(&(point, warnings))
+                }
+                AssociationSourceItem::Rejected(rejection) => serde_json::to_vec(rejection),
+            }
+            .map_err(|error| error.to_string())?
+            .len();
+            if size > MAX_INSPECT_DECODED_BYTES.saturating_sub(decoded_sample_bytes) {
+                break;
+            }
+            decoded_sample_bytes += size;
+            inspected_records += 1;
+            if let AssociationSourceItem::Rejected(rejection) = item {
+                diagnostics.record(&rejection);
+            }
+        }
+    }
+
+    let runnable_view_command = normalized.as_ref().map(|mapping| {
+        build_command(
+            "view",
+            source,
+            resolved.assembly,
+            mapping_pairs(mapping)
+                .into_iter()
+                .map(|(logical, source)| (logical, source.to_string()))
+                .collect(),
+        )
+    });
+    let resolution_commands = ambiguity_commands(source, &resolved, &ambiguities);
+    let explicit_mappings = display_mappings(&explicit.fields);
+    let inferred_mappings = resolved
+        .fields
+        .iter()
+        .filter(|(logical, _)| !explicit.fields.contains_key(logical))
+        .map(|(logical, source)| (logical.to_string(), source.clone()))
+        .collect();
+
+    Ok(AssociationInspectReport {
+        source_kind: "hail".into(),
+        inspected_records,
+        decoded_sample_bytes,
+        declared_logical_assemblies: inspection.reference_genomes,
+        fields: inspection
+            .fields
+            .into_iter()
+            .map(|field| InspectFieldReport {
+                name: field.name,
+                data_type: field.data_type.unwrap_or_else(|| "unknown".into()),
+            })
+            .collect(),
+        explicit_mappings,
+        inferred_mappings,
+        mappings: display_mappings(&resolved.fields),
+        ambiguities,
+        unresolved,
+        invalid_reasons: diagnostics
+            .reasons
+            .into_iter()
+            .map(|(reason, details)| {
+                (
+                    reason,
+                    InspectReasonReport {
+                        count: details.count,
+                        examples: details.examples,
+                    },
+                )
+            })
+            .collect(),
+        ready: normalized.is_some(),
+        runnable_view_command,
+        resolution_commands,
+    })
+}
+
 pub fn print_human_report(report: &AssociationInspectReport) {
     println!("Association source: {}", report.source_kind);
+    if !report.declared_logical_assemblies.is_empty() {
+        println!(
+            "Declared logical assembly: {} (reported only; never inferred)",
+            report.declared_logical_assemblies.join(", ")
+        );
+    }
     println!(
         "Inspected: {} records, {} decoded bytes (limits: {} records, {} bytes)",
         report.inspected_records,
@@ -188,6 +344,10 @@ pub fn print_human_report(report: &AssociationInspectReport) {
             println!("  {command}");
         }
     }
+}
+
+fn inspect_source_error(error: AssociationSourceError) -> String {
+    format!("{}: {}", error.code(), error.internal_message())
 }
 
 fn print_mapping_section(label: &str, mappings: &BTreeMap<String, String>) {
@@ -314,6 +474,66 @@ fn type_compatible(logical: LogicalField, data_type: &str) -> bool {
         | LogicalField::Af
         | LogicalField::Ac => matches!(data_type, "integer" | "number" | "mixed"),
         _ => data_type != "empty",
+    }
+}
+
+/// Hail reports exact dotted leaf paths and schema types rather than the
+/// sampled flat-file type labels. Keep this inference separate so adding Hail
+/// inspection cannot change existing delimited inference semantics.
+fn infer_hail_mappings(
+    paths: &[String],
+    types: &[String],
+    mapping: &mut MappingInput,
+    ambiguities: &mut BTreeMap<String, Vec<String>>,
+) {
+    let mut already_used: BTreeSet<String> = mapping.fields.values().cloned().collect();
+    for logical in LOGICAL_FIELDS {
+        if mapping.fields.contains_key(&logical) {
+            continue;
+        }
+        let aliases = aliases(logical);
+        let mut candidates: Vec<String> = paths
+            .iter()
+            .zip(types)
+            .filter(|(path, data_type)| {
+                let leaf = path.rsplit('.').next().unwrap_or(path);
+                !already_used.contains(path.as_str())
+                    && aliases.contains(&normalize_name(leaf))
+                    && hail_type_compatible(logical, data_type)
+            })
+            .map(|(path, _)| path.clone())
+            .collect();
+        candidates.sort();
+        candidates.dedup();
+        match candidates.len() {
+            0 => {}
+            1 => {
+                let source = candidates.remove(0);
+                already_used.insert(source.clone());
+                mapping.fields.insert(logical, source);
+            }
+            _ => {
+                ambiguities.insert(logical.to_string(), candidates);
+            }
+        }
+    }
+}
+
+fn hail_type_compatible(logical: LogicalField, data_type: &str) -> bool {
+    let logical_type = data_type
+        .split_once(" (")
+        .map_or(data_type, |(name, _)| name);
+    match logical {
+        LogicalField::Position => matches!(logical_type, "Int32" | "Int64"),
+        LogicalField::Pvalue
+        | LogicalField::NegLog10P
+        | LogicalField::Beta
+        | LogicalField::Se
+        | LogicalField::Af
+        | LogicalField::Ac => {
+            matches!(logical_type, "Int32" | "Int64" | "Float32" | "Float64")
+        }
+        _ => matches!(logical_type, "String" | "Binary"),
     }
 }
 
@@ -486,6 +706,37 @@ mod tests {
             100,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn bounded_hail_inspect_reuses_report_contract_without_inferring_assembly() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../data/test/association/single-variant.ht");
+        let source = source.to_str().unwrap();
+
+        let report = inspect_hail(source, &MappingInput::default(), 100).unwrap();
+        assert_eq!(report.source_kind, "hail");
+        assert_eq!(report.declared_logical_assemblies, ["GRCh38"]);
+        assert!(report.unresolved.contains(&"assembly".to_string()));
+        assert_eq!(report.inspected_records, 0);
+        assert!(!report.ready);
+
+        let mut input = MappingInput::default();
+        input.assembly = Some(AssociationBuildArg::Grch38);
+        let report = inspect_hail(source, &input, 100).unwrap();
+        assert!(report.ready);
+        assert_eq!(report.inspected_records, 12);
+        assert_eq!(report.invalid_reasons["invalid_pvalue"].count, 2);
+        assert!(report
+            .runnable_view_command
+            .as_deref()
+            .unwrap()
+            .contains("contig=locus.contig"));
+
+        input.assembly = Some(AssociationBuildArg::Grch37);
+        assert!(inspect_hail(source, &input, 100)
+            .unwrap_err()
+            .contains("conflicts"));
     }
 
     #[test]
