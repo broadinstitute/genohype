@@ -1218,6 +1218,27 @@ fn manifest_matches_request(
         && manifest.top_hits.len() as u64 == (request.top_hits as u64).min(manifest.valid_row_count)
 }
 
+fn top_hits_match_manifest_encoding(
+    stored: &[genohype_association::AssociationPointV1],
+    manifest: &[genohype_association::AssociationPointV1],
+) -> bool {
+    if stored.len() != manifest.len() {
+        return false;
+    }
+    // SQLite retains the source f64 bits, while the manifest's public contract is
+    // JSON text and serde_json's decoder may choose an adjacent representable f64.
+    // Route the stored values through that same wire encoding before requiring
+    // exact equality. This permits only the precision that the checksummed
+    // manifest itself cannot distinguish; every browser-visible field and order
+    // remains bound.
+    serde_json::to_vec(stored)
+        .ok()
+        .and_then(|bytes| {
+            serde_json::from_slice::<Vec<genohype_association::AssociationPointV1>>(&bytes).ok()
+        })
+        .is_some_and(|transported| transported == manifest)
+}
+
 fn validate_database(
     path: &Path,
     marker: &AssociationSessionCompletionV1,
@@ -1281,7 +1302,7 @@ fn validate_database(
         let stored = store
             .top_hits(&marker.dataset_id, manifest.top_hits.len() as u32)
             .map_err(|_| AssociationSessionError::CorruptSession)?;
-        if stored != manifest.top_hits {
+        if !top_hits_match_manifest_encoding(&stored, &manifest.top_hits) {
             return Err(AssociationSessionError::CorruptSession);
         }
     } else {
@@ -2045,6 +2066,147 @@ mod tests {
         claim.write_raster(&png, &NeverCancel).unwrap();
         claim.write_manifest(&manifest, &NeverCancel).unwrap();
         (claim, manifest)
+    }
+
+    #[test]
+    fn mixed_tsv_low_pvalue_publishes_and_warm_validates() {
+        let fixture = include_str!("../../data/test/association/single-variant.tsv");
+        let header = fixture.lines().next().unwrap();
+        let accepted = fixture
+            .lines()
+            .find(|line| line.starts_with("chr4\t68123456\t"))
+            .unwrap();
+        let rejected = fixture
+            .lines()
+            .find(|line| line.starts_with("chr1\t101004\t"))
+            .unwrap();
+        let temp = TempDir::new().unwrap();
+        let source_path = temp.path().join("mixed.tsv");
+        fs::write(&source_path, format!("{header}\n{accepted}\n{rejected}\n")).unwrap();
+        let layout = GenomeLayoutV1::new([("4", 190_214_555)], 320, 160, 0).unwrap();
+        let mut request = request(&layout);
+        request.mapping.ref_allele = Some("REF".into());
+        request.mapping.alt_allele = Some("ALT".into());
+        request.mapping.neg_log10_p = Some("NEG_LOG10_P".into());
+        request.mapping.beta = Some("BETA".into());
+        request.mapping.se = Some("SE".into());
+        request.mapping.af = Some("AF".into());
+        request.mapping.ac = Some("AC".into());
+        request.mapping.series = Some("SERIES".into());
+
+        let cells = accepted.split('\t').collect::<Vec<_>>();
+        let pvalue = cells[4].parse::<f64>().unwrap();
+        let point = AssociationPointV1 {
+            contig: "4".into(),
+            position: cells[1].parse().unwrap(),
+            ref_allele: Some(cells[2].into()),
+            alt_allele: Some(cells[3].into()),
+            pvalue,
+            neg_log10_p: -pvalue.log10(),
+            beta: Some(cells[6].parse().unwrap()),
+            standard_error: Some(cells[7].parse().unwrap()),
+            allele_frequency: None,
+            allele_count: None,
+            gene_symbol: None,
+            consequence: None,
+            series: Some(cells[10].into()),
+            source_ordinal: 0,
+        };
+        assert_eq!(point.position, 68_123_456);
+        assert_eq!(point.pvalue, 2e-30);
+
+        let registry =
+            AssociationSessionRegistry::open_for_test(temp.path().join("cache")).unwrap();
+        let lookup = SessionLookup::observe_local(&source_path, request.clone()).unwrap();
+        let claim = registry.claim(lookup.clone()).unwrap();
+        let fingerprint = format!("sha256:{}", "b".repeat(64));
+        let mut store = SqliteAssociationStore::create(claim.database_path()).unwrap();
+        store
+            .begin_build(&AssociationBuildV1 {
+                dataset_id: claim.dataset_id().clone(),
+                created_at: "unix:1".into(),
+            })
+            .unwrap();
+        store
+            .insert_points(claim.dataset_id(), std::slice::from_ref(&point))
+            .unwrap();
+        store
+            .replace_top_hits(claim.dataset_id(), std::slice::from_ref(&point))
+            .unwrap();
+        store
+            .complete_build(claim.dataset_id(), &fingerprint)
+            .unwrap();
+        drop(store);
+
+        let mut raster =
+            genohype_association::AssociationRasterizer::from_layout(&layout, Background::White)
+                .unwrap();
+        raster
+            .render_association_point(&layout, &point, 2.5, 178)
+            .unwrap();
+        let png = raster.png_bytes().unwrap();
+        let manifest = AssociationVisualizationManifestV1 {
+            schema_version: SCHEMA_VERSION_V1.into(),
+            plot_id: claim.dataset_id().to_string(),
+            kind: PlotKindV1::Manhattan,
+            title: "Association dataset".into(),
+            assembly: "GRCh38".into(),
+            coordinate_convention: COORDINATE_CONVENTION_V1.into(),
+            source_fingerprint: fingerprint,
+            genohype_version: "test".into(),
+            created_at: "unix:1".into(),
+            layout: layout.clone(),
+            layout_hash: layout.layout_hash("GRCh38"),
+            thresholds: request.thresholds.clone(),
+            row_count: 2,
+            valid_row_count: 1,
+            skipped_row_count: 1,
+            rendered_point_count: 1,
+            significant_hit_count: 1,
+            top_hits: vec![point],
+            warnings: vec!["invalid_pvalue=1".into()],
+            resources: AssociationVisualizationResourcesV1 {
+                raster: ResourceDescriptorV1 {
+                    url: RASTER_NAME.into(),
+                    media_type: "image/png".into(),
+                    byte_size: Some(png.len() as u64),
+                    checksum: Some(checksum(&png)),
+                    expires_at: None,
+                },
+                region_api: Some(ResourceDescriptorV1 {
+                    url: format!("datasets/{}/region", claim.dataset_id()),
+                    media_type: "application/json".into(),
+                    byte_size: None,
+                    checksum: None,
+                    expires_at: None,
+                }),
+                table_api: Some(ResourceDescriptorV1 {
+                    url: format!("datasets/{}/table", claim.dataset_id()),
+                    media_type: "application/json".into(),
+                    byte_size: None,
+                    checksum: None,
+                    expires_at: None,
+                }),
+            },
+        };
+        claim.write_raster(&png, &NeverCancel).unwrap();
+        claim.write_manifest(&manifest, &NeverCancel).unwrap();
+        let session = claim
+            .publish(
+                SessionCompletion {
+                    source_fingerprint: manifest.source_fingerprint.clone(),
+                    created_at: UNIX_EPOCH + Duration::from_secs(1),
+                    expires_at: None,
+                    ephemeral: false,
+                },
+                &NeverCancel,
+            )
+            .unwrap();
+        drop(session);
+        assert!(registry
+            .lookup_valid(&lookup, SystemTime::now())
+            .unwrap()
+            .is_some());
     }
 
     #[test]
