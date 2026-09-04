@@ -31,6 +31,7 @@ const RASTER_NAME: &str = "raster.png";
 const MANIFEST_NAME: &str = "manifest.json";
 const COMPLETE_NAME: &str = "complete.json";
 const ACTIVE_LOCK_NAME: &str = ".active.lock";
+const HANDOFF_LOCK_NAME: &str = ".handoff.lock";
 const CACHE_CLEAR_LOCK_NAME: &str = ".genohype-cache.lock";
 const STAGING_PROTOCOL_LOCK_NAME: &str = ".staging-protocol.lock";
 const STREAM_BUFFER_BYTES: usize = 64 * 1024;
@@ -426,6 +427,7 @@ impl AssociationSessionRegistry {
         let staging_name = format!(".{}.building", Uuid::new_v4());
         let staging_path = self.root.join("staging").join(staging_name);
         create_private_directory(&staging_path)?;
+        let handoff_lock = open_private_lock(&staging_path.join(HANDOFF_LOCK_NAME))?;
         let active_path = staging_path.join(ACTIVE_LOCK_NAME);
         let active_lock = open_private_lock(&active_path)?;
         FileExt::lock_exclusive(&active_lock).map_err(private_io)?;
@@ -442,6 +444,7 @@ impl AssociationSessionRegistry {
             staging_path: Some(staging_path),
             generation_path: None,
             request_lock: Some(request_lock),
+            handoff_lock: Some(handoff_lock),
             active_lock: Some(active_lock),
             global_lock: Some(global_lock),
         })
@@ -465,14 +468,14 @@ impl AssociationSessionRegistry {
                     summary.refused_entries += 1;
                     continue;
                 }
-                match try_lock_active(&entry.path(), true)? {
-                    Some(lock) => {
+                match try_lock_generation(&entry.path(), true)? {
+                    Some(locks) => {
                         if remove_generation_directory(&entry.path()).is_ok() {
                             summary.staging_removed += 1;
                         } else {
                             summary.refused_entries += 1;
                         }
-                        drop(lock);
+                        drop(locks);
                     }
                     None => summary.retained_locked += 1,
                 }
@@ -496,9 +499,10 @@ impl AssociationSessionRegistry {
             if !(policy.remove_expired && expired || policy.remove_orphans && orphan) {
                 continue;
             }
-            match try_lock_active(&entry.path(), false)? {
-                Some(lock) => {
-                    // Recheck under the active lock so a concurrent publication cannot be removed.
+            match try_lock_generation(&entry.path(), false)? {
+                Some(locks) => {
+                    // Recheck while both generation locks are exclusive so neither
+                    // publication handoff nor an active reader can race deletion.
                     let current = self.registered_sessions()?;
                     let current_expiry = current.get(&name).copied().flatten();
                     let still_expired = current_expiry.is_some_and(|expiry| now >= expiry);
@@ -513,7 +517,7 @@ impl AssociationSessionRegistry {
                             summary.refused_entries += 1;
                         }
                     }
-                    drop(lock);
+                    drop(locks);
                 }
                 None => summary.retained_locked += 1,
             }
@@ -696,12 +700,18 @@ impl AssociationSessionRegistry {
         expected_marker_checksum: Option<&str>,
         expected_request: Option<&NormalizedSessionRequestV1>,
         ephemeral: bool,
-        held_active_lock: Option<File>,
+        held_generation_locks: Option<GenerationLocks>,
     ) -> Result<CompletedAssociationSession, AssociationSessionError> {
         let id = DatasetIdV1::new(dataset_id.to_string())
             .map_err(|_| AssociationSessionError::CorruptSession)?;
         let directory = self.root.join("sessions").join(dataset_id);
         reject_directory(&directory)?;
+        let locks = match held_generation_locks {
+            Some(locks) => locks,
+            None => lock_generation_shared(&directory)?,
+        };
+        // Validate only after deletion is excluded. The handoff lock is created
+        // here for legacy complete generations that predate this protocol.
         validate_generation_entries(&directory)?;
 
         let marker_bytes = read_bounded(&directory.join(COMPLETE_NAME), COMPLETE_MAX_BYTES)?;
@@ -769,14 +779,6 @@ impl AssociationSessionRegistry {
             expected_request,
         )?;
 
-        let active_lock = match held_active_lock {
-            Some(lock) => lock,
-            None => {
-                let lock = open_existing_private_file(&directory.join(ACTIVE_LOCK_NAME))?;
-                FileExt::lock_shared(&lock).map_err(private_io)?;
-                lock
-            }
-        };
         let global_lock = open_private_lock(&self.cache_clear_lock)?;
         FileExt::lock_shared(&global_lock).map_err(private_io)?;
         Ok(CompletedAssociationSession {
@@ -784,7 +786,8 @@ impl AssociationSessionRegistry {
                 dataset_id: id,
                 directory,
                 marker,
-                active_lock: Some(active_lock),
+                handoff_lock: Some(locks.handoff),
+                active_lock: Some(locks.active),
                 global_lock: Some(global_lock),
                 ephemeral,
             }),
@@ -833,6 +836,7 @@ pub(crate) struct BuildClaim {
     staging_path: Option<PathBuf>,
     generation_path: Option<PathBuf>,
     request_lock: Option<File>,
+    handoff_lock: Option<File>,
     active_lock: Option<File>,
     global_lock: Option<File>,
 }
@@ -985,43 +989,58 @@ impl BuildClaim {
         check_cancel(cancellation)?;
 
         let marker_checksum = checksum(&marker_bytes);
-        let active_for_session = self
-            .active_lock
+        // Acquire the cleanup-visible handoff lock before cloning the lock
+        // ownership that will be retained by the completed session. The active
+        // lock is still exclusive here, so validation and publication remain
+        // protected even if cleanup observed the renamed directory as an orphan.
+        let handoff = self
+            .handoff_lock
             .as_ref()
-            .ok_or(AssociationSessionError::ClaimConsumed)?
-            .try_clone()
-            .map_err(private_io)?;
+            .ok_or(AssociationSessionError::ClaimConsumed)?;
+        FileExt::lock_shared(handoff).map_err(private_io)?;
+        let locks_for_session = GenerationLocks {
+            handoff: handoff.try_clone().map_err(private_io)?,
+            active: self
+                .active_lock
+                .as_ref()
+                .ok_or(AssociationSessionError::ClaimConsumed)?
+                .try_clone()
+                .map_err(private_io)?,
+        };
         let session = self.registry.validate_generation(
             self.dataset_id.as_str(),
             Some(&marker.session_key),
             Some(&marker_checksum),
             Some(&self.lookup.request),
             completion.ephemeral,
-            Some(active_for_session),
+            Some(locks_for_session),
         )?;
         check_cancel(cancellation)?;
 
         if !completion.ephemeral {
-            // Publish while the original exclusive active lock is still held.
+            // Publish while the original active lock is still exclusive and the
+            // handoff lock is shared. Cleanup must acquire the handoff lock first,
+            // so it cannot enter deletion while flock performs its non-atomic
+            // exclusive-to-shared active-lock conversion.
             self.registry
                 .publish_registry(&self.lookup, &marker, &marker_checksum)?;
-            #[cfg(test)]
-            self.registry.run_before_active_transition_hook();
-        } else {
-            // Ephemeral generations are intentionally never registered.
-            #[cfg(test)]
-            self.registry.run_before_active_transition_hook();
         }
-        // Retain exclusive ownership in the returned handle. `flock` cannot
-        // atomically convert an exclusive lock to a shared lock, and even a
-        // registered generation can become cleanup-eligible before that conversion
-        // completes (for example when a long build outlives its retention). Keeping
-        // the existing lock mode closes that deletion window for both retained and
-        // ephemeral sessions. A later opener may acquire a shared lock after this
-        // active handle is released.
-        // Irreversible success point: no cancellation probe or fallible operation
-        // follows registry publication (or completed ephemeral validation).
+        // Ephemeral generations are intentionally never registered, but use the
+        // same handoff protocol so cleanup cannot remove the orphan during the
+        // active-lock conversion.
+        #[cfg(test)]
+        self.registry.run_before_active_transition_hook();
+        let active = self
+            .active_lock
+            .as_ref()
+            .ok_or(AssociationSessionError::ClaimConsumed)?;
+        // Publication is the final fallible boundary. A valid descriptor's flock
+        // downgrade succeeds on supported platforms; if an OS nevertheless rejects
+        // it, retaining exclusive ownership is the safe failure mode.
+        let _ = FileExt::lock_shared(active);
+
         self.generation_path.take();
+        self.handoff_lock.take();
         self.active_lock.take();
         self.release_locks();
         Ok(session)
@@ -1034,9 +1053,12 @@ impl BuildClaim {
     }
 
     fn cleanup_staging(&mut self) -> Result<(), AssociationSessionError> {
+        if let Some(handoff) = self.handoff_lock.as_ref() {
+            FileExt::lock_exclusive(handoff).map_err(private_io)?;
+        }
         if let Some(active) = self.active_lock.as_ref() {
-            // Upgrade/retain exclusive ownership before deleting either a staging
-            // directory or a renamed-but-unpublished generation.
+            // The common handoff-then-active order prevents deletion during a
+            // publication downgrade or a completed reader's lifetime.
             FileExt::lock_exclusive(active).map_err(private_io)?;
         }
         let path = self
@@ -1047,6 +1069,7 @@ impl BuildClaim {
             remove_generation_directory(&path)?;
         }
         self.active_lock.take();
+        self.handoff_lock.take();
         Ok(())
     }
     fn release_locks(&mut self) {
@@ -1098,6 +1121,7 @@ struct CompletedInner {
     dataset_id: DatasetIdV1,
     directory: PathBuf,
     marker: AssociationSessionCompletionV1,
+    handoff_lock: Option<File>,
     active_lock: Option<File>,
     global_lock: Option<File>,
     ephemeral: bool,
@@ -1107,17 +1131,20 @@ impl Drop for CompletedInner {
         if !self.ephemeral {
             return;
         }
-        // Arc uniqueness means this is the final viewer handle. Upgrade the
-        // continuously-held active lock before deletion while retaining the
-        // shared broad-cache lock, so neither cleanup nor cache clear can race.
-        let Some(active) = self.active_lock.as_ref() else {
+        // Arc uniqueness means this is the final viewer handle. Upgrade both
+        // locks in cleanup order while retaining the broad-cache lock. Holding
+        // handoff exclusively makes the active shared-to-exclusive conversion
+        // safe from cleanup and any other completed reader.
+        let (Some(handoff), Some(active)) = (self.handoff_lock.as_ref(), self.active_lock.as_ref())
+        else {
             return;
         };
-        if FileExt::lock_exclusive(active).is_err() {
+        if FileExt::lock_exclusive(handoff).is_err() || FileExt::lock_exclusive(active).is_err() {
             return;
         }
         let _ = remove_generation_directory(&self.directory);
         self.active_lock.take();
+        self.handoff_lock.take();
         self.global_lock.take();
     }
 }
@@ -1283,6 +1310,7 @@ fn validate_generation_entries(directory: &Path) -> Result<(), AssociationSessio
         MANIFEST_NAME,
         COMPLETE_NAME,
         ACTIVE_LOCK_NAME,
+        HANDOFF_LOCK_NAME,
     ]
     .into_iter()
     .collect();
@@ -1314,7 +1342,12 @@ fn remove_generation_directory(path: &Path) -> Result<(), AssociationSessionErro
         };
         if !matches!(
             name,
-            DATABASE_NAME | RASTER_NAME | MANIFEST_NAME | COMPLETE_NAME | ACTIVE_LOCK_NAME
+            DATABASE_NAME
+                | RASTER_NAME
+                | MANIFEST_NAME
+                | COMPLETE_NAME
+                | ACTIVE_LOCK_NAME
+                | HANDOFF_LOCK_NAME
         ) || !entry.file_type().map_err(private_io)?.is_file()
         {
             return Err(AssociationSessionError::UnsafeEntry);
@@ -1326,6 +1359,7 @@ fn remove_generation_directory(path: &Path) -> Result<(), AssociationSessionErro
         RASTER_NAME,
         DATABASE_NAME,
         ACTIVE_LOCK_NAME,
+        HANDOFF_LOCK_NAME,
     ] {
         let child = path.join(name);
         match fs::symlink_metadata(&child) {
@@ -1340,20 +1374,46 @@ fn remove_generation_directory(path: &Path) -> Result<(), AssociationSessionErro
     fs::remove_dir(path).map_err(private_io)
 }
 
-fn try_lock_active(
+struct GenerationLocks {
+    // All multi-lock operations use handoff before active. Cleanup only tries
+    // the second lock, preventing circular waits with publishers and readers.
+    handoff: File,
+    active: File,
+}
+
+fn lock_generation_shared(directory: &Path) -> Result<GenerationLocks, AssociationSessionError> {
+    // Creating this protocol-only file upgrades complete legacy generations in
+    // place. The active lock still provides their original deletion protection.
+    let handoff = open_private_lock(&directory.join(HANDOFF_LOCK_NAME))?;
+    FileExt::lock_shared(&handoff).map_err(private_io)?;
+    let active = open_existing_private_file(&directory.join(ACTIVE_LOCK_NAME))?;
+    FileExt::lock_shared(&active).map_err(private_io)?;
+    Ok(GenerationLocks { handoff, active })
+}
+
+fn try_lock_generation(
     directory: &Path,
-    create_if_missing: bool,
-) -> Result<Option<File>, AssociationSessionError> {
-    let path = directory.join(ACTIVE_LOCK_NAME);
-    let file = if create_if_missing {
-        // Caller holds the exclusive staging-protocol lock, proving that a
-        // missing active lock is crash residue rather than live creation.
-        open_private_lock(&path)?
+    create_active_if_missing: bool,
+) -> Result<Option<GenerationLocks>, AssociationSessionError> {
+    // Handoff is protocol metadata and may be absent from legacy or crashed
+    // generations. Creating it is safe; retained sessions still require their
+    // original active lock to exist, while staging cleanup may create active only
+    // under the exclusive staging-protocol lock.
+    let handoff = open_private_lock(&directory.join(HANDOFF_LOCK_NAME))?;
+    match FileExt::try_lock_exclusive(&handoff) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+        Err(error) => return Err(private_io(error)),
+    }
+
+    let active_path = directory.join(ACTIVE_LOCK_NAME);
+    let active = if create_active_if_missing {
+        open_private_lock(&active_path)?
     } else {
-        open_existing_private_file(&path)?
+        open_existing_private_file(&active_path)?
     };
-    match FileExt::try_lock_exclusive(&file) {
-        Ok(()) => Ok(Some(file)),
+    match FileExt::try_lock_exclusive(&active) {
+        Ok(()) => Ok(Some(GenerationLocks { handoff, active })),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
         Err(error) => Err(private_io(error)),
     }
@@ -1945,7 +2005,7 @@ mod tests {
     }
 
     #[test]
-    fn identities_are_distinct_and_warm_lookup_does_not_touch_source_contents() {
+    fn identities_legacy_lock_upgrade_and_warm_lookup_are_safe() {
         let temp = TempDir::new().unwrap();
         let (registry, lookup, claim, manifest) = prepare_claim(temp.path());
         assert_ne!(lookup.request_key(), claim.dataset_id().as_str());
@@ -1961,12 +2021,17 @@ mod tests {
             )
             .unwrap();
         let first = session.dataset_id().clone();
+        let generation = temp.path().join("sessions").join(first.as_str());
         drop(session);
+        // Completed generations from before the handoff protocol have only the
+        // active lock. A warm opener upgrades them before validation.
+        fs::remove_file(generation.join(HANDOFF_LOCK_NAME)).unwrap();
         let warm = registry
             .lookup_valid(&lookup, SystemTime::now())
             .unwrap()
             .unwrap();
         assert_eq!(warm.dataset_id(), &first);
+        assert!(generation.join(HANDOFF_LOCK_NAME).is_file());
         assert_ne!(
             warm.completion().session_key,
             warm.completion().source_fingerprint
@@ -2428,21 +2493,23 @@ mod tests {
 
         let temp = TempDir::new().unwrap();
         let (registry, _lookup, claim, manifest) = prepare_claim(temp.path());
-        let (cleanup_thread_tx, cleanup_thread_rx) = mpsc::channel();
+        let (cleanup_tx, cleanup_rx) = mpsc::channel();
         let cleanup_registry = registry.clone();
         registry.set_before_active_transition_hook(move || {
-            let thread = std::thread::spawn(move || {
-                cleanup_registry
-                    .cleanup(CleanupPolicy {
-                        now: UNIX_EPOCH + Duration::from_secs(3),
-                        remove_expired: true,
-                        remove_orphans: true,
-                        remove_staging: false,
-                    })
-                    .unwrap()
-            });
-            cleanup_thread_tx.send(thread).unwrap();
-            std::thread::yield_now();
+            // This runs after the already-expired row is committed but before
+            // the active lock is downgraded, making the race deterministic.
+            cleanup_tx
+                .send(
+                    cleanup_registry
+                        .cleanup(CleanupPolicy {
+                            now: UNIX_EPOCH + Duration::from_secs(3),
+                            remove_expired: true,
+                            remove_orphans: true,
+                            remove_staging: false,
+                        })
+                        .unwrap(),
+                )
+                .unwrap();
         });
         let session = claim
             .publish(
@@ -2455,8 +2522,7 @@ mod tests {
                 &NeverCancel,
             )
             .unwrap();
-        let concurrent_cleanup = cleanup_thread_rx.recv().unwrap().join().unwrap();
-        assert_eq!(concurrent_cleanup.retained_locked, 1);
+        assert_eq!(cleanup_rx.recv().unwrap().retained_locked, 1);
         assert_eq!(
             registry
                 .cleanup(CleanupPolicy {
@@ -2590,6 +2656,15 @@ mod tests {
                 &NeverCancel,
             )
             .unwrap();
+        let handoff_path = temp
+            .path()
+            .join("sessions")
+            .join(id.as_str())
+            .join(HANDOFF_LOCK_NAME);
+        assert_eq!(
+            fs::metadata(&handoff_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let cleanup = registry.cleanup(CleanupPolicy::default()).unwrap();
         assert_eq!(cleanup.retained_locked, 1);
         assert!(session.database_path().exists());
