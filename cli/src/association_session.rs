@@ -297,7 +297,7 @@ impl AssociationSessionRegistry {
     }
 
     #[cfg(test)]
-    fn open_for_test(root: PathBuf) -> Result<Self, AssociationSessionError> {
+    pub(crate) fn open_for_test(root: PathBuf) -> Result<Self, AssociationSessionError> {
         let parent = root
             .parent()
             .ok_or(AssociationSessionError::CacheUnavailable)?;
@@ -1115,6 +1115,13 @@ impl CompletedAssociationSession {
     }
     pub(crate) fn completion(&self) -> &AssociationSessionCompletionV1 {
         &self.inner.marker
+    }
+
+    #[cfg(test)]
+    pub(crate) fn completion_mut_for_test(&mut self) -> &mut AssociationSessionCompletionV1 {
+        &mut Arc::get_mut(&mut self.inner)
+            .expect("test fixture must hold the only completed-session handle")
+            .marker
     }
 }
 struct CompletedInner {

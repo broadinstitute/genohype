@@ -1,17 +1,23 @@
 use super::server::{self, DatasetService, ServerState};
 use super::*;
+use crate::association_session::{
+    AssociationSessionRegistry, CompletedAssociationSession, NormalizedSessionRequestV1,
+    SessionCompletion, SessionLookup,
+};
 use axum::body::{to_bytes, Body};
 use axum::http::{header, Method, Request, StatusCode};
 use genohype_association::{
-    AssociationBuildV1, AssociationPageV1, AssociationPointV1, AssociationStore,
-    AssociationThresholdV1, AssociationVisualizationManifestV1,
-    AssociationVisualizationResourcesV1, DatasetIdV1, GenomeLayoutV1, PlotKindV1,
-    ResourceDescriptorV1, SqliteAssociationStore, COORDINATE_CONVENTION_V1, SCHEMA_VERSION_V1,
+    AssociationBuildV1, AssociationPageV1, AssociationPointV1, AssociationRasterizer,
+    AssociationStore, AssociationThresholdV1, AssociationVisualizationManifestV1,
+    AssociationVisualizationResourcesV1, Background, DatasetIdV1, GenomeLayoutV1, NeverCancel,
+    NormalizedFieldMappingV1, PlotKindV1, ResourceDescriptorV1, SessionBackgroundV1,
+    SqliteAssociationStore, COORDINATE_CONVENTION_V1, SCHEMA_VERSION_V1, STORE_SCHEMA_VERSION_V1,
 };
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
+use tempfile::TempDir;
 use tower::ServiceExt;
 
 fn artifact_bytes() -> (AssociationVisualizationManifestV1, Vec<u8>) {
@@ -131,6 +137,157 @@ fn write_dataset(path: &Path) {
     store
         .complete_build(&id, &format!("sha256:{}", "a".repeat(64)))
         .unwrap();
+}
+
+fn completed_ephemeral_session() -> (TempDir, CompletedAssociationSession, PathBuf) {
+    let temp = tempfile::tempdir().unwrap();
+    let registry = AssociationSessionRegistry::open_for_test(temp.path().join("registry")).unwrap();
+    let source = temp.path().join("source.tsv");
+    fs::write(&source, b"CHR\tPOS\tP\n1\t10\t1e-8\n").unwrap();
+    let layout = GenomeLayoutV1::new(vec![("1".to_string(), 100)], 32, 16, 0).unwrap();
+    let request = NormalizedSessionRequestV1 {
+        association_schema_version: SCHEMA_VERSION_V1.into(),
+        store_schema_version: STORE_SCHEMA_VERSION_V1,
+        mapping: NormalizedFieldMappingV1 {
+            contig: "CHR".into(),
+            position: "POS".into(),
+            ref_allele: None,
+            alt_allele: None,
+            pvalue: Some("P".into()),
+            neg_log10_p: None,
+            beta: None,
+            se: None,
+            af: None,
+            ac: None,
+            gene: None,
+            consequence: None,
+            series: None,
+        },
+        assembly: "GRCh38".into(),
+        thresholds: vec![AssociationThresholdV1 {
+            name: "genome_wide_significance".into(),
+            pvalue: 5e-8,
+        }],
+        significance_threshold: 5e-8,
+        top_hits: 1,
+        width: layout.width,
+        height: layout.height,
+        layout_hash: layout.layout_hash("GRCh38"),
+        point_radius: 2.5,
+        point_alpha: 178,
+        background: SessionBackgroundV1::White,
+        renderer_version: "test".into(),
+    };
+    let lookup = SessionLookup::observe_local(&source, request).unwrap();
+    let claim = registry.claim(lookup).unwrap();
+    let id = claim.dataset_id().clone();
+    let fingerprint = format!("sha256:{}", "a".repeat(64));
+    let association_point = point("1", 10, 1e-8, "GENE1", 0);
+
+    let mut store = SqliteAssociationStore::create(claim.database_path()).unwrap();
+    store
+        .begin_build(&AssociationBuildV1 {
+            dataset_id: id.clone(),
+            created_at: "unix:1".into(),
+        })
+        .unwrap();
+    store
+        .insert_points(&id, std::slice::from_ref(&association_point))
+        .unwrap();
+    store
+        .replace_top_hits(&id, std::slice::from_ref(&association_point))
+        .unwrap();
+    store.complete_build(&id, &fingerprint).unwrap();
+    drop(store);
+
+    let mut rasterizer = AssociationRasterizer::from_layout(&layout, Background::White).unwrap();
+    rasterizer
+        .render_association_point(&layout, &association_point, 2.5, 178)
+        .unwrap();
+    let raster = rasterizer.png_bytes().unwrap();
+    let manifest = AssociationVisualizationManifestV1 {
+        schema_version: SCHEMA_VERSION_V1.into(),
+        plot_id: id.to_string(),
+        kind: PlotKindV1::Manhattan,
+        title: "Ephemeral production-path fixture".into(),
+        assembly: "GRCh38".into(),
+        coordinate_convention: COORDINATE_CONVENTION_V1.into(),
+        source_fingerprint: fingerprint.clone(),
+        genohype_version: "test".into(),
+        created_at: "unix:1".into(),
+        layout: layout.clone(),
+        layout_hash: layout.layout_hash("GRCh38"),
+        thresholds: vec![AssociationThresholdV1 {
+            name: "genome_wide_significance".into(),
+            pvalue: 5e-8,
+        }],
+        row_count: 1,
+        valid_row_count: 1,
+        skipped_row_count: 0,
+        rendered_point_count: 1,
+        significant_hit_count: 1,
+        top_hits: vec![association_point],
+        warnings: vec![],
+        resources: AssociationVisualizationResourcesV1 {
+            raster: ResourceDescriptorV1 {
+                url: "raster.png".into(),
+                media_type: "image/png".into(),
+                byte_size: Some(raster.len() as u64),
+                checksum: Some(format!("sha256:{:x}", Sha256::digest(&raster))),
+                expires_at: None,
+            },
+            region_api: Some(ResourceDescriptorV1 {
+                url: format!("datasets/{id}/region"),
+                media_type: "application/json".into(),
+                byte_size: None,
+                checksum: None,
+                expires_at: None,
+            }),
+            table_api: Some(ResourceDescriptorV1 {
+                url: format!("datasets/{id}/table"),
+                media_type: "application/json".into(),
+                byte_size: None,
+                checksum: None,
+                expires_at: None,
+            }),
+        },
+    };
+    claim.write_raster(&raster, &NeverCancel).unwrap();
+    claim.write_manifest(&manifest, &NeverCancel).unwrap();
+    let session = claim
+        .publish(
+            SessionCompletion {
+                source_fingerprint: fingerprint,
+                created_at: UNIX_EPOCH + Duration::from_secs(1),
+                expires_at: None,
+                ephemeral: true,
+            },
+            &NeverCancel,
+        )
+        .unwrap();
+    let generation = session.database_path().parent().unwrap().to_path_buf();
+    assert!(generation.is_dir());
+    (temp, session, generation)
+}
+
+fn refresh_database_completion_marker(session: &mut CompletedAssociationSession) {
+    let database = fs::read(session.database_path()).unwrap();
+    {
+        let marker = session.completion_mut_for_test();
+        marker.database.byte_size = database.len() as u64;
+        marker.database.checksum = format!("sha256:{:x}", Sha256::digest(&database));
+    }
+    let mut marker = serde_json::to_vec_pretty(session.completion()).unwrap();
+    marker.push(b'\n');
+    fs::write(
+        session
+            .database_path()
+            .parent()
+            .unwrap()
+            .join("complete.json"),
+        marker,
+    )
+    .unwrap();
 }
 
 async fn router_response(
@@ -623,6 +780,119 @@ fn browser_open_failure_keeps_manual_url_available() {
     })
     .unwrap();
     assert!(stderr.is_empty());
+}
+
+#[test]
+fn production_dataset_serve_fails_closed_for_changed_completed_session_state() {
+    let (_temp, session, generation) = completed_ephemeral_session();
+    let marker_path = generation.join("complete.json");
+    let mut marker: serde_json::Value =
+        serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
+    marker["created_at"] = serde_json::json!("unix:2");
+    fs::write(&marker_path, serde_json::to_vec_pretty(&marker).unwrap()).unwrap();
+    let error = serve_dataset_viewer(
+        session,
+        ViewerOptions {
+            port: 0,
+            open: false,
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("session marker changed"));
+    assert!(!generation.exists());
+
+    let (_temp, session, generation) = completed_ephemeral_session();
+    fs::write(session.raster_path(), b"not the completed raster").unwrap();
+    let error = serve_dataset_viewer(
+        session,
+        ViewerOptions {
+            port: 0,
+            open: false,
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("raster"));
+    assert!(!generation.exists());
+
+    let (_temp, mut session, generation) = completed_ephemeral_session();
+    let connection = rusqlite::Connection::open(session.database_path()).unwrap();
+    connection
+        .execute("UPDATE association_datasets SET status='building'", [])
+        .unwrap();
+    drop(connection);
+    refresh_database_completion_marker(&mut session);
+    let error = serve_dataset_viewer(
+        session,
+        ViewerOptions {
+            port: 0,
+            open: false,
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("required build state"));
+    assert!(!generation.exists());
+
+    let (_temp, mut session, generation) = completed_ephemeral_session();
+    let (_other_temp, other_session, other_generation) = completed_ephemeral_session();
+    fs::copy(other_session.database_path(), session.database_path()).unwrap();
+    refresh_database_completion_marker(&mut session);
+    let error = serve_dataset_viewer(
+        session,
+        ViewerOptions {
+            port: 0,
+            open: false,
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("required build state"));
+    assert!(!generation.exists());
+    assert!(other_generation.exists());
+    drop(other_session);
+    assert!(!other_generation.exists());
+}
+
+#[tokio::test]
+async fn production_dataset_router_retains_ephemeral_session_until_shutdown_drop() {
+    let (_temp, session, generation) = completed_ephemeral_session();
+    let dataset_id = session.dataset_id().clone();
+    let prepared = prepare_dataset_artifacts(&session).unwrap();
+    let dataset = DatasetService::from_session(session);
+    dataset.validate_complete().await.unwrap();
+    let token = server::generate_url_token();
+    let app = server::build_router(
+        ServerState::new(token.clone(), prepared.manifest, prepared.raster).with_dataset(dataset),
+    );
+    assert!(
+        generation.exists(),
+        "router state must retain the generation"
+    );
+
+    let listener = server::bind_loopback(0).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(server::serve_with_shutdown(listener, app, async move {
+        let _ = shutdown_rx.await;
+    }));
+    let url = format!("http://{address}/{token}/api/datasets/{dataset_id}/table?limit=1");
+    let response = reqwest::get(url).await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let page: AssociationPageV1 = response.json().await.unwrap();
+    assert_eq!(page.total, 1);
+    assert!(
+        generation.exists(),
+        "live server state dropped the generation"
+    );
+
+    shutdown_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("server did not shut down")
+        .unwrap()
+        .unwrap();
+    assert!(
+        !generation.exists(),
+        "final server-state drop must delete the ephemeral generation"
+    );
 }
 
 #[tokio::test]
