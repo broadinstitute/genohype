@@ -1,0 +1,63 @@
+{
+  "schema_version": "1.0",
+  "dataset_id": "123e4567-e89b-42d3-a456-426614174000",
+  "title": "Height locus",
+  "assembly": "GRCh38",
+  "coordinate_convention": "1-based-inclusive",
+  "source_fingerprint": "sha256:fixture",
+  "layout": {
+    "contig": "4",
+    "contig_length": 190214555,
+    "requested_start": 68000111,
+    "requested_end": 68999001,
+    "effective_start": 68000001,
+    "effective_end": 69000000,
+    "requested_width": 777,
+    "width": 800,
+    "height": 320,
+    "dpr": 2,
+    "physical_width": 1600,
+    "physical_height": 640,
+    "y_scale": {
+      "height": 640,
+      "log_threshold": 10.0,
+      "linear_fraction": 0.6,
+      "max_neg_log_p": 350.0
+    }
+  },
+  "layout_hash": "sha256:58e894ece562c4722bf4385139b9d73d3a86fb1eddc41b42d265dcaff56c4d4f",
+  "render_hash": "sha256:35f568ed68feae4d126044e0d44a00fac919be8b6a8d4bd3293e639ad88aff13",
+  "significance_threshold": 5e-8,
+  "counts": {
+    "source_point_count": 3,
+    "rasterized_point_count": 3,
+    "significant_point_count": 2,
+    "coding_point_count": 1,
+    "selected_point_count": 1,
+    "overlay_point_count": 3
+  },
+  "aggregation": {
+    "rule_id": "pixel_strata_v1",
+    "input_point_count": 3,
+    "protected_selected_count": 1,
+    "protected_significant_count": 2,
+    "protected_coding_count": 1,
+    "protected_union_count": 3,
+    "ordinary_input_count": 0,
+    "ordinary_budget": 997,
+    "rendered_ordinary_count": 0,
+    "omitted_ordinary_count": 0,
+    "rasterized_point_count": 3,
+    "overlay_point_count": 3
+  },
+  "resources": {
+    "raster": {
+      "url": "region/raster/fixture.png",
+      "media_type": "image/png"
+    },
+    "overlay": {
+      "url": "region/overlay/fixture.json",
+      "media_type": "application/json"
+    }
+  }
+}

@@ -8,6 +8,8 @@ const schemaDirectory = resolve(scriptDirectory, '../../../../association/schema
 const schemaFiles = [
   'association-visualization-v1.schema.json',
   'association-page-v1.schema.json',
+  'association-region-render-v1.schema.json',
+  'association-region-overlay-v1.schema.json',
 ];
 const schemas = schemaFiles.map((file) => {
   const bytes = readFileSync(resolve(schemaDirectory, file));

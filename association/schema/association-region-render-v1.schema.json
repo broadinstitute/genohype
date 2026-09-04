@@ -1,0 +1,411 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AssociationRegionRenderManifestV1",
+  "type": "object",
+  "properties": {
+    "aggregation": {
+      "$ref": "#/$defs/RegionAggregationDisclosureV1"
+    },
+    "assembly": {
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 1
+    },
+    "coordinate_convention": {
+      "type": "string"
+    },
+    "counts": {
+      "$ref": "#/$defs/AssociationRegionCountsV1"
+    },
+    "dataset_id": {
+      "$ref": "#/$defs/DatasetIdV1"
+    },
+    "layout": {
+      "$ref": "#/$defs/RegionLayoutV1"
+    },
+    "layout_hash": {
+      "type": "string",
+      "maxLength": 71,
+      "minLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "render_hash": {
+      "type": "string",
+      "maxLength": 71,
+      "minLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "resources": {
+      "$ref": "#/$defs/AssociationRegionResourcesV1"
+    },
+    "schema_version": {
+      "type": "string",
+      "pattern": "^1\\.[0-9]+$"
+    },
+    "significance_threshold": {
+      "type": "number",
+      "format": "double"
+    },
+    "source_fingerprint": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1
+    },
+    "title": {
+      "type": "string",
+      "maxLength": 512,
+      "minLength": 1
+    }
+  },
+  "required": [
+    "schema_version",
+    "dataset_id",
+    "title",
+    "assembly",
+    "coordinate_convention",
+    "source_fingerprint",
+    "layout",
+    "layout_hash",
+    "render_hash",
+    "significance_threshold",
+    "counts",
+    "aggregation",
+    "resources"
+  ],
+  "$defs": {
+    "AssociationRegionCountsV1": {
+      "type": "object",
+      "properties": {
+        "coding_point_count": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0
+        },
+        "overlay_point_count": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0
+        },
+        "rasterized_point_count": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0
+        },
+        "selected_point_count": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0
+        },
+        "significant_point_count": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0
+        },
+        "source_point_count": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0
+        }
+      },
+      "required": [
+        "source_point_count",
+        "rasterized_point_count",
+        "significant_point_count",
+        "coding_point_count",
+        "selected_point_count",
+        "overlay_point_count"
+      ]
+    },
+    "AssociationRegionResourcesV1": {
+      "type": "object",
+      "properties": {
+        "overlay": {
+          "$ref": "#/$defs/ResourceDescriptorV1"
+        },
+        "raster": {
+          "$ref": "#/$defs/ResourceDescriptorV1"
+        }
+      },
+      "required": [
+        "raster",
+        "overlay"
+      ]
+    },
+    "DatasetIdV1": {
+      "description": "Browser-safe opaque dataset identifier. V1 uses canonical lowercase UUID-v4 text.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "RegionAggregationDisclosureV1": {
+      "description": "Complete accounting for dense raster input and bounded semantic output.\nCategory counts may overlap; `protected_union_count` is their exact union.",
+      "type": "object",
+      "properties": {
+        "input_point_count": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0
+        },
+        "omitted_ordinary_count": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0
+        },
+        "ordinary_budget": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0
+        },
+        "ordinary_input_count": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0
+        },
+        "overlay_point_count": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0
+        },
+        "protected_coding_count": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0
+        },
+        "protected_selected_count": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0
+        },
+        "protected_significant_count": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0
+        },
+        "protected_union_count": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0
+        },
+        "rasterized_point_count": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0
+        },
+        "rendered_ordinary_count": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0
+        },
+        "rule_id": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 1
+        }
+      },
+      "required": [
+        "rule_id",
+        "input_point_count",
+        "protected_selected_count",
+        "protected_significant_count",
+        "protected_coding_count",
+        "protected_union_count",
+        "ordinary_input_count",
+        "ordinary_budget",
+        "rendered_ordinary_count",
+        "omitted_ordinary_count",
+        "rasterized_point_count",
+        "overlay_point_count"
+      ]
+    },
+    "RegionLayoutV1": {
+      "description": "Canonical quantized region geometry. `width` and `height` are logical CSS\npixels; `physical_*` are the exact raster dimensions.",
+      "type": "object",
+      "properties": {
+        "contig": {
+          "type": "string",
+          "maxLength": 4096,
+          "minLength": 1
+        },
+        "contig_length": {
+          "type": "integer",
+          "format": "int64",
+          "maximum": 9007199254740991,
+          "minimum": 1
+        },
+        "dpr": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 4,
+          "minimum": 1
+        },
+        "effective_end": {
+          "type": "integer",
+          "format": "int64",
+          "maximum": 9007199254740991,
+          "minimum": 1
+        },
+        "effective_start": {
+          "type": "integer",
+          "format": "int64",
+          "maximum": 9007199254740991,
+          "minimum": 1
+        },
+        "height": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 2048,
+          "minimum": 64
+        },
+        "physical_height": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 16384,
+          "minimum": 1
+        },
+        "physical_width": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 16384,
+          "minimum": 1
+        },
+        "requested_end": {
+          "type": "integer",
+          "format": "int64",
+          "maximum": 9007199254740991,
+          "minimum": 1
+        },
+        "requested_start": {
+          "type": "integer",
+          "format": "int64",
+          "maximum": 9007199254740991,
+          "minimum": 1
+        },
+        "requested_width": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 4096,
+          "minimum": 50
+        },
+        "width": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 4100,
+          "minimum": 50
+        },
+        "y_scale": {
+          "$ref": "#/$defs/YScale"
+        }
+      },
+      "required": [
+        "contig",
+        "contig_length",
+        "requested_start",
+        "requested_end",
+        "effective_start",
+        "effective_end",
+        "requested_width",
+        "width",
+        "height",
+        "dpr",
+        "physical_width",
+        "physical_height",
+        "y_scale"
+      ]
+    },
+    "ResourceDescriptorV1": {
+      "description": "Browser-fetchable artifact or API route. URLs must be relative and credential-free.",
+      "type": "object",
+      "properties": {
+        "byte_size": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0
+        },
+        "checksum": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 256
+        },
+        "expires_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 64
+        },
+        "media_type": {
+          "type": "string",
+          "maxLength": 255,
+          "minLength": 1
+        },
+        "url": {
+          "type": "string",
+          "maxLength": 2048,
+          "pattern": "^[^/\\\\?:#@%][^\\\\?:#@%]*$"
+        }
+      },
+      "required": [
+        "url",
+        "media_type"
+      ]
+    },
+    "YScale": {
+      "description": "Canonical hybrid linear/logarithmic Manhattan y scale.",
+      "type": "object",
+      "properties": {
+        "height": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 1
+        },
+        "linear_fraction": {
+          "type": "number",
+          "format": "double",
+          "maximum": 0.6,
+          "minimum": 0.6
+        },
+        "log_threshold": {
+          "type": "number",
+          "format": "double",
+          "maximum": 10.0,
+          "minimum": 10.0
+        },
+        "max_neg_log_p": {
+          "type": "number",
+          "format": "double",
+          "maximum": 350.0,
+          "minimum": 350.0
+        }
+      },
+      "required": [
+        "height",
+        "log_threshold",
+        "linear_fraction",
+        "max_neg_log_p"
+      ]
+    }
+  }
+}

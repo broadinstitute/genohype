@@ -1,0 +1,121 @@
+{
+  "schema_version": "1.0",
+  "layout_hash": "sha256:58e894ece562c4722bf4385139b9d73d3a86fb1eddc41b42d265dcaff56c4d4f",
+  "render_hash": "sha256:35f568ed68feae4d126044e0d44a00fac919be8b6a8d4bd3293e639ad88aff13",
+  "layout": {
+    "contig": "4",
+    "contig_length": 190214555,
+    "requested_start": 68000111,
+    "requested_end": 68999001,
+    "effective_start": 68000001,
+    "effective_end": 69000000,
+    "requested_width": 777,
+    "width": 800,
+    "height": 320,
+    "dpr": 2,
+    "physical_width": 1600,
+    "physical_height": 640,
+    "y_scale": {
+      "height": 640,
+      "log_threshold": 10.0,
+      "linear_fraction": 0.6,
+      "max_neg_log_p": 350.0
+    }
+  },
+  "significance_threshold": 5e-8,
+  "points": [
+    {
+      "point": {
+        "contig": "4",
+        "position": 68000001,
+        "ref_allele": "A",
+        "alt_allele": "G",
+        "pvalue": 0.0,
+        "neg_log10_p": 400.0,
+        "beta": 0.1,
+        "standard_error": 0.02,
+        "allele_frequency": 0.01,
+        "allele_count": 20.0,
+        "gene_symbol": "GENE1",
+        "consequence": "stop_gained",
+        "series": "genome",
+        "source_ordinal": 7
+      },
+      "selected": false,
+      "significant": true,
+      "coding": true,
+      "ordinary_representative": false
+    },
+    {
+      "point": {
+        "contig": "4",
+        "position": 68500000,
+        "ref_allele": "A",
+        "alt_allele": "G",
+        "pvalue": 1e-12,
+        "neg_log10_p": 12.0,
+        "beta": 0.1,
+        "standard_error": 0.02,
+        "allele_frequency": 0.01,
+        "allele_count": 20.0,
+        "gene_symbol": "GENE1",
+        "consequence": "intron_variant",
+        "series": "genome",
+        "source_ordinal": 8
+      },
+      "selected": false,
+      "significant": true,
+      "coding": false,
+      "ordinary_representative": false
+    },
+    {
+      "point": {
+        "contig": "4",
+        "position": 68999999,
+        "ref_allele": "A",
+        "alt_allele": "G",
+        "pvalue": 0.5,
+        "neg_log10_p": 0.3010299956639812,
+        "beta": 0.1,
+        "standard_error": 0.02,
+        "allele_frequency": 0.01,
+        "allele_count": 20.0,
+        "gene_symbol": "GENE1",
+        "consequence": "intron_variant",
+        "series": "genome",
+        "source_ordinal": 9
+      },
+      "selected": true,
+      "significant": false,
+      "coding": false,
+      "ordinary_representative": false
+    }
+  ],
+  "gene_annotations": {
+    "state": "available",
+    "features": [
+      {
+        "id": "ENSG000001",
+        "symbol": "GENE1",
+        "contig": "4",
+        "start": 68100000,
+        "end": 68900000,
+        "strand": "plus"
+      }
+    ]
+  },
+  "aggregation": {
+    "rule_id": "pixel_strata_v1",
+    "input_point_count": 3,
+    "protected_selected_count": 1,
+    "protected_significant_count": 2,
+    "protected_coding_count": 1,
+    "protected_union_count": 3,
+    "ordinary_input_count": 0,
+    "ordinary_budget": 997,
+    "rendered_ordinary_count": 0,
+    "omitted_ordinary_count": 0,
+    "rasterized_point_count": 3,
+    "overlay_point_count": 3
+  }
+}

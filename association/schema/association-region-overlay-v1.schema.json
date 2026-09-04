@@ -1,0 +1,500 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AssociationRegionOverlayV1",
+  "type": "object",
+  "properties": {
+    "aggregation": {
+      "$ref": "#/$defs/RegionAggregationDisclosureV1"
+    },
+    "gene_annotations": {
+      "$ref": "#/$defs/GeneAnnotationsV1"
+    },
+    "layout": {
+      "$ref": "#/$defs/RegionLayoutV1"
+    },
+    "layout_hash": {
+      "type": "string",
+      "maxLength": 71,
+      "minLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "points": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AssociationRegionOverlayPointV1"
+      },
+      "maxItems": 1000
+    },
+    "render_hash": {
+      "type": "string",
+      "maxLength": 71,
+      "minLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "schema_version": {
+      "type": "string",
+      "pattern": "^1\\.[0-9]+$"
+    },
+    "significance_threshold": {
+      "type": "number",
+      "format": "double"
+    }
+  },
+  "required": [
+    "schema_version",
+    "layout_hash",
+    "render_hash",
+    "layout",
+    "significance_threshold",
+    "points",
+    "gene_annotations",
+    "aggregation"
+  ],
+  "$defs": {
+    "AssociationPointV1": {
+      "description": "Canonical normalized single-variant association row.",
+      "type": "object",
+      "properties": {
+        "allele_count": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "minimum": 0.0
+        },
+        "allele_frequency": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "maximum": 1.0,
+          "minimum": 0.0
+        },
+        "alt_allele": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 4096
+        },
+        "beta": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "consequence": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 4096
+        },
+        "contig": {
+          "type": "string",
+          "maxLength": 4096,
+          "minLength": 1
+        },
+        "gene_symbol": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 4096
+        },
+        "neg_log10_p": {
+          "type": "number",
+          "format": "double",
+          "minimum": 0.0
+        },
+        "position": {
+          "type": "integer",
+          "format": "int64",
+          "maximum": 9007199254740991,
+          "minimum": 1
+        },
+        "pvalue": {
+          "type": "number",
+          "format": "double",
+          "maximum": 1.0,
+          "minimum": 0.0
+        },
+        "ref_allele": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 4096
+        },
+        "series": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 4096
+        },
+        "source_ordinal": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0
+        },
+        "standard_error": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        }
+      },
+      "required": [
+        "contig",
+        "position",
+        "pvalue",
+        "neg_log10_p",
+        "source_ordinal"
+      ]
+    },
+    "AssociationRegionOverlayPointV1": {
+      "type": "object",
+      "properties": {
+        "coding": {
+          "description": "Derived only from the fixed `coding_consequence_v1` SO vocabulary.",
+          "type": "boolean"
+        },
+        "ordinary_representative": {
+          "type": "boolean"
+        },
+        "point": {
+          "$ref": "#/$defs/AssociationPointV1"
+        },
+        "selected": {
+          "description": "Exact selection identity is `point.source_ordinal`.",
+          "type": "boolean"
+        },
+        "significant": {
+          "description": "Strictly `pvalue < threshold`, with p-value zero included as underflow.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "point",
+        "selected",
+        "significant",
+        "coding",
+        "ordinary_representative"
+      ]
+    },
+    "GeneAnnotationStateV1": {
+      "type": "string",
+      "enum": [
+        "unavailable",
+        "available",
+        "error"
+      ]
+    },
+    "GeneAnnotationsV1": {
+      "type": "object",
+      "properties": {
+        "features": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/GeneFeatureV1"
+          },
+          "maxItems": 1000
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 1024
+        },
+        "state": {
+          "$ref": "#/$defs/GeneAnnotationStateV1"
+        }
+      },
+      "required": [
+        "state",
+        "features"
+      ]
+    },
+    "GeneFeatureV1": {
+      "type": "object",
+      "properties": {
+        "contig": {
+          "type": "string",
+          "maxLength": 4096,
+          "minLength": 1
+        },
+        "end": {
+          "type": "integer",
+          "format": "int64",
+          "maximum": 9007199254740991,
+          "minimum": 1
+        },
+        "id": {
+          "type": "string",
+          "maxLength": 4096,
+          "minLength": 1
+        },
+        "start": {
+          "type": "integer",
+          "format": "int64",
+          "maximum": 9007199254740991,
+          "minimum": 1
+        },
+        "strand": {
+          "$ref": "#/$defs/GeneStrandV1"
+        },
+        "symbol": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 4096
+        }
+      },
+      "required": [
+        "id",
+        "contig",
+        "start",
+        "end",
+        "strand"
+      ]
+    },
+    "GeneStrandV1": {
+      "type": "string",
+      "enum": [
+        "plus",
+        "minus",
+        "unknown"
+      ]
+    },
+    "RegionAggregationDisclosureV1": {
+      "description": "Complete accounting for dense raster input and bounded semantic output.\nCategory counts may overlap; `protected_union_count` is their exact union.",
+      "type": "object",
+      "properties": {
+        "input_point_count": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0
+        },
+        "omitted_ordinary_count": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0
+        },
+        "ordinary_budget": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0
+        },
+        "ordinary_input_count": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0
+        },
+        "overlay_point_count": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0
+        },
+        "protected_coding_count": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0
+        },
+        "protected_selected_count": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0
+        },
+        "protected_significant_count": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0
+        },
+        "protected_union_count": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0
+        },
+        "rasterized_point_count": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0
+        },
+        "rendered_ordinary_count": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0
+        },
+        "rule_id": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 1
+        }
+      },
+      "required": [
+        "rule_id",
+        "input_point_count",
+        "protected_selected_count",
+        "protected_significant_count",
+        "protected_coding_count",
+        "protected_union_count",
+        "ordinary_input_count",
+        "ordinary_budget",
+        "rendered_ordinary_count",
+        "omitted_ordinary_count",
+        "rasterized_point_count",
+        "overlay_point_count"
+      ]
+    },
+    "RegionLayoutV1": {
+      "description": "Canonical quantized region geometry. `width` and `height` are logical CSS\npixels; `physical_*` are the exact raster dimensions.",
+      "type": "object",
+      "properties": {
+        "contig": {
+          "type": "string",
+          "maxLength": 4096,
+          "minLength": 1
+        },
+        "contig_length": {
+          "type": "integer",
+          "format": "int64",
+          "maximum": 9007199254740991,
+          "minimum": 1
+        },
+        "dpr": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 4,
+          "minimum": 1
+        },
+        "effective_end": {
+          "type": "integer",
+          "format": "int64",
+          "maximum": 9007199254740991,
+          "minimum": 1
+        },
+        "effective_start": {
+          "type": "integer",
+          "format": "int64",
+          "maximum": 9007199254740991,
+          "minimum": 1
+        },
+        "height": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 2048,
+          "minimum": 64
+        },
+        "physical_height": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 16384,
+          "minimum": 1
+        },
+        "physical_width": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 16384,
+          "minimum": 1
+        },
+        "requested_end": {
+          "type": "integer",
+          "format": "int64",
+          "maximum": 9007199254740991,
+          "minimum": 1
+        },
+        "requested_start": {
+          "type": "integer",
+          "format": "int64",
+          "maximum": 9007199254740991,
+          "minimum": 1
+        },
+        "requested_width": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 4096,
+          "minimum": 50
+        },
+        "width": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 4100,
+          "minimum": 50
+        },
+        "y_scale": {
+          "$ref": "#/$defs/YScale"
+        }
+      },
+      "required": [
+        "contig",
+        "contig_length",
+        "requested_start",
+        "requested_end",
+        "effective_start",
+        "effective_end",
+        "requested_width",
+        "width",
+        "height",
+        "dpr",
+        "physical_width",
+        "physical_height",
+        "y_scale"
+      ]
+    },
+    "YScale": {
+      "description": "Canonical hybrid linear/logarithmic Manhattan y scale.",
+      "type": "object",
+      "properties": {
+        "height": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 1
+        },
+        "linear_fraction": {
+          "type": "number",
+          "format": "double",
+          "maximum": 0.6,
+          "minimum": 0.6
+        },
+        "log_threshold": {
+          "type": "number",
+          "format": "double",
+          "maximum": 10.0,
+          "minimum": 10.0
+        },
+        "max_neg_log_p": {
+          "type": "number",
+          "format": "double",
+          "maximum": 350.0,
+          "minimum": 350.0
+        }
+      },
+      "required": [
+        "height",
+        "log_threshold",
+        "linear_fraction",
+        "max_neg_log_p"
+      ]
+    }
+  }
+}
