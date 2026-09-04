@@ -3,6 +3,7 @@ import { resolve } from 'node:path';
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
+import { computeLayoutHash } from '@genohype/association-viz';
 import { App, associationManifestUrl, loadAssociationViewer } from './App.js';
 
 type Json = Record<string, any>;
@@ -13,8 +14,27 @@ function fixture(): Json {
   ));
 }
 
-function response(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
+function response(body: unknown, status = 200, url?: string): Response {
+  const result = new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
+  if (url) Object.defineProperty(result, 'url', { configurable: true, value: url });
+  return result;
+}
+
+function locusRootFixture(): Json {
+  const root = fixture();
+  root.plot_id = '123e4567-e89b-42d3-a456-426614174000';
+  root.layout.contigs = [{ name: '4', length: 190214555, x_start: 0, x_end: 100, color: '#404040' }];
+  root.top_hits = root.top_hits.map((hit: Json, index: number) => ({
+    ...hit, contig: '4', position: 68_500_000 + index, source_ordinal: index === 0 ? 9 : 8,
+  }));
+  root.layout_hash = computeLayoutHash(root.layout, root.assembly);
+  delete root.resources.table_api;
+  root.resources.region_api.url = 'datasets/123e4567-e89b-42d3-a456-426614174000/region';
+  return root;
+}
+
+function regionFixture(name: string): Json {
+  return JSON.parse(readFileSync(resolve(process.cwd(), `../../../association/tests/fixtures/${name}`), 'utf8'));
 }
 
 describe('association viewer app', () => {
@@ -199,5 +219,82 @@ describe('association viewer app', () => {
     await userEvent.click(firstRow);
     expect(firstRow).toHaveAttribute('aria-selected', 'true');
     expect(document.querySelector('.association-hit-selection')).toBeInTheDocument();
+    expect(new URL(window.location.href).searchParams.get('selected')).toBe(String(fixture().top_hits[0].source_ordinal));
+  });
+
+  it('navigates chromosome clicks with history while retaining token-root API requests', async () => {
+    vi.stubGlobal('ResizeObserver', class { observe() {} disconnect() {} unobserve() {} });
+    const root = fixture();
+    delete root.resources.table_api;
+    const pending = new Promise<Response>(() => {});
+    const fetchMock = vi.fn((input: URL | RequestInfo) => {
+      const url = new URL(String(input));
+      return url.pathname === '/token/api/manifest' ? Promise.resolve(response(root)) : pending;
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    render(<App />);
+    await waitFor(() => expect(document.querySelector('[data-route="root"]')).toBeInTheDocument());
+    const image = screen.getByRole('img');
+    vi.spyOn(image, 'getBoundingClientRect').mockReturnValue({
+      x: 0, y: 0, top: 0, left: 0, right: 100, bottom: 50, width: 100, height: 50, toJSON: () => ({}),
+    });
+    fireEvent.load(image);
+    await userEvent.click(await screen.findByRole('button', { name: 'Chromosome 1' }));
+    expect(window.location.pathname).toBe('/token/chromosome/1');
+    await waitFor(() => expect(fetchMock.mock.calls.some(([input]) =>
+      new URL(String(input)).pathname === '/token/api/datasets/height-genome/chromosomes/1/manifest')).toBe(true));
+    expect(screen.getByRole('status')).toHaveTextContent('Loading association detail');
+  });
+
+  it('loads a direct locus route, rebases resources, and synchronizes selected overlay/table state', async () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 857 });
+    Object.defineProperty(window, 'devicePixelRatio', { configurable: true, value: 2 });
+    window.history.replaceState(null, '', '/token/locus/4/68000111-68999001?selected=9');
+    const root = locusRootFixture();
+    const regionManifest = regionFixture('association-region-render-v1.json');
+    const overlay = regionFixture('association-region-overlay-v1.json');
+    const selected = overlay.points.find((entry: Json) => entry.point.source_ordinal === 9).point;
+    const page = {
+      schema_version: '1.0', dataset_id: root.plot_id, points: [selected], offset: 0, limit: 100, total: 3,
+      sort: null, direction: null, search: null,
+    };
+    const fetchMock = vi.fn((input: URL | RequestInfo) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/token/api/manifest') return Promise.resolve(response(root));
+      if (url.pathname.endsWith('/region/manifest')) {
+        return Promise.resolve(response(regionManifest, 200, `https://example.test/token/api/datasets/${root.plot_id}/region/manifest`));
+      }
+      if (url.pathname.endsWith('/region/overlay/fixture.json')) return Promise.resolve(response(overlay));
+      if (url.pathname.endsWith(`/datasets/${root.plot_id}/region`)) return Promise.resolve(response(page));
+      return Promise.resolve(response({}, 404));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    render(<App />);
+    await waitFor(() => expect(document.querySelector('[data-route="locus"]')).toBeInTheDocument());
+    expect(screen.getAllByText('GENE1').length).toBeGreaterThan(0);
+    await waitFor(() => expect(within(screen.getByRole('table')).getAllByRole('row')[1]).toHaveAttribute('aria-selected', 'true'));
+    const manifestRequest = new URL(String(fetchMock.mock.calls.find(([input]) => String(input).includes('/region/manifest'))?.[0]));
+    expect(Object.fromEntries(manifestRequest.searchParams)).toMatchObject({
+      contig: '4', start: '68000111', end: '68999001', width: '777', height: '320', dpr: '2', selected: '9',
+    });
+    expect(fetchMock.mock.calls.some(([input]) => String(input).includes('limit=100'))).toBe(true);
+    expect(fetchMock.mock.calls.every(([input]) => !String(input).includes('limit=1001'))).toBe(true);
+  });
+
+  it('reacts to popstate and canonicalizes aliases after the root manifest loads', async () => {
+    const root = fixture();
+    delete root.resources.table_api;
+    const fetchMock = vi.fn((input: URL | RequestInfo) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/token/api/manifest') return Promise.resolve(response(root));
+      return new Promise<Response>(() => {});
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    render(<App />);
+    await waitFor(() => expect(document.querySelector('[data-route="root"]')).toBeInTheDocument());
+    window.history.pushState(null, '', '/token/chromosome/chr02?selected=2');
+    fireEvent.popState(window);
+    await waitFor(() => expect(window.location.href).toBe('https://example.test/token/chromosome/2?selected=2'));
+    expect(screen.getByRole('status')).toHaveTextContent('Loading association detail');
   });
 });

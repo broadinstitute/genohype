@@ -75,6 +75,21 @@ describe('association table page transport', () => {
     expect(url.href).toContain('search=BRCA1+%26+10%25_hits');
   });
 
+  it('preserves fixed inclusive region parameters without sending unsupported table controls', () => {
+    const url = associationTablePageUrl(
+      new URL('https://example.test/token/api/datasets/id/region?contig=4&start=1&end=1000000'),
+      100,
+      100,
+      'locus',
+      'ascending',
+      'ignored for bounded region pages',
+      'region',
+    );
+    expect(Object.fromEntries(url.searchParams)).toEqual({
+      contig: '4', start: '1', end: '1000000', offset: '100', limit: '100',
+    });
+  });
+
   it('manages paging, sort, and debounced search state', async () => {
     const hits = fixture().top_hits as AssociationPointV1[];
     const fetchMock = vi.fn(async (input: URL | RequestInfo) => {

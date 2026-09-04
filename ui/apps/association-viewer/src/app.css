@@ -16,6 +16,15 @@ body { margin: 0; }
 .association-viewer-app > header h1,
 .viewer-state h1 { margin: 0; font-size: 22px; }
 .association-viewer-app > header p { margin: 5px 0 20px; color: #646b75; }
+.association-viewer-navigation { display: flex; gap: 8px; margin-bottom: 14px; }
+.association-viewer-navigation button { cursor: pointer; }
+.association-detail-empty {
+  border: 1px solid #cbd3df;
+  border-radius: 5px;
+  padding: 10px 12px;
+  background: #f6f8fb;
+  color: #505966;
+}
 .viewer-state { display: grid; align-content: center; justify-items: center; text-align: center; }
 .viewer-error { color: #982735; }
 .association-table-fallback {

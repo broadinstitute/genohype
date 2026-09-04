@@ -32,6 +32,7 @@ interface UseAssociationTablePageOptions {
   total: number;
   limit?: number;
   debounceMs?: number;
+  requestKind?: 'table' | 'region';
 }
 
 function boundedSearch(input: string): string {
@@ -54,15 +55,20 @@ export function associationTablePageUrl(
   sort: AssociationTableSortV1,
   direction: AssociationSortDirectionV1,
   search: string,
+  requestKind: 'table' | 'region' = 'table',
 ): URL {
-  const params = new URLSearchParams();
-  params.set('offset', String(offset));
-  params.set('limit', String(limit));
-  params.set('sort', sort);
-  params.set('direction', direction);
-  params.set('search', search);
   const url = new URL(tableApiUrl.href);
-  url.search = params.toString();
+  url.searchParams.set('offset', String(offset));
+  url.searchParams.set('limit', String(limit));
+  if (requestKind === 'table') {
+    url.searchParams.set('sort', sort);
+    url.searchParams.set('direction', direction);
+    url.searchParams.set('search', search);
+  } else {
+    url.searchParams.delete('sort');
+    url.searchParams.delete('direction');
+    url.searchParams.delete('search');
+  }
   return url;
 }
 
@@ -72,13 +78,14 @@ export function useAssociationTablePage({
   total: manifestTotal,
   limit = ASSOCIATION_TABLE_PAGE_LIMIT,
   debounceMs = ASSOCIATION_TABLE_SEARCH_DEBOUNCE_MS,
+  requestKind = 'table',
 }: UseAssociationTablePageOptions): AssociationTablePageState {
   const [rows, setRows] = useState<readonly AssociationPointV1[]>(fallbackRows);
   const [total, setTotal] = useState(manifestTotal);
   const [offset, setOffsetState] = useState(0);
   const [query, setQueryState] = useState('');
   const [debouncedQuery, setDebouncedQuery] = useState('');
-  const [sort, setSortState] = useState<AssociationTableSortV1>('pvalue');
+  const [sort, setSortState] = useState<AssociationTableSortV1>(requestKind === 'region' ? 'locus' : 'pvalue');
   const [direction, setDirection] = useState<AssociationSortDirectionV1>('ascending');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -110,6 +117,7 @@ export function useAssociationTablePage({
       sort,
       direction,
       debouncedQuery,
+      requestKind,
     );
     setLoading(true);
     setError(null);
@@ -134,9 +142,9 @@ export function useAssociationTablePage({
       if (
         page.offset !== offset
         || page.limit !== limit
-        || page.sort !== sort
-        || page.direction !== direction
-        || (page.search ?? '') !== debouncedQuery
+        || (requestKind === 'table' && page.sort !== sort)
+        || (requestKind === 'table' && page.direction !== direction)
+        || (requestKind === 'table' && (page.search ?? '') !== debouncedQuery)
         || page.points.length > limit
         || page.total < page.offset + page.points.length
       ) {
@@ -159,7 +167,7 @@ export function useAssociationTablePage({
     });
 
     return () => controller.abort();
-  }, [debouncedQuery, direction, limit, offset, query, retryCount, sort, tableApiHref]);
+  }, [debouncedQuery, direction, limit, offset, query, requestKind, retryCount, sort, tableApiHref]);
 
   const setQuery = useCallback((nextQuery: string) => {
     setQueryState(boundedSearch(nextQuery));
