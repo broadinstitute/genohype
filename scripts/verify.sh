@@ -6,7 +6,10 @@ cd "$repo_root"
 
 ./scripts/test-release.sh
 ./scripts/build-dashboard.sh
-./scripts/build-association-viewer.sh
+if [[ "${GENOHYPE_UI_DEPS_INSTALLED:-0}" != "1" ]]; then
+  (cd ui && npm ci)
+fi
+./scripts/build-association-viewer.sh --check --skip-install
 (
   cd ui
   npm run build

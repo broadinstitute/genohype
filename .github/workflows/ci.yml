@@ -18,6 +18,7 @@ jobs:
     timeout-minutes: 60
     env:
       CARGO_TERM_COLOR: always
+      GENOHYPE_UI_DEPS_INSTALLED: 1
     steps:
       - uses: actions/checkout@v7
 
