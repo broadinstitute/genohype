@@ -57,6 +57,7 @@ fn local_worker_scan_publishes_canonical_bounded_receipt_last() {
     assert_eq!(first.skipped_row_count, 2);
     assert_eq!(first.rendered_point_count, 10);
     assert_eq!(first.significant_hit_count, 5);
+    assert_eq!(first.threshold, Some(5e-8));
     assert_eq!(first.top_hits.len(), 10);
     assert_eq!(first.warnings, ["pvalue_underflow"]);
     assert!(first.top_hits.iter().all(|point| point.source_ordinal < 12));

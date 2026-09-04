@@ -51,9 +51,10 @@ pub struct ManhattanPartitionRasterArtifactV1 {
 ///
 /// The best points are kept in canonical association order and are hard-bounded
 /// at 100. `source_digest` fingerprints every decoded row, including skipped
-/// rows, while excluding input and output paths. `raster` binds canonical
-/// publication to the exact finalized whole-genome PNG shard. It remains
-/// optional on the wire solely so pre-binding receipts can be read for diagnostics.
+/// rows, while excluding input and output paths. `threshold` binds significant-hit
+/// classification to the scan configuration and `raster` binds canonical publication
+/// to the exact finalized whole-genome PNG shard. Both remain optional on the wire
+/// solely so older receipts can be read for diagnostics.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ManhattanPartitionReductionReceiptV1 {
     pub schema_version: String,
@@ -64,6 +65,8 @@ pub struct ManhattanPartitionReductionReceiptV1 {
     pub skipped_row_count: u64,
     pub rendered_point_count: u64,
     pub significant_hit_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<f64>,
     pub top_hits: Vec<AssociationPointV1>,
     pub warnings: Vec<String>,
     pub source_digest: String,
@@ -81,6 +84,8 @@ struct ManhattanPartitionReductionReceiptWireV1 {
     skipped_row_count: u64,
     rendered_point_count: u64,
     significant_hit_count: u64,
+    #[serde(default)]
+    threshold: Option<f64>,
     top_hits: Vec<AssociationPointV1>,
     warnings: Vec<String>,
     source_digest: String,
@@ -103,6 +108,7 @@ impl<'de> Deserialize<'de> for ManhattanPartitionReductionReceiptV1 {
             skipped_row_count: wire.skipped_row_count,
             rendered_point_count: wire.rendered_point_count,
             significant_hit_count: wire.significant_hit_count,
+            threshold: wire.threshold,
             top_hits: wire.top_hits,
             warnings: wire.warnings,
             source_digest: wire.source_digest,
@@ -133,6 +139,9 @@ impl ManhattanPartitionReductionReceiptV1 {
         }
         if self.significant_hit_count > self.valid_row_count {
             return Err("significant_hit_count cannot exceed valid_row_count".into());
+        }
+        if let Some(threshold) = self.threshold {
+            validate_threshold(threshold)?;
         }
         let expected_top_hits =
             self.valid_row_count
@@ -236,6 +245,12 @@ impl ManhattanPartitionReductionReceiptV1 {
 
     pub(crate) fn to_json_bytes(&self) -> Result<Vec<u8>> {
         self.validate().map_err(HailError::InvalidFormat)?;
+        if self.threshold.is_none() {
+            return Err(HailError::InvalidFormat(
+                "cannot publish a Manhattan partition reduction receipt without a scan threshold"
+                    .into(),
+            ));
+        }
         if self.raster.is_none() {
             return Err(HailError::InvalidFormat(
                 "cannot publish an unbound Manhattan partition reduction receipt".into(),
@@ -263,15 +278,21 @@ pub(crate) struct ManhattanPartitionReductionAccumulatorV1 {
     skipped_row_count: u64,
     rendered_point_count: u64,
     significant_hit_count: u64,
+    threshold: f64,
     top_hits: TopK,
     warnings: BTreeSet<String>,
     source_hasher: Sha256,
 }
 
 impl ManhattanPartitionReductionAccumulatorV1 {
-    pub(crate) fn new(partition_index: usize, source: ManhattanSource) -> Result<Self> {
+    pub(crate) fn new(
+        partition_index: usize,
+        source: ManhattanSource,
+        threshold: f64,
+    ) -> Result<Self> {
         // Fail before scanning if a stable partition+row ordinal cannot be formed.
         source_ordinal(partition_index, 0)?;
+        validate_threshold(threshold).map_err(HailError::InvalidFormat)?;
         let source = ManhattanReductionSourceV1::from(source);
         // Reuse the integrated/legacy partition domain so a later bounded merge can
         // produce the same source fingerprint regardless of execution mode.
@@ -284,6 +305,7 @@ impl ManhattanPartitionReductionAccumulatorV1 {
             skipped_row_count: 0,
             rendered_point_count: 0,
             significant_hit_count: 0,
+            threshold,
             top_hits: TopK::new(MANHATTAN_PARTITION_TOP_HITS_MAX_V1)
                 .map_err(|error| HailError::InvalidFormat(error.to_string()))?,
             warnings: BTreeSet::new(),
@@ -370,6 +392,7 @@ impl ManhattanPartitionReductionAccumulatorV1 {
             skipped_row_count: self.skipped_row_count,
             rendered_point_count: self.rendered_point_count,
             significant_hit_count: self.significant_hit_count,
+            threshold: Some(self.threshold),
             top_hits: self.top_hits.into_sorted_vec(),
             warnings: self.warnings.into_iter().collect(),
             source_digest: format!("sha256:{:x}", self.source_hasher.finalize()),
@@ -387,6 +410,7 @@ impl ManhattanPartitionReductionAccumulatorV1 {
 pub(crate) fn merge_partition_reduction_receipts_in_order<I>(
     expected_source: ManhattanReductionSourceV1,
     expected_partition_count: usize,
+    expected_threshold: f64,
     receipts: I,
 ) -> Result<LegacyScanSummary>
 where
@@ -397,6 +421,7 @@ where
             "distributed Manhattan source has no expected partitions".into(),
         ));
     }
+    validate_threshold(expected_threshold).map_err(HailError::InvalidFormat)?;
     let mut row_count = 0_u64;
     let mut valid_row_count = 0_u64;
     let mut skipped_row_count = 0_u64;
@@ -419,6 +444,21 @@ where
                 "Manhattan partition {} has wrong source identity",
                 receipt.partition_index
             )));
+        }
+        match receipt.threshold {
+            Some(threshold) if threshold.to_bits() == expected_threshold.to_bits() => {}
+            Some(threshold) => {
+                return Err(HailError::InvalidFormat(format!(
+                    "Manhattan partition {} scan threshold {threshold} does not match aggregate threshold {expected_threshold}",
+                    receipt.partition_index
+                )))
+            }
+            None => {
+                return Err(HailError::InvalidFormat(format!(
+                    "Manhattan partition {} reduction receipt has no scan threshold",
+                    receipt.partition_index
+                )))
+            }
         }
         if receipt.partition_index != expected_index as u64 {
             return Err(HailError::InvalidFormat(format!(
@@ -481,6 +521,7 @@ where
 pub(crate) fn merge_partition_reduction_receipts(
     expected_source: ManhattanReductionSourceV1,
     expected_partition_count: usize,
+    expected_threshold: f64,
     mut receipts: Vec<ManhattanPartitionReductionReceiptV1>,
 ) -> Result<LegacyScanSummary> {
     receipts.sort_by_key(|receipt| receipt.partition_index);
@@ -495,8 +536,16 @@ pub(crate) fn merge_partition_reduction_receipts(
     merge_partition_reduction_receipts_in_order(
         expected_source,
         expected_partition_count,
+        expected_threshold,
         receipts.into_iter().map(Ok),
     )
+}
+
+fn validate_threshold(threshold: f64) -> std::result::Result<(), String> {
+    if !threshold.is_finite() || threshold <= 0.0 || threshold > 1.0 {
+        return Err("scan threshold must be finite and in (0, 1]".into());
+    }
+    Ok(())
 }
 
 fn validate_sha256(digest: &str, name: &str) -> std::result::Result<(), String> {
@@ -569,7 +618,7 @@ mod tests {
     #[test]
     fn receipt_round_trips_with_stable_wire_names() {
         let mut accumulator =
-            ManhattanPartitionReductionAccumulatorV1::new(0, ManhattanSource::Exome).unwrap();
+            ManhattanPartitionReductionAccumulatorV1::new(0, ManhattanSource::Exome, 5e-8).unwrap();
         accumulator
             .observe_source_row(&EncodedValue::Int32(7))
             .unwrap();
@@ -580,6 +629,10 @@ mod tests {
         let json = serde_json::to_string(&receipt).unwrap();
         assert!(json.contains("\"source\":\"exome\""));
         assert!(json.contains("\"schema_version\":\"1.0\""));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap()["threshold"],
+            serde_json::json!(5e-8)
+        );
         let decoded: ManhattanPartitionReductionReceiptV1 = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, receipt);
     }
@@ -587,7 +640,8 @@ mod tests {
     #[test]
     fn receipt_is_bounded_and_counts_every_observation() {
         let mut accumulator =
-            ManhattanPartitionReductionAccumulatorV1::new(3, ManhattanSource::Genome).unwrap();
+            ManhattanPartitionReductionAccumulatorV1::new(3, ManhattanSource::Genome, 5e-8)
+                .unwrap();
         for row in 0..150_u32 {
             accumulator
                 .observe_source_row(&EncodedValue::Int32(row as i32))
@@ -636,6 +690,7 @@ mod tests {
                 skipped_row_count: 1,
                 rendered_point_count: top_hits.len() as u64,
                 significant_hit_count: pvalues.iter().filter(|&&p| p < 5e-8).count() as u64,
+                threshold: Some(5e-8),
                 top_hits,
                 warnings: vec!["pvalue_underflow".into()],
                 source_digest: format!("sha256:{:064x}", partition_index + 1),
@@ -648,12 +703,14 @@ mod tests {
         let forward = merge_partition_reduction_receipts(
             ManhattanReductionSourceV1::Exome,
             2,
+            5e-8,
             vec![first.clone(), second.clone()],
         )
         .unwrap();
         let reverse = merge_partition_reduction_receipts(
             ManhattanReductionSourceV1::Exome,
             2,
+            5e-8,
             vec![second, first],
         )
         .unwrap();
@@ -687,6 +744,7 @@ mod tests {
             skipped_row_count: 0,
             rendered_point_count: 0,
             significant_hit_count: 0,
+            threshold: Some(5e-8),
             top_hits: vec![],
             warnings: vec![],
             source_digest: format!("sha256:{:064x}", partition_index + 1),
@@ -696,6 +754,7 @@ mod tests {
         assert!(merge_partition_reduction_receipts(
             ManhattanReductionSourceV1::Exome,
             2,
+            5e-8,
             vec![zero.clone()]
         )
         .unwrap_err()
@@ -704,6 +763,7 @@ mod tests {
         assert!(merge_partition_reduction_receipts(
             ManhattanReductionSourceV1::Exome,
             2,
+            5e-8,
             vec![zero.clone(), zero.clone()]
         )
         .unwrap_err()
@@ -712,6 +772,7 @@ mod tests {
         assert!(merge_partition_reduction_receipts(
             ManhattanReductionSourceV1::Genome,
             1,
+            5e-8,
             vec![zero]
         )
         .unwrap_err()
@@ -720,9 +781,40 @@ mod tests {
     }
 
     #[test]
+    fn canonical_merge_rejects_absent_and_mismatched_scan_thresholds() {
+        let receipt =
+            ManhattanPartitionReductionAccumulatorV1::new(0, ManhattanSource::Exome, 5e-8)
+                .unwrap()
+                .finish()
+                .unwrap();
+
+        let mut absent = receipt.clone();
+        absent.threshold = None;
+        let error = merge_partition_reduction_receipts(
+            ManhattanReductionSourceV1::Exome,
+            1,
+            5e-8,
+            vec![absent],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("no scan threshold"));
+
+        let error = merge_partition_reduction_receipts(
+            ManhattanReductionSourceV1::Exome,
+            1,
+            1e-6,
+            vec![receipt],
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match aggregate threshold"));
+    }
+
+    #[test]
     fn deserialization_rejects_unbounded_or_inconsistent_receipts() {
         let mut accumulator =
-            ManhattanPartitionReductionAccumulatorV1::new(0, ManhattanSource::Exome).unwrap();
+            ManhattanPartitionReductionAccumulatorV1::new(0, ManhattanSource::Exome, 5e-8).unwrap();
         accumulator
             .observe_source_row(&EncodedValue::Int32(1))
             .unwrap();
@@ -758,16 +850,19 @@ mod tests {
     #[test]
     fn old_unbound_receipts_deserialize_for_diagnostics_but_cannot_publish() {
         let accumulator =
-            ManhattanPartitionReductionAccumulatorV1::new(0, ManhattanSource::Exome).unwrap();
+            ManhattanPartitionReductionAccumulatorV1::new(0, ManhattanSource::Exome, 5e-8).unwrap();
         let receipt = accumulator.finish().unwrap();
-        let json = serde_json::to_string(&receipt).unwrap();
+        let mut value = serde_json::to_value(&receipt).unwrap();
+        value.as_object_mut().unwrap().remove("threshold");
+        let json = serde_json::to_string(&value).unwrap();
         let decoded: ManhattanPartitionReductionReceiptV1 = serde_json::from_str(&json).unwrap();
         assert!(decoded.raster.is_none());
+        assert!(decoded.threshold.is_none());
         assert!(decoded
             .to_json_bytes()
             .unwrap_err()
             .to_string()
-            .contains("unbound"));
+            .contains("without a scan threshold"));
         assert!(decoded
             .verify_finalized_raster("part-00000.png", 1, 1, b"not a png")
             .unwrap_err()
@@ -778,7 +873,7 @@ mod tests {
     #[test]
     fn producer_refuses_receipts_above_the_ingestion_byte_limit() {
         let mut accumulator =
-            ManhattanPartitionReductionAccumulatorV1::new(0, ManhattanSource::Exome).unwrap();
+            ManhattanPartitionReductionAccumulatorV1::new(0, ManhattanSource::Exome, 5e-8).unwrap();
         accumulator
             .observe_source_row(&EncodedValue::Int32(1))
             .unwrap();
@@ -801,7 +896,7 @@ mod tests {
     #[test]
     fn receipt_validation_rejects_noncanonical_warning_vocabulary() {
         let accumulator =
-            ManhattanPartitionReductionAccumulatorV1::new(0, ManhattanSource::Exome).unwrap();
+            ManhattanPartitionReductionAccumulatorV1::new(0, ManhattanSource::Exome, 5e-8).unwrap();
         let receipt = accumulator.finish().unwrap();
         let mut value = serde_json::to_value(receipt).unwrap();
         value["warnings"] = serde_json::json!(["partition-specific-warning-00000"]);
@@ -826,6 +921,7 @@ mod tests {
                 skipped_row_count: 0,
                 rendered_point_count: 0,
                 significant_hit_count: 0,
+                threshold: Some(5e-8),
                 top_hits: vec![],
                 warnings: vec!["pvalue_underflow".into()],
                 source_digest: format!("sha256:{:064x}", partition_index + 1),
@@ -835,6 +931,7 @@ mod tests {
         let merged = merge_partition_reduction_receipts_in_order(
             ManhattanReductionSourceV1::Genome,
             PARTITIONS,
+            5e-8,
             receipts,
         )
         .unwrap();
@@ -845,7 +942,7 @@ mod tests {
     #[test]
     fn deserialization_rejects_truncated_and_noncanonical_top_hits() {
         let mut accumulator =
-            ManhattanPartitionReductionAccumulatorV1::new(0, ManhattanSource::Exome).unwrap();
+            ManhattanPartitionReductionAccumulatorV1::new(0, ManhattanSource::Exome, 5e-8).unwrap();
         for row in 0..3 {
             accumulator
                 .observe_source_row(&EncodedValue::Int32(row))

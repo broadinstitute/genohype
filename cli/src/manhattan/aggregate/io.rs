@@ -3,6 +3,7 @@
 //! This module handles local and cloud file operations for parquet files,
 //! directory discovery, cleanup, and size calculations.
 
+use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use genohype_core::error::Result;
 use genohype_core::io::is_cloud_path;
@@ -121,8 +122,14 @@ pub(crate) fn list_cloud_parquet_files(dir: &str, suffix: &str) -> Result<Vec<St
 // Parquet Reading
 // =============================================================================
 
-/// Read all record batches from a parquet file.
-pub(crate) fn read_parquet_file(path: &str) -> Result<Vec<RecordBatch>> {
+/// The file-level Arrow schema and all record batches decoded from one Parquet file.
+pub(crate) struct ParquetFile {
+    pub(crate) schema: SchemaRef,
+    pub(crate) batches: Vec<RecordBatch>,
+}
+
+/// Read the file schema and all record batches from a parquet file.
+pub(crate) fn read_parquet_file(path: &str) -> Result<ParquetFile> {
     if is_cloud_path(path) {
         read_cloud_parquet_file(path)
     } else {
@@ -131,17 +138,18 @@ pub(crate) fn read_parquet_file(path: &str) -> Result<Vec<RecordBatch>> {
 }
 
 /// Read parquet from local filesystem.
-pub(crate) fn read_local_parquet_file(path: &str) -> Result<Vec<RecordBatch>> {
+pub(crate) fn read_local_parquet_file(path: &str) -> Result<ParquetFile> {
     let file = File::open(path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let schema = builder.schema().clone();
     let reader = builder.build()?;
 
-    let batches: Vec<RecordBatch> = reader.collect::<std::result::Result<_, _>>()?;
-    Ok(batches)
+    let batches = reader.collect::<std::result::Result<_, _>>()?;
+    Ok(ParquetFile { schema, batches })
 }
 
 /// Read parquet from cloud storage.
-pub(crate) fn read_cloud_parquet_file(path: &str) -> Result<Vec<RecordBatch>> {
+pub(crate) fn read_cloud_parquet_file(path: &str) -> Result<ParquetFile> {
     use genohype_core::io::{get_file_size, range_read};
 
     // Download entire file to memory (sig.parquet files are small)
@@ -151,10 +159,11 @@ pub(crate) fn read_cloud_parquet_file(path: &str) -> Result<Vec<RecordBatch>> {
     // bytes::Bytes implements ChunkReader
     let bytes = bytes::Bytes::from(data);
     let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)?;
+    let schema = builder.schema().clone();
     let reader = builder.build()?;
 
-    let batches: Vec<RecordBatch> = reader.collect::<std::result::Result<_, _>>()?;
-    Ok(batches)
+    let batches = reader.collect::<std::result::Result<_, _>>()?;
+    Ok(ParquetFile { schema, batches })
 }
 
 // =============================================================================

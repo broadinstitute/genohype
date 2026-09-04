@@ -200,8 +200,11 @@ pub fn process_manhattan_scan_v2(
             let mut renderer = ManhattanRenderer::new_transparent(width, height);
             let mut chrom_renderers: HashMap<String, ManhattanRenderer> = HashMap::new();
             let mut chrom_layouts: HashMap<String, ChromosomeLayout> = HashMap::new();
-            let mut reduction =
-                ManhattanPartitionReductionAccumulatorV1::new(partition_id, spec.source)?;
+            let mut reduction = ManhattanPartitionReductionAccumulatorV1::new(
+                partition_id,
+                spec.source,
+                threshold,
+            )?;
 
             // Significant rows are streamed in bounded batches rather than retained in memory.
             let sig_file = format!("{}/part-{:05}-sig.parquet", output_base, partition_id);
@@ -514,7 +517,7 @@ fn verify_compatibility_significant_hits(
                 "compatibility significant-hit entry for {source} must be absent when the canonical count is zero"
             )));
         }
-        let batches = crate::manhattan::aggregate::io::read_parquet_file(&expected_path).map_err(
+        let parquet = crate::manhattan::aggregate::io::read_parquet_file(&expected_path).map_err(
             |error| {
                 crate::HailError::InvalidFormat(format!(
                     "invalid zero-hit compatibility Parquet {expected_path}: {error}"
@@ -522,9 +525,11 @@ fn verify_compatibility_significant_hits(
             },
         )?;
         let expected_schema = crate::manhattan::sig_writer::sig_hit_schema();
-        if batches
-            .iter()
-            .any(|batch| batch.schema().as_ref() != &expected_schema || batch.num_rows() != 0)
+        if parquet.schema.as_ref() != &expected_schema
+            || parquet
+                .batches
+                .iter()
+                .any(|batch| batch.schema().as_ref() != &expected_schema || batch.num_rows() != 0)
         {
             return Err(crate::HailError::InvalidFormat(format!(
                 "zero-hit compatibility Parquet for {source} is stale or invalid"
@@ -561,7 +566,7 @@ fn verify_compatibility_significant_hits(
         )));
     }
 
-    let batches =
+    let parquet =
         crate::manhattan::aggregate::io::read_parquet_file(&entry.path).map_err(|error| {
             crate::HailError::InvalidFormat(format!(
                 "invalid compatibility significant-hit Parquet {}: {error}",
@@ -569,9 +574,14 @@ fn verify_compatibility_significant_hits(
             ))
         })?;
     let expected_schema = crate::manhattan::sig_writer::sig_hit_schema();
+    if parquet.schema.as_ref() != &expected_schema {
+        return Err(crate::HailError::InvalidFormat(format!(
+            "compatibility {source} significant-hit Parquet has the wrong file schema"
+        )));
+    }
     let mut actual_count = 0_u64;
     let mut canonical_top_present = false;
-    for batch in &batches {
+    for batch in &parquet.batches {
         if batch.schema().as_ref() != &expected_schema
             || expected_schema
                 .fields()

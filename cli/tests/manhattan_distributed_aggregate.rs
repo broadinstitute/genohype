@@ -32,6 +32,10 @@ fn canonical_scan_geometry() -> (ChromosomeLayout, YScale, HashMap<String, u32>)
 }
 
 fn scan(output: &Path, source: ManhattanSource) {
+    scan_at_threshold(output, source, 1e-7);
+}
+
+fn scan_at_threshold(output: &Path, source: ManhattanSource, threshold: f64) {
     let (layout, y_scale, contig_lengths) = canonical_scan_geometry();
     let config = ManhattanConfig::default();
     let plot_type = match source {
@@ -44,7 +48,7 @@ fn scan(output: &Path, source: ManhattanSource) {
         source,
         table_path: fixture_path().to_string_lossy().into_owned(),
         output_path: output.to_string_lossy().into_owned(),
-        threshold: 1e-7,
+        threshold,
         y_field: "Pvalue".into(),
         layout,
         y_scale,
@@ -190,6 +194,57 @@ fn aggregate_rejects_missing_duplicate_and_corrupt_receipts() {
 }
 
 #[test]
+fn aggregation_rejects_scan_and_aggregate_threshold_mismatch_before_publication() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("manhattans/meta/threshold-mismatch");
+    scan_at_threshold(&output, ManhattanSource::Exome, 5e-8);
+    let mut spec = aggregate_spec(&output, true, false);
+    spec.threshold = 1e-6;
+
+    let error = run_aggregation(&spec).unwrap_err();
+    assert!(error.to_string().contains("scan threshold"), "{error}");
+    assert!(!output.join("plots/exome_manhattan.png").exists());
+    assert!(!output.join("plots/exome_manhattan.manifest.json").exists());
+}
+
+#[test]
+fn aggregation_rejects_mixed_partition_scan_thresholds_before_publication() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("manhattans/meta/mixed-thresholds");
+    scan_at_threshold(&output, ManhattanSource::Exome, 5e-8);
+
+    fs::copy(
+        output.join("exome/part-00000.png"),
+        output.join("exome/part-00001.png"),
+    )
+    .unwrap();
+    let mut receipt: serde_json::Value =
+        serde_json::from_slice(&fs::read(output.join("exome/part-00000-reduction.json")).unwrap())
+            .unwrap();
+    receipt["partition_index"] = serde_json::json!(1);
+    receipt["threshold"] = serde_json::json!(1e-6);
+    receipt["raster"]["basename"] = serde_json::json!("part-00001.png");
+    receipt["raster"]["partition_index"] = serde_json::json!(1);
+    for hit in receipt["top_hits"].as_array_mut().unwrap() {
+        let ordinal = hit["source_ordinal"].as_u64().unwrap();
+        hit["source_ordinal"] = serde_json::json!(ordinal + (1_u64 << 32));
+    }
+    fs::write(
+        output.join("exome/part-00001-reduction.json"),
+        serde_json::to_vec(&receipt).unwrap(),
+    )
+    .unwrap();
+
+    let mut spec = aggregate_spec(&output, true, false);
+    spec.threshold = 5e-8;
+    spec.exome_partitions = Some(2);
+    let error = run_aggregation(&spec).unwrap_err();
+    assert!(error.to_string().contains("scan threshold"), "{error}");
+    assert!(!output.join("plots/exome_manhattan.png").exists());
+    assert!(!output.join("plots/exome_manhattan.manifest.json").exists());
+}
+
+#[test]
 fn aggregation_requires_exact_raster_partition_inventory_and_bounded_receipts() {
     for case in ["missing-png", "extra-png", "oversized-receipt"] {
         let temp = tempfile::tempdir().unwrap();
@@ -312,6 +367,28 @@ fn zero_hit_publication_replaces_stale_compatibility_artifacts_with_truthful_par
         .path()
         .join("manhattans/.completed_phenos/meta_zero-hits");
     assert!(marker.is_file());
+
+    // A zero-row Parquet can have no record batches, so file-level schema must
+    // still be checked rather than inferred from batches.
+    {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        let file = fs::File::create(output.join("exome_significant.parquet")).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "unrelated",
+            DataType::Utf8,
+            false,
+        )]));
+        ArrowWriter::try_new(file, schema, None)
+            .unwrap()
+            .close()
+            .unwrap();
+    }
+    let error = verify_and_checkpoint(&spec).unwrap_err();
+    assert!(error.to_string().contains("stale or invalid"), "{error}");
+    assert!(!marker.exists());
 
     fs::write(
         output.join("exome_significant.parquet"),

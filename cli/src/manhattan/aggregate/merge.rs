@@ -69,10 +69,10 @@ pub(crate) fn merge_significant_hits(
     let results: Vec<Result<(Vec<RecordBatch>, Option<TopHitCandidate>)>> = sig_files
         .par_iter()
         .map(|file_path| {
-            let batches = read_parquet_file(file_path)?;
+            let parquet = read_parquet_file(file_path)?;
             // Find top hit candidate in this file while we have it in memory
-            let top_candidate = find_top_hit_in_batches(&batches);
-            Ok((batches, top_candidate))
+            let top_candidate = find_top_hit_in_batches(&parquet.batches);
+            Ok((parquet.batches, top_candidate))
         })
         .collect();
 
@@ -207,10 +207,10 @@ pub(crate) fn merge_and_combine_hits(
     let results: Vec<Result<(Vec<RecordBatch>, Option<TopHitCandidate>)>> = sig_files
         .par_iter()
         .map(|file_path| {
-            let batches = read_parquet_file(file_path)?;
+            let parquet = read_parquet_file(file_path)?;
             // Find top hit candidate in this file while we have it in memory
-            let top_candidate = find_top_hit_in_batches(&batches);
-            Ok((batches, top_candidate))
+            let top_candidate = find_top_hit_in_batches(&parquet.batches);
+            Ok((parquet.batches, top_candidate))
         })
         .collect();
 

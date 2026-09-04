@@ -25,7 +25,9 @@ use crate::manhattan::data::{
 use crate::manhattan::genes::{render_gene_manhattan_styled, scan_gene_burden_to_parquet};
 use crate::manhattan::layout::ChromosomeLayout;
 use crate::manhattan::legacy_manifest::{write_manifest, LegacyScanSummary};
-use crate::manhattan::pipeline::composite::composite_partial_pngs_with_style_for_partitions;
+use crate::manhattan::pipeline::composite::{
+    verify_exact_partition_png_inventory, VerifiedPngCompositor,
+};
 use crate::manhattan::pipeline::composite_partial_pngs_with_style;
 use crate::manhattan::qq::scan_qq_to_parquet;
 use genohype_core::error::Result;
@@ -190,27 +192,34 @@ pub fn run_aggregation(spec: &ManhattanAggregateSpec) -> Result<(usize, serde_js
     let exome_style = spec.styling.resolve(PlotType::Exome);
     let genome_style = spec.styling.resolve(PlotType::Genome);
 
-    // Step 1: Validate and merge every expected receipt before publishing a final raster.
-    let exome_reduction = if let Some(source_path) = spec.exome_results.as_deref() {
-        Some(load_source_reduction(
+    // Step 1: Read each canonical shard exactly once, verify those bytes against its
+    // receipt, and immediately composite those same bytes. Prepare every enabled source
+    // before publishing any canonical manifest, so threshold disagreement fails closed.
+    println!("  Compositing receipt-verified partial PNGs...");
+    let exome_prepared = if let Some(source_path) = spec.exome_results.as_deref() {
+        Some(prepare_source_pngs(
             output_base,
             "exome",
             ManhattanReductionSourceV1::Exome,
             expected_partition_count(spec.exome_partitions, source_path, "exome")?,
             spec.width,
             spec.height,
+            spec.threshold,
+            &exome_style.background,
         )?)
     } else {
         None
     };
-    let genome_reduction = if let Some(source_path) = spec.genome_results.as_deref() {
-        Some(load_source_reduction(
+    let genome_prepared = if let Some(source_path) = spec.genome_results.as_deref() {
+        Some(prepare_source_pngs(
             output_base,
             "genome",
             ManhattanReductionSourceV1::Genome,
             expected_partition_count(spec.genome_partitions, source_path, "genome")?,
             spec.width,
             spec.height,
+            spec.threshold,
+            &genome_style.background,
         )?)
     } else {
         None
@@ -218,56 +227,26 @@ pub fn run_aggregation(spec: &ManhattanAggregateSpec) -> Result<(usize, serde_js
 
     // Compatibility top-hit metadata comes from the same canonical bounded reduction
     // as the source manifest. Parquet is still independently checked for the row.
-    let exome_canonical_top = exome_reduction
+    let exome_canonical_top = exome_prepared
         .as_ref()
-        .map(|reduction| compatibility_top_hit_from_reduction(reduction, "exome"))
+        .map(|prepared| compatibility_top_hit_from_reduction(&prepared.reduction, "exome"))
         .transpose()?
         .flatten();
-    let genome_canonical_top = genome_reduction
+    let genome_canonical_top = genome_prepared
         .as_ref()
-        .map(|reduction| compatibility_top_hit_from_reduction(reduction, "genome"))
+        .map(|prepared| compatibility_top_hit_from_reduction(&prepared.reduction, "genome"))
         .transpose()?
         .flatten();
 
-    // Composite each whole-genome raster, then publish its canonical sibling manifest last.
-    println!("  Compositing partial PNGs...");
-    let exome_count = if let Some(reduction) = exome_reduction {
-        composite_source_pngs(
-            output_base,
-            "exome",
-            spec.width,
-            spec.height,
-            spec.threshold,
-            &exome_style.background,
-            reduction,
-            expected_partition_count(
-                spec.exome_partitions,
-                spec.exome_results.as_deref().unwrap(),
-                "exome",
-            )?,
-        )?
-    } else {
-        0
-    };
-
-    let genome_count = if let Some(reduction) = genome_reduction {
-        composite_source_pngs(
-            output_base,
-            "genome",
-            spec.width,
-            spec.height,
-            spec.threshold,
-            &genome_style.background,
-            reduction,
-            expected_partition_count(
-                spec.genome_partitions,
-                spec.genome_results.as_deref().unwrap(),
-                "genome",
-            )?,
-        )?
-    } else {
-        0
-    };
+    // Every receipt and shard has succeeded. Canonical manifests may now be published.
+    let exome_count = exome_prepared
+        .map(|prepared| publish_prepared_source(prepared, spec.width, spec.height, spec.threshold))
+        .transpose()?
+        .unwrap_or(0);
+    let genome_count = genome_prepared
+        .map(|prepared| publish_prepared_source(prepared, spec.width, spec.height, spec.threshold))
+        .transpose()?
+        .unwrap_or(0);
 
     // Step 1b: Composite compatibility-only per-chromosome PNGs. They intentionally do
     // not claim canonical manifests because their geometry is not genome-wide.
@@ -725,23 +704,65 @@ fn expected_partition_count(
     Ok(count)
 }
 
-fn load_source_reduction(
+struct PreparedSourcePng {
+    output_stem: String,
+    reduction: LegacyScanSummary,
+    raster: Vec<u8>,
+}
+
+fn prepare_source_pngs(
     output_base: &str,
     source_name: &str,
     source: ManhattanReductionSourceV1,
     expected_partition_count: usize,
     expected_width: u32,
     expected_height: u32,
-) -> Result<LegacyScanSummary> {
+    expected_threshold: f64,
+    background: &BackgroundStyle,
+) -> Result<PreparedSourcePng> {
+    prepare_source_pngs_with_reader(
+        output_base,
+        source_name,
+        source,
+        expected_partition_count,
+        expected_width,
+        expected_height,
+        expected_threshold,
+        background,
+        |path, maximum| match maximum {
+            Some(maximum) => read_file_bytes_at_most(path, maximum),
+            None => read_file_bytes(path),
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_source_pngs_with_reader<F>(
+    output_base: &str,
+    source_name: &str,
+    source: ManhattanReductionSourceV1,
+    expected_partition_count: usize,
+    expected_width: u32,
+    expected_height: u32,
+    expected_threshold: f64,
+    background: &BackgroundStyle,
+    mut read: F,
+) -> Result<PreparedSourcePng>
+where
+    F: FnMut(&str, Option<u64>) -> Result<Vec<u8>>,
+{
     let source_dir = format!("{output_base}/{source_name}");
-    // Synthesize the complete deterministic inventory instead of listing and sorting
-    // O(P) object names. Each iterator item is fully validated before its counts or
-    // top hits enter the bounded global reduction.
+    verify_exact_partition_png_inventory(&source_dir, expected_partition_count)?;
+    let output_stem = format!("{output_base}/plots/{source_name}_manhattan");
+    let output_path = format!("{output_stem}.png");
+    let mut compositor = VerifiedPngCompositor::new(expected_width, expected_height, background)?;
+
+    // Synthesize expected names and consume each receipt and raster together. The raster
+    // Vec is verified, decoded, blended, and dropped before the next partition is read.
     let receipts = (0..expected_partition_count).map(|index| {
-        let receipt_name = format!("part-{index:05}-reduction.json");
-        let receipt_path = format!("{source_dir}/{receipt_name}");
+        let receipt_path = format!("{source_dir}/part-{index:05}-reduction.json");
         let maximum_receipt_bytes = MANHATTAN_PARTITION_REDUCTION_MAX_BYTES_V1 as u64;
-        let bytes = read_file_bytes_at_most(&receipt_path, maximum_receipt_bytes).map_err(|error| {
+        let bytes = read(&receipt_path, Some(maximum_receipt_bytes)).map_err(|error| {
             crate::HailError::InvalidFormat(format!(
                 "failed to read Manhattan reduction receipt within {maximum_receipt_bytes} byte limit: {receipt_path}: {error}"
             ))
@@ -760,11 +781,28 @@ fn load_source_reduction(
         }
         let raster_name = format!("part-{index:05}.png");
         let raster_path = format!("{source_dir}/{raster_name}");
-        let raster = read_file_bytes(&raster_path)?;
-        receipt.verify_finalized_raster(&raster_name, expected_width, expected_height, &raster)?;
+        let raster = read(&raster_path, None)?;
+        receipt.verify_finalized_raster(
+            &raster_name,
+            expected_width,
+            expected_height,
+            &raster,
+        )?;
+        compositor.composite_verified_bytes(&raster_name, &raster)?;
         Ok(receipt)
     });
-    merge_partition_reduction_receipts_in_order(source, expected_partition_count, receipts)
+    let reduction = merge_partition_reduction_receipts_in_order(
+        source,
+        expected_partition_count,
+        expected_threshold,
+        receipts,
+    )?;
+    let raster = compositor.finish(&output_path, expected_threshold)?;
+    Ok(PreparedSourcePng {
+        output_stem,
+        reduction,
+        raster,
+    })
 }
 
 fn read_file_bytes_at_most(path: &str, maximum: u64) -> Result<Vec<u8>> {
@@ -805,35 +843,15 @@ fn read_file_bytes(path: &str) -> Result<Vec<u8>> {
     }
 }
 
-/// Composite partial PNGs for a source (exome or genome) and publish its
-/// canonical manifest only after the complete raster can be read and digested.
-fn composite_source_pngs(
-    output_base: &str,
-    source: &str,
+/// Publish a canonical manifest from the exact final PNG bytes returned by the
+/// verified streaming compositor.
+fn publish_prepared_source(
+    prepared: PreparedSourcePng,
     width: u32,
     height: u32,
     threshold: f64,
-    background: &BackgroundStyle,
-    reduction: LegacyScanSummary,
-    expected_partition_count: usize,
 ) -> Result<u64> {
-    let parts_dir = format!("{output_base}/{source}");
-    let output_stem = format!("{output_base}/plots/{source}_manhattan");
-    let output_path = format!("{output_stem}.png");
-    let rendered_point_count = reduction.rendered_point_count;
-
-    // The transparent scan shards contain points only; draw the configured threshold
-    // while producing the final whole-genome raster.
-    composite_partial_pngs_with_style_for_partitions(
-        &parts_dir,
-        &output_path,
-        width,
-        height,
-        threshold,
-        background,
-        expected_partition_count,
-    )?;
-    let raster = read_file_bytes(&output_path)?;
+    let rendered_point_count = prepared.reduction.rendered_point_count;
     let layout = genohype_association::GenomeLayoutV1::new(
         genohype_association::canonical_contig_lengths(genohype_association::Assembly::Grch38),
         width,
@@ -841,7 +859,81 @@ fn composite_source_pngs(
         4,
     )
     .map_err(|error| crate::HailError::InvalidFormat(error.to_string()))?;
-    write_manifest(&output_stem, layout, threshold, reduction, &raster)?;
-
+    write_manifest(
+        &prepared.output_stem,
+        layout,
+        threshold,
+        prepared.reduction,
+        &prepared.raster,
+    )?;
     Ok(rendered_point_count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::distributed::manhattan::ManhattanPartitionReductionAccumulatorV1;
+    use crate::distributed::message::ManhattanSource;
+    use std::cell::Cell;
+
+    #[test]
+    fn verified_shard_bytes_are_composited_without_rereading_mutated_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("manhattans/meta/toctou");
+        let source_dir = output.join("exome");
+        std::fs::create_dir_all(output.join("plots")).unwrap();
+        std::fs::create_dir_all(&source_dir).unwrap();
+
+        let mut verified = tiny_skia::Pixmap::new(8, 8).unwrap();
+        verified.fill(tiny_skia::Color::from_rgba8(255, 0, 0, 255));
+        let verified = verified.encode_png().unwrap();
+        let mut substituted = tiny_skia::Pixmap::new(8, 8).unwrap();
+        substituted.fill(tiny_skia::Color::from_rgba8(0, 0, 255, 255));
+        let substituted = substituted.encode_png().unwrap();
+
+        let raster_path = source_dir.join("part-00000.png");
+        std::fs::write(&raster_path, &verified).unwrap();
+        let receipt =
+            ManhattanPartitionReductionAccumulatorV1::new(0, ManhattanSource::Exome, 5e-8)
+                .unwrap()
+                .finish_with_finalized_raster("part-00000.png".into(), &verified)
+                .unwrap();
+        std::fs::write(
+            source_dir.join("part-00000-reduction.json"),
+            receipt.to_json_bytes().unwrap(),
+        )
+        .unwrap();
+
+        let raster_reads = Cell::new(0usize);
+        let prepared = prepare_source_pngs_with_reader(
+            output.to_str().unwrap(),
+            "exome",
+            ManhattanReductionSourceV1::Exome,
+            1,
+            8,
+            8,
+            5e-8,
+            &BackgroundStyle::White,
+            |path, maximum| {
+                let bytes = match maximum {
+                    Some(maximum) => read_file_bytes_at_most(path, maximum)?,
+                    None => read_file_bytes(path)?,
+                };
+                if path.ends_with("part-00000.png") {
+                    raster_reads.set(raster_reads.get() + 1);
+                    // Deterministically replace the mutable path immediately after its
+                    // verified bytes have been read. Rendering must still use `bytes`.
+                    std::fs::write(path, &substituted)?;
+                }
+                Ok(bytes)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(raster_reads.get(), 1);
+        assert_eq!(std::fs::read(&raster_path).unwrap(), substituted);
+        let rendered = tiny_skia::Pixmap::decode_png(&prepared.raster).unwrap();
+        let pixel = rendered.pixel(0, 4).unwrap();
+        assert!(pixel.red() > pixel.blue());
+    }
 }

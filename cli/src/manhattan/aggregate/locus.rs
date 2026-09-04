@@ -449,7 +449,7 @@ fn generate_single_locus_core(
 
 /// Extract significant positions from the consolidated significant.parquet file.
 pub fn extract_sig_positions(parquet_path: &str) -> Result<Vec<SigPosition>> {
-    let batches = if is_cloud_path(parquet_path) {
+    let parquet = if is_cloud_path(parquet_path) {
         // For cloud paths, handle 404 (file not found) gracefully -
         // phenotypes with no significant hits won't have this file
         match read_cloud_parquet_file(parquet_path) {
@@ -474,7 +474,7 @@ pub fn extract_sig_positions(parquet_path: &str) -> Result<Vec<SigPosition>> {
 
     let mut positions = Vec::new();
 
-    for batch in &batches {
+    for batch in &parquet.batches {
         if batch.num_rows() == 0 {
             continue;
         }

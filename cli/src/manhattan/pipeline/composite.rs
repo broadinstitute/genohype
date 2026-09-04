@@ -16,6 +16,185 @@ use std::io::Write;
 use std::time::Instant;
 use tiny_skia::Pixmap;
 
+/// Incremental compositor for receipt-verified canonical shards.
+///
+/// Callers pass the exact byte slice they verified. Each shard is decoded and
+/// blended immediately, so no mutable path is reread and memory is one final
+/// canvas plus one shard.
+pub(crate) struct VerifiedPngCompositor {
+    canvas: Pixmap,
+    width: u32,
+    height: u32,
+}
+
+impl VerifiedPngCompositor {
+    pub(crate) fn new(width: u32, height: u32, background: &BackgroundStyle) -> Result<Self> {
+        let mut canvas = Pixmap::new(width, height).ok_or_else(|| {
+            HailError::Io(std::io::Error::other("Failed to create canvas pixmap"))
+        })?;
+        match background {
+            BackgroundStyle::Transparent => {}
+            BackgroundStyle::White => canvas.fill(tiny_skia::Color::WHITE),
+            BackgroundStyle::Color(hex) => canvas.fill(hex_to_color(hex, 1.0)),
+        }
+        Ok(Self {
+            canvas,
+            width,
+            height,
+        })
+    }
+
+    pub(crate) fn composite_verified_bytes(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
+        let partial = Pixmap::decode_png(bytes).map_err(|error| {
+            HailError::InvalidFormat(format!("failed to decode verified PNG {name}: {error}"))
+        })?;
+        if partial.width() != self.width || partial.height() != self.height {
+            return Err(HailError::InvalidFormat(format!(
+                "Manhattan partial PNG {name} has dimensions {}x{}, expected {}x{}",
+                partial.width(),
+                partial.height(),
+                self.width,
+                self.height
+            )));
+        }
+        self.canvas.draw_pixmap(
+            0,
+            0,
+            partial.as_ref(),
+            &tiny_skia::PixmapPaint::default(),
+            tiny_skia::Transform::identity(),
+            None,
+        );
+        Ok(())
+    }
+
+    /// Draw the threshold, encode, and write the exact returned bytes.
+    pub(crate) fn finish(mut self, output_path: &str, threshold: f64) -> Result<Vec<u8>> {
+        draw_threshold_line_on_pixmap(&mut self.canvas, self.width, threshold);
+        let png_data = self.canvas.encode_png().map_err(|error| {
+            HailError::Io(std::io::Error::other(format!(
+                "Failed to encode PNG: {error}"
+            )))
+        })?;
+        if is_cloud_path(output_path) {
+            let mut writer = StreamingCloudWriter::new(output_path)?;
+            writer.write_all(&png_data)?;
+            writer.finish()?;
+        } else {
+            fs::write(output_path, &png_data)?;
+        }
+        Ok(png_data)
+    }
+}
+
+/// Verify that the canonical shard directory has exactly the expected PNG names
+/// without retaining an O(partition count) inventory.
+pub(crate) fn verify_exact_partition_png_inventory(
+    parts_dir: &str,
+    expected_partition_count: usize,
+) -> Result<()> {
+    if is_cloud_path(parts_dir) {
+        return verify_exact_cloud_partition_png_inventory(parts_dir, expected_partition_count);
+    }
+
+    let mut count = 0usize;
+    for entry in fs::read_dir(parts_dir)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name.starts_with("part-") || !name.ends_with(".png") {
+            continue;
+        }
+        validate_partition_png_name(&name, expected_partition_count)?;
+        count += 1;
+    }
+    if count != expected_partition_count {
+        return Err(HailError::InvalidFormat(format!(
+            "expected {expected_partition_count} Manhattan partial PNGs, found {count}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_partition_png_name(name: &str, expected_partition_count: usize) -> Result<()> {
+    let index = name
+        .strip_prefix("part-")
+        .and_then(|name| name.strip_suffix(".png"))
+        .and_then(|index| index.parse::<usize>().ok())
+        .filter(|index| name == format!("part-{index:05}.png"))
+        .ok_or_else(|| {
+            HailError::InvalidFormat(format!("unexpected Manhattan partial PNG {name:?}"))
+        })?;
+    if index >= expected_partition_count {
+        return Err(HailError::InvalidFormat(format!(
+            "unexpected Manhattan partial PNG {name:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn verify_exact_cloud_partition_png_inventory(
+    parts_dir: &str,
+    expected_partition_count: usize,
+) -> Result<()> {
+    use futures::StreamExt;
+    use object_store::path::Path as ObjectPath;
+    use object_store::ObjectStore;
+    use std::sync::Arc;
+
+    let url = url::Url::parse(parts_dir)
+        .map_err(|error| HailError::InvalidFormat(format!("invalid cloud URL: {error}")))?;
+    let bucket = url
+        .host_str()
+        .ok_or_else(|| HailError::InvalidFormat("cloud URL has no bucket".into()))?;
+    let prefix = ObjectPath::from(format!(
+        "{}/",
+        url.path().trim_start_matches('/').trim_end_matches('/')
+    ));
+    let store: Arc<dyn ObjectStore> = match url.scheme() {
+        #[cfg(feature = "gcp")]
+        "gs" => genohype_core::io::get_gcs_client(bucket)?,
+        #[cfg(feature = "aws")]
+        "s3" => Arc::new(
+            object_store::aws::AmazonS3Builder::new()
+                .with_bucket_name(bucket)
+                .build()
+                .map_err(|error| HailError::InvalidFormat(error.to_string()))?,
+        ),
+        scheme => {
+            return Err(HailError::InvalidFormat(format!(
+                "unsupported cloud URL scheme: {scheme}"
+            )))
+        }
+    };
+    let runtime = tokio::runtime::Runtime::new()?;
+    let prefix_text = prefix.to_string();
+    let count = runtime.block_on(async {
+        let mut count = 0usize;
+        let mut objects = store.list(Some(&prefix));
+        while let Some(object) = objects.next().await {
+            let object = object.map_err(HailError::ObjectStore)?;
+            let location = object.location.to_string();
+            let Some(name) = location.strip_prefix(&prefix_text) else {
+                continue;
+            };
+            if name.contains('/') || !name.starts_with("part-") || !name.ends_with(".png") {
+                continue;
+            }
+            validate_partition_png_name(name, expected_partition_count)?;
+            count += 1;
+        }
+        Ok::<_, HailError>(count)
+    })?;
+    if count != expected_partition_count {
+        return Err(HailError::InvalidFormat(format!(
+            "expected {expected_partition_count} Manhattan partial PNGs, found {count}"
+        )));
+    }
+    Ok(())
+}
+
 /// Composite multiple partial PNG images into a final Manhattan plot.
 ///
 /// This function is called by the coordinator after all workers have finished
