@@ -280,6 +280,8 @@ pub(crate) struct AssociationSessionRegistry {
     /// cache clear removes. Recreating the cache tree can never replace the
     /// inode on which active sessions hold their shared lock.
     cache_clear_lock: Arc<PathBuf>,
+    #[cfg(test)]
+    after_rename_hook: Arc<std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>>,
 }
 impl AssociationSessionRegistry {
     pub(crate) fn open_default() -> Result<Self, AssociationSessionError> {
@@ -319,9 +321,24 @@ impl AssociationSessionRegistry {
         let registry = Self {
             root: Arc::new(root),
             cache_clear_lock: Arc::new(cache_clear_lock),
+            #[cfg(test)]
+            after_rename_hook: Arc::new(std::sync::Mutex::new(None)),
         };
         registry.initialize_registry()?;
         Ok(registry)
+    }
+
+    #[cfg(test)]
+    fn set_after_rename_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.after_rename_hook.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn run_after_rename_hook(&self) {
+        let hook = self.after_rename_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     pub(crate) fn lookup_valid(
@@ -930,6 +947,8 @@ impl BuildClaim {
         fs::rename(&staging, &destination).map_err(private_io)?;
         self.generation_path = Some(destination);
         sync_directory(&self.registry.root.join("sessions"))?;
+        #[cfg(test)]
+        self.registry.run_after_rename_hook();
         check_cancel(cancellation)?;
 
         let marker_checksum = checksum(&marker_bytes);
@@ -1780,6 +1799,50 @@ mod tests {
         (registry, lookup, claim, manifest)
     }
 
+    fn prepare_rebuild(
+        registry: &AssociationSessionRegistry,
+        lookup: &SessionLookup,
+        mut manifest: AssociationVisualizationManifestV1,
+    ) -> (BuildClaim, AssociationVisualizationManifestV1) {
+        let claim = registry.claim(lookup.clone()).unwrap();
+        let fingerprint = manifest.source_fingerprint.clone();
+        let mut store = SqliteAssociationStore::create(claim.database_path()).unwrap();
+        store
+            .begin_build(&AssociationBuildV1 {
+                dataset_id: claim.dataset_id().clone(),
+                created_at: manifest.created_at.clone(),
+            })
+            .unwrap();
+        store.insert_points(claim.dataset_id(), &[point()]).unwrap();
+        store
+            .replace_top_hits(claim.dataset_id(), &[point()])
+            .unwrap();
+        store
+            .complete_build(claim.dataset_id(), &fingerprint)
+            .unwrap();
+        drop(store);
+
+        let mut raster = genohype_association::AssociationRasterizer::from_layout(
+            &manifest.layout,
+            Background::White,
+        )
+        .unwrap();
+        raster
+            .render_association_point(&manifest.layout, &point(), 2.5, 178)
+            .unwrap();
+        let png = raster.png_bytes().unwrap();
+        manifest.plot_id = claim.dataset_id().to_string();
+        manifest.resources.raster.byte_size = Some(png.len() as u64);
+        manifest.resources.raster.checksum = Some(checksum(&png));
+        manifest.resources.table_api.as_mut().unwrap().url =
+            format!("datasets/{}/table", claim.dataset_id());
+        manifest.resources.region_api.as_mut().unwrap().url =
+            format!("datasets/{}/region", claim.dataset_id());
+        claim.write_raster(&png, &NeverCancel).unwrap();
+        claim.write_manifest(&manifest, &NeverCancel).unwrap();
+        (claim, manifest)
+    }
+
     #[test]
     fn identities_are_distinct_and_warm_lookup_does_not_touch_source_contents() {
         let temp = TempDir::new().unwrap();
@@ -1910,6 +1973,85 @@ mod tests {
             .lookup_valid(&lookup, SystemTime::now())
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn post_rename_failure_and_cancellation_preserve_old_generation() {
+        let temp = TempDir::new().unwrap();
+        let (registry, lookup, claim, manifest) = prepare_claim(temp.path());
+        let old = claim
+            .publish(
+                SessionCompletion {
+                    source_fingerprint: manifest.source_fingerprint.clone(),
+                    created_at: UNIX_EPOCH + Duration::from_secs(1),
+                    expires_at: Some(SystemTime::now() + Duration::from_secs(60)),
+                    ephemeral: false,
+                },
+                &NeverCancel,
+            )
+            .unwrap();
+        let old_id = old.dataset_id().clone();
+        drop(old);
+
+        let (claim, rebuilt_manifest) = prepare_rebuild(&registry, &lookup, manifest.clone());
+        let new_id = claim.dataset_id().clone();
+        let corrupt_path = temp
+            .path()
+            .join("sessions")
+            .join(new_id.as_str())
+            .join(MANIFEST_NAME);
+        registry.set_after_rename_hook(move || fs::remove_file(corrupt_path).unwrap());
+        assert!(claim
+            .publish(
+                SessionCompletion {
+                    source_fingerprint: rebuilt_manifest.source_fingerprint,
+                    created_at: UNIX_EPOCH + Duration::from_secs(1),
+                    expires_at: None,
+                    ephemeral: false,
+                },
+                &NeverCancel,
+            )
+            .is_err());
+        assert!(!temp.path().join("sessions").join(new_id.as_str()).exists());
+        assert_eq!(
+            registry
+                .lookup_valid(&lookup, SystemTime::now())
+                .unwrap()
+                .unwrap()
+                .dataset_id(),
+            &old_id
+        );
+
+        let (claim, rebuilt_manifest) = prepare_rebuild(&registry, &lookup, manifest);
+        let cancelled_id = claim.dataset_id().clone();
+        let cancellation = genohype_association::BuildCancellation::default();
+        let trigger = cancellation.clone();
+        registry.set_after_rename_hook(move || trigger.cancel());
+        assert!(matches!(
+            claim.publish(
+                SessionCompletion {
+                    source_fingerprint: rebuilt_manifest.source_fingerprint,
+                    created_at: UNIX_EPOCH + Duration::from_secs(1),
+                    expires_at: None,
+                    ephemeral: false,
+                },
+                &cancellation,
+            ),
+            Err(AssociationSessionError::Cancelled)
+        ));
+        assert!(!temp
+            .path()
+            .join("sessions")
+            .join(cancelled_id.as_str())
+            .exists());
+        assert_eq!(
+            registry
+                .lookup_valid(&lookup, SystemTime::now())
+                .unwrap()
+                .unwrap()
+                .dataset_id(),
+            &old_id
+        );
     }
 
     #[test]
