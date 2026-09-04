@@ -3,10 +3,33 @@ import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import type { AssociationPointV1 } from '../contracts/types.js';
 import { goldenManifest } from '../test/fixture.js';
-import { AssociationHitTable } from './AssociationHitTable.js';
+import {
+  AssociationHitTable,
+  type AssociationHitTableControlledProps,
+} from './AssociationHitTable.js';
 
 function dataRows(): HTMLElement[] {
   return within(screen.getByRole('table')).getAllByRole('row').slice(1).filter((row) => !row.getAttribute('aria-hidden'));
+}
+
+function controlledProps(
+  overrides: Partial<AssociationHitTableControlledProps> = {},
+): AssociationHitTableControlledProps {
+  return {
+    mode: 'server',
+    rows: goldenManifest().top_hits,
+    total: 202,
+    offset: 100,
+    limit: 100,
+    query: '',
+    sort: 'pvalue',
+    direction: 'ascending',
+    loading: false,
+    onQueryChange: vi.fn(),
+    onSortChange: vi.fn(),
+    onOffsetChange: vi.fn(),
+    ...overrides,
+  };
 }
 
 describe('AssociationHitTable', () => {
@@ -87,6 +110,116 @@ describe('AssociationHitTable', () => {
       source_ordinal: index,
     }));
     const { container } = render(<AssociationHitTable hits={hits} height={120} rowHeight={30} />);
+    expect(dataRows().length).toBeLessThan(20);
+    const viewport = container.querySelector('.association-table-viewport') as HTMLDivElement;
+    fireEvent.scroll(viewport, { target: { scrollTop: 3000 } });
+    expect(dataRows().some((row) => row.textContent?.includes('1:101'))).toBe(true);
+  });
+
+  it('renders a controlled server page exactly as received without local filtering or sorting', () => {
+    const rows = [...goldenManifest().top_hits].reverse();
+    render(<AssociationHitTable {...controlledProps({
+      rows,
+      query: 'does-not-match-any-row',
+      sort: 'locus',
+      direction: 'ascending',
+    })} />);
+
+    expect(screen.getByRole('searchbox', { name: 'Search hits' })).toHaveValue('does-not-match-any-row');
+    expect(dataRows()).toHaveLength(2);
+    expect(dataRows()[0]).toHaveTextContent('2:9');
+    expect(dataRows()[1]).toHaveTextContent('1:3 A>G');
+  });
+
+  it('delegates query and sort changes and explicitly resets the offset', async () => {
+    const user = userEvent.setup();
+    const onQueryChange = vi.fn();
+    const onSortChange = vi.fn();
+    const onOffsetChange = vi.fn();
+    render(<AssociationHitTable {...controlledProps({
+      onQueryChange,
+      onSortChange,
+      onOffsetChange,
+    })} />);
+
+    await user.type(screen.getByRole('searchbox', { name: 'Search hits' }), 'G');
+    expect(onQueryChange).toHaveBeenCalledWith('G');
+    expect(onOffsetChange).toHaveBeenCalledWith(0);
+
+    onOffsetChange.mockClear();
+    await user.click(screen.getByRole('button', { name: 'Variant' }));
+    expect(onSortChange).toHaveBeenCalledWith('locus', 'ascending');
+    expect(onOffsetChange).toHaveBeenCalledWith(0);
+
+    onOffsetChange.mockClear();
+    await user.click(screen.getByRole('button', { name: 'P-value' }));
+    expect(onSortChange).toHaveBeenCalledWith('pvalue', 'descending');
+    expect(onOffsetChange).toHaveBeenCalledWith(0);
+  });
+
+  it('shows the server range and delegates bounded previous and next pages', async () => {
+    const user = userEvent.setup();
+    const onOffsetChange = vi.fn();
+    const { rerender } = render(<AssociationHitTable {...controlledProps({ onOffsetChange })} />);
+
+    expect(screen.getByRole('status')).toHaveTextContent('101–102 of 202 hits');
+    await user.click(screen.getByRole('button', { name: 'Previous' }));
+    expect(onOffsetChange).toHaveBeenCalledWith(0);
+    await user.click(screen.getByRole('button', { name: 'Next' }));
+    expect(onOffsetChange).toHaveBeenCalledWith(200);
+
+    rerender(<AssociationHitTable {...controlledProps({ offset: 0, onOffsetChange })} />);
+    expect(screen.getByRole('button', { name: 'Previous' })).toBeDisabled();
+    rerender(<AssociationHitTable {...controlledProps({ offset: 200, total: 202, onOffsetChange })} />);
+    expect(screen.getByRole('button', { name: 'Next' })).toBeDisabled();
+  });
+
+  it('announces loading and errors without discarding already loaded rows', () => {
+    const { rerender } = render(<AssociationHitTable {...controlledProps({ loading: true })} />);
+    expect(screen.getByRole('region', { name: 'Top association hits' })).toHaveAttribute('aria-busy', 'true');
+    expect(screen.getByText('Loading association hits.')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Previous' })).toBeDisabled();
+    expect(dataRows()).toHaveLength(2);
+
+    rerender(<AssociationHitTable {...controlledProps({ error: 'The table page could not be loaded.' })} />);
+    expect(screen.getByRole('alert')).toHaveTextContent('The table page could not be loaded.');
+    expect(dataRows()).toHaveLength(2);
+  });
+
+  it('keeps an off-page controlled selection while preserving row focus and keyboard behavior', () => {
+    const onSelectedHitChange = vi.fn();
+    const offPageKey = '22:999:A:T:9000';
+    const { rerender } = render(<AssociationHitTable {...controlledProps({
+      selectedHitKey: offPageKey,
+      onSelectedHitChange,
+    })} />);
+
+    expect(dataRows().every((row) => row.getAttribute('aria-selected') === 'false')).toBe(true);
+    expect(dataRows()[0]).toHaveAttribute('tabindex', '0');
+    expect(onSelectedHitChange).not.toHaveBeenCalled();
+    dataRows()[0].focus();
+    fireEvent.keyDown(dataRows()[0], { key: 'ArrowDown' });
+    expect(onSelectedHitChange).toHaveBeenCalledWith(expect.objectContaining({ contig: '2' }));
+
+    rerender(<AssociationHitTable {...controlledProps({ selectedHitKey: '2:9:::2' })} />);
+    expect(dataRows()[1]).toHaveAttribute('aria-selected', 'true');
+  });
+
+  it('retains virtualization for controlled server pages', () => {
+    const template = goldenManifest().top_hits[0];
+    const rows: AssociationPointV1[] = Array.from({ length: 500 }, (_, index) => ({
+      ...template,
+      position: index + 1,
+      source_ordinal: index,
+    }));
+    const { container } = render(<AssociationHitTable {...controlledProps({
+      rows,
+      total: 500,
+      offset: 0,
+      limit: 500,
+      height: 120,
+      rowHeight: 30,
+    })} />);
     expect(dataRows().length).toBeLessThan(20);
     const viewport = container.querySelector('.association-table-viewport') as HTMLDivElement;
     fireEvent.scroll(viewport, { target: { scrollTop: 3000 } });

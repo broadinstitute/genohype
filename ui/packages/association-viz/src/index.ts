@@ -1,6 +1,9 @@
 export type {
+  AssociationPageV1,
   AssociationPointV1,
   AssociationResourceName,
+  AssociationSortDirectionV1,
+  AssociationTableSortV1,
   AssociationThresholdV1,
   AssociationVisualizationManifestV1,
   AssociationVisualizationResourcesV1,
@@ -12,6 +15,7 @@ export type {
 } from './contracts/types.js';
 export {
   ManifestValidationError,
+  parseAssociationPage,
   parseAssociationVisualizationManifest,
   resolveAssociationResourceUrl,
   type ManifestValidationCode,
@@ -22,6 +26,8 @@ export {
 } from './manhattan/AssociationManhattanViewer.js';
 export {
   AssociationHitTable,
+  type AssociationHitTableControlledProps,
+  type AssociationHitTableLocalProps,
   type AssociationHitTableProps,
 } from './manhattan/AssociationHitTable.js';
 export {

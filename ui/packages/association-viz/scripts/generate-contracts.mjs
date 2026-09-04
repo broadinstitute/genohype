@@ -4,13 +4,16 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
-const schemaPath = resolve(
-  scriptDirectory,
-  '../../../../association/schema/association-visualization-v1.schema.json',
-);
+const schemaDirectory = resolve(scriptDirectory, '../../../../association/schema');
+const schemaFiles = [
+  'association-visualization-v1.schema.json',
+  'association-page-v1.schema.json',
+];
+const schemas = schemaFiles.map((file) => {
+  const bytes = readFileSync(resolve(schemaDirectory, file));
+  return { file, bytes, schema: JSON.parse(bytes.toString('utf8')) };
+});
 const outputPath = resolve(scriptDirectory, '../src/contracts/types.ts');
-const schemaBytes = readFileSync(schemaPath);
-const schema = JSON.parse(schemaBytes.toString('utf8'));
 
 // Preserve the package's existing public name while deriving its shape from the
 // Rust type named `YScale` in the schema.
@@ -59,24 +62,37 @@ function emitNamedType(name, node) {
   return lines.join('\n');
 }
 
-const digest = createHash('sha256').update(schemaBytes).digest('hex');
 const blocks = [
   '/**',
   ' * GENERATED FILE — DO NOT EDIT.',
-  ' * Source: association/schema/association-visualization-v1.schema.json',
-  ` * Schema SHA-256: ${digest}`,
+  ` * Sources: ${schemaFiles.map((file) => `association/schema/${file}`).join(', ')}`,
+  ...schemas.map(({ file, bytes }) => ` * ${file} SHA-256: ${createHash('sha256').update(bytes).digest('hex')}`),
   ' * Regenerate with: npm run contracts:generate -w @genohype/association-viz',
   ' */',
   '',
 ];
-for (const [name, definition] of Object.entries(schema.$defs ?? {})) {
+
+const definitions = new Map();
+for (const { file, schema } of schemas) {
+  for (const [name, definition] of Object.entries(schema.$defs ?? {})) {
+    const existing = definitions.get(name);
+    if (existing && JSON.stringify(existing.definition) !== JSON.stringify(definition)) {
+      throw new Error(`conflicting ${name} definitions in ${existing.file} and ${file}`);
+    }
+    if (!existing) definitions.set(name, { file, definition });
+  }
+}
+for (const [name, { definition }] of definitions) {
   blocks.push(emitNamedType(name, definition), '');
 }
-blocks.push(emitNamedType(schema.title, schema), '');
+for (const { schema } of schemas) {
+  blocks.push(emitNamedType(schema.title, schema), '');
+}
 
-const resourcesRef = schema.properties?.resources?.$ref;
+const manifestSchema = schemas[0].schema;
+const resourcesRef = manifestSchema.properties?.resources?.$ref;
 const resourcesDefinition = resourcesRef
-  ? schema.$defs?.[resourcesRef.split('/').at(-1)]
+  ? manifestSchema.$defs?.[resourcesRef.split('/').at(-1)]
   : undefined;
 if (!resourcesDefinition?.properties) {
   throw new Error('manifest resources definition is missing from the schema');

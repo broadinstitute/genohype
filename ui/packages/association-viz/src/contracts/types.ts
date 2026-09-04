@@ -1,7 +1,8 @@
 /**
  * GENERATED FILE — DO NOT EDIT.
- * Source: association/schema/association-visualization-v1.schema.json
- * Schema SHA-256: d77ee42ae265bb0ff058abb73df752ac6d4463b3f825a9e148cc3bfbb3c3bb8c
+ * Sources: association/schema/association-visualization-v1.schema.json, association/schema/association-page-v1.schema.json
+ * association-visualization-v1.schema.json SHA-256: 718b10211efde93506441b17cda5ca94e6bbd926f0ff3666ab33aa71f17aa1dc
+ * association-page-v1.schema.json SHA-256: 41fed34cee5fbd5678dc8ffb0b4a6af0a5304b32a49d1b38e23289ea20ce2a00
  * Regenerate with: npm run contracts:generate -w @genohype/association-viz
  */
 
@@ -73,6 +74,12 @@ export interface YScaleV1 {
   [minorField: string]: unknown;
 }
 
+export type AssociationSortDirectionV1 = "ascending" | "descending";
+
+export type AssociationTableSortV1 = "pvalue" | "locus";
+
+export type DatasetIdV1 = string;
+
 export interface AssociationVisualizationManifestV1 {
   assembly: string;
   coordinate_convention: string;
@@ -94,6 +101,19 @@ export interface AssociationVisualizationManifestV1 {
   top_hits: AssociationPointV1[];
   valid_row_count: number;
   warnings: string[];
+  [minorField: string]: unknown;
+}
+
+export interface AssociationPageV1 {
+  dataset_id: DatasetIdV1;
+  direction?: AssociationSortDirectionV1 | null;
+  limit: number;
+  offset: number;
+  points: AssociationPointV1[];
+  schema_version: string;
+  search?: string | null;
+  sort?: AssociationTableSortV1 | null;
+  total: number;
   [minorField: string]: unknown;
 }
 

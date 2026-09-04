@@ -1,9 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import type { AssociationPointV1 } from '../contracts/types.js';
+import type {
+  AssociationPointV1,
+  AssociationSortDirectionV1,
+  AssociationTableSortV1,
+} from '../contracts/types.js';
 import { compareCanonicalContigs, stableHitKey } from './layout.js';
 
-export interface AssociationHitTableProps {
-  hits: readonly AssociationPointV1[];
+interface AssociationHitTableSharedProps {
   selectedHitKey?: string | null;
   onSelectedHitChange?: (hit: AssociationPointV1) => void;
   onHitHover?: (hit: AssociationPointV1 | null) => void;
@@ -13,8 +16,35 @@ export interface AssociationHitTableProps {
   className?: string;
 }
 
-type SortField = 'pvalue' | 'locus';
-type SortDirection = 'ascending' | 'descending';
+/** Existing bounded, client-side table behavior. */
+export interface AssociationHitTableLocalProps extends AssociationHitTableSharedProps {
+  mode?: 'local';
+  hits: readonly AssociationPointV1[];
+}
+
+/** Fetch-independent controlled mode for one server-ordered page. */
+export interface AssociationHitTableControlledProps extends AssociationHitTableSharedProps {
+  mode: 'server';
+  rows: readonly AssociationPointV1[];
+  total: number;
+  offset: number;
+  limit: number;
+  query: string;
+  sort: AssociationTableSortV1;
+  direction: AssociationSortDirectionV1;
+  loading: boolean;
+  error?: string | null;
+  onQueryChange: (query: string) => void;
+  onSortChange: (
+    sort: AssociationTableSortV1,
+    direction: AssociationSortDirectionV1,
+  ) => void;
+  onOffsetChange: (offset: number) => void;
+}
+
+export type AssociationHitTableProps =
+  | AssociationHitTableLocalProps
+  | AssociationHitTableControlledProps;
 
 function compareLocus(left: AssociationPointV1, right: AssociationPointV1): number {
   return compareCanonicalContigs(left.contig, right.contig)
@@ -34,38 +64,49 @@ function formatVariant(hit: AssociationPointV1): string {
   return `${hit.contig}:${hit.position.toLocaleString()}${alleles}`;
 }
 
-export function AssociationHitTable({
-  hits,
-  selectedHitKey,
-  onSelectedHitChange,
-  onHitHover,
-  onOpenLocus,
-  height = 320,
-  rowHeight = 42,
-  className,
-}: AssociationHitTableProps) {
+export function AssociationHitTable(props: AssociationHitTableProps) {
+  const {
+    selectedHitKey,
+    onSelectedHitChange,
+    onHitHover,
+    onOpenLocus,
+    height = 320,
+    rowHeight = 42,
+    className,
+  } = props;
+  const serverMode = props.mode === 'server';
   const viewportRef = useRef<HTMLDivElement>(null);
   const pendingFocusKey = useRef<string | null>(null);
-  const [query, setQuery] = useState('');
-  const [sortField, setSortField] = useState<SortField>('pvalue');
-  const [sortDirection, setSortDirection] = useState<SortDirection>('ascending');
+  const [localQuery, setLocalQuery] = useState('');
+  const [localSort, setLocalSort] = useState<AssociationTableSortV1>('pvalue');
+  const [localDirection, setLocalDirection] = useState<AssociationSortDirectionV1>('ascending');
   const [scrollTop, setScrollTop] = useState(0);
   const [activeKey, setActiveKey] = useState<string | null>(selectedHitKey ?? null);
+
+  const query = serverMode ? props.query : localQuery;
+  const sort = serverMode ? props.sort : localSort;
+  const direction = serverMode ? props.direction : localDirection;
+  const sourceRows = serverMode ? props.rows : props.hits;
   const rows = useMemo(() => {
+    if (serverMode) return [...sourceRows];
     const normalizedQuery = query.trim().toLowerCase();
-    const filtered = normalizedQuery ? hits.filter((hit) => searchableText(hit).includes(normalizedQuery)) : [...hits];
+    const filtered = normalizedQuery
+      ? sourceRows.filter((hit) => searchableText(hit).includes(normalizedQuery))
+      : [...sourceRows];
     filtered.sort((left, right) => {
-      const order = sortField === 'pvalue'
+      const order = sort === 'pvalue'
         ? left.pvalue - right.pvalue || right.neg_log10_p - left.neg_log10_p || compareLocus(left, right)
         : compareLocus(left, right);
-      return sortDirection === 'ascending' ? order : -order;
+      return direction === 'ascending' ? order : -order;
     });
     return filtered;
-  }, [hits, query, sortDirection, sortField]);
+  }, [direction, query, serverMode, sort, sourceRows]);
 
   useEffect(() => {
-    if (selectedHitKey) setActiveKey(selectedHitKey);
-  }, [selectedHitKey]);
+    if (selectedHitKey && rows.some((hit) => stableHitKey(hit) === selectedHitKey)) {
+      setActiveKey(selectedHitKey);
+    }
+  }, [rows, selectedHitKey]);
 
   useEffect(() => {
     if (!activeKey || rows.some((hit) => stableHitKey(hit) === activeKey)) return;
@@ -88,6 +129,13 @@ export function AssociationHitTable({
     }
   }, [height, rowHeight, rows, selectedHitKey]);
 
+  const serverOffset = serverMode ? props.offset : null;
+  useEffect(() => {
+    if (serverOffset === null) return;
+    if (viewportRef.current) viewportRef.current.scrollTop = 0;
+    setScrollTop(0);
+  }, [serverOffset]);
+
   const overscan = 3;
   const start = Math.max(0, Math.floor(scrollTop / rowHeight) - overscan);
   const visibleCount = Math.ceil(height / rowHeight) + overscan * 2;
@@ -104,17 +152,38 @@ export function AssociationHitTable({
     }
   }, [activeKey, start, end]);
 
-  const updateSort = (field: SortField) => {
-    if (sortField === field) setSortDirection((value) => value === 'ascending' ? 'descending' : 'ascending');
-    else {
-      setSortField(field);
-      setSortDirection('ascending');
+  const resetScroll = () => {
+    if (viewportRef.current) viewportRef.current.scrollTop = 0;
+    setScrollTop(0);
+  };
+
+  const updateQuery = (nextQuery: string) => {
+    resetScroll();
+    if (serverMode) {
+      props.onQueryChange(nextQuery);
+      props.onOffsetChange(0);
+    } else {
+      setLocalQuery(nextQuery);
     }
   };
 
-  const moveActive = (current: AssociationPointV1, direction: number) => {
+  const updateSort = (field: AssociationTableSortV1) => {
+    const nextDirection = sort === field
+      ? direction === 'ascending' ? 'descending' : 'ascending'
+      : 'ascending';
+    resetScroll();
+    if (serverMode) {
+      props.onSortChange(field, nextDirection);
+      props.onOffsetChange(0);
+    } else {
+      setLocalSort(field);
+      setLocalDirection(nextDirection);
+    }
+  };
+
+  const moveActive = (current: AssociationPointV1, movement: number) => {
     const index = rows.findIndex((hit) => stableHitKey(hit) === stableHitKey(current));
-    const nextIndex = Math.max(0, Math.min(rows.length - 1, index + direction));
+    const nextIndex = Math.max(0, Math.min(rows.length - 1, index + movement));
     const next = rows[nextIndex];
     if (!next) return;
     const key = stableHitKey(next);
@@ -136,20 +205,36 @@ export function AssociationHitTable({
   };
 
   const classes = ['association-table-section', className].filter(Boolean).join(' ');
+  const rangeStart = serverMode && rows.length > 0 ? props.offset + 1 : 0;
+  const rangeEnd = serverMode && rows.length > 0
+    ? Math.min(props.total, props.offset + rows.length)
+    : 0;
+  const pageStatus = serverMode
+    ? `${rangeStart.toLocaleString()}–${rangeEnd.toLocaleString()} of ${props.total.toLocaleString()} hits`
+    : `${rows.length.toLocaleString()} of ${props.hits.length.toLocaleString()} hits`;
+
   return (
-    <section className={classes} aria-label="Top association hits">
+    <section className={classes} aria-label="Top association hits" aria-busy={serverMode && props.loading}>
       <div className="association-table-toolbar">
         <label>
           <span>Search hits</span>
           <input
             type="search"
             value={query}
-            onChange={(event) => { setQuery(event.target.value); setScrollTop(0); }}
+            onChange={(event) => updateQuery(event.target.value)}
             placeholder="Variant, gene, consequence…"
           />
         </label>
-        <span role="status">{rows.length.toLocaleString()} of {hits.length.toLocaleString()} hits</span>
+        <span role="status" aria-live="polite" aria-atomic="true">{pageStatus}</span>
       </div>
+      {serverMode && (
+        <>
+          <span className="association-visually-hidden" aria-live="polite" aria-atomic="true">
+            {props.loading ? 'Loading association hits.' : `Association hits loaded. ${pageStatus}.`}
+          </span>
+          {props.error && <div className="association-table-error" role="alert">{props.error}</div>}
+        </>
+      )}
       <div
         ref={viewportRef}
         className="association-table-viewport"
@@ -159,12 +244,12 @@ export function AssociationHitTable({
         <table className="association-hit-table">
           <thead>
             <tr>
-              <th aria-sort={sortField === 'locus' ? sortDirection : 'none'}>
+              <th aria-sort={sort === 'locus' ? direction : 'none'}>
                 <button type="button" onClick={() => updateSort('locus')}>Variant</button>
               </th>
               <th>Gene</th>
               <th>Consequence</th>
-              <th aria-sort={sortField === 'pvalue' ? sortDirection : 'none'}>
+              <th aria-sort={sort === 'pvalue' ? direction : 'none'}>
                 <button type="button" onClick={() => updateSort('pvalue')}>P-value</button>
               </th>
               <th>Beta</th>
@@ -220,8 +305,26 @@ export function AssociationHitTable({
             {end < rows.length && <tr aria-hidden="true" className="association-spacer"><td colSpan={7} style={{ height: (rows.length - end) * rowHeight }} /></tr>}
           </tbody>
         </table>
-        {rows.length === 0 && <div className="association-table-empty">No matching hits.</div>}
+        {rows.length === 0 && !serverMode && <div className="association-table-empty">No matching hits.</div>}
+        {rows.length === 0 && serverMode && !props.loading && !props.error && (
+          <div className="association-table-empty">No matching hits.</div>
+        )}
       </div>
+      {serverMode && (
+        <nav className="association-table-pagination" aria-label="Association hit pages">
+          <button
+            type="button"
+            disabled={props.loading || props.offset === 0}
+            onClick={() => props.onOffsetChange(Math.max(0, props.offset - props.limit))}
+          >Previous</button>
+          <span>{pageStatus}</span>
+          <button
+            type="button"
+            disabled={props.loading || rows.length === 0 || props.offset + rows.length >= props.total}
+            onClick={() => props.onOffsetChange(props.offset + props.limit)}
+          >Next</button>
+        </nav>
+      )}
     </section>
   );
 }

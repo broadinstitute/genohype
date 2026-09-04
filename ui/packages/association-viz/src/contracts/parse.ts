@@ -4,7 +4,10 @@ import {
   verifyLayoutHash,
 } from '../manhattan/layout.js';
 import type {
+  AssociationPageV1,
   AssociationPointV1,
+  AssociationSortDirectionV1,
+  AssociationTableSortV1,
   AssociationThresholdV1,
   AssociationVisualizationManifestV1,
   GenomeLayoutV1,
@@ -32,9 +35,22 @@ function record(value: unknown, path: string): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-function string(value: unknown, path: string, nonEmpty = false): string {
+function string(value: unknown, path: string, nonEmpty = false, maximumLength?: number): string {
   if (typeof value !== 'string' || (nonEmpty && !value.trim())) fail(`${path} must be a non-empty string`);
+  if (maximumLength !== undefined && Array.from(value).length > maximumLength) {
+    fail(`${path} cannot exceed ${maximumLength} characters`);
+  }
   return value;
+}
+
+function schemaVersion(value: unknown, contract: string): string {
+  const version = string(value, 'schema_version');
+  const match = /^(\d+)\.(\d+)$/.exec(version);
+  if (!match || match[1] !== String(Number(match[1]))) {
+    fail(`malformed schema version ${JSON.stringify(version)}`);
+  }
+  if (Number(match[1]) !== 1) fail(`unsupported ${contract} schema major version ${match[1]}`);
+  return version;
 }
 
 function finite(value: unknown, path: string): number {
@@ -60,9 +76,13 @@ function array(value: unknown, path: string): unknown[] {
   return value;
 }
 
-function optionalNullableString(value: unknown, path: string): string | null | undefined {
+function optionalNullableString(
+  value: unknown,
+  path: string,
+  maximumLength?: number,
+): string | null | undefined {
   if (value === undefined || value === null) return value;
-  return string(value, path);
+  return string(value, path, false, maximumLength);
 }
 
 function optionalNullableFinite(value: unknown, path: string): number | null | undefined {
@@ -144,10 +164,9 @@ function parseLayout(value: unknown): GenomeLayoutV1 {
   } as GenomeLayoutV1;
 }
 
-function parsePoint(value: unknown, index: number): AssociationPointV1 {
-  const path = `top_hits[${index}]`;
+function parsePoint(value: unknown, path: string): AssociationPointV1 {
   const source = record(value, path);
-  const contig = string(source.contig, `${path}.contig`, true);
+  const contig = string(source.contig, `${path}.contig`, true, 4_096);
   if (canonicalContig(contig) !== contig) fail(`${path}.contig must use canonical spelling`);
   const pvalue = finite(source.pvalue, `${path}.pvalue`);
   const significance = finite(source.neg_log10_p, `${path}.neg_log10_p`);
@@ -166,15 +185,15 @@ function parsePoint(value: unknown, index: number): AssociationPointV1 {
     pvalue,
     neg_log10_p: significance,
     source_ordinal: integer(source.source_ordinal, `${path}.source_ordinal`),
-    ref_allele: optionalNullableString(source.ref_allele, `${path}.ref_allele`),
-    alt_allele: optionalNullableString(source.alt_allele, `${path}.alt_allele`),
+    ref_allele: optionalNullableString(source.ref_allele, `${path}.ref_allele`, 4_096),
+    alt_allele: optionalNullableString(source.alt_allele, `${path}.alt_allele`, 4_096),
     beta: optionalNullableFinite(source.beta, `${path}.beta`),
     standard_error: optionalNullableFinite(source.standard_error, `${path}.standard_error`),
     allele_frequency: alleleFrequency,
     allele_count: alleleCount,
-    gene_symbol: optionalNullableString(source.gene_symbol, `${path}.gene_symbol`),
-    consequence: optionalNullableString(source.consequence, `${path}.consequence`),
-    series: optionalNullableString(source.series, `${path}.series`),
+    gene_symbol: optionalNullableString(source.gene_symbol, `${path}.gene_symbol`, 4_096),
+    consequence: optionalNullableString(source.consequence, `${path}.consequence`, 4_096),
+    series: optionalNullableString(source.series, `${path}.series`, 4_096),
   } as AssociationPointV1;
 }
 
@@ -203,12 +222,7 @@ function parseThreshold(value: unknown, index: number): AssociationThresholdV1 {
 /** Parse and fully validate a V1 manifest while tolerating unknown V1 minor fields. */
 export function parseAssociationVisualizationManifest(input: unknown): AssociationVisualizationManifestV1 {
   const source = record(input, 'manifest');
-  const schemaVersion = string(source.schema_version, 'schema_version');
-  const versionMatch = /^(\d+)\.(\d+)$/.exec(schemaVersion);
-  if (!versionMatch || versionMatch[1] !== String(Number(versionMatch[1]))) {
-    fail(`malformed schema version ${JSON.stringify(schemaVersion)}`);
-  }
-  if (Number(versionMatch[1]) !== 1) fail(`unsupported association manifest schema major version ${versionMatch[1]}`);
+  const parsedSchemaVersion = schemaVersion(source.schema_version, 'association manifest');
 
   const kind = string(source.kind, 'kind');
   if (kind !== 'manhattan' && kind !== 'locus') fail('kind must be manhattan or locus');
@@ -225,7 +239,7 @@ export function parseAssociationVisualizationManifest(input: unknown): Associati
 
   const rawTopHits = array(source.top_hits, 'top_hits');
   if (rawTopHits.length > 1_000) fail('top_hits cannot contain more than 1000 points');
-  const topHits = rawTopHits.map(parsePoint);
+  const topHits = rawTopHits.map((point, index) => parsePoint(point, `top_hits[${index}]`));
   if (!topHits.slice(1).every((point, index) => comparePoints(topHits[index], point) <= 0)) {
     fail('top_hits are not in canonical order');
   }
@@ -247,7 +261,7 @@ export function parseAssociationVisualizationManifest(input: unknown): Associati
   const warnings = array(source.warnings, 'warnings').map((value, index) => string(value, `warnings[${index}]`));
   return {
     ...source,
-    schema_version: schemaVersion,
+    schema_version: parsedSchemaVersion,
     plot_id: string(source.plot_id, 'plot_id', true),
     kind,
     title: string(source.title, 'title', true),
@@ -269,6 +283,50 @@ export function parseAssociationVisualizationManifest(input: unknown): Associati
       table_api: resources.table_api == null ? resources.table_api as null | undefined : parseResource(resources.table_api, 'resources.table_api'),
     },
   } as AssociationVisualizationManifestV1;
+}
+
+/** Parse and fully validate a bounded V1 table or region page. */
+export function parseAssociationPage(input: unknown): AssociationPageV1 {
+  const source = record(input, 'page');
+  const parsedSchemaVersion = schemaVersion(source.schema_version, 'association page');
+  const datasetId = string(source.dataset_id, 'dataset_id');
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(datasetId)) {
+    fail('dataset_id must be a canonical lowercase UUID-v4');
+  }
+
+  const rawPoints = array(source.points, 'points');
+  if (rawPoints.length > 1_000) fail('points cannot contain more than 1000 rows');
+  const points = rawPoints.map((point, index) => parsePoint(point, `points[${index}]`));
+
+  let sort: AssociationTableSortV1 | null | undefined;
+  if (source.sort === undefined || source.sort === null) sort = source.sort;
+  else if (source.sort === 'pvalue' || source.sort === 'locus') sort = source.sort;
+  else fail('sort must be pvalue, locus, null, or omitted');
+
+  let direction: AssociationSortDirectionV1 | null | undefined;
+  if (source.direction === undefined || source.direction === null) direction = source.direction;
+  else if (source.direction === 'ascending' || source.direction === 'descending') direction = source.direction;
+  else fail('direction must be ascending, descending, null, or omitted');
+
+  let search: string | null | undefined;
+  if (source.search === undefined || source.search === null) search = source.search;
+  else {
+    search = string(source.search, 'search', false, 256);
+    if (new TextEncoder().encode(search).length > 256) fail('search cannot exceed 256 UTF-8 bytes');
+  }
+
+  return {
+    ...source,
+    schema_version: parsedSchemaVersion,
+    dataset_id: datasetId,
+    points,
+    offset: integer(source.offset, 'offset'),
+    limit: integer(source.limit, 'limit', 1, 1_000),
+    total: integer(source.total, 'total'),
+    sort,
+    direction,
+    search,
+  } as AssociationPageV1;
 }
 
 /** Resolve a previously validated relative resource against the fetched manifest URL. */

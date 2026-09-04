@@ -113,6 +113,15 @@
   font: inherit;
   font-size: 13px;
 }
+.association-table-error {
+  margin-bottom: 8px;
+  border: 1px solid #e9a8ae;
+  border-radius: 4px;
+  padding: 8px 10px;
+  background: #fff5f5;
+  color: #b42332;
+  font-size: 12px;
+}
 .association-table-viewport { position: relative; overflow: auto; border: 1px solid var(--association-border); border-radius: 5px; }
 .association-hit-table { width: 100%; min-width: 780px; border-collapse: collapse; table-layout: fixed; font-size: 12px; }
 .association-hit-table th {
@@ -141,6 +150,24 @@
 .association-hit-table td button { border: 1px solid var(--association-border); border-radius: 3px; padding: 3px 7px; background: var(--association-surface); color: var(--association-accent); cursor: pointer; }
 .association-spacer td { padding: 0; border: 0; }
 .association-table-empty { padding: 28px; color: var(--association-muted); text-align: center; }
+.association-table-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 8px;
+  color: var(--association-muted);
+  font-size: 12px;
+}
+.association-table-pagination button {
+  border: 1px solid var(--association-border);
+  border-radius: 4px;
+  padding: 5px 9px;
+  background: var(--association-surface);
+  color: var(--association-accent);
+  cursor: pointer;
+}
+.association-table-pagination button:disabled { color: var(--association-muted); cursor: default; opacity: 0.55; }
 .association-visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 
 @media (max-width: 700px) {
