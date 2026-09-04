@@ -16,7 +16,7 @@ use noodles::vcf::variant::record::AlternateBases as _;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::File;
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::Path;
 
 /// Maximum decompressed VCF header bytes accepted before noodles allocates them.
@@ -30,12 +30,24 @@ const RECORD_BOUND_PREFIX: &str = "association_vcf_record_bound:";
 
 type Input = BufReader<BoundedVcfReader<Box<dyn Read>>>;
 
+#[derive(Debug, Default)]
+struct RawStructuralTokens {
+    chrom: String,
+    position: String,
+    reference: String,
+    alternate: String,
+}
+
 /// Sequential lazy-record reader. The bounder sits below both noodles header and
 /// record parsing, so an oversized header or FORMAT-heavy record is rejected
-/// before noodles can grow its String past the corresponding limit.
+/// before noodles can grow its String past the corresponding limit. The raw line
+/// buffer is likewise bounded and is retained only long enough to preserve the
+/// exact four mapped structural tokens; INFO/FORMAT and the full row are dropped.
 pub struct VcfRecordReader {
     reader: vcf::io::Reader<Input>,
     header: vcf::Header,
+    raw_record: Vec<u8>,
+    raw_structural: RawStructuralTokens,
 }
 
 impl VcfRecordReader {
@@ -71,7 +83,12 @@ impl VcfRecordReader {
             .read_header()
             .map_err(|error| vcf_io_error("header", error))?;
         validate_observed_fields(&header)?;
-        Ok(Self { reader, header })
+        Ok(Self {
+            reader,
+            header,
+            raw_record: Vec::new(),
+            raw_structural: RawStructuralTokens::default(),
+        })
     }
 
     pub fn header(&self) -> &vcf::Header {
@@ -84,12 +101,60 @@ impl VcfRecordReader {
         &mut self,
         record: &mut vcf::Record,
     ) -> Result<Option<usize>, AssociationSourceError> {
-        match self.reader.read_record(record) {
-            Ok(0) => Ok(None),
-            Ok(size) => Ok(Some(size)),
-            Err(error) => Err(vcf_io_error("record", error)),
+        self.raw_record.clear();
+        let size = self
+            .reader
+            .get_mut()
+            .read_until(b'\n', &mut self.raw_record)
+            .map_err(|error| vcf_io_error("record", error))?;
+        if size == 0 {
+            return Ok(None);
         }
+
+        *record = vcf::Record::try_from(self.raw_record.as_slice())
+            .map_err(|error| vcf_io_error("record", error))?;
+        self.raw_structural = raw_structural_tokens(&self.raw_record)?;
+        self.raw_record.clear();
+        Ok(Some(size))
     }
+
+    fn raw_structural(&self) -> &RawStructuralTokens {
+        &self.raw_structural
+    }
+}
+
+fn raw_structural_tokens(raw_record: &[u8]) -> Result<RawStructuralTokens, AssociationSourceError> {
+    let line = raw_record.strip_suffix(b"\n").unwrap_or(raw_record);
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let mut fields = line.split(|byte| *byte == b'\t');
+    let mut next = || {
+        fields.next().ok_or_else(|| {
+            AssociationSourceError::new(
+                "invalid_vcf_record",
+                "VCF record does not contain all required structural fields",
+            )
+        })
+    };
+    let chrom = next()?;
+    let position = next()?;
+    let _id = next()?;
+    let reference = next()?;
+    let alternate = next()?;
+    let decode = |value: &[u8]| {
+        std::str::from_utf8(value).map(str::to_string).map_err(|_| {
+            AssociationSourceError::new(
+                "invalid_vcf_record",
+                "VCF structural fields must contain valid UTF-8",
+            )
+        })
+    };
+
+    Ok(RawStructuralTokens {
+        chrom: decode(chrom)?,
+        position: decode(position)?,
+        reference: decode(reference)?,
+        alternate: decode(alternate)?,
+    })
 }
 
 /// One-pass association source for plain and BGZF VCF. Source ordinals are a
@@ -175,6 +240,7 @@ impl AssociationSource for VcfAssociationSource {
 
             let decoded = decode_record(
                 &self.record,
+                self.records.raw_structural(),
                 &self.prepared,
                 record_ordinal,
                 self.next_source_ordinal,
@@ -286,8 +352,14 @@ pub fn inspect_vcf(
         }
         decoded_sample_bytes += size;
         if let Some(prepared) = &prepared {
-            let decoded = decode_record(&record, prepared, inspected_records, next_source_ordinal)
-                .map_err(inspect_source_error)?;
+            let decoded = decode_record(
+                &record,
+                reader.raw_structural(),
+                prepared,
+                inspected_records,
+                next_source_ordinal,
+            )
+            .map_err(inspect_source_error)?;
             next_source_ordinal = next_source_ordinal
                 .checked_add(decoded.items.len() as u64)
                 .ok_or_else(|| "VCF contains too many record/ALT items".to_string())?;
@@ -545,6 +617,7 @@ struct DecodedRecord {
 
 fn decode_record(
     record: &vcf::Record,
+    raw_structural: &RawStructuralTokens,
     prepared: &PreparedMapping,
     record_ordinal: u64,
     first_source_ordinal: u64,
@@ -555,21 +628,23 @@ fn decode_record(
         None => {
             return Ok(single_rejection(
                 record,
+                raw_structural,
                 prepared,
                 first_source_ordinal,
                 "missing_position",
                 LogicalField::Position,
-                Some("0"),
+                Some(&raw_structural.position),
             ))
         }
         Some(Err(_)) => {
             return Ok(single_rejection(
                 record,
+                raw_structural,
                 prepared,
                 first_source_ordinal,
                 "malformed_position",
                 LogicalField::Position,
-                Some("POS"),
+                Some(&raw_structural.position),
             ))
         }
         Some(Ok(value)) => i64::try_from(usize::from(value)).map_err(|_| {
@@ -590,27 +665,30 @@ fn decode_record(
         Err(_) => {
             return Ok(single_rejection(
                 record,
+                raw_structural,
                 prepared,
                 first_source_ordinal,
                 "malformed_alt",
                 LogicalField::Alt,
-                Some("ALT"),
+                Some(&raw_structural.alternate),
             ))
         }
     };
     if contig.is_empty() {
         return Ok(single_rejection(
             record,
+            raw_structural,
             prepared,
             first_source_ordinal,
             "missing_contig",
             LogicalField::Contig,
-            Some(""),
+            Some(&raw_structural.chrom),
         ));
     }
     if reference.is_empty() || reference == "." {
         return Ok(single_rejection(
             record,
+            raw_structural,
             prepared,
             first_source_ordinal,
             "invalid_ref",
@@ -625,11 +703,12 @@ fn decode_record(
     {
         return Ok(single_rejection(
             record,
+            raw_structural,
             prepared,
             first_source_ordinal,
             "missing_alt",
             LogicalField::Alt,
-            Some("."),
+            Some(&raw_structural.alternate),
         ));
     }
 
@@ -822,6 +901,7 @@ fn decode_record(
 
 fn single_rejection(
     record: &vcf::Record,
+    raw_structural: &RawStructuralTokens,
     prepared: &PreparedMapping,
     source_ordinal: u64,
     code: &'static str,
@@ -829,26 +909,7 @@ fn single_rejection(
     example: Option<&str>,
 ) -> DecodedRecord {
     let states = parse_mapped_info(record.info().as_ref(), prepared);
-    let position = record
-        .variant_start()
-        .and_then(Result::ok)
-        .map(usize::from)
-        .and_then(|value| i64::try_from(value).ok())
-        .unwrap_or_default();
-    let alternates = record
-        .alternate_bases()
-        .iter()
-        .filter_map(Result::ok)
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    let digest = semantic_record_digest(
-        record.reference_sequence_name(),
-        position,
-        record.reference_bases(),
-        &alternates,
-        prepared,
-        &states,
-    );
+    let digest = rejected_record_digest(raw_structural, prepared, &states);
     DecodedRecord {
         items: vec![AssociationSourceItem::Rejected(rejection(
             source_ordinal,
@@ -1017,6 +1078,28 @@ fn semantic_record_digest(
     for alternate in alternates {
         hash_bytes(&mut hasher, alternate.as_bytes());
     }
+    for field in prepared.fields.values() {
+        hash_bytes(&mut hasher, field.logical.as_str().as_bytes());
+        hash_bytes(&mut hasher, field.source.as_bytes());
+        hash_numeric_state(
+            &mut hasher,
+            states.get(&field.logical).expect("mapped state exists"),
+        );
+    }
+    hasher.finalize().into()
+}
+
+fn rejected_record_digest(
+    raw_structural: &RawStructuralTokens,
+    prepared: &PreparedMapping,
+    states: &BTreeMap<LogicalField, NumericState>,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"genohype.association.vcf-rejected-record-semantic.v1\0");
+    hash_bytes(&mut hasher, raw_structural.chrom.as_bytes());
+    hash_bytes(&mut hasher, raw_structural.position.as_bytes());
+    hash_bytes(&mut hasher, raw_structural.reference.as_bytes());
+    hash_bytes(&mut hasher, raw_structural.alternate.as_bytes());
     for field in prepared.fields.values() {
         hash_bytes(&mut hasher, field.logical.as_str().as_bytes());
         hash_bytes(&mut hasher, field.source.as_bytes());
@@ -1656,6 +1739,77 @@ mod tests {
         assert_ne!(
             source.finalized_source_fingerprint(),
             Some(malformed_fingerprint.as_str())
+        );
+    }
+
+    #[test]
+    fn rejected_fingerprints_preserve_raw_structural_tokens_but_ignore_unmapped_columns() {
+        let header = "##INFO=<ID=BAD,Number=1,Type=String,Description=\"unused\">\n##INFO=<ID=P,Number=1,Type=Float,Description=\"p\">\n";
+
+        let malformed_position_x = fixture(
+            header,
+            "1\tx\t.\tA\tC\t.\tPASS\tBAD=first;P=0.25\tGT\t0/1\n",
+        );
+        let mut source = open(&malformed_position_x, mapping("P"));
+        let items = collect(&mut source);
+        assert!(matches!(
+            &items[0],
+            AssociationSourceItem::Rejected(r)
+                if r.reason_code == "malformed_position"
+                    && r.bounded_example.as_deref() == Some("x")
+        ));
+        let position_x_fingerprint = source.finalized_source_fingerprint().unwrap().to_string();
+
+        let malformed_position_y = fixture(
+            header,
+            "1\ty\t.\tA\tC\t.\tPASS\tBAD=first;P=0.25\tGT\t0/1\n",
+        );
+        let mut source = open(&malformed_position_y, mapping("P"));
+        collect(&mut source);
+        assert_ne!(
+            source.finalized_source_fingerprint(),
+            Some(position_x_fingerprint.as_str())
+        );
+
+        // The lazy noodles record maps both a missing `.` ALT and an empty,
+        // malformed ALT token to no alternates. Rejected identity must retain
+        // the exact raw mapped token rather than collapsing the two.
+        let missing_alt = fixture(
+            header,
+            "1\t10\t.\tA\t.\t.\tPASS\tBAD=first;P=0.25\tGT\t0/1\n",
+        );
+        let mut source = open(&missing_alt, mapping("P"));
+        let items = collect(&mut source);
+        assert!(matches!(
+            &items[0],
+            AssociationSourceItem::Rejected(r) if r.reason_code == "missing_alt"
+        ));
+        let missing_alt_fingerprint = source.finalized_source_fingerprint().unwrap().to_string();
+
+        let malformed_alt = fixture(
+            header,
+            "1\t10\t.\tA\t\t.\tPASS\tBAD=first;P=0.25\tGT\t0/1\n",
+        );
+        let mut source = open(&malformed_alt, mapping("P"));
+        let items = collect(&mut source);
+        assert!(matches!(
+            &items[0],
+            AssociationSourceItem::Rejected(r) if r.reason_code == "missing_alt"
+        ));
+        assert_ne!(
+            source.finalized_source_fingerprint(),
+            Some(missing_alt_fingerprint.as_str())
+        );
+
+        let unmapped_changes = fixture(
+            header,
+            "1\tx\t.\tA\tC\t.\tPASS\tBAD=second;P=0.25\tGT\t1/1\n",
+        );
+        let mut source = open(&unmapped_changes, mapping("P"));
+        collect(&mut source);
+        assert_eq!(
+            source.finalized_source_fingerprint(),
+            Some(position_x_fingerprint.as_str())
         );
     }
 
