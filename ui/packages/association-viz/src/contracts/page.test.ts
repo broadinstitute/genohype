@@ -19,6 +19,22 @@ function page(): Json {
   };
 }
 
+function setExactPointTextBoundary(point: Json): void {
+  point.contig = '1';
+  point.ref_allele = 'x'.repeat(4_096);
+  point.alt_allele = 'x'.repeat(4_096);
+  point.gene_symbol = 'x'.repeat(4_096);
+  point.consequence = 'x'.repeat(4_095);
+  point.series = null;
+}
+
+function setSinglePointWindow(input: Json): void {
+  input.points = [input.points[0]];
+  input.offset = 0;
+  input.limit = 1;
+  input.total = 1;
+}
+
 describe('association page V1 parser', () => {
   it('parses table pages and preserves compatible minor fields', () => {
     const input = page();
@@ -48,6 +64,20 @@ describe('association page V1 parser', () => {
       offset: 100,
       limit: 100,
     });
+  });
+
+  it('rejects unpaired table fields and search on region envelopes', () => {
+    for (const mutate of [
+      (input: Json) => { delete input.direction; },
+      (input: Json) => { input.direction = null; },
+      (input: Json) => { delete input.sort; },
+      (input: Json) => { input.sort = null; },
+      (input: Json) => { input.sort = null; input.direction = null; },
+    ]) {
+      const input = page();
+      mutate(input);
+      expect(() => parseAssociationPage(input)).toThrow(ManifestValidationError);
+    }
   });
 
   it.each(['2.0', '0.9'])('rejects unsupported major %s', (version) => {
@@ -91,6 +121,23 @@ describe('association page V1 parser', () => {
     }
   });
 
+  it('rejects inconsistent page windows before parsing points', () => {
+    for (const mutate of [
+      (input: Json) => { input.points = [input.points[0], structuredClone(input.points[0])]; input.limit = 1; },
+      (input: Json) => { input.offset = input.total; },
+      (input: Json) => { input.total = input.offset + input.points.length - 1; },
+      (input: Json) => {
+        input.points = [input.points[0], structuredClone(input.points[0])];
+        input.offset = Number.MAX_SAFE_INTEGER - 1;
+        input.total = Number.MAX_SAFE_INTEGER;
+      },
+    ]) {
+      const input = page();
+      mutate(input);
+      expect(() => parseAssociationPage(input)).toThrow(ManifestValidationError);
+    }
+  });
+
   it('validates every normalized point and its browser-safe bounds', () => {
     for (const mutate of [
       (input: Json) => { input.points[0].contig = 'chr1'; },
@@ -98,12 +145,51 @@ describe('association page V1 parser', () => {
       (input: Json) => { input.points[0].pvalue = Number.NaN; },
       (input: Json) => { input.points[0].neg_log10_p = -1; },
       (input: Json) => { input.points[0].allele_frequency = 2; },
-      (input: Json) => { input.points[0].gene_symbol = 'x'.repeat(4097); },
+      (input: Json) => { input.points[0].gene_symbol = 'x'.repeat(4_097); },
+      (input: Json) => { input.points[0].gene_symbol = 'é'.repeat(2_049); },
+      (input: Json) => {
+        setExactPointTextBoundary(input.points[0]);
+        input.points[0].consequence = 'x'.repeat(4_096);
+      },
     ]) {
       const input = page();
       mutate(input);
       expect(() => parseAssociationPage(input)).toThrow(ManifestValidationError);
     }
+  });
+
+  it('accepts exact per-field and combined UTF-8 byte boundaries', () => {
+    const multibyte = page();
+    setSinglePointWindow(multibyte);
+    multibyte.points[0].gene_symbol = 'é'.repeat(2_048);
+    expect(parseAssociationPage(multibyte).points[0].gene_symbol).toHaveLength(2_048);
+
+    const combined = page();
+    setSinglePointWindow(combined);
+    setExactPointTextBoundary(combined.points[0]);
+    expect(parseAssociationPage(combined).points).toHaveLength(1);
+  });
+
+  it('enforces the aggregate page point text byte bound', () => {
+    const boundary = page();
+    const template = structuredClone(boundary.points[0]);
+    setExactPointTextBoundary(template);
+    boundary.points = Array.from({ length: 64 }, (_, sourceOrdinal) => ({
+      ...template,
+      source_ordinal: sourceOrdinal,
+    }));
+    boundary.offset = 0;
+    boundary.limit = 64;
+    boundary.total = 64;
+    expect(parseAssociationPage(boundary).points).toHaveLength(64);
+
+    const oversized = page();
+    const minimalPoint = { ...oversized.points[0], source_ordinal: 64 };
+    oversized.points = [...boundary.points, minimalPoint];
+    oversized.offset = 0;
+    oversized.limit = 65;
+    oversized.total = 65;
+    expect(() => parseAssociationPage(oversized)).toThrow(/1048576 UTF-8 bytes/);
   });
 
   it('rejects oversized pages before traversing malformed tail entries', () => {
@@ -125,12 +211,19 @@ describe('association page V1 parser', () => {
 
   it('accepts the JSON-safe integer boundary', () => {
     const input = page();
-    input.offset = Number.MAX_SAFE_INTEGER;
+    setSinglePointWindow(input);
+    input.offset = Number.MAX_SAFE_INTEGER - 1;
     input.total = Number.MAX_SAFE_INTEGER;
     input.points[0].source_ordinal = Number.MAX_SAFE_INTEGER;
     expect(parseAssociationPage(input)).toMatchObject({
-      offset: Number.MAX_SAFE_INTEGER,
+      offset: Number.MAX_SAFE_INTEGER - 1,
       total: Number.MAX_SAFE_INTEGER,
     });
+
+    const empty = page();
+    empty.points = [];
+    empty.offset = Number.MAX_SAFE_INTEGER;
+    empty.total = 0;
+    expect(parseAssociationPage(empty).points).toEqual([]);
   });
 });

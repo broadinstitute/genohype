@@ -90,6 +90,42 @@ function optionalNullableFinite(value: unknown, path: string): number | null | u
   return finite(value, path);
 }
 
+const MAX_POINT_FIELD_BYTES = 4_096;
+const MAX_POINT_TEXT_BYTES = 16_384;
+const MAX_PAGE_POINT_TEXT_BYTES = 1_048_576;
+const utf8Encoder = new TextEncoder();
+
+function utf8ByteLength(value: string): number {
+  return utf8Encoder.encode(value).length;
+}
+
+function pointTextField(value: unknown, path: string, nonEmpty = false): string {
+  const parsed = string(value, path, nonEmpty);
+  if (utf8ByteLength(parsed) > MAX_POINT_FIELD_BYTES) {
+    fail(`${path} cannot exceed ${MAX_POINT_FIELD_BYTES} UTF-8 bytes`);
+  }
+  return parsed;
+}
+
+function optionalNullablePointText(
+  value: unknown,
+  path: string,
+): string | null | undefined {
+  if (value === undefined || value === null) return value;
+  return pointTextField(value, path);
+}
+
+function pointTextBytes(point: AssociationPointV1): number {
+  return [
+    point.contig,
+    point.ref_allele,
+    point.alt_allele,
+    point.gene_symbol,
+    point.consequence,
+    point.series,
+  ].reduce((total, value) => total + (value == null ? 0 : utf8ByteLength(value)), 0);
+}
+
 function parseResourceValue(value: unknown, path: string): ResourceDescriptorV1 {
   const source = record(value, path);
   const url = string(source.url, `${path}.url`);
@@ -166,7 +202,7 @@ function parseLayout(value: unknown): GenomeLayoutV1 {
 
 function parsePoint(value: unknown, path: string): AssociationPointV1 {
   const source = record(value, path);
-  const contig = string(source.contig, `${path}.contig`, true, 4_096);
+  const contig = pointTextField(source.contig, `${path}.contig`, true);
   if (canonicalContig(contig) !== contig) fail(`${path}.contig must use canonical spelling`);
   const pvalue = finite(source.pvalue, `${path}.pvalue`);
   const significance = finite(source.neg_log10_p, `${path}.neg_log10_p`);
@@ -178,23 +214,27 @@ function parsePoint(value: unknown, path: string): AssociationPointV1 {
   }
   const alleleCount = optionalNullableFinite(source.allele_count, `${path}.allele_count`);
   if (alleleCount != null && alleleCount < 0) fail(`${path}.allele_count must be non-negative`);
-  return {
+  const point = {
     ...source,
     contig,
     position: integer(source.position, `${path}.position`, 1),
     pvalue,
     neg_log10_p: significance,
     source_ordinal: integer(source.source_ordinal, `${path}.source_ordinal`),
-    ref_allele: optionalNullableString(source.ref_allele, `${path}.ref_allele`, 4_096),
-    alt_allele: optionalNullableString(source.alt_allele, `${path}.alt_allele`, 4_096),
+    ref_allele: optionalNullablePointText(source.ref_allele, `${path}.ref_allele`),
+    alt_allele: optionalNullablePointText(source.alt_allele, `${path}.alt_allele`),
     beta: optionalNullableFinite(source.beta, `${path}.beta`),
     standard_error: optionalNullableFinite(source.standard_error, `${path}.standard_error`),
     allele_frequency: alleleFrequency,
     allele_count: alleleCount,
-    gene_symbol: optionalNullableString(source.gene_symbol, `${path}.gene_symbol`, 4_096),
-    consequence: optionalNullableString(source.consequence, `${path}.consequence`, 4_096),
-    series: optionalNullableString(source.series, `${path}.series`, 4_096),
+    gene_symbol: optionalNullablePointText(source.gene_symbol, `${path}.gene_symbol`),
+    consequence: optionalNullablePointText(source.consequence, `${path}.consequence`),
+    series: optionalNullablePointText(source.series, `${path}.series`),
   } as AssociationPointV1;
+  if (pointTextBytes(point) > MAX_POINT_TEXT_BYTES) {
+    fail(`${path} text cannot exceed ${MAX_POINT_TEXT_BYTES} UTF-8 bytes`);
+  }
+  return point;
 }
 
 function compareOptionalString(left: string | null | undefined, right: string | null | undefined): number {
@@ -296,7 +336,26 @@ export function parseAssociationPage(input: unknown): AssociationPageV1 {
 
   const rawPoints = array(source.points, 'points');
   if (rawPoints.length > 1_000) fail('points cannot contain more than 1000 rows');
-  const points = rawPoints.map((point, index) => parsePoint(point, `points[${index}]`));
+  const offset = integer(source.offset, 'offset');
+  const limit = integer(source.limit, 'limit', 1, 1_000);
+  const total = integer(source.total, 'total');
+  if (rawPoints.length > limit) fail('points cannot contain more rows than limit');
+  if (rawPoints.length > 0) {
+    const endOffset = offset + rawPoints.length;
+    if (offset >= total || !Number.isSafeInteger(endOffset) || endOffset > total) {
+      fail('nonempty page range must be within total');
+    }
+  }
+
+  let pagePointTextBytes = 0;
+  const points = rawPoints.map((point, index) => {
+    const parsed = parsePoint(point, `points[${index}]`);
+    pagePointTextBytes += pointTextBytes(parsed);
+    if (pagePointTextBytes > MAX_PAGE_POINT_TEXT_BYTES) {
+      fail(`page point text cannot exceed ${MAX_PAGE_POINT_TEXT_BYTES} UTF-8 bytes`);
+    }
+    return parsed;
+  });
 
   let sort: AssociationTableSortV1 | null | undefined;
   if (source.sort === undefined || source.sort === null) sort = source.sort;
@@ -312,17 +371,22 @@ export function parseAssociationPage(input: unknown): AssociationPageV1 {
   if (source.search === undefined || source.search === null) search = source.search;
   else {
     search = string(source.search, 'search', false, 256);
-    if (new TextEncoder().encode(search).length > 256) fail('search cannot exceed 256 UTF-8 bytes');
+    if (utf8ByteLength(search) > 256) fail('search cannot exceed 256 UTF-8 bytes');
   }
+
+  if ((sort != null) !== (direction != null)) {
+    fail('sort and direction must either both be present or both be absent');
+  }
+  if (sort == null && search != null) fail('region pages cannot carry search');
 
   return {
     ...source,
     schema_version: parsedSchemaVersion,
     dataset_id: datasetId,
     points,
-    offset: integer(source.offset, 'offset'),
-    limit: integer(source.limit, 'limit', 1, 1_000),
-    total: integer(source.total, 'total'),
+    offset,
+    limit,
+    total,
     sort,
     direction,
     search,
