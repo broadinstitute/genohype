@@ -1030,6 +1030,85 @@ async fn detail_cache_is_single_flight_off_runtime_and_safely_evicts() {
 }
 
 #[tokio::test]
+async fn two_manifest_consumers_keep_exact_http_resources_until_lease_expiry() {
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("private-associations.sqlite3");
+    write_dataset(&database);
+    let (manifest, raster) = detail_manifest();
+    let dataset = DatasetService::for_test_with_manifest(dataset_id(), database, manifest.clone())
+        .with_cache_config(1, 1024 * 1024, 1, Duration::from_secs(15));
+    let app = server::build_router(
+        ServerState::new(
+            "correct-token".into(),
+            serde_json::to_vec(&manifest).unwrap(),
+            raster,
+        )
+        .with_dataset(dataset),
+    );
+    let id = dataset_id();
+    let manifest_path = format!(
+        "/correct-token/api/datasets/{id}/region/manifest?contig=1&start=10&end=20&width=50&height=64&dpr=1"
+    );
+
+    let response = router_response(app.clone(), Method::GET, &manifest_path).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let client_a: genohype_association::AssociationRegionRenderManifestV1 =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let response = router_response(app.clone(), Method::GET, &manifest_path).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let client_b: genohype_association::AssociationRegionRenderManifestV1 =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(client_a.resources, client_b.resources);
+
+    let overlay_path = format!(
+        "/correct-token/api/datasets/{id}/region/{}",
+        client_a.resources.overlay.url
+    );
+    let raster_path = format!(
+        "/correct-token/api/datasets/{id}/region/{}",
+        client_a.resources.raster.url
+    );
+    let overlay_a = router_response(app.clone(), Method::GET, &overlay_path).await;
+    assert_eq!(overlay_a.status(), StatusCode::OK);
+    let overlay_a = to_bytes(overlay_a.into_body(), usize::MAX).await.unwrap();
+    let raster_a = router_response(app.clone(), Method::GET, &raster_path).await;
+    assert_eq!(raster_a.status(), StatusCode::OK);
+    let raster_a = to_bytes(raster_a.into_body(), usize::MAX).await.unwrap();
+
+    // With one-entry capacity this distinct render would evict the advertised
+    // bundle if A's resource reads discharged the lease. Pressure must instead
+    // be rejected without growing the cache or breaking B's URLs.
+    let pressure = router_response(
+        app.clone(),
+        Method::GET,
+        &format!("{manifest_path}&threshold=0.02"),
+    )
+    .await;
+    assert_eq!(pressure.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let overlay_b = router_response(app.clone(), Method::GET, &overlay_path).await;
+    assert_eq!(overlay_b.status(), StatusCode::OK);
+    let overlay_b = to_bytes(overlay_b.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(overlay_a, overlay_b);
+    let overlay: genohype_association::AssociationRegionOverlayV1 =
+        serde_json::from_slice(&overlay_b).unwrap();
+    overlay.validate_against(&client_b).unwrap();
+
+    let raster_b = router_response(app, Method::GET, &raster_path).await;
+    assert_eq!(raster_b.status(), StatusCode::OK);
+    let raster_b = to_bytes(raster_b.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(raster_a, raster_b);
+    let pixmap = tiny_skia::Pixmap::decode_png(&raster_b).unwrap();
+    assert_eq!(
+        (pixmap.width(), pixmap.height()),
+        (
+            client_b.layout.physical_width,
+            client_b.layout.physical_height
+        )
+    );
+}
+
+#[tokio::test]
 async fn detached_detail_flights_survive_owner_abort_and_retry_after_error_or_panic() {
     let temp = tempfile::tempdir().unwrap();
     let database = temp.path().join("private-associations.sqlite3");

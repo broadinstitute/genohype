@@ -87,8 +87,6 @@ enum FlightState {
 
 struct FetchLease {
     expires_at: Instant,
-    raster_pending: bool,
-    overlay_pending: bool,
 }
 
 struct CacheEntry {
@@ -341,8 +339,6 @@ impl DetailCache {
             if matches!(entry.value, CachedValue::Region(_)) {
                 entry.lease = Some(FetchLease {
                     expires_at: now + lease_duration,
-                    raster_pending: true,
-                    overlay_pending: true,
                 });
             }
         }
@@ -423,8 +419,6 @@ impl DetailCache {
                 byte_weight: weight,
                 lease: lease.then(|| FetchLease {
                     expires_at: now + self.fetch_lease,
-                    raster_pending: true,
-                    overlay_pending: true,
                 }),
             },
         );
@@ -463,13 +457,9 @@ impl DetailCache {
         };
         for key in keys {
             if let Some(entry) = state.entries.get_mut(&key) {
+                // Resource reads are useful LRU observations, but they cannot
+                // discharge the bounded lease promised to manifest consumers.
                 entry.last_used = clock;
-                if let Some(lease) = entry.lease.as_mut() {
-                    lease.raster_pending = false;
-                    if !lease.overlay_pending {
-                        entry.lease = None;
-                    }
-                }
             }
         }
         Some(bytes)
@@ -486,13 +476,9 @@ impl DetailCache {
             CachedValue::Region(value) if value.raster_id == render_id => value.overlay.clone(),
             _ => return None,
         };
+        // As with raster reads, observing one consumer's fetch must not end
+        // the time lease protecting other consumers of the same manifest.
         entry.last_used = clock;
-        if let Some(lease) = entry.lease.as_mut() {
-            lease.overlay_pending = false;
-            if !lease.raster_pending {
-                entry.lease = None;
-            }
-        }
         Some(bytes)
     }
 
@@ -1264,42 +1250,54 @@ mod detail_tests {
     }
 
     #[tokio::test]
-    async fn atomic_bundle_lease_releases_after_both_fetches_and_expires() {
+    async fn atomic_bundle_time_lease_ignores_fetches_stays_bounded_and_expires() {
         let origin = Instant::now();
         let now = Arc::new(StdMutex::new(origin));
         let clock: Now = {
             let now = now.clone();
             Arc::new(move || *now.lock().unwrap())
         };
-        let cache = DetailCache::configured(1, 1024 * 1024, 1, Duration::from_secs(5), clock);
+        let max_bytes = 1024 * 1024;
+        let cache = DetailCache::configured(1, max_bytes, 1, Duration::from_secs(5), clock);
         let first = bundle('a', 16);
         cache.publish_region(Ok(first.clone())).await.unwrap();
+        cache.advertise_region(first.clone()).await.unwrap();
+
         assert!(cache
             .region_overlay(&"f".repeat(64), &first.overlay_id)
             .await
             .is_none());
-        assert!(matches!(
-            cache.publish_region(Ok(bundle('b', 16))).await,
-            Err(DetailError::Busy)
-        ));
         assert!(cache
             .region_overlay(&first.raster_id, &first.overlay_id)
             .await
             .is_some());
+        assert!(cache.region_raster(&first.raster_id).await.is_some());
+
+        // Even after one consumer fetches both resources, another advertised
+        // consumer remains protected and pressure is rejected, not overgrown.
         assert!(matches!(
             cache.publish_region(Ok(bundle('b', 16))).await,
             Err(DetailError::Busy)
         ));
+        let (entries, bytes, flights) = cache.stats().await;
+        assert_eq!((entries, flights), (1, 0));
+        assert!(bytes <= max_bytes);
+        assert!(cache
+            .region_overlay(&first.raster_id, &first.overlay_id)
+            .await
+            .is_some());
         assert!(cache.region_raster(&first.raster_id).await.is_some());
-        cache.publish_region(Ok(bundle('b', 16))).await.unwrap();
 
-        let second = bundle('c', 16);
-        assert!(matches!(
-            cache.publish_region(Ok(second)).await,
-            Err(DetailError::Busy)
-        ));
+        // Expiry is clock-injected and deterministic; ordinary LRU eviction
+        // can then replace the old bundle while preserving configured limits.
         *now.lock().unwrap() = origin + Duration::from_secs(6);
-        cache.publish_region(Ok(bundle('c', 16))).await.unwrap();
+        let second = bundle('c', 16);
+        cache.publish_region(Ok(second.clone())).await.unwrap();
+        assert!(cache.region_raster(&first.raster_id).await.is_none());
+        assert!(cache.region_raster(&second.raster_id).await.is_some());
+        let (entries, bytes, flights) = cache.stats().await;
+        assert_eq!((entries, flights), (1, 0));
+        assert!(bytes <= max_bytes);
     }
 
     #[tokio::test]
