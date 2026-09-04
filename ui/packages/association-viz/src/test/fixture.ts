@@ -12,3 +12,10 @@ export function rawGoldenManifest(): unknown {
 export function goldenManifest(): AssociationVisualizationManifestV1 {
   return rawGoldenManifest() as AssociationVisualizationManifestV1;
 }
+
+export function fullGrch38Manifest(): AssociationVisualizationManifestV1 {
+  return JSON.parse(readFileSync(
+    resolve(process.cwd(), '../../../association/tests/fixtures/association-visualization-v1-phase1-grch38-3000x800.json'),
+    'utf8',
+  )) as AssociationVisualizationManifestV1;
+}

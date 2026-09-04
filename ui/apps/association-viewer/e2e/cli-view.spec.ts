@@ -18,8 +18,6 @@ async function startViewer(root: string): Promise<{ process: ChildProcessWithout
     '--table', fixture,
     '--y-field', 'Pvalue',
     '--output', join(root, 'plot'),
-    '--width', '800',
-    '--height', '400',
     '--view',
     '--no-open',
     '--port', '0',
@@ -77,11 +75,13 @@ test('production CLI viewer renders bounded artifacts and synchronizes plot/tabl
 
     await page.goto(viewer.url);
     await expect(page.locator('main[data-state="ready"]')).toBeVisible();
+    await expect(page.locator('main[data-state="schema-error"]')).toHaveCount(0);
     const raster = page.locator('img.association-raster');
     await expect(raster).toBeVisible();
-    await expect.poll(() => raster.evaluate((image: HTMLImageElement) => [image.naturalWidth, image.naturalHeight])).toEqual([800, 400]);
+    await expect.poll(() => raster.evaluate((image: HTMLImageElement) => [image.naturalWidth, image.naturalHeight])).toEqual([3000, 800]);
     await expect(page.getByLabel('Chromosomes')).toBeVisible();
     await expect(page.getByRole('table')).toBeVisible();
+    await expect(page.locator('.association-table-toolbar [role="status"]')).toHaveText('10 of 10 hits');
 
     const manifestResponse = await page.request.get(new URL('api/manifest', viewer.url).href);
     expect(manifestResponse.ok()).toBeTruthy();
@@ -89,10 +89,13 @@ test('production CLI viewer renders bounded artifacts and synchronizes plot/tabl
     expect(manifestBody.length).toBeLessThan(16 * 1024 * 1024);
     const manifest = JSON.parse(manifestBody.toString('utf8'));
     expect(manifest.resources.raster.url).toBe('raster');
-    expect(manifest.top_hits.length).toBeGreaterThan(1);
-    expect(manifest.top_hits.length).toBeLessThanOrEqual(1000);
+    expect(manifest.layout).toMatchObject({ width: 3000, height: 800 });
+    expect(manifest.valid_row_count).toBe(10);
+    expect(manifest.rendered_point_count).toBe(10);
+    expect(manifest.top_hits).toHaveLength(10);
 
     const plotHits = page.locator('svg[aria-label="Interactive top association hits"] circle[role="button"]');
+    await expect(plotHits).toHaveCount(10);
     await expect(plotHits.first()).toBeVisible();
     await plotHits.first().click();
     const selectedRow = page.locator('tbody tr[aria-selected="true"]');

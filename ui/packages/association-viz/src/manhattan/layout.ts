@@ -171,13 +171,17 @@ export function verifyCanonicalGeometry(layout: GenomeLayoutV1): void {
   }
   const expected = deriveCanonicalContigs(layout);
   if (expected.length !== layout.contigs.length) throw new Error('non-canonical layout geometry');
+  // A shortest-round-trip JSON coordinate can land one ULP from the value
+  // independently re-derived by JavaScript. Match Rust's narrow, width-scaled
+  // allowance; all hashed geometry inputs and non-coordinate fields stay exact.
+  const tolerance = Number.EPSILON * Math.max(layout.width, 1) * 8;
   expected.forEach((contig, index) => {
     const actual = layout.contigs[index];
     if (
       actual.name !== contig.name
       || actual.length !== contig.length
-      || actual.x_start !== contig.x_start
-      || actual.x_end !== contig.x_end
+      || !(Math.abs(actual.x_start - contig.x_start) <= tolerance)
+      || !(Math.abs(actual.x_end - contig.x_end) <= tolerance)
       || actual.color !== contig.color
     ) throw new Error('non-canonical layout geometry');
   });

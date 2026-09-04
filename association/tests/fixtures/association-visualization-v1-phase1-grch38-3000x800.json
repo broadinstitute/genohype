@@ -1,0 +1,384 @@
+{
+  "schema_version": "1.0",
+  "plot_id": "genohype-association-demo",
+  "kind": "manhattan",
+  "title": "Manhattan plot for genohype-association-demo",
+  "assembly": "GRCh38",
+  "coordinate_convention": "1-based-inclusive",
+  "source_fingerprint": "sha256:1bec64b0d446c687c3bafdcc10d27ddacbc709c5cf4b18ac1de223ed61ccd149",
+  "genohype_version": "0.1.0",
+  "created_at": "2026-09-04T08:25:57Z",
+  "layout": {
+    "width": 3000,
+    "height": 800,
+    "contig_gap": 4,
+    "contigs": [
+      {
+        "name": "1",
+        "length": 248956422,
+        "x_start": 0.0,
+        "x_end": 234.1005190625777,
+        "color": "#404040"
+      },
+      {
+        "name": "2",
+        "length": 242193529,
+        "x_start": 238.1005190625777,
+        "x_end": 465.8417052389177,
+        "color": "#4682B4"
+      },
+      {
+        "name": "3",
+        "length": 198295559,
+        "x_start": 469.8417052389177,
+        "x_end": 656.3044319955868,
+        "color": "#404040"
+      },
+      {
+        "name": "4",
+        "length": 190214555,
+        "x_start": 660.3044319955868,
+        "x_end": 839.1683701138702,
+        "color": "#4682B4"
+      },
+      {
+        "name": "5",
+        "length": 181538259,
+        "x_start": 843.1683701138702,
+        "x_end": 1013.8737502772173,
+        "color": "#404040"
+      },
+      {
+        "name": "6",
+        "length": 170805979,
+        "x_start": 1017.8737502772173,
+        "x_end": 1178.487274610772,
+        "color": "#4682B4"
+      },
+      {
+        "name": "7",
+        "length": 159345973,
+        "x_start": 1182.487274610772,
+        "x_end": 1332.3246424928968,
+        "color": "#404040"
+      },
+      {
+        "name": "8",
+        "length": 145138636,
+        "x_start": 1336.3246424928968,
+        "x_end": 1472.8024635937902,
+        "color": "#4682B4"
+      },
+      {
+        "name": "9",
+        "length": 138394717,
+        "x_start": 1476.8024635937902,
+        "x_end": 1606.9387935785558,
+        "color": "#404040"
+      },
+      {
+        "name": "10",
+        "length": 133797422,
+        "x_start": 1610.9387935785558,
+        "x_end": 1736.7521615881376,
+        "color": "#4682B4"
+      },
+      {
+        "name": "11",
+        "length": 135086622,
+        "x_start": 1740.7521615881376,
+        "x_end": 1867.7777995474196,
+        "color": "#404040"
+      },
+      {
+        "name": "12",
+        "length": 133275309,
+        "x_start": 1871.7777995474196,
+        "x_end": 1997.1002104516276,
+        "color": "#4682B4"
+      },
+      {
+        "name": "13",
+        "length": 114364328,
+        "x_start": 2001.1002104516276,
+        "x_end": 2108.6401097318435,
+        "color": "#404040"
+      },
+      {
+        "name": "14",
+        "length": 107043718,
+        "x_start": 2112.6401097318435,
+        "x_end": 2213.2962396074095,
+        "color": "#4682B4"
+      },
+      {
+        "name": "15",
+        "length": 101991189,
+        "x_start": 2217.2962396074095,
+        "x_end": 2313.2013385516316,
+        "color": "#404040"
+      },
+      {
+        "name": "16",
+        "length": 90338345,
+        "x_start": 2317.2013385516316,
+        "x_end": 2402.1489502093627,
+        "color": "#4682B4"
+      },
+      {
+        "name": "17",
+        "length": 83257441,
+        "x_start": 2406.1489502093627,
+        "x_end": 2484.4381945572027,
+        "color": "#404040"
+      },
+      {
+        "name": "18",
+        "length": 80373285,
+        "x_start": 2488.4381945572027,
+        "x_end": 2564.015388292998,
+        "color": "#4682B4"
+      },
+      {
+        "name": "19",
+        "length": 58617616,
+        "x_start": 2568.015388292998,
+        "x_end": 2623.135132630466,
+        "color": "#404040"
+      },
+      {
+        "name": "20",
+        "length": 64444167,
+        "x_start": 2627.135132630466,
+        "x_end": 2687.733741913401,
+        "color": "#4682B4"
+      },
+      {
+        "name": "21",
+        "length": 46709983,
+        "x_start": 2691.733741913401,
+        "x_end": 2735.656413913018,
+        "color": "#404040"
+      },
+      {
+        "name": "22",
+        "length": 50818468,
+        "x_start": 2739.656413913018,
+        "x_end": 2787.442406502375,
+        "color": "#4682B4"
+      },
+      {
+        "name": "X",
+        "length": 156040895,
+        "x_start": 2791.442406502375,
+        "x_end": 2938.171919326468,
+        "color": "#404040"
+      },
+      {
+        "name": "Y",
+        "length": 57227415,
+        "x_start": 2942.171919326468,
+        "x_end": 2995.9844197170364,
+        "color": "#4682B4"
+      },
+      {
+        "name": "MT",
+        "length": 16569,
+        "x_start": 2999.9844197170364,
+        "x_end": 3000.0,
+        "color": "#404040"
+      }
+    ],
+    "y_scale": {
+      "height": 800,
+      "log_threshold": 10.0,
+      "linear_fraction": 0.6,
+      "max_neg_log_p": 350.0
+    }
+  },
+  "layout_hash": "sha256:b7f2905a9bf186c1f8eb64638d6e6e6cc829c4fd9a07afddd5c0a015c80818dc",
+  "thresholds": [
+    {
+      "name": "genome_wide_significance",
+      "pvalue": 5e-8
+    }
+  ],
+  "row_count": 12,
+  "valid_row_count": 10,
+  "skipped_row_count": 2,
+  "rendered_point_count": 10,
+  "significant_hit_count": 5,
+  "top_hits": [
+    {
+      "contig": "4",
+      "position": 68500000,
+      "ref_allele": "G",
+      "alt_allele": "A",
+      "pvalue": 0.0,
+      "neg_log10_p": 320.0,
+      "beta": -1.4,
+      "standard_error": 0.3,
+      "allele_frequency": 0.0001,
+      "allele_count": 1.0,
+      "gene_symbol": null,
+      "consequence": null,
+      "series": null,
+      "source_ordinal": 8
+    },
+    {
+      "contig": "4",
+      "position": 68123456,
+      "ref_allele": "T",
+      "alt_allele": "A",
+      "pvalue": 1.9999999999999998e-30,
+      "neg_log10_p": 29.69897000433602,
+      "beta": 1.2,
+      "standard_error": 0.2,
+      "allele_frequency": null,
+      "allele_count": null,
+      "gene_symbol": null,
+      "consequence": null,
+      "series": null,
+      "source_ordinal": 7
+    },
+    {
+      "contig": "1",
+      "position": 101003,
+      "ref_allele": "G",
+      "alt_allele": "A",
+      "pvalue": 1e-12,
+      "neg_log10_p": 12.0,
+      "beta": 0.7,
+      "standard_error": 0.08,
+      "allele_frequency": 0.005,
+      "allele_count": 1.0,
+      "gene_symbol": null,
+      "consequence": null,
+      "series": null,
+      "source_ordinal": 2
+    },
+    {
+      "contig": "4",
+      "position": 68000010,
+      "ref_allele": "C",
+      "alt_allele": "G",
+      "pvalue": 1e-12,
+      "neg_log10_p": 12.0,
+      "beta": -0.7,
+      "standard_error": 0.08,
+      "allele_frequency": 0.005,
+      "allele_count": 1.0,
+      "gene_symbol": null,
+      "consequence": null,
+      "series": null,
+      "source_ordinal": 6
+    },
+    {
+      "contig": "4",
+      "position": 68900000,
+      "ref_allele": "C",
+      "alt_allele": "T",
+      "pvalue": 4e-8,
+      "neg_log10_p": 7.397940008672037,
+      "beta": 0.4,
+      "standard_error": 0.1,
+      "allele_frequency": 0.03,
+      "allele_count": null,
+      "gene_symbol": null,
+      "consequence": null,
+      "series": null,
+      "source_ordinal": 10
+    },
+    {
+      "contig": "1",
+      "position": 101002,
+      "ref_allele": "C",
+      "alt_allele": "T",
+      "pvalue": 5e-8,
+      "neg_log10_p": 7.301029995663981,
+      "beta": -0.2,
+      "standard_error": 0.04,
+      "allele_frequency": 0.01,
+      "allele_count": 2.0,
+      "gene_symbol": null,
+      "consequence": null,
+      "series": null,
+      "source_ordinal": 1
+    },
+    {
+      "contig": "4",
+      "position": 69000000,
+      "ref_allele": "CT",
+      "alt_allele": "C",
+      "pvalue": 1e-6,
+      "neg_log10_p": 6.0,
+      "beta": 0.3,
+      "standard_error": 0.07,
+      "allele_frequency": 0.02,
+      "allele_count": 4.0,
+      "gene_symbol": null,
+      "consequence": null,
+      "series": null,
+      "source_ordinal": 11
+    },
+    {
+      "contig": "4",
+      "position": 68000001,
+      "ref_allele": "A",
+      "alt_allele": "C",
+      "pvalue": 0.05,
+      "neg_log10_p": 1.3010299956639813,
+      "beta": 0.02,
+      "standard_error": 0.01,
+      "allele_frequency": 0.15,
+      "allele_count": 30.0,
+      "gene_symbol": null,
+      "consequence": null,
+      "series": null,
+      "source_ordinal": 5
+    },
+    {
+      "contig": "1",
+      "position": 101001,
+      "ref_allele": "A",
+      "alt_allele": "G",
+      "pvalue": 0.5,
+      "neg_log10_p": 0.3010299956639812,
+      "beta": 0.1,
+      "standard_error": 0.05,
+      "allele_frequency": 0.2,
+      "allele_count": 40.0,
+      "gene_symbol": null,
+      "consequence": null,
+      "series": null,
+      "source_ordinal": 0
+    },
+    {
+      "contig": "4",
+      "position": 68750000,
+      "ref_allele": "A",
+      "alt_allele": "AT",
+      "pvalue": 0.8,
+      "neg_log10_p": 0.0969100130080564,
+      "beta": null,
+      "standard_error": null,
+      "allele_frequency": 0.25,
+      "allele_count": 50.0,
+      "gene_symbol": null,
+      "consequence": null,
+      "series": null,
+      "source_ordinal": 9
+    }
+  ],
+  "warnings": [
+    "pvalue_underflow"
+  ],
+  "resources": {
+    "raster": {
+      "url": "raster",
+      "media_type": "image/png",
+      "byte_size": 56576,
+      "checksum": "sha256:cc632f9aabac48f59d3b1ac0ec8f9dd9ee0a3f4c96d8ed7735c1d446acdda046"
+    }
+  }
+}
