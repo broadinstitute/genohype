@@ -7,6 +7,8 @@ import { computeLayoutHash } from '@genohype/association-viz';
 import { App, associationManifestUrl, loadAssociationViewer } from './App.js';
 
 type Json = Record<string, any>;
+const DATASET_ID = '123e4567-e89b-42d3-a456-426614174000';
+
 function fixture(): Json {
   return JSON.parse(readFileSync(
     resolve(process.cwd(), '../../../association/tests/fixtures/association-visualization-v1.json'),
@@ -22,7 +24,7 @@ function response(body: unknown, status = 200, url?: string): Response {
 
 function locusRootFixture(): Json {
   const root = fixture();
-  root.plot_id = '123e4567-e89b-42d3-a456-426614174000';
+  root.plot_id = DATASET_ID;
   root.layout.contigs = [{ name: '4', length: 190214555, x_start: 0, x_end: 100, color: '#404040' }];
   root.top_hits = root.top_hits.map((hit: Json, index: number) => ({
     ...hit, contig: '4', position: 68_500_000 + index, source_ordinal: index === 0 ? 9 : 8,
@@ -35,6 +37,17 @@ function locusRootFixture(): Json {
 
 function regionFixture(name: string): Json {
   return JSON.parse(readFileSync(resolve(process.cwd(), `../../../association/tests/fixtures/${name}`), 'utf8'));
+}
+
+function chromosomeFixture(root: Json, contigName: string): Json {
+  const chromosome = structuredClone(root);
+  const contig = chromosome.layout.contigs.find((entry: Json) => entry.name === contigName);
+  chromosome.layout.contigs = [{ ...contig, x_start: 0, x_end: chromosome.layout.width }];
+  chromosome.top_hits = chromosome.top_hits.filter((hit: Json) => hit.contig === contigName);
+  chromosome.layout_hash = computeLayoutHash(chromosome.layout, chromosome.assembly);
+  chromosome.resources.raster.url = 'raster';
+  delete chromosome.resources.table_api;
+  return chromosome;
 }
 
 describe('association viewer app', () => {
@@ -166,11 +179,12 @@ describe('association viewer app', () => {
   it('pages server rows while preserving a selected top hit outside the current page', async () => {
     vi.stubGlobal('ResizeObserver', class { observe() {} disconnect() {} unobserve() {} });
     const manifest = fixture();
+    manifest.plot_id = DATASET_ID;
     manifest.resources.table_api.url = 'datasets/opaque/table';
     const [firstHit, secondHit] = manifest.top_hits;
     const page = (point: Json, offset: number) => ({
       schema_version: '1.0',
-      dataset_id: '2f1f76b8-d244-4d95-8219-ec8dbeb24d8b',
+      dataset_id: manifest.plot_id,
       points: [point],
       offset,
       limit: 100,
@@ -202,6 +216,9 @@ describe('association viewer app', () => {
     await waitFor(() => expect(screen.getAllByText('101–101 of 200 hits')).toHaveLength(2));
     expect(within(screen.getByRole('table')).getAllByRole('row')[1]).toHaveAttribute('aria-selected', 'false');
     expect(document.querySelector('.association-hit-selection')).toBeInTheDocument();
+    expect(screen.getByRole('searchbox', { name: 'Search hits' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Variant' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'P-value' })).toBeInTheDocument();
   });
 
   it('synchronizes controlled table and plot selection', async () => {
@@ -246,6 +263,123 @@ describe('association viewer app', () => {
     expect(screen.getByRole('status')).toHaveTextContent('Loading association detail');
   });
 
+  it('keeps a chromosome raster failure route-local and recovers the healthy root view through Back', async () => {
+    const root = fixture();
+    root.plot_id = DATASET_ID;
+    delete root.resources.table_api;
+    delete root.resources.region_api;
+    const chromosome = chromosomeFixture(root, '1');
+    const fetchMock = vi.fn((input: URL | RequestInfo) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/token/api/manifest') return Promise.resolve(response(root));
+      if (url.pathname.endsWith('/chromosomes/1/manifest')) return Promise.resolve(response(chromosome));
+      return Promise.resolve(response({}, 404));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    render(<App />);
+    await waitFor(() => expect(document.querySelector('[data-route="root"]')).toBeInTheDocument());
+
+    window.history.pushState(null, '', '/token/chromosome/1');
+    fireEvent.popState(window);
+    await waitFor(() => expect(document.querySelector('[data-route="chromosome"]')).toBeInTheDocument());
+    fireEvent.error(screen.getByRole('img'));
+
+    expect(document.querySelector('[data-route="chromosome"]')).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('Association raster could not be loaded');
+    expect(screen.getByRole('button', { name: 'Back' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Whole genome' })).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Back' }));
+    await waitFor(() => expect(document.querySelector('[data-route="root"]')).toBeInTheDocument());
+    expect(screen.getByRole('heading', { name: root.title })).toBeInTheDocument();
+  });
+
+  it.each([429, 503])('keeps HTTP %i busy detail failures bounded, navigable, and manually retriable', async (busyStatus) => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 857 });
+    Object.defineProperty(window, 'devicePixelRatio', { configurable: true, value: 2 });
+    window.history.replaceState(null, '', '/token/locus/4/68000111-68999001');
+    const root = locusRootFixture();
+    const regionManifest = regionFixture('association-region-render-v1.json');
+    const overlay = regionFixture('association-region-overlay-v1.json');
+    let busy = true;
+    const fetchMock = vi.fn((input: URL | RequestInfo) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/token/api/manifest') return Promise.resolve(response(root));
+      if (url.pathname.endsWith('/region/manifest')) {
+        if (busy) {
+          busy = false;
+          return Promise.resolve(response({ source_path: '/private/study.tsv' }, busyStatus));
+        }
+        return Promise.resolve(response(regionManifest, 200, `https://example.test/token/api/datasets/${root.plot_id}/region/manifest`));
+      }
+      if (url.pathname.endsWith('/region/overlay/fixture.json')) return Promise.resolve(response(overlay));
+      if (url.pathname.endsWith(`/datasets/${root.plot_id}/region`)) {
+        return Promise.resolve(response({
+          schema_version: '1.0', dataset_id: root.plot_id, points: [], offset: 0, limit: 100, total: 0,
+          sort: null, direction: null, search: null,
+        }));
+      }
+      return Promise.resolve(response({}, 404));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    render(<App />);
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('association server is busy');
+    expect(alert).not.toHaveTextContent('/private');
+    expect(within(alert).getByRole('button', { name: 'Back' })).toBeInTheDocument();
+    expect(within(alert).getByRole('button', { name: 'Whole genome' })).toBeInTheDocument();
+    await userEvent.click(within(alert).getByRole('button', { name: 'Retry detail' }));
+    await waitFor(() => expect(document.querySelector('[data-route="locus"]')).toBeInTheDocument());
+  });
+
+  it('resets chromosome page 2 before the first locus table request', async () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 857 });
+    Object.defineProperty(window, 'devicePixelRatio', { configurable: true, value: 2 });
+    window.history.replaceState(null, '', '/token/chromosome/4');
+    const root = locusRootFixture();
+    const chromosome = chromosomeFixture(root, '4');
+    const regionManifest = regionFixture('association-region-render-v1.json');
+    const overlay = regionFixture('association-region-overlay-v1.json');
+    const tableRequests: URL[] = [];
+    const fetchMock = vi.fn((input: URL | RequestInfo) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/token/api/manifest') return Promise.resolve(response(root));
+      if (url.pathname.endsWith('/chromosomes/4/manifest')) return Promise.resolve(response(chromosome));
+      if (url.pathname.endsWith('/region/manifest')) {
+        return Promise.resolve(response(regionManifest, 200, `https://example.test/token/api/datasets/${root.plot_id}/region/manifest`));
+      }
+      if (url.pathname.endsWith('/region/overlay/fixture.json')) return Promise.resolve(response(overlay));
+      if (url.pathname.endsWith(`/datasets/${root.plot_id}/region`)) {
+        tableRequests.push(url);
+        const offset = Number(url.searchParams.get('offset'));
+        const locus = url.searchParams.get('start') === String(regionManifest.layout.effective_start);
+        const point = locus ? overlay.points[0].point : root.top_hits[offset === 0 ? 0 : 1];
+        return Promise.resolve(response({
+          schema_version: '1.0', dataset_id: root.plot_id, points: [point], offset, limit: 100,
+          total: locus ? 3 : 200, sort: null, direction: null, search: null,
+        }));
+      }
+      return Promise.resolve(response({}, 404));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    render(<App />);
+
+    await waitFor(() => expect(screen.getAllByText('1–1 of 200 hits')).toHaveLength(2));
+    await userEvent.click(screen.getByRole('button', { name: 'Next' }));
+    await waitFor(() => expect(screen.getAllByText('101–101 of 200 hits')).toHaveLength(2));
+
+    window.history.pushState(null, '', '/token/locus/4/68000111-68999001');
+    fireEvent.popState(window);
+    await waitFor(() => expect(document.querySelector('[data-route="locus"]')).toBeInTheDocument());
+    await waitFor(() => expect(tableRequests.some((url) =>
+      url.searchParams.get('start') === String(regionManifest.layout.effective_start)
+      && url.searchParams.get('offset') === '0')).toBe(true));
+    expect(tableRequests.some((url) =>
+      url.searchParams.get('start') === String(regionManifest.layout.effective_start)
+      && url.searchParams.get('offset') === '100')).toBe(false);
+  });
+
   it('loads a direct locus route, rebases resources, and synchronizes selected overlay/table state', async () => {
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 857 });
     Object.defineProperty(window, 'devicePixelRatio', { configurable: true, value: 2 });
@@ -279,6 +413,11 @@ describe('association viewer app', () => {
     });
     expect(fetchMock.mock.calls.some(([input]) => String(input).includes('limit=100'))).toBe(true);
     expect(fetchMock.mock.calls.every(([input]) => !String(input).includes('limit=1001'))).toBe(true);
+    expect(screen.getByText('Ordered by locus')).toBeInTheDocument();
+    expect(screen.queryByRole('searchbox')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Variant' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'P-value' })).not.toBeInTheDocument();
+    expect(screen.getAllByRole('columnheader').every((header) => !header.hasAttribute('aria-sort'))).toBe(true);
   });
 
   it('reacts to popstate and canonicalizes aliases after the root manifest loads', async () => {

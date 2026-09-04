@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ManifestValidationError,
   parseAssociationRegionRenderManifest,
@@ -43,7 +43,7 @@ export type AssociationDetailState =
     rasterUrl: string;
   }
   | { kind: 'schema-error'; message: string }
-  | { kind: 'resource-error'; message: string }
+  | { kind: 'resource-error'; message: string; retriable?: boolean }
   | { kind: 'bounded-too-dense'; message: string };
 
 function requestError(status: number): AssociationDetailState {
@@ -52,6 +52,9 @@ function requestError(status: number): AssociationDetailState {
   }
   if (status === 400) return { kind: 'resource-error', message: 'The detail request was not accepted.' };
   if (status === 404) return { kind: 'resource-error', message: 'The requested association detail was not found.' };
+  if (status === 429 || status === 503) {
+    return { kind: 'resource-error', message: 'The association server is busy. Try this detail again shortly.', retriable: true };
+  }
   return { kind: 'resource-error', message: `Association detail request failed with HTTP ${status}.` };
 }
 
@@ -197,9 +200,10 @@ export function useAssociationDetail(
   route: ViewerRoute,
   root: URL,
   rootManifest: AssociationVisualizationManifestV1,
-): { state: AssociationDetailState; metrics: DetailRequestMetrics } {
+): { state: AssociationDetailState; metrics: DetailRequestMetrics; retry: () => void } {
   const [metrics, setMetrics] = useState(currentMetrics);
   const [state, setState] = useState<AssociationDetailState>({ kind: 'idle' });
+  const [retryCount, setRetryCount] = useState(0);
 
   useEffect(() => {
     let timeout: number | undefined;
@@ -239,7 +243,8 @@ export function useAssociationDetail(
       if (!controller.signal.aborted) setState({ kind: 'resource-error', message: 'Association detail request failed.' });
     });
     return () => controller.abort();
-  }, [metrics, requestUrl, rootManifest, route]);
+  }, [metrics, requestUrl, retryCount, rootManifest, route]);
 
-  return { state, metrics };
+  const retry = useCallback(() => setRetryCount((count) => count + 1), []);
+  return { state, metrics, retry };
 }

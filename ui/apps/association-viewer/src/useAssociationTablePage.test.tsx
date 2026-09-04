@@ -105,6 +105,7 @@ describe('association table page transport', () => {
     vi.stubGlobal('fetch', fetchMock);
     const { result } = renderHook(() => useAssociationTablePage({
       tableApiUrl: new URL('https://example.test/token/api/datasets/id/table'),
+      expectedDatasetId: DATASET_ID,
       fallbackRows: hits,
       total: 250,
       debounceMs: 10,
@@ -141,6 +142,7 @@ describe('association table page transport', () => {
 
     const { result } = renderHook(() => useAssociationTablePage({
       tableApiUrl: new URL('https://example.test/token/api/datasets/id/table'),
+      expectedDatasetId: DATASET_ID,
       fallbackRows: hits,
       total: 2,
     }));
@@ -169,6 +171,82 @@ describe('association table page transport', () => {
   });
 
   it.each([
+    ['wrong dataset', 'table', { dataset_id: '123e4567-e89b-42d3-a456-426614174000' }],
+    ['region-shaped table response', 'table', { sort: null, direction: null, search: null }],
+    ['table-shaped region response', 'region', { sort: 'locus', direction: 'ascending', search: '' }],
+  ] as const)('rejects a %s path-safely', async (_name, requestKind, overrides) => {
+    const hits = fixture().top_hits as AssociationPointV1[];
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(page([hits[0]], overrides))));
+    const { result } = renderHook(() => useAssociationTablePage({
+      tableApiUrl: new URL(`https://example.test/token/api/datasets/id/${requestKind}`),
+      expectedDatasetId: DATASET_ID,
+      fallbackRows: hits,
+      total: 10_000,
+      requestKind,
+    }));
+
+    await waitFor(() => expect(result.current.error).not.toBeNull());
+    expect(result.current.rows).toEqual(hits);
+    expect(result.current.error).toBe('Association table returned invalid or unavailable data. Showing inline top hits instead.');
+  });
+
+  it('resets URL/mode state before requesting and aborts a stale prior endpoint response', async () => {
+    const hits = fixture().top_hits as AssociationPointV1[];
+    const stale = deferred<Response>();
+    const fresh = deferred<Response>();
+    const signals: AbortSignal[] = [];
+    const fetchMock = vi.fn((_input: URL | RequestInfo, init?: RequestInit) => {
+      signals.push(init?.signal as AbortSignal);
+      if (fetchMock.mock.calls.length === 1) return Promise.resolve(jsonResponse(page([hits[0]], { total: 250 })));
+      if (fetchMock.mock.calls.length === 2) return stale.promise;
+      return fresh.promise;
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { result, rerender } = renderHook(
+      ({ href, requestKind }: { href: string; requestKind: 'table' | 'region' }) => useAssociationTablePage({
+        tableApiUrl: new URL(href),
+        expectedDatasetId: DATASET_ID,
+        fallbackRows: requestKind === 'region' ? [hits[1]] : hits,
+        total: requestKind === 'region' ? 1 : 250,
+        requestKind,
+      }),
+      { initialProps: { href: 'https://example.test/token/api/datasets/id/table', requestKind: 'table' as 'table' | 'region' } },
+    );
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    act(() => result.current.setOffset(100));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    rerender({ href: 'https://example.test/token/api/datasets/id/region?contig=4&start=1&end=10', requestKind: 'region' });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+
+    expect(signals[1].aborted).toBe(true);
+    expect(result.current).toMatchObject({
+      rows: [hits[1]], offset: 0, query: '', sort: 'locus', direction: 'ascending', loading: true, error: null,
+    });
+    const freshUrl = new URL(String(fetchMock.mock.calls[2]?.[0]));
+    expect(Object.fromEntries(freshUrl.searchParams)).toEqual({
+      contig: '4', start: '1', end: '10', offset: '0', limit: '100',
+    });
+
+    await act(async () => {
+      fresh.resolve(jsonResponse(page([hits[1]], {
+        total: 1, sort: null, direction: null, search: null,
+      })));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(result.current.rows).toEqual([hits[1]]);
+
+    await act(async () => {
+      stale.resolve(jsonResponse(page([hits[0]], { offset: 100, total: 250 })));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(result.current.rows).toEqual([hits[1]]);
+  });
+
+  it.each([
     ['malformed', () => Promise.resolve(jsonResponse({ source_path: '/private/input.tsv' }))],
     ['network', () => Promise.reject(new Error('/private/input.tsv was unavailable'))],
     ['HTTP', () => Promise.resolve(jsonResponse({}, 500))],
@@ -177,6 +255,7 @@ describe('association table page transport', () => {
     vi.stubGlobal('fetch', vi.fn(request));
     const { result } = renderHook(() => useAssociationTablePage({
       tableApiUrl: new URL('https://example.test/token/api/datasets/id/table'),
+      expectedDatasetId: DATASET_ID,
       fallbackRows: hits,
       total: 10_000,
     }));

@@ -111,11 +111,23 @@ describe('association detail transport', () => {
     [400, 'resource-error'],
     [404, 'resource-error'],
     [422, 'bounded-too-dense'],
+    [429, 'resource-error'],
     [503, 'resource-error'],
   ])('maps HTTP %i to a visible typed state', async (status, kind) => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response({}, status)));
     await expect(loadLocusDetail(new URL('https://host.test/token/request'), rootManifest(), locusRoute, fixtureMetrics))
       .resolves.toMatchObject({ kind });
+  });
+
+  it.each([429, 503])('marks HTTP %i server-busy responses as bounded and retriable', async (status) => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response({ source_path: '/private/input.tsv' }, status)));
+    const state = await loadLocusDetail(new URL('https://host.test/token/request'), rootManifest(), locusRoute, fixtureMetrics);
+    expect(state).toEqual({
+      kind: 'resource-error',
+      message: 'The association server is busy. Try this detail again shortly.',
+      retriable: true,
+    });
+    expect(JSON.stringify(state)).not.toContain('/private');
   });
 
   it('rejects bad manifest hashes and mismatched overlays before display', async () => {

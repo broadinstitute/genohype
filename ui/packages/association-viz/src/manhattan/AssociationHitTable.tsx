@@ -7,6 +7,8 @@ import type {
 import { compareCanonicalContigs, stableHitKey } from './layout.js';
 
 interface AssociationHitTableSharedProps {
+  /** Fixed locus mode removes unsupported search/sort controls and orders local fallback rows by locus. */
+  controls?: 'full' | 'fixed-locus';
   selectedHitKey?: string | null;
   onSelectedHitChange?: (hit: AssociationPointV1) => void;
   onHitHover?: (hit: AssociationPointV1 | null) => void;
@@ -73,8 +75,10 @@ export function AssociationHitTable(props: AssociationHitTableProps) {
     height = 320,
     rowHeight = 42,
     className,
+    controls = 'full',
   } = props;
   const serverMode = props.mode === 'server';
+  const fixedLocusOrder = controls === 'fixed-locus';
   const viewportRef = useRef<HTMLDivElement>(null);
   const pendingFocusKey = useRef<string | null>(null);
   const [localQuery, setLocalQuery] = useState('');
@@ -83,9 +87,9 @@ export function AssociationHitTable(props: AssociationHitTableProps) {
   const [scrollTop, setScrollTop] = useState(0);
   const [activeKey, setActiveKey] = useState<string | null>(selectedHitKey ?? null);
 
-  const query = serverMode ? props.query : localQuery;
-  const sort = serverMode ? props.sort : localSort;
-  const direction = serverMode ? props.direction : localDirection;
+  const query = fixedLocusOrder ? '' : serverMode ? props.query : localQuery;
+  const sort = fixedLocusOrder ? 'locus' : serverMode ? props.sort : localSort;
+  const direction = fixedLocusOrder ? 'ascending' : serverMode ? props.direction : localDirection;
   const sourceRows = serverMode ? props.rows : props.hits;
   const rows = useMemo(() => {
     if (serverMode) return [...sourceRows];
@@ -216,15 +220,19 @@ export function AssociationHitTable(props: AssociationHitTableProps) {
   return (
     <section className={classes} aria-label="Top association hits" aria-busy={serverMode && props.loading}>
       <div className="association-table-toolbar">
-        <label>
-          <span>Search hits</span>
-          <input
-            type="search"
-            value={query}
-            onChange={(event) => updateQuery(event.target.value)}
-            placeholder="Variant, gene, consequence…"
-          />
-        </label>
+        {fixedLocusOrder ? (
+          <span className="association-table-fixed-order">Ordered by locus</span>
+        ) : (
+          <label>
+            <span>Search hits</span>
+            <input
+              type="search"
+              value={query}
+              onChange={(event) => updateQuery(event.target.value)}
+              placeholder="Variant, gene, consequence…"
+            />
+          </label>
+        )}
         <span role="status" aria-live="polite" aria-atomic="true">{pageStatus}</span>
       </div>
       {serverMode && (
@@ -244,14 +252,22 @@ export function AssociationHitTable(props: AssociationHitTableProps) {
         <table className="association-hit-table">
           <thead>
             <tr>
-              <th aria-sort={sort === 'locus' ? direction : 'none'}>
-                <button type="button" onClick={() => updateSort('locus')}>Variant</button>
-              </th>
+              {fixedLocusOrder ? (
+                <th>Variant <span className="association-visually-hidden">(fixed locus order)</span></th>
+              ) : (
+                <th aria-sort={sort === 'locus' ? direction : 'none'}>
+                  <button type="button" onClick={() => updateSort('locus')}>Variant</button>
+                </th>
+              )}
               <th>Gene</th>
               <th>Consequence</th>
-              <th aria-sort={sort === 'pvalue' ? direction : 'none'}>
-                <button type="button" onClick={() => updateSort('pvalue')}>P-value</button>
-              </th>
+              {fixedLocusOrder ? (
+                <th>P-value</th>
+              ) : (
+                <th aria-sort={sort === 'pvalue' ? direction : 'none'}>
+                  <button type="button" onClick={() => updateSort('pvalue')}>P-value</button>
+                </th>
+              )}
               <th>Beta</th>
               <th>AF</th>
               <th><span className="association-visually-hidden">Actions</span></th>

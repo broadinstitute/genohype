@@ -4,6 +4,7 @@ import {
   type AssociationPointV1,
   type AssociationSortDirectionV1,
   type AssociationTableSortV1,
+  type DatasetIdV1,
 } from '@genohype/association-viz';
 
 export const ASSOCIATION_TABLE_PAGE_LIMIT = 100;
@@ -28,6 +29,7 @@ export interface AssociationTablePageState {
 
 interface UseAssociationTablePageOptions {
   tableApiUrl: URL;
+  expectedDatasetId: DatasetIdV1;
   fallbackRows: readonly AssociationPointV1[];
   total: number;
   limit?: number;
@@ -74,6 +76,7 @@ export function associationTablePageUrl(
 
 export function useAssociationTablePage({
   tableApiUrl,
+  expectedDatasetId,
   fallbackRows,
   total: manifestTotal,
   limit = ASSOCIATION_TABLE_PAGE_LIMIT,
@@ -92,8 +95,27 @@ export function useAssociationTablePage({
   const [retryCount, setRetryCount] = useState(0);
   const requestSequence = useRef(0);
   const tableApiHref = tableApiUrl.href;
+  const requestIdentity = `${requestKind}\u0000${expectedDatasetId}\u0000${tableApiHref}`;
+  const requestIdentityRef = useRef(requestIdentity);
   const fallbackRowsRef = useRef(fallbackRows);
   fallbackRowsRef.current = fallbackRows;
+
+  // Reset synchronously during prop reconciliation so a new endpoint can never issue
+  // its first request with the previous endpoint's paging or control state.
+  if (requestIdentityRef.current !== requestIdentity) {
+    requestIdentityRef.current = requestIdentity;
+    requestSequence.current += 1;
+    setRows(fallbackRows);
+    setTotal(manifestTotal);
+    setOffsetState(0);
+    setQueryState('');
+    setDebouncedQuery('');
+    setSortState(requestKind === 'region' ? 'locus' : 'pvalue');
+    setDirection('ascending');
+    setLoading(true);
+    setError(null);
+    setRetryCount(0);
+  }
 
   useEffect(() => {
     if (query === debouncedQuery) return;
@@ -126,7 +148,7 @@ export function useAssociationTablePage({
       signal: controller.signal,
       headers: { Accept: 'application/json' },
     }).then(async (response) => {
-      if (!response.ok) throw new Error('http');
+      if (!response.ok) throw new Error(response.status === 429 || response.status === 503 ? 'busy' : 'http');
       let input: unknown;
       try {
         input = await response.json();
@@ -140,8 +162,10 @@ export function useAssociationTablePage({
         throw new Error('invalid');
       }
       if (
-        page.offset !== offset
+        page.dataset_id !== expectedDatasetId
+        || page.offset !== offset
         || page.limit !== limit
+        || (requestKind === 'region' && (page.sort != null || page.direction != null || page.search != null))
         || (requestKind === 'table' && page.sort !== sort)
         || (requestKind === 'table' && page.direction !== direction)
         || (requestKind === 'table' && (page.search ?? '') !== debouncedQuery)
@@ -160,25 +184,29 @@ export function useAssociationTablePage({
       setTotal(fallbackRowsRef.current.length);
       setLoading(false);
       setError(
-        requestError instanceof Error && requestError.message === 'http'
-          ? 'Association table request failed. Showing inline top hits instead.'
-          : 'Association table returned invalid or unavailable data. Showing inline top hits instead.',
+        requestError instanceof Error && requestError.message === 'busy'
+          ? 'Association table service is busy. Showing inline top hits instead; retry shortly.'
+          : requestError instanceof Error && requestError.message === 'http'
+            ? 'Association table request failed. Showing inline top hits instead.'
+            : 'Association table returned invalid or unavailable data. Showing inline top hits instead.',
       );
     });
 
     return () => controller.abort();
-  }, [debouncedQuery, direction, limit, offset, query, requestKind, retryCount, sort, tableApiHref]);
+  }, [debouncedQuery, direction, expectedDatasetId, limit, offset, query, requestKind, retryCount, sort, tableApiHref]);
 
   const setQuery = useCallback((nextQuery: string) => {
+    if (requestKind === 'region') return;
     setQueryState(boundedSearch(nextQuery));
     setOffsetState(0);
-  }, []);
+  }, [requestKind]);
 
   const setSort = useCallback((nextSort: AssociationTableSortV1, nextDirection: AssociationSortDirectionV1) => {
+    if (requestKind === 'region') return;
     setSortState(nextSort);
     setDirection(nextDirection);
     setOffsetState(0);
-  }, []);
+  }, [requestKind]);
 
   const setOffset = useCallback((nextOffset: number) => {
     const safeOffset = Number.isFinite(nextOffset)

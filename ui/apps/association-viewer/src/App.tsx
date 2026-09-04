@@ -9,6 +9,7 @@ import {
   stableHitKey,
   type AssociationPointV1,
   type AssociationVisualizationManifestV1,
+  type DatasetIdV1,
 } from '@genohype/association-viz';
 import {
   canonicalizeViewerRoute,
@@ -98,6 +99,7 @@ export interface AppProps {
 
 interface ServerAssociationTableProps {
   tableApiUrl: URL;
+  expectedDatasetId: DatasetIdV1;
   fallbackRows: readonly AssociationPointV1[];
   total: number;
   selectedHitKey: string | null;
@@ -110,6 +112,7 @@ interface ServerAssociationTableProps {
 
 function ServerAssociationTable({
   tableApiUrl,
+  expectedDatasetId,
   fallbackRows,
   total,
   selectedHitKey,
@@ -119,7 +122,7 @@ function ServerAssociationTable({
   onSelectedPointAvailable,
   onOpenLocus,
 }: ServerAssociationTableProps) {
-  const page = useAssociationTablePage({ tableApiUrl, fallbackRows, total, requestKind });
+  const page = useAssociationTablePage({ tableApiUrl, expectedDatasetId, fallbackRows, total, requestKind });
 
   useEffect(() => {
     if (selectedSourceOrdinal === null) return;
@@ -135,6 +138,7 @@ function ServerAssociationTable({
           <button type="button" onClick={page.retry}>Retry table request</button>
         </div>
         <AssociationHitTable
+          controls={requestKind === 'region' ? 'fixed-locus' : 'full'}
           hits={fallbackRows}
           selectedHitKey={selectedHitKey}
           onSelectedHitChange={onSelectedHitChange}
@@ -147,6 +151,7 @@ function ServerAssociationTable({
   return (
     <AssociationHitTable
       mode="server"
+      controls={requestKind === 'region' ? 'fixed-locus' : 'full'}
       rows={page.rows}
       total={page.total}
       offset={page.offset}
@@ -309,7 +314,9 @@ function ReadyRoute({
         />
         {state.tableApiUrl ? (
           <ServerAssociationTable
+            key={`table:${state.tableApiUrl.href}`}
             tableApiUrl={state.tableApiUrl}
+            expectedDatasetId={state.manifest.plot_id}
             fallbackRows={state.manifest.top_hits}
             total={state.manifest.valid_row_count}
             selectedHitKey={selectedHitKey}
@@ -340,7 +347,14 @@ function ReadyRoute({
     return <main className="viewer-state viewer-error" data-state="bounded-too-dense" role="alert">{controls}<h1>Region too dense</h1><p>{detail.state.message}</p></main>;
   }
   if (detail.state.kind === 'resource-error') {
-    return <main className="viewer-state viewer-error" data-state="resource-error" role="alert">{controls}<h1>Association detail unavailable</h1><p>{detail.state.message}</p></main>;
+    return (
+      <main className="viewer-state viewer-error" data-state="resource-error" role="alert">
+        {controls}
+        <h1>Association detail unavailable</h1>
+        <p>{detail.state.message}</p>
+        {detail.state.retriable && <button type="button" onClick={detail.retry}>Retry detail</button>}
+      </main>
+    );
   }
 
   if (route.kind === 'chromosome' && detail.state.kind === 'chromosome-ready') {
@@ -363,11 +377,12 @@ function ReadyRoute({
           selectedContig={route.contig}
           onHitClick={select}
           onOpenLocus={openLocus}
-          onResourceError={onRootResourceError}
         />
         {regionTable && (
           <ServerAssociationTable
+            key={`region:${regionTable.href}`}
             tableApiUrl={regionTable}
+            expectedDatasetId={state.manifest.plot_id}
             fallbackRows={detail.state.manifest.top_hits}
             total={detail.state.manifest.valid_row_count}
             requestKind="region"
@@ -410,7 +425,9 @@ function ReadyRoute({
         />
         {regionTable && (
           <ServerAssociationTable
+            key={`region:${regionTable.href}`}
             tableApiUrl={regionTable}
+            expectedDatasetId={state.manifest.plot_id}
             fallbackRows={fallbackRows}
             total={detail.state.manifest.counts.source_point_count}
             requestKind="region"

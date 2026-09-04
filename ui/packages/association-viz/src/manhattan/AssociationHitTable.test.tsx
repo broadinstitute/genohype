@@ -157,6 +157,36 @@ describe('AssociationHitTable', () => {
     expect(onOffsetChange).toHaveBeenCalledWith(0);
   });
 
+  it('shows fixed locus order without unsupported region controls or false aria-sort state', () => {
+    const onQueryChange = vi.fn();
+    const onSortChange = vi.fn();
+    render(<AssociationHitTable {...controlledProps({
+      controls: 'fixed-locus',
+      query: 'ignored',
+      sort: 'pvalue',
+      direction: 'descending',
+      onQueryChange,
+      onSortChange,
+    })} />);
+
+    expect(screen.getByText('Ordered by locus')).toBeInTheDocument();
+    expect(screen.queryByRole('searchbox')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Variant' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'P-value' })).not.toBeInTheDocument();
+    expect(screen.getAllByRole('columnheader').every((header) => !header.hasAttribute('aria-sort'))).toBe(true);
+    expect(screen.getByRole('columnheader', { name: 'Variant (fixed locus order)' })).toBeInTheDocument();
+    expect(onQueryChange).not.toHaveBeenCalled();
+    expect(onSortChange).not.toHaveBeenCalled();
+  });
+
+  it('sorts a fixed-locus local fallback without exposing unsupported controls', () => {
+    render(<AssociationHitTable controls="fixed-locus" hits={[...goldenManifest().top_hits].reverse()} />);
+    expect(dataRows()[0]).toHaveTextContent('1:3 A>G');
+    expect(dataRows()[1]).toHaveTextContent('2:9');
+    expect(screen.queryByRole('searchbox')).not.toBeInTheDocument();
+    expect(screen.getByText('Ordered by locus')).toBeInTheDocument();
+  });
+
   it('shows the server range and delegates bounded previous and next pages', async () => {
     const user = userEvent.setup();
     const onOffsetChange = vi.fn();
