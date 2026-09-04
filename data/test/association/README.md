@@ -9,4 +9,10 @@
 
 The rows deliberately include ordinary and genome-wide-significant p-values, tied p-values, a `Pvalue == 0` row with `Pvalue_log10 == 320`, finite invalid values (negative and greater than one), and missing optional values. Consumers must skip invalid p-values rather than treating them as hits. NaN and infinite cases are covered by Phase 1 normalization unit tests so this fixture's JSON query output remains standards-compliant.
 
-Routine tests use these checked-in fixtures and require no cloud credentials. Regenerate the Hail table with `data/test/association/generate_fixture.py`; keep the TSV rows semantically identical when refreshing either fixture. To refresh a larger uncommitted real-data subset for manual testing, run `data/test/association/refresh-height-fixture.sh`; its default output is under `/tmp`.
+Routine tests use these checked-in fixtures and require no cloud credentials. Exercise bounded flat-file inspection with:
+
+```bash
+genohype association inspect data/test/association/single-variant.tsv --build GRCh38
+```
+
+The report deterministically infers the exact TSV header spellings, reports the two invalid p-value rows, and prints a shell-quoted `association view` command containing every resolved mapping. Regenerate the Hail table with `data/test/association/generate_fixture.py`; keep the TSV rows semantically identical when refreshing either fixture. To refresh a larger uncommitted real-data subset for manual testing, run `data/test/association/refresh-height-fixture.sh`; its default output is under `/tmp`.

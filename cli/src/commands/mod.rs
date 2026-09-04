@@ -2,6 +2,7 @@
 
 #[cfg(feature = "vep")]
 pub mod annotate;
+pub mod association;
 pub mod export;
 pub mod info;
 #[cfg(feature = "clickhouse")]

@@ -1,5 +1,6 @@
 //! CLI argument definitions using clap derive API.
 
+pub mod association;
 pub mod cluster;
 pub mod export;
 pub mod manhattan;
@@ -14,6 +15,7 @@ pub mod vcf;
 pub mod annotate;
 
 // Re-export everything so `main.rs` doesn't break
+pub use association::*;
 pub use cluster::*;
 pub use export::*;
 pub use manhattan::*;
@@ -102,6 +104,12 @@ pub enum Commands {
     SafeExport {
         #[command(subcommand)]
         command: SafeExportCommands,
+    },
+
+    /// Inspect and view generalized association datasets
+    Association {
+        #[command(subcommand)]
+        command: AssociationCommands,
     },
 
     /// Generate Manhattan plots (PNG + JSON sidecar)

@@ -7,6 +7,7 @@
 //! - export: Export data to other formats (Parquet, ClickHouse, BigQuery)
 
 mod association_server;
+mod association_sources;
 mod benchmark;
 mod cli;
 mod clickhouse;
@@ -37,6 +38,7 @@ use genohype_core::metadata::CacheOptions;
 use owo_colors::OwoColorize;
 
 // Import command handlers from the commands module
+use commands::association::run_association_command;
 #[cfg(feature = "bigquery")]
 use commands::export::run_export_bigquery;
 use commands::export::{
@@ -119,6 +121,7 @@ fn main() -> Result<()> {
         },
         Commands::Manifest { command } => run_manifest_command(command)?,
         Commands::SafeExport { command } => run_safe_export_command(command)?,
+        Commands::Association { command } => run_association_command(command)?,
         Commands::Manhattan(args) => run_manhattan(args)?,
         Commands::ManhattanBatch(args) => run_manhattan_batch(args)?,
         Commands::Loci(args) => run_loci(args)?,
