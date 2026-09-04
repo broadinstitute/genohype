@@ -1,4 +1,4 @@
-use crate::layout::canonical_assembly;
+use crate::layout::{canonical_assembly, validate_raster_dimensions, MAX_ENCODED_RASTER_BYTES};
 use crate::manifest::{validate_schema_version, AssociationThresholdV1, SCHEMA_VERSION_V1};
 use crate::reduction::MAX_TOP_K;
 use crate::JSON_SAFE_INTEGER_MAX;
@@ -121,6 +121,10 @@ pub struct SessionKeyInputsV1 {
     #[schemars(length(min = 1, max = 64))]
     pub assembly: String,
     pub thresholds: Vec<AssociationThresholdV1>,
+    /// Strict (`pvalue < significance_threshold`) count threshold. It must be
+    /// advertised by exactly one entry in `thresholds`.
+    #[schemars(range(min = 0.0, max = 1.0))]
+    pub significance_threshold: f64,
     #[schemars(range(max = 1000))]
     pub top_hits: usize,
     #[schemars(range(min = 1))]
@@ -148,8 +152,7 @@ impl SessionKeyInputsV1 {
         self.mapping.validate()?;
         if !matches!(self.assembly.as_str(), "GRCh37" | "GRCh38")
             || canonical_assembly(&self.assembly) != self.assembly
-            || self.width == 0
-            || self.height == 0
+            || validate_raster_dimensions(self.width, self.height).is_err()
         {
             return Err(SessionError::InvalidSessionInput);
         }
@@ -166,6 +169,17 @@ impl SessionKeyInputsV1 {
             return Err(SessionError::InvalidSessionInput);
         }
         if self.thresholds.len() > 100
+            || !self.significance_threshold.is_finite()
+            || self.significance_threshold <= 0.0
+            || self.significance_threshold > 1.0
+            || self
+                .thresholds
+                .iter()
+                .filter(|threshold| {
+                    threshold.pvalue.to_bits() == self.significance_threshold.to_bits()
+                })
+                .count()
+                != 1
             || self.thresholds.iter().any(|threshold| {
                 threshold.name.trim().is_empty()
                     || threshold.name.trim() != threshold.name
@@ -269,8 +283,8 @@ impl AssociationSessionCompletionV1 {
     pub fn validate(&self) -> Result<(), SessionError> {
         if self.schema_version != SCHEMA_VERSION_V1
             || self.store_schema_version != STORE_SCHEMA_VERSION_V1
-            || self.raster_width == 0
-            || self.raster_height == 0
+            || validate_raster_dimensions(self.raster_width, self.raster_height).is_err()
+            || self.raster.byte_size > MAX_ENCODED_RASTER_BYTES
             || self.created_at.is_empty()
             || self.created_at.len() > 64
             || self
@@ -396,8 +410,12 @@ mod tests {
         let mut inputs = session_inputs();
         inputs.thresholds = vec![AssociationThresholdV1 {
             name: "   ".into(),
-            pvalue: 0.5,
+            pvalue: inputs.significance_threshold,
         }];
+        assert_eq!(inputs.validate(), Err(SessionError::InvalidSessionInput));
+
+        let mut inputs = session_inputs();
+        inputs.significance_threshold = 1e-6;
         assert_eq!(inputs.validate(), Err(SessionError::InvalidSessionInput));
     }
 
@@ -410,6 +428,10 @@ mod tests {
     #[test]
     fn page_and_render_inputs_invalidate_session_identity() {
         let baseline = session_inputs().session_key().unwrap();
+        let mut changed = session_inputs();
+        changed.significance_threshold = 1e-6;
+        changed.thresholds[0].pvalue = 1e-6;
+        assert_ne!(baseline, changed.session_key().unwrap());
         let mut changed = session_inputs();
         changed.point_radius = 3.0;
         assert_ne!(baseline, changed.session_key().unwrap());
@@ -431,7 +453,11 @@ mod tests {
             source_fingerprint: format!("sha256:{}", "a".repeat(64)),
             mapping: mapping(),
             assembly: "GRCh38".into(),
-            thresholds: vec![],
+            thresholds: vec![AssociationThresholdV1 {
+                name: "significance".into(),
+                pvalue: 5e-8,
+            }],
+            significance_threshold: 5e-8,
             top_hits: 100,
             width: 3000,
             height: 800,

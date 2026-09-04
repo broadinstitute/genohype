@@ -6,11 +6,11 @@
 
 use fs2::FileExt;
 use genohype_association::{
-    AssociationBuildCancellation, AssociationSessionCompletionV1, AssociationSortDirectionV1,
-    AssociationStore, AssociationTablePageRequestV1, AssociationTableSortV1,
-    AssociationVisualizationManifestV1, CompletedArtifactV1, DatasetIdV1, NormalizedFieldMappingV1,
-    SessionBackgroundV1, SessionKeyInputsV1, SqliteAssociationStore, SCHEMA_VERSION_V1,
-    STORE_SCHEMA_VERSION_V1,
+    validate_raster_dimensions, AssociationBuildCancellation, AssociationSessionCompletionV1,
+    AssociationSortDirectionV1, AssociationStore, AssociationTablePageRequestV1,
+    AssociationTableSortV1, AssociationVisualizationManifestV1, CompletedArtifactV1, DatasetIdV1,
+    NormalizedFieldMappingV1, SessionBackgroundV1, SessionKeyInputsV1, SqliteAssociationStore,
+    MAX_ENCODED_RASTER_BYTES, SCHEMA_VERSION_V1, STORE_SCHEMA_VERSION_V1,
 };
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
@@ -31,7 +31,9 @@ const RASTER_NAME: &str = "raster.png";
 const MANIFEST_NAME: &str = "manifest.json";
 const COMPLETE_NAME: &str = "complete.json";
 const ACTIVE_LOCK_NAME: &str = ".active.lock";
-const GLOBAL_LOCK_NAME: &str = ".global.lock";
+const CACHE_CLEAR_LOCK_NAME: &str = ".genohype-cache.lock";
+const STAGING_PROTOCOL_LOCK_NAME: &str = ".staging-protocol.lock";
+const STREAM_BUFFER_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct NormalizedSessionRequestV1 {
@@ -40,6 +42,7 @@ pub(crate) struct NormalizedSessionRequestV1 {
     pub mapping: NormalizedFieldMappingV1,
     pub assembly: String,
     pub thresholds: Vec<genohype_association::AssociationThresholdV1>,
+    pub significance_threshold: f64,
     pub top_hits: usize,
     pub width: u32,
     pub height: u32,
@@ -58,6 +61,7 @@ impl NormalizedSessionRequestV1 {
             mapping: self.mapping.clone(),
             assembly: self.assembly.clone(),
             thresholds: self.thresholds.clone(),
+            significance_threshold: self.significance_threshold,
             top_hits: self.top_hits,
             width: self.width,
             height: self.height,
@@ -272,6 +276,10 @@ pub(crate) struct CleanupSummary {
 #[derive(Clone)]
 pub(crate) struct AssociationSessionRegistry {
     root: Arc<PathBuf>,
+    /// Persistent and deliberately outside `<cache>/genohype`, which broad
+    /// cache clear removes. Recreating the cache tree can never replace the
+    /// inode on which active sessions hold their shared lock.
+    cache_clear_lock: Arc<PathBuf>,
 }
 impl AssociationSessionRegistry {
     pub(crate) fn open_default() -> Result<Self, AssociationSessionError> {
@@ -280,23 +288,37 @@ impl AssociationSessionRegistry {
         ensure_private_directory(&genohype)?;
         let association = genohype.join("association");
         ensure_private_directory(&association)?;
-        Self::open_root(association.join("v1"))
+        Self::open_root(association.join("v1"), cache.join(CACHE_CLEAR_LOCK_NAME))
     }
 
     #[cfg(test)]
     fn open_for_test(root: PathBuf) -> Result<Self, AssociationSessionError> {
-        Self::open_root(root)
+        let parent = root
+            .parent()
+            .ok_or(AssociationSessionError::CacheUnavailable)?;
+        let unique = root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(AssociationSessionError::CacheUnavailable)?;
+        let clear_lock = parent.join(format!(".{unique}-genohype-cache.lock"));
+        Self::open_root(root, clear_lock)
     }
 
-    fn open_root(root: PathBuf) -> Result<Self, AssociationSessionError> {
+    fn open_root(
+        root: PathBuf,
+        cache_clear_lock: PathBuf,
+    ) -> Result<Self, AssociationSessionError> {
         ensure_private_directory(&root)?;
         for child in ["claims", "staging", "sessions"] {
             ensure_private_directory(&root.join(child))?;
         }
-        let global = open_private_lock(&root.join(GLOBAL_LOCK_NAME))?;
-        drop(global);
+        let protocol = open_private_lock(&root.join(STAGING_PROTOCOL_LOCK_NAME))?;
+        drop(protocol);
+        let clear = open_private_lock(&cache_clear_lock)?;
+        drop(clear);
         let registry = Self {
             root: Arc::new(root),
+            cache_clear_lock: Arc::new(cache_clear_lock),
         };
         registry.initialize_registry()?;
         Ok(registry)
@@ -321,6 +343,7 @@ impl AssociationSessionRegistry {
             Some(&row.session_key),
             Some(&row.marker_checksum),
             false,
+            None,
         ) {
             Ok(session) => {
                 let expected_session_key = lookup
@@ -349,7 +372,7 @@ impl AssociationSessionRegistry {
         &self,
         lookup: SessionLookup,
     ) -> Result<BuildClaim, AssociationSessionError> {
-        let global_lock = open_private_lock(&self.root.join(GLOBAL_LOCK_NAME))?;
+        let global_lock = open_private_lock(&self.cache_clear_lock)?;
         FileExt::lock_shared(&global_lock).map_err(private_io)?;
         let claim_path = self
             .root
@@ -360,15 +383,21 @@ impl AssociationSessionRegistry {
 
         let dataset_id = DatasetIdV1::new(Uuid::new_v4().to_string())
             .map_err(|_| AssociationSessionError::InvalidDataset)?;
+        // Exclude staging scavengers only for the tiny directory/lock creation
+        // window. A crash before `.active.lock` is then safely distinguishable
+        // from a live creator by cleanup holding this same protocol lock.
+        let protocol = open_private_lock(&self.root.join(STAGING_PROTOCOL_LOCK_NAME))?;
+        FileExt::lock_exclusive(&protocol).map_err(private_io)?;
         let staging_name = format!(".{}.building", Uuid::new_v4());
         let staging_path = self.root.join("staging").join(staging_name);
         create_private_directory(&staging_path)?;
-        let database_path = staging_path.join(DATABASE_NAME);
-        let database_file = open_private_lock(&database_path)?;
-        drop(database_file);
         let active_path = staging_path.join(ACTIVE_LOCK_NAME);
         let active_lock = open_private_lock(&active_path)?;
         FileExt::lock_exclusive(&active_lock).map_err(private_io)?;
+        drop(protocol);
+        let database_path = staging_path.join(DATABASE_NAME);
+        let database_file = open_private_lock(&database_path)?;
+        drop(database_file);
 
         Ok(BuildClaim {
             registry: self.clone(),
@@ -376,6 +405,7 @@ impl AssociationSessionRegistry {
             dataset_id,
             database_path,
             staging_path: Some(staging_path),
+            generation_path: None,
             request_lock: Some(request_lock),
             active_lock: Some(active_lock),
             global_lock: Some(global_lock),
@@ -387,10 +417,12 @@ impl AssociationSessionRegistry {
         policy: CleanupPolicy,
     ) -> Result<CleanupSummary, AssociationSessionError> {
         let now = system_seconds(policy.now)?;
-        let global = open_private_lock(&self.root.join(GLOBAL_LOCK_NAME))?;
+        let global = open_private_lock(&self.cache_clear_lock)?;
         FileExt::lock_shared(&global).map_err(private_io)?;
         let mut summary = CleanupSummary::default();
         if policy.remove_staging {
+            let protocol = open_private_lock(&self.root.join(STAGING_PROTOCOL_LOCK_NAME))?;
+            FileExt::lock_exclusive(&protocol).map_err(private_io)?;
             for entry in fs::read_dir(self.root.join("staging")).map_err(private_io)? {
                 let entry = entry.map_err(private_io)?;
                 let name = entry.file_name().to_string_lossy().into_owned();
@@ -398,7 +430,7 @@ impl AssociationSessionRegistry {
                     summary.refused_entries += 1;
                     continue;
                 }
-                match try_lock_active(&entry.path())? {
+                match try_lock_active(&entry.path(), true)? {
                     Some(lock) => {
                         if remove_generation_directory(&entry.path()).is_ok() {
                             summary.staging_removed += 1;
@@ -410,6 +442,7 @@ impl AssociationSessionRegistry {
                     None => summary.retained_locked += 1,
                 }
             }
+            drop(protocol);
         }
 
         let registered = self.registered_sessions()?;
@@ -428,7 +461,7 @@ impl AssociationSessionRegistry {
             if !(policy.remove_expired && expired || policy.remove_orphans && orphan) {
                 continue;
             }
-            match try_lock_active(&entry.path())? {
+            match try_lock_active(&entry.path(), false)? {
                 Some(lock) => {
                     // Recheck under the active lock so a concurrent publication cannot be removed.
                     let current = self.registered_sessions()?;
@@ -457,7 +490,7 @@ impl AssociationSessionRegistry {
     pub(crate) fn try_claim_broad_cache_clear(
         &self,
     ) -> Result<Option<BroadCacheClearGuard>, AssociationSessionError> {
-        let file = open_private_lock(&self.root.join(GLOBAL_LOCK_NAME))?;
+        let file = open_private_lock(&self.cache_clear_lock)?;
         match FileExt::try_lock_exclusive(&file) {
             Ok(()) => Ok(Some(BroadCacheClearGuard { _file: file })),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
@@ -572,6 +605,7 @@ impl AssociationSessionRegistry {
         marker: &AssociationSessionCompletionV1,
         marker_checksum: &str,
     ) -> Result<(), AssociationSessionError> {
+        let expires_at = marker.expires_at.as_deref().map(parse_time).transpose()?;
         let mut connection = self.connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -589,16 +623,35 @@ impl AssociationSessionRegistry {
                     lookup.observation.key,
                     marker.dataset_id.as_str(),
                     marker.session_key,
-                    marker.expires_at.as_deref().map(parse_time).transpose()?,
+                    expires_at,
                     marker_checksum,
                 ],
             )
             .map_err(private_db)?;
-        transaction.commit().map_err(private_db)?;
+
+        // SQLite FULL commit is the final fallible pointer-publication boundary.
+        // There are intentionally no file/directory fsync calls afterward: those
+        // could report failure after the durable row already replaced the old one.
+        if transaction.commit().is_ok() {
+            return Ok(());
+        }
         drop(connection);
-        sync_file(&self.root.join("registry.sqlite3"))?;
-        sync_directory(&self.root)?;
-        Ok(())
+
+        // A commit error can be outcome-ambiguous. Recover success iff a fresh
+        // connection proves the exact intended row won; otherwise report failure
+        // and leave the previous pointer authoritative.
+        let committed = self.registry_row(&lookup.request_key)?.is_some_and(|row| {
+            row.observation_key == lookup.observation.key
+                && row.dataset_id == marker.dataset_id.as_str()
+                && row.session_key == marker.session_key
+                && row.expires_at == expires_at
+                && row.marker_checksum == marker_checksum
+        });
+        if committed {
+            Ok(())
+        } else {
+            Err(AssociationSessionError::PrivateDatabase)
+        }
     }
 
     fn validate_generation(
@@ -607,6 +660,7 @@ impl AssociationSessionRegistry {
         expected_session_key: Option<&str>,
         expected_marker_checksum: Option<&str>,
         ephemeral: bool,
+        held_active_lock: Option<File>,
     ) -> Result<CompletedAssociationSession, AssociationSessionError> {
         let id = DatasetIdV1::new(dataset_id.to_string())
             .map_err(|_| AssociationSessionError::CorruptSession)?;
@@ -630,8 +684,11 @@ impl AssociationSessionRegistry {
             return Err(AssociationSessionError::CorruptSession);
         }
         validate_artifact(&directory.join(DATABASE_NAME), &marker.database)?;
-        let raster =
-            read_and_validate_artifact(&directory.join(RASTER_NAME), &marker.raster, u64::MAX)?;
+        let raster = read_and_validate_artifact(
+            &directory.join(RASTER_NAME),
+            &marker.raster,
+            MAX_ENCODED_RASTER_BYTES,
+        )?;
         let manifest_bytes = read_and_validate_artifact(
             &directory.join(MANIFEST_NAME),
             &marker.manifest,
@@ -670,9 +727,15 @@ impl AssociationSessionRegistry {
         }
         validate_database(&directory.join(DATABASE_NAME), &marker, &manifest)?;
 
-        let active_lock = open_existing_private_file(&directory.join(ACTIVE_LOCK_NAME))?;
-        FileExt::lock_shared(&active_lock).map_err(private_io)?;
-        let global_lock = open_private_lock(&self.root.join(GLOBAL_LOCK_NAME))?;
+        let active_lock = match held_active_lock {
+            Some(lock) => lock,
+            None => {
+                let lock = open_existing_private_file(&directory.join(ACTIVE_LOCK_NAME))?;
+                FileExt::lock_shared(&lock).map_err(private_io)?;
+                lock
+            }
+        };
+        let global_lock = open_private_lock(&self.cache_clear_lock)?;
         FileExt::lock_shared(&global_lock).map_err(private_io)?;
         Ok(CompletedAssociationSession {
             inner: Arc::new(CompletedInner {
@@ -726,6 +789,7 @@ pub(crate) struct BuildClaim {
     dataset_id: DatasetIdV1,
     database_path: PathBuf,
     staging_path: Option<PathBuf>,
+    generation_path: Option<PathBuf>,
     request_lock: Option<File>,
     active_lock: Option<File>,
     global_lock: Option<File>,
@@ -748,6 +812,9 @@ impl BuildClaim {
         bytes: &[u8],
         cancellation: &dyn AssociationBuildCancellation,
     ) -> Result<(), AssociationSessionError> {
+        if bytes.len() as u64 > MAX_ENCODED_RASTER_BYTES {
+            return Err(AssociationSessionError::InvalidCompletion);
+        }
         self.write_artifact(RASTER_NAME, bytes, cancellation)
     }
     pub(crate) fn write_manifest(
@@ -811,10 +878,13 @@ impl BuildClaim {
             .with_source(source_fingerprint.clone())
             .session_key()
             .map_err(|_| AssociationSessionError::InvalidCompletion)?;
-        let database = artifact(&database_path)?;
-        let raster = artifact(&staging.join(RASTER_NAME))?;
+        let database = artifact(&database_path, cancellation)?;
+        let raster = artifact(&staging.join(RASTER_NAME), cancellation)?;
+        if raster.byte_size > MAX_ENCODED_RASTER_BYTES {
+            return Err(AssociationSessionError::InvalidCompletion);
+        }
         let manifest_path = staging.join(MANIFEST_NAME);
-        let manifest = artifact(&manifest_path)?;
+        let manifest = artifact(&manifest_path, cancellation)?;
         let manifest_created_at = serde_json::from_slice::<AssociationVisualizationManifestV1>(
             &read_bounded(&manifest_path, MANIFEST_MAX_BYTES)?,
         )
@@ -845,9 +915,9 @@ impl BuildClaim {
         sync_directory(staging)?;
         check_cancel(cancellation)?;
 
-        if let Some(active) = self.active_lock.take() {
-            let _ = FileExt::unlock(&active);
-        }
+        // Keep the original exclusive active lock continuously held across
+        // rename, fsync, validation, and registry publication. A clone is moved
+        // into the completed handle only after content validation.
         let staging = self
             .staging_path
             .take()
@@ -858,21 +928,41 @@ impl BuildClaim {
             .join("sessions")
             .join(self.dataset_id.as_str());
         fs::rename(&staging, &destination).map_err(private_io)?;
+        self.generation_path = Some(destination);
         sync_directory(&self.registry.root.join("sessions"))?;
         check_cancel(cancellation)?;
 
         let marker_checksum = checksum(&marker_bytes);
+        let active_for_session = self
+            .active_lock
+            .as_ref()
+            .ok_or(AssociationSessionError::ClaimConsumed)?
+            .try_clone()
+            .map_err(private_io)?;
         let session = self.registry.validate_generation(
             self.dataset_id.as_str(),
             Some(&marker.session_key),
             Some(&marker_checksum),
             completion.ephemeral,
+            Some(active_for_session),
         )?;
         check_cancel(cancellation)?;
+
+        // Downgrade before the final pointer commit. The session clone keeps the
+        // shared active protection continuously; cleanup cannot acquire exclusive.
+        let active = self
+            .active_lock
+            .as_ref()
+            .ok_or(AssociationSessionError::ClaimConsumed)?;
+        FileExt::lock_shared(active).map_err(private_io)?;
         if !completion.ephemeral {
+            // Irreversible success point: no cancellation probe or other fallible
+            // operation is allowed after this exact registry commit boundary.
             self.registry
                 .publish_registry(&self.lookup, &marker, &marker_checksum)?;
         }
+        self.generation_path.take();
+        self.active_lock.take();
         self.release_locks();
         Ok(session)
     }
@@ -884,12 +974,19 @@ impl BuildClaim {
     }
 
     fn cleanup_staging(&mut self) -> Result<(), AssociationSessionError> {
-        if let Some(active) = self.active_lock.take() {
-            let _ = FileExt::unlock(&active);
+        if let Some(active) = self.active_lock.as_ref() {
+            // Upgrade/retain exclusive ownership before deleting either a staging
+            // directory or a renamed-but-unpublished generation.
+            FileExt::lock_exclusive(active).map_err(private_io)?;
         }
-        if let Some(path) = self.staging_path.take() {
+        let path = self
+            .generation_path
+            .take()
+            .or_else(|| self.staging_path.take());
+        if let Some(path) = path {
             remove_generation_directory(&path)?;
         }
+        self.active_lock.take();
         Ok(())
     }
     fn release_locks(&mut self) {
@@ -950,15 +1047,18 @@ impl Drop for CompletedInner {
         if !self.ephemeral {
             return;
         }
-        if let Some(file) = self.active_lock.take() {
-            let _ = FileExt::unlock(&file);
-            drop(file);
-        }
-        if let Some(file) = self.global_lock.take() {
-            let _ = FileExt::unlock(&file);
-            drop(file);
+        // Arc uniqueness means this is the final viewer handle. Upgrade the
+        // continuously-held active lock before deletion while retaining the
+        // shared broad-cache lock, so neither cleanup nor cache clear can race.
+        let Some(active) = self.active_lock.as_ref() else {
+            return;
+        };
+        if FileExt::lock_exclusive(active).is_err() {
+            return;
         }
         let _ = remove_generation_directory(&self.directory);
+        self.active_lock.take();
+        self.global_lock.take();
     }
 }
 
@@ -1145,8 +1245,18 @@ fn remove_generation_directory(path: &Path) -> Result<(), AssociationSessionErro
     fs::remove_dir(path).map_err(private_io)
 }
 
-fn try_lock_active(directory: &Path) -> Result<Option<File>, AssociationSessionError> {
-    let file = open_existing_private_file(&directory.join(ACTIVE_LOCK_NAME))?;
+fn try_lock_active(
+    directory: &Path,
+    create_if_missing: bool,
+) -> Result<Option<File>, AssociationSessionError> {
+    let path = directory.join(ACTIVE_LOCK_NAME);
+    let file = if create_if_missing {
+        // Caller holds the exclusive staging-protocol lock, proving that a
+        // missing active lock is crash residue rather than live creation.
+        open_private_lock(&path)?
+    } else {
+        open_existing_private_file(&path)?
+    };
     match FileExt::try_lock_exclusive(&file) {
         Ok(()) => Ok(Some(file)),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
@@ -1154,28 +1264,56 @@ fn try_lock_active(directory: &Path) -> Result<Option<File>, AssociationSessionE
     }
 }
 
-fn artifact(path: &Path) -> Result<CompletedArtifactV1, AssociationSessionError> {
-    reject_regular_file(path)?;
-    let bytes = fs::read(path).map_err(private_io)?;
+fn artifact(
+    path: &Path,
+    cancellation: &dyn AssociationBuildCancellation,
+) -> Result<CompletedArtifactV1, AssociationSessionError> {
+    let (byte_size, checksum) = stream_artifact(path, Some(cancellation))?;
     Ok(CompletedArtifactV1 {
-        byte_size: bytes.len() as u64,
-        checksum: checksum(&bytes),
+        byte_size,
+        checksum,
     })
 }
 fn validate_artifact(
     path: &Path,
     expected: &CompletedArtifactV1,
 ) -> Result<(), AssociationSessionError> {
-    reject_regular_file(path)?;
-    let metadata = fs::metadata(path).map_err(private_io)?;
-    if metadata.len() != expected.byte_size {
-        return Err(AssociationSessionError::CorruptSession);
-    }
-    let bytes = fs::read(path).map_err(private_io)?;
-    if checksum(&bytes) != expected.checksum {
+    let (byte_size, checksum) = stream_artifact(path, None)?;
+    if byte_size != expected.byte_size || checksum != expected.checksum {
         return Err(AssociationSessionError::CorruptSession);
     }
     Ok(())
+}
+
+/// Hash through one fixed stack buffer. This is used for multi-gigabyte SQLite
+/// databases on both publication and warm validation paths.
+fn stream_artifact(
+    path: &Path,
+    cancellation: Option<&dyn AssociationBuildCancellation>,
+) -> Result<(u64, String), AssociationSessionError> {
+    reject_regular_file(path)?;
+    let expected_size = fs::metadata(path).map_err(private_io)?.len();
+    let mut file = File::open(path).map_err(private_io)?;
+    let mut buffer = [0_u8; STREAM_BUFFER_BYTES];
+    let mut size = 0_u64;
+    let mut hash = Sha256::new();
+    loop {
+        if let Some(cancellation) = cancellation {
+            check_cancel(cancellation)?;
+        }
+        let read = file.read(&mut buffer).map_err(private_io)?;
+        if read == 0 {
+            break;
+        }
+        size = size
+            .checked_add(read as u64)
+            .ok_or(AssociationSessionError::CorruptSession)?;
+        hash.update(&buffer[..read]);
+    }
+    if size != expected_size {
+        return Err(AssociationSessionError::CorruptSession);
+    }
+    Ok((size, format!("sha256:{:x}", hash.finalize())))
 }
 fn read_and_validate_artifact(
     path: &Path,
@@ -1214,15 +1352,64 @@ fn validate_png_dimensions(
     width: u32,
     height: u32,
 ) -> Result<(), AssociationSessionError> {
-    if bytes.len() < 24
-        || &bytes[..8] != b"\x89PNG\r\n\x1a\n"
-        || &bytes[12..16] != b"IHDR"
-        || u32::from_be_bytes(bytes[16..20].try_into().unwrap()) != width
-        || u32::from_be_bytes(bytes[20..24].try_into().unwrap()) != height
+    if bytes.len() as u64 > MAX_ENCODED_RASTER_BYTES
+        || validate_raster_dimensions(width, height).is_err()
+        || !valid_png_chunk_crcs(bytes)
     {
         return Err(AssociationSessionError::CorruptSession);
     }
+    // Full decode validates image structure, truncation, and DEFLATE data; the
+    // explicit chunk walk above also enforces every PNG CRC.
+    let pixmap = tiny_skia::Pixmap::decode_png(bytes)
+        .map_err(|_| AssociationSessionError::CorruptSession)?;
+    if pixmap.width() != width || pixmap.height() != height {
+        return Err(AssociationSessionError::CorruptSession);
+    }
     Ok(())
+}
+
+fn valid_png_chunk_crcs(bytes: &[u8]) -> bool {
+    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return false;
+    }
+    let mut offset = 8_usize;
+    let mut saw_iend = false;
+    while offset < bytes.len() {
+        let Some(header) = bytes.get(offset..offset.saturating_add(8)) else {
+            return false;
+        };
+        let length = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+        let chunk_end = match offset
+            .checked_add(12)
+            .and_then(|base| base.checked_add(length))
+        {
+            Some(end) if end <= bytes.len() => end,
+            _ => return false,
+        };
+        let kind_and_data = &bytes[offset + 4..offset + 8 + length];
+        let expected =
+            u32::from_be_bytes(bytes[offset + 8 + length..chunk_end].try_into().unwrap());
+        if png_crc32(kind_and_data) != expected {
+            return false;
+        }
+        if &header[4..8] == b"IEND" {
+            saw_iend = length == 0 && chunk_end == bytes.len();
+            break;
+        }
+        offset = chunk_end;
+    }
+    saw_iend
+}
+
+fn png_crc32(bytes: &[u8]) -> u32 {
+    let mut crc = u32::MAX;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & 0_u32.wrapping_sub(crc & 1));
+        }
+    }
+    !crc
 }
 
 fn ensure_private_directory(path: &Path) -> Result<(), AssociationSessionError> {
@@ -1476,6 +1663,7 @@ mod tests {
                 name: "genome_wide_significance".into(),
                 pvalue: 5e-8,
             }],
+            significance_threshold: 5e-8,
             top_hits: 1,
             width: layout.width,
             height: layout.height,
@@ -1748,7 +1936,7 @@ mod tests {
         marker.raster_width += 1;
         fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
         assert!(registry
-            .validate_generation(id.as_str(), None, None, false)
+            .validate_generation(id.as_str(), None, None, false, None)
             .is_err());
 
         let temp = TempDir::new().unwrap();
@@ -1775,11 +1963,81 @@ mod tests {
         let marker_path = directory.join(COMPLETE_NAME);
         let mut marker: AssociationSessionCompletionV1 =
             serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
-        marker.database = artifact(&database_path).unwrap();
+        marker.database = artifact(&database_path, &NeverCancel).unwrap();
         fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
         assert!(registry
-            .validate_generation(id.as_str(), None, None, false)
+            .validate_generation(id.as_str(), None, None, false, None)
             .is_err());
+    }
+
+    #[test]
+    fn significance_threshold_is_keyed_and_must_be_advertised() {
+        let layout = GenomeLayoutV1::new([("1", 100)], 64, 32, 0).unwrap();
+        let baseline = request(&layout);
+        let observation = format!("sha256:{}", "a".repeat(64));
+        let baseline_key = baseline
+            .with_source(observation.clone())
+            .session_key()
+            .unwrap();
+
+        let mut changed = baseline.clone();
+        changed.significance_threshold = 1e-6;
+        assert!(changed.validate().is_err());
+        changed.thresholds[0].pvalue = 1e-6;
+        assert_ne!(
+            baseline_key,
+            changed.with_source(observation).session_key().unwrap()
+        );
+    }
+
+    #[test]
+    fn png_validation_decodes_crc_and_enforces_shared_bounds() {
+        let pixmap = tiny_skia::Pixmap::new(8, 8).unwrap();
+        let valid = pixmap.encode_png().unwrap();
+        assert!(validate_png_dimensions(&valid, 8, 8).is_ok());
+
+        let mut bad_crc = valid;
+        let last = bad_crc.len() - 1;
+        bad_crc[last] ^= 0xff;
+        assert_eq!(
+            validate_png_dimensions(&bad_crc, 8, 8),
+            Err(AssociationSessionError::CorruptSession)
+        );
+        assert_eq!(
+            validate_png_dimensions(&[], 4097, 4096),
+            Err(AssociationSessionError::CorruptSession)
+        );
+    }
+
+    #[test]
+    fn sparse_artifacts_are_streamed_through_the_fixed_buffer() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("large-sparse.sqlite3");
+        let file = File::create(&path).unwrap();
+        let size = 32 * 1024 * 1024 + 17;
+        file.set_len(size).unwrap();
+        drop(file);
+        let (observed, digest) = stream_artifact(&path, None).unwrap();
+        assert_eq!(observed, size);
+        assert_eq!(STREAM_BUFFER_BYTES, 64 * 1024);
+        assert!(valid_sha256(&digest));
+    }
+
+    #[test]
+    fn missing_active_lock_crash_staging_is_safely_scavenged() {
+        let temp = TempDir::new().unwrap();
+        let registry =
+            AssociationSessionRegistry::open_for_test(temp.path().to_path_buf()).unwrap();
+        let crashed = temp
+            .path()
+            .join("staging")
+            .join(format!(".{}.building", Uuid::new_v4()));
+        create_private_directory(&crashed).unwrap();
+        fs::write(crashed.join(DATABASE_NAME), b"partial").unwrap();
+        assert!(!crashed.join(ACTIVE_LOCK_NAME).exists());
+        let summary = registry.cleanup(CleanupPolicy::default()).unwrap();
+        assert_eq!(summary.staging_removed, 1);
+        assert!(!crashed.exists());
     }
 
     #[test]

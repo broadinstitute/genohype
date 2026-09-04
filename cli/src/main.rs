@@ -7,6 +7,7 @@
 //! - export: Export data to other formats (Parquet, ClickHouse, BigQuery)
 
 mod association_server;
+mod association_session;
 mod association_sources;
 mod benchmark;
 mod cli;
@@ -184,8 +185,11 @@ fn main() -> Result<()> {
         Commands::Cache { command } => match command {
             CacheCommands::Clear => {
                 if let Some(cache) = genohype_core::metadata::MetadataCache::new() {
+                    // MetadataCache::clear coordinates through a persistent lock
+                    // outside the deleted tree; active association sessions hold
+                    // that same inode shared and make this operation refuse safely.
                     let cache_dir = cache.cache_dir().to_path_buf();
-                    cache.clear().map_err(|e| genohype_core::HailError::Io(e))?;
+                    cache.clear().map_err(genohype_core::HailError::Io)?;
                     println!("Cache cleared: {}", cache_dir.display());
                 } else {
                     eprintln!("Could not determine cache directory");

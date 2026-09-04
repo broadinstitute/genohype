@@ -1,3 +1,4 @@
+use crate::layout::{validate_raster_dimensions, MAX_ENCODED_RASTER_BYTES};
 use crate::{AssociationPointV1, GenomeLayoutV1};
 use std::error::Error;
 use std::fmt;
@@ -17,6 +18,8 @@ pub struct AssociationRasterizer {
 
 impl AssociationRasterizer {
     pub fn new(width: u32, height: u32, background: Background) -> Result<Self, RenderError> {
+        validate_raster_dimensions(width, height)
+            .map_err(|_| RenderError::InvalidDimensions { width, height })?;
         let mut pixmap =
             Pixmap::new(width, height).ok_or(RenderError::InvalidDimensions { width, height })?;
         match background {
@@ -132,9 +135,14 @@ impl AssociationRasterizer {
 
     /// Encode the raster as standalone PNG bytes without touching the filesystem.
     pub fn png_bytes(&self) -> Result<Vec<u8>, RenderError> {
-        self.pixmap
+        let bytes = self
+            .pixmap
             .encode_png()
-            .map_err(|error| RenderError::PngEncoding(error.to_string()))
+            .map_err(|_| RenderError::PngEncoding)?;
+        if bytes.len() as u64 > MAX_ENCODED_RASTER_BYTES {
+            return Err(RenderError::EncodedRasterTooLarge);
+        }
+        Ok(bytes)
     }
 }
 
@@ -158,7 +166,8 @@ pub enum RenderError {
     InvalidRadius,
     InvalidThreshold,
     InvalidColor(String),
-    PngEncoding(String),
+    PngEncoding,
+    EncodedRasterTooLarge,
 }
 
 impl fmt::Display for RenderError {
@@ -170,7 +179,8 @@ impl fmt::Display for RenderError {
             Self::InvalidRadius => write!(f, "point radius must be finite and positive"),
             Self::InvalidThreshold => write!(f, "threshold must be finite and in 0 < p <= 1"),
             Self::InvalidColor(color) => write!(f, "invalid six-digit RGB color {color:?}"),
-            Self::PngEncoding(error) => write!(f, "PNG encoding failed: {error}"),
+            Self::PngEncoding => write!(f, "PNG encoding failed"),
+            Self::EncodedRasterTooLarge => write!(f, "encoded PNG exceeds the hard byte limit"),
         }
     }
 }

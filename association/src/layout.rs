@@ -9,6 +9,25 @@ use std::fmt;
 use crate::scale::YScale;
 use crate::JSON_SAFE_INTEGER_MAX;
 
+/// Shared hard resource limits for every raster construction and validation boundary.
+pub const MAX_RASTER_DIMENSION: u32 = 16_384;
+pub const MAX_RASTER_PIXELS: u64 = 16_777_216;
+pub const MAX_ENCODED_RASTER_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Validate dimensions before any pixel buffer can be allocated.
+pub fn validate_raster_dimensions(width: u32, height: u32) -> Result<(), LayoutError> {
+    let pixels = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or(LayoutError::DimensionsOverflow)?;
+    if width == 0 || height == 0 {
+        return Err(LayoutError::ZeroDimension);
+    }
+    if width > MAX_RASTER_DIMENSION || height > MAX_RASTER_DIMENSION || pixels > MAX_RASTER_PIXELS {
+        return Err(LayoutError::DimensionsLimit);
+    }
+    Ok(())
+}
+
 const GRCH38_LENGTHS: [u64; 25] = [
     248_956_422,
     242_193_529,
@@ -187,9 +206,7 @@ impl GenomeLayoutV1 {
         I: IntoIterator<Item = (S, u64)>,
         S: Into<String>,
     {
-        if width == 0 || height == 0 {
-            return Err(LayoutError::ZeroDimension);
-        }
+        validate_raster_dimensions(width, height)?;
         let mut normalized = Vec::new();
         let mut names = HashSet::new();
         for (name, length) in contigs {
@@ -344,6 +361,7 @@ fn update_string(digest: &mut Sha256, value: &str) {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LayoutError {
     ZeroDimension,
+    DimensionsLimit,
     NoContigs,
     InvalidContig,
     ZeroContigLength(String),
@@ -359,6 +377,10 @@ impl fmt::Display for LayoutError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ZeroDimension => write!(f, "layout dimensions must be non-zero"),
+            Self::DimensionsLimit => write!(
+                f,
+                "layout exceeds the bounded raster dimension or pixel limit"
+            ),
             Self::NoContigs => write!(f, "layout requires at least one contig"),
             Self::InvalidContig => write!(f, "contig cannot be empty"),
             Self::ZeroContigLength(name) => write!(f, "contig {name} has zero length"),
@@ -459,6 +481,19 @@ mod tests {
         let mut alias = base.clone();
         alias.contigs[0].name = "chr1".into();
         assert_eq!(alias.validate(), Err(LayoutError::NonCanonicalGeometry));
+    }
+
+    #[test]
+    fn raster_dimensions_have_shared_hard_limits() {
+        assert!(validate_raster_dimensions(4096, 4096).is_ok());
+        assert_eq!(
+            validate_raster_dimensions(4097, 4096),
+            Err(LayoutError::DimensionsLimit)
+        );
+        assert_eq!(
+            validate_raster_dimensions(MAX_RASTER_DIMENSION + 1, 1),
+            Err(LayoutError::DimensionsLimit)
+        );
     }
 
     #[test]

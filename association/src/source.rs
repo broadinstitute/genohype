@@ -7,6 +7,8 @@ use std::error::Error;
 use std::fmt;
 
 pub const MAX_REJECTION_EXAMPLE_BYTES: usize = 80;
+pub const MAX_SOURCE_ERROR_CODE_BYTES: usize = 64;
+pub const MAX_SOURCE_ERROR_MESSAGE_BYTES: usize = 256;
 pub const MAX_REJECTION_EXAMPLES_PER_REASON: usize = 5;
 pub const MAX_REJECTION_REASON_CATEGORIES: usize = 100;
 const REJECTION_OVERFLOW_REASON: &str = "other_rejections";
@@ -125,21 +127,58 @@ pub trait AssociationSource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssociationSourceErrorCode(String);
+impl AssociationSourceErrorCode {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl PartialEq<&str> for AssociationSourceErrorCode {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+impl fmt::Display for AssociationSourceErrorCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Checked fatal source failure. Construction is the only way to create one,
+/// so adapters cannot bypass the byte and safe-code limits. The detailed cause
+/// remains bounded and private; outward formatting is intentionally generic.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssociationSourceError {
-    pub code: String,
-    pub message: String,
+    pub code: AssociationSourceErrorCode,
+    message: String,
 }
 impl AssociationSourceError {
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        let code = code.into();
+        let code = if valid_error_code(&code) {
+            code
+        } else {
+            "source_failure".to_string()
+        };
+        let message = truncate_utf8(&message.into(), MAX_SOURCE_ERROR_MESSAGE_BYTES);
         Self {
-            code: code.into(),
-            message: message.into(),
+            code: AssociationSourceErrorCode(code),
+            message,
         }
+    }
+
+    pub fn code(&self) -> &str {
+        self.code.as_str()
+    }
+
+    /// Bounded internal diagnostic for trusted terminal logging only.
+    pub fn internal_message(&self) -> &str {
+        &self.message
     }
 }
 impl fmt::Display for AssociationSourceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.code, self.message)
+        f.write_str("association source failed")
     }
 }
 impl Error for AssociationSourceError {}
@@ -176,6 +215,15 @@ impl RejectionDiagnostics {
     }
 }
 
+fn valid_error_code(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_SOURCE_ERROR_CODE_BYTES
+        && value.as_bytes()[0].is_ascii_lowercase()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
 fn truncate_utf8(value: &str, maximum: usize) -> String {
     if value.len() <= maximum {
         return value.to_string();
@@ -195,6 +243,18 @@ mod tests {
         let rejection = AssociationSourceRejectionV1::new(1, "bad", None, Some(&"é".repeat(100)));
         assert!(rejection.bounded_example.unwrap().len() <= 80);
     }
+    #[test]
+    fn fatal_errors_are_checked_bounded_and_generic_outward() {
+        let error = AssociationSourceError::new(
+            "/private/source.tsv",
+            format!("secret/path/{}", "é".repeat(1_000)),
+        );
+        assert_eq!(error.code(), "source_failure");
+        assert!(error.internal_message().len() <= MAX_SOURCE_ERROR_MESSAGE_BYTES);
+        assert_eq!(error.to_string(), "association source failed");
+        assert!(!error.to_string().contains("secret"));
+    }
+
     #[test]
     fn diagnostics_bound_examples_and_reason_categories() {
         let mut diagnostics = RejectionDiagnostics::default();

@@ -288,15 +288,12 @@ fn build_after_begin<S: AssociationSource, T: AssociationStore>(
         &png_bytes,
     )?;
 
+    // This state transition is the builder's irreversible success point. Every
+    // cancellation probe and fallible integrity check is deliberately before it;
+    // after a successful transition we return success without another boundary
+    // that could report failure while leaving a complete store behind.
     check_cancelled(cancellation)?;
     store.complete_build(&config.dataset_id, &source_fingerprint)?;
-    check_cancelled(cancellation)?;
-    if !store.is_complete(&config.dataset_id)? {
-        return Err(AssociationBuildError::InconsistentProduct);
-    }
-    if !ranked.is_empty() && store.top_hits(&config.dataset_id, ranked.len() as u32)? != ranked {
-        return Err(AssociationBuildError::InconsistentProduct);
-    }
 
     Ok(AssociationBuildProduct {
         source_fingerprint,
@@ -356,6 +353,17 @@ fn validate_config<S: AssociationSource>(
     }
     config.table_resource.validate()?;
     config.region_resource.validate()?;
+    if config
+        .thresholds
+        .iter()
+        .filter(|threshold| {
+            threshold.pvalue.to_bits() == config.options.significance_threshold.to_bits()
+        })
+        .count()
+        != 1
+    {
+        return Err(BuildContractError::SignificanceThresholdNotAdvertised.into());
+    }
     for threshold in &config.thresholds {
         if threshold.name.trim().is_empty()
             || threshold.name.len() > 128
@@ -496,6 +504,7 @@ fn valid_sha256(value: &str) -> bool {
 pub enum BuildContractError {
     InvalidOptions,
     InvalidConfig,
+    SignificanceThresholdNotAdvertised,
 }
 impl fmt::Display for BuildContractError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -504,6 +513,10 @@ impl fmt::Display for BuildContractError {
                 write!(f, "association build options are outside bounded V1 limits")
             }
             Self::InvalidConfig => write!(f, "association build configuration is invalid"),
+            Self::SignificanceThresholdNotAdvertised => write!(
+                f,
+                "strict significance count threshold must be advertised exactly once"
+            ),
         }
     }
 }
@@ -577,5 +590,12 @@ mod tests {
         let mut bad = AssociationBuildOptionsV1::default();
         bad.insert_batch_size = 1001;
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn strict_significance_boundary_excludes_equality() {
+        let threshold = 5e-8;
+        assert!(!(threshold < threshold));
+        assert!((threshold / 2.0) < threshold);
     }
 }

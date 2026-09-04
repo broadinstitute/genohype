@@ -26,8 +26,9 @@ pub use build::{
     NeverCancel,
 };
 pub use layout::{
-    canonical_assembly, canonical_contig, canonical_contig_cmp, canonical_contig_lengths, Assembly,
-    ContigLayoutV1, GenomeLayoutV1, LayoutError,
+    canonical_assembly, canonical_contig, canonical_contig_cmp, canonical_contig_lengths,
+    validate_raster_dimensions, Assembly, ContigLayoutV1, GenomeLayoutV1, LayoutError,
+    MAX_ENCODED_RASTER_BYTES, MAX_RASTER_DIMENSION, MAX_RASTER_PIXELS,
 };
 pub use manifest::{
     generate_manifest_schema, validate_schema_version, AssociationThresholdV1,
@@ -53,9 +54,11 @@ pub use session::{
     SessionBackgroundV1, SessionError, SessionKeyInputsV1, STORE_SCHEMA_VERSION_V1,
 };
 pub use source::{
-    AssociationSource, AssociationSourceError, AssociationSourceFieldV1, AssociationSourceItem,
-    AssociationSourceKindV1, AssociationSourceMetadataV1, AssociationSourceRejectionV1,
-    RejectionDiagnostics, MAX_REJECTION_EXAMPLES_PER_REASON, MAX_REJECTION_REASON_CATEGORIES,
+    AssociationSource, AssociationSourceError, AssociationSourceErrorCode,
+    AssociationSourceFieldV1, AssociationSourceItem, AssociationSourceKindV1,
+    AssociationSourceMetadataV1, AssociationSourceRejectionV1, RejectionDiagnostics,
+    MAX_REJECTION_EXAMPLES_PER_REASON, MAX_REJECTION_REASON_CATEGORIES,
+    MAX_SOURCE_ERROR_CODE_BYTES, MAX_SOURCE_ERROR_MESSAGE_BYTES,
 };
 pub use store::{
     AssociationBuildV1, AssociationStore, AssociationStoreError, SqliteAssociationStore,

@@ -235,11 +235,36 @@ impl MetadataCache {
         Ok(cache_path)
     }
 
-    /// Remove all cached data.
+    /// Remove all cached data while coordinating with association sessions.
+    ///
+    /// The persistent lock is a sibling of `genohype`, never inside the tree
+    /// being deleted. Active association builders/viewers hold this inode shared,
+    /// so clear cannot create a replacement inode and race their live databases.
     pub fn clear(&self) -> std::io::Result<()> {
+        let parent = self.cache_dir.parent().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid cache root")
+        })?;
+        std::fs::create_dir_all(parent)?;
+        let lock_path = parent.join(".genohype-cache.lock");
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let lock = options.open(&lock_path)?;
+        lock.try_lock().map_err(|error| match error {
+            std::fs::TryLockError::WouldBlock => std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "cache clear refused while an association session is active",
+            ),
+            std::fs::TryLockError::Error(error) => error,
+        })?;
         if self.cache_dir.exists() {
             std::fs::remove_dir_all(&self.cache_dir)?;
         }
+        drop(lock);
         Ok(())
     }
 }
@@ -411,7 +436,7 @@ mod tests {
 
     #[test]
     fn test_clear() {
-        let (_tmp, cache) = temp_cache();
+        let (tmp, cache) = temp_cache();
         let opts = CacheOptions::default();
 
         cache
@@ -421,6 +446,28 @@ mod tests {
             .unwrap();
 
         assert!(cache.cache_dir.exists());
+        cache.clear().unwrap();
+        assert!(!cache.cache_dir.exists());
+        assert!(tmp.path().join(".genohype-cache.lock").is_file());
+    }
+
+    #[test]
+    fn test_clear_refuses_a_shared_persistent_lock() {
+        let (tmp, cache) = temp_cache();
+        std::fs::create_dir_all(&cache.cache_dir).unwrap();
+        let lock_path = tmp.path().join(".genohype-cache.lock");
+        let shared = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        shared.lock_shared().unwrap();
+        let error = cache.clear().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(cache.cache_dir.exists());
+        drop(shared);
         cache.clear().unwrap();
         assert!(!cache.cache_dir.exists());
     }
