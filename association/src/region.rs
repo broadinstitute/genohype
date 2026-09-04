@@ -928,6 +928,250 @@ impl fmt::Display for GeneReferenceError {
 }
 impl Error for GeneReferenceError {}
 
+/// Bounded, association-owned accumulator for a streamed region scan.
+///
+/// The reducer retains every protected point (selected, significant, or coding)
+/// up to the public overlay limit and at most one ordinary representative per
+/// V1 pixel stratum. Its memory use is therefore independent of input size.
+/// Canonical scan points may be pushed one at a time in any order.
+#[derive(Debug)]
+pub struct RegionOverlayReducerV1 {
+    layout: RegionLayoutV1,
+    significance_threshold: f64,
+    selected_ordinals: Vec<u64>,
+    protected: Vec<AssociationRegionOverlayPointV1>,
+    ordinary_buckets: HashMap<(u32, u8), AssociationPointV1>,
+    input_count: u64,
+    selected_count: u64,
+    significant_count: u64,
+    coding_count: u64,
+    ordinary_count: u64,
+}
+
+impl RegionOverlayReducerV1 {
+    /// Create a reducer for one checked layout, threshold, and selection set.
+    pub fn new(
+        layout: &RegionLayoutV1,
+        significance_threshold: f64,
+        selected_ordinals: &HashSet<u64>,
+    ) -> Result<Self, RegionContractError> {
+        layout.validate()?;
+        validate_threshold(significance_threshold)?;
+        if selected_ordinals.len() > MAX_REGION_OVERLAY_POINTS
+            || selected_ordinals
+                .iter()
+                .any(|ordinal| *ordinal > JSON_SAFE_INTEGER_MAX)
+        {
+            return Err(RegionContractError::InvalidOverlayPoint);
+        }
+        let mut selected_ordinals: Vec<_> = selected_ordinals.iter().copied().collect();
+        selected_ordinals.sort_unstable();
+        Ok(Self {
+            layout: layout.clone(),
+            significance_threshold,
+            selected_ordinals,
+            protected: Vec::new(),
+            ordinary_buckets: HashMap::new(),
+            input_count: 0,
+            selected_count: 0,
+            significant_count: 0,
+            coding_count: 0,
+            ordinary_count: 0,
+        })
+    }
+
+    /// Consume one point from a canonical region scan.
+    ///
+    /// Errors are returned directly so this method can be used as a
+    /// `AssociationStore::scan_region` sink. The accumulator must be discarded
+    /// after a push error.
+    pub fn push(&mut self, point: &AssociationPointV1) -> Result<(), RegionContractError> {
+        let (point, _) = point
+            .clone()
+            .normalize()
+            .map_err(|_| RegionContractError::InvalidOverlayPoint)?;
+        let x = self
+            .layout
+            .x_for(point.position)
+            .filter(|_| point.contig == self.layout.contig)
+            .ok_or(RegionContractError::InvalidOverlayPoint)?;
+        let selected = self
+            .selected_ordinals
+            .binary_search(&point.source_ordinal)
+            .is_ok();
+        let significant = is_significant(&point, self.significance_threshold);
+        let coding = coding_consequence_v1(point.consequence.as_deref());
+        let is_protected = selected || significant || coding;
+
+        if is_protected && self.protected.len() == MAX_REGION_OVERLAY_POINTS {
+            return Err(RegionContractError::ProtectedOverlayLimit {
+                count: MAX_REGION_OVERLAY_POINTS + 1,
+                maximum: MAX_REGION_OVERLAY_POINTS,
+            });
+        }
+
+        let input_count = self
+            .input_count
+            .checked_add(1)
+            .ok_or(RegionContractError::ArithmeticOverflow)?;
+        let selected_count = self
+            .selected_count
+            .checked_add(u64::from(selected))
+            .ok_or(RegionContractError::ArithmeticOverflow)?;
+        let significant_count = self
+            .significant_count
+            .checked_add(u64::from(significant))
+            .ok_or(RegionContractError::ArithmeticOverflow)?;
+        let coding_count = self
+            .coding_count
+            .checked_add(u64::from(coding))
+            .ok_or(RegionContractError::ArithmeticOverflow)?;
+        let ordinary_count = self
+            .ordinary_count
+            .checked_add(u64::from(!is_protected))
+            .ok_or(RegionContractError::ArithmeticOverflow)?;
+
+        if is_protected {
+            self.protected.push(AssociationRegionOverlayPointV1 {
+                point,
+                selected,
+                significant,
+                coding,
+                ordinary_representative: false,
+            });
+        } else {
+            let x_bucket_count = self.layout.physical_width.min(REGION_X_STRATA_V1);
+            let x_bucket = ((f64::from(x) * f64::from(x_bucket_count)
+                / f64::from(self.layout.physical_width))
+            .floor() as u32)
+                .min(x_bucket_count - 1);
+            let clipped = point
+                .neg_log10_p
+                .clamp(0.0, self.layout.y_scale.max_neg_log_p);
+            let stratum = ((clipped / self.layout.y_scale.max_neg_log_p
+                * f64::from(REGION_Y_STRATA_V1))
+            .floor() as u8)
+                .min(REGION_Y_STRATA_V1 - 1);
+            self.ordinary_buckets
+                .entry((x_bucket, stratum))
+                .and_modify(|current| {
+                    if compare_association_points(&point, current).is_lt() {
+                        *current = point.clone();
+                    }
+                })
+                .or_insert(point);
+        }
+
+        self.input_count = input_count;
+        self.selected_count = selected_count;
+        self.significant_count = significant_count;
+        self.coding_count = coding_count;
+        self.ordinary_count = ordinary_count;
+        Ok(())
+    }
+
+    /// Finish the overlay against the exact render identity used by the raster.
+    /// Available gene features are normalized, clipped, and sorted here.
+    pub fn finish(
+        mut self,
+        identity: &RegionRenderIdentityV1,
+        mut gene_annotations: GeneAnnotationsV1,
+    ) -> Result<AssociationRegionOverlayV1, RegionContractError> {
+        if identity.layout() != &self.layout
+            || identity.significance_threshold().to_bits() != self.significance_threshold.to_bits()
+        {
+            return Err(RegionContractError::ReducerIdentityMismatch);
+        }
+
+        if gene_annotations.state == GeneAnnotationStateV1::Available {
+            let request = GeneRegionRequestV1 {
+                assembly: identity.assembly.clone(),
+                contig: self.layout.contig.clone(),
+                start: self.layout.effective_start,
+                end: self.layout.effective_end,
+            };
+            gene_annotations.features =
+                normalize_gene_features(&request, gene_annotations.features)
+                    .map_err(|_| RegionContractError::InvalidGenes)?;
+        }
+        gene_annotations.validate(&self.layout)?;
+
+        let ordinary_budget = MAX_REGION_OVERLAY_POINTS - self.protected.len();
+        let mut representatives: Vec<_> = self.ordinary_buckets.into_values().collect();
+        representatives.sort_by(compare_association_points);
+        representatives.truncate(ordinary_budget);
+        let rendered_ordinary = representatives.len() as u64;
+        self.protected
+            .extend(
+                representatives
+                    .into_iter()
+                    .map(|point| AssociationRegionOverlayPointV1 {
+                        point,
+                        selected: false,
+                        significant: false,
+                        coding: false,
+                        ordinary_representative: true,
+                    }),
+            );
+        self.protected
+            .sort_by(|left, right| compare_association_points(&left.point, &right.point));
+
+        let protected_union_count = self
+            .input_count
+            .checked_sub(self.ordinary_count)
+            .ok_or(RegionContractError::InconsistentCounts)?;
+        let omitted_ordinary_count = self
+            .ordinary_count
+            .checked_sub(rendered_ordinary)
+            .ok_or(RegionContractError::InconsistentCounts)?;
+        let disclosure = RegionAggregationDisclosureV1 {
+            rule_id: REGION_DENSE_RULE_V1.into(),
+            input_point_count: self.input_count,
+            protected_selected_count: self.selected_count,
+            protected_significant_count: self.significant_count,
+            protected_coding_count: self.coding_count,
+            protected_union_count,
+            ordinary_input_count: self.ordinary_count,
+            ordinary_budget: ordinary_budget as u64,
+            rendered_ordinary_count: rendered_ordinary,
+            omitted_ordinary_count,
+            rasterized_point_count: self.input_count,
+            overlay_point_count: self.protected.len() as u64,
+        };
+        disclosure.validate()?;
+        if self
+            .protected
+            .iter()
+            .map(|entry| point_text_len(&entry.point))
+            .sum::<usize>()
+            > MAX_REGION_OVERLAY_TEXT_BYTES
+        {
+            return Err(RegionContractError::OverlayTextLimit);
+        }
+
+        let overlay_hash = region_overlay_hash(
+            identity.raster_hash(),
+            &self.selected_ordinals,
+            &gene_annotations,
+        );
+        let overlay = AssociationRegionOverlayV1 {
+            schema_version: ASSOCIATION_REGION_SCHEMA_VERSION_V1.into(),
+            layout_hash: identity.layout_hash().into(),
+            raster_hash: identity.raster_hash().into(),
+            render_hash: identity.render_hash().into(),
+            overlay_hash,
+            selected_ordinals: self.selected_ordinals,
+            layout: self.layout,
+            significance_threshold: self.significance_threshold,
+            points: self.protected,
+            gene_annotations,
+            aggregation: disclosure,
+        };
+        overlay.validate()?;
+        Ok(overlay)
+    }
+}
+
 /// Build a bounded deterministic semantic overlay. Input iteration order and
 /// batch boundaries do not affect the result.
 pub fn reduce_region_overlay<I>(
@@ -939,146 +1183,15 @@ pub fn reduce_region_overlay<I>(
 where
     I: IntoIterator<Item = AssociationPointV1>,
 {
-    let layout = identity.layout();
-    let significance_threshold = identity.significance_threshold();
-    if selected_ordinals.len() > MAX_REGION_OVERLAY_POINTS
-        || selected_ordinals
-            .iter()
-            .any(|ordinal| *ordinal > JSON_SAFE_INTEGER_MAX)
-    {
-        return Err(RegionContractError::InvalidOverlayPoint);
-    }
-    let mut selected_identity: Vec<_> = selected_ordinals.iter().copied().collect();
-    selected_identity.sort_unstable();
-    let mut protected = Vec::new();
-    let mut buckets: HashMap<(u32, u8), AssociationPointV1> = HashMap::new();
-    let mut input = 0_u64;
-    let mut selected_count = 0_u64;
-    let mut significant_count = 0_u64;
-    let mut coding_count = 0_u64;
-    let mut ordinary_count = 0_u64;
-    let mut input_ordinals = HashSet::new();
-
+    let mut reducer = RegionOverlayReducerV1::new(
+        identity.layout(),
+        identity.significance_threshold(),
+        selected_ordinals,
+    )?;
     for point in points {
-        let (point, _) = point
-            .normalize()
-            .map_err(|_| RegionContractError::InvalidOverlayPoint)?;
-        if point.contig != layout.contig
-            || layout.x_for(point.position).is_none()
-            || !input_ordinals.insert(point.source_ordinal)
-        {
-            return Err(RegionContractError::InvalidOverlayPoint);
-        }
-        input = input
-            .checked_add(1)
-            .ok_or(RegionContractError::ArithmeticOverflow)?;
-        let selected = selected_ordinals.contains(&point.source_ordinal);
-        let significant = is_significant(&point, significance_threshold);
-        let coding = coding_consequence_v1(point.consequence.as_deref());
-        selected_count += u64::from(selected);
-        significant_count += u64::from(significant);
-        coding_count += u64::from(coding);
-        if selected || significant || coding {
-            protected.push(AssociationRegionOverlayPointV1 {
-                point,
-                selected,
-                significant,
-                coding,
-                ordinary_representative: false,
-            });
-            if protected.len() > MAX_REGION_OVERLAY_POINTS {
-                return Err(RegionContractError::ProtectedOverlayLimit {
-                    count: protected.len(),
-                    maximum: MAX_REGION_OVERLAY_POINTS,
-                });
-            }
-        } else {
-            ordinary_count += 1;
-            let x = layout
-                .x_for(point.position)
-                .expect("point was range checked");
-            let x_bucket_count = layout.physical_width.min(REGION_X_STRATA_V1);
-            let x_bucket = ((f64::from(x) * f64::from(x_bucket_count)
-                / f64::from(layout.physical_width))
-            .floor() as u32)
-                .min(x_bucket_count - 1);
-            let clipped = point.neg_log10_p.clamp(0.0, layout.y_scale.max_neg_log_p);
-            let stratum = ((clipped / layout.y_scale.max_neg_log_p * f64::from(REGION_Y_STRATA_V1))
-                .floor() as u8)
-                .min(REGION_Y_STRATA_V1 - 1);
-            buckets
-                .entry((x_bucket, stratum))
-                .and_modify(|current| {
-                    if compare_association_points(&point, current).is_lt() {
-                        *current = point.clone();
-                    }
-                })
-                .or_insert(point);
-        }
+        reducer.push(&point)?;
     }
-
-    let ordinary_budget = MAX_REGION_OVERLAY_POINTS - protected.len();
-    let mut representatives: Vec<_> = buckets.into_values().collect();
-    representatives.sort_by(compare_association_points);
-    representatives.truncate(ordinary_budget);
-    let rendered_ordinary = representatives.len() as u64;
-    protected.extend(
-        representatives
-            .into_iter()
-            .map(|point| AssociationRegionOverlayPointV1 {
-                point,
-                selected: false,
-                significant: false,
-                coding: false,
-                ordinary_representative: true,
-            }),
-    );
-    protected.sort_by(|left, right| compare_association_points(&left.point, &right.point));
-
-    let disclosure = RegionAggregationDisclosureV1 {
-        rule_id: REGION_DENSE_RULE_V1.into(),
-        input_point_count: input,
-        protected_selected_count: selected_count,
-        protected_significant_count: significant_count,
-        protected_coding_count: coding_count,
-        protected_union_count: input - ordinary_count,
-        ordinary_input_count: ordinary_count,
-        ordinary_budget: ordinary_budget as u64,
-        rendered_ordinary_count: rendered_ordinary,
-        omitted_ordinary_count: ordinary_count - rendered_ordinary,
-        rasterized_point_count: input,
-        overlay_point_count: protected.len() as u64,
-    };
-    disclosure.validate()?;
-    if protected
-        .iter()
-        .map(|entry| point_text_len(&entry.point))
-        .sum::<usize>()
-        > MAX_REGION_OVERLAY_TEXT_BYTES
-    {
-        return Err(RegionContractError::OverlayTextLimit);
-    }
-    gene_annotations.validate(layout)?;
-    let overlay_hash = region_overlay_hash(
-        identity.raster_hash(),
-        &selected_identity,
-        &gene_annotations,
-    );
-    let overlay = AssociationRegionOverlayV1 {
-        schema_version: ASSOCIATION_REGION_SCHEMA_VERSION_V1.into(),
-        layout_hash: identity.layout_hash().into(),
-        raster_hash: identity.raster_hash().into(),
-        render_hash: identity.render_hash().into(),
-        overlay_hash,
-        selected_ordinals: selected_identity,
-        layout: layout.clone(),
-        significance_threshold,
-        points: protected,
-        gene_annotations,
-        aggregation: disclosure,
-    };
-    overlay.validate()?;
-    Ok(overlay)
+    reducer.finish(identity, gene_annotations)
 }
 
 pub fn normalize_gene_features(
@@ -1236,6 +1349,7 @@ pub enum RegionContractError {
     InconsistentCounts,
     InvalidResourceMediaType,
     InvalidOverlayPoint,
+    ReducerIdentityMismatch,
     OverlayTextLimit,
     InvalidGenes,
     ProtectedOverlayLimit { count: usize, maximum: usize },
@@ -1462,6 +1576,187 @@ mod tests {
     }
 
     #[test]
+    fn incremental_reducer_matches_convenience_across_chunks_and_permutations() {
+        let layout = RegionLayoutV1::new("1", 100, 1, 100, 50, 64, 1).unwrap();
+        let identity = identity(&layout, 5e-8);
+        let selected = HashSet::from([19, 1_499]);
+        let points: Vec<_> = (0..1_500)
+            .map(|ordinal| {
+                let position = ordinal % 100 + 1;
+                if ordinal % 307 == 0 {
+                    point(position, 0.0, 400.0, None, ordinal as u64)
+                } else if ordinal % 211 == 0 {
+                    point(
+                        position,
+                        0.5,
+                        0.301,
+                        Some("missense_variant"),
+                        ordinal as u64,
+                    )
+                } else {
+                    point(position, 0.5, 0.301, None, ordinal as u64)
+                }
+            })
+            .collect();
+        let expected =
+            reduce_region_overlay(&identity, points.clone(), &selected, no_genes()).unwrap();
+        let expected_bytes = serde_json::to_vec(&expected).unwrap();
+
+        let mut reversed = points.clone();
+        reversed.reverse();
+        let mut rotated = points.clone();
+        rotated.rotate_left(617);
+        for permutation in [points, reversed, rotated] {
+            for chunk_size in [1, 7, 333] {
+                let mut reducer = RegionOverlayReducerV1::new(&layout, 5e-8, &selected).unwrap();
+                for chunk in permutation.chunks(chunk_size) {
+                    for point in chunk {
+                        reducer.push(point).unwrap();
+                    }
+                }
+                let actual = reducer.finish(&identity, no_genes()).unwrap();
+                assert_eq!(serde_json::to_vec(&actual).unwrap(), expected_bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_constructor_push_and_finish_failures_are_typed() {
+        let layout = RegionLayoutV1::new("1", 100, 1, 100, 50, 64, 1).unwrap();
+        assert!(matches!(
+            RegionOverlayReducerV1::new(&layout, 0.0, &HashSet::new()),
+            Err(RegionContractError::InvalidThreshold)
+        ));
+        let mut noncanonical = layout.clone();
+        noncanonical.physical_width += 1;
+        assert!(matches!(
+            RegionOverlayReducerV1::new(&noncanonical, 5e-8, &HashSet::new()),
+            Err(RegionContractError::NonCanonicalLayout)
+        ));
+
+        let mut reducer = RegionOverlayReducerV1::new(&layout, 5e-8, &HashSet::new()).unwrap();
+        let mut wrong_contig = point(1, 0.5, 0.301, None, 1);
+        wrong_contig.contig = "2".into();
+        let mut sink = |point: &AssociationPointV1| {
+            reducer
+                .push(point)
+                .map_err(|error| crate::AssociationStoreError::Sink(error.to_string()))
+        };
+        assert!(matches!(
+            sink(&wrong_contig),
+            Err(crate::AssociationStoreError::Sink(_))
+        ));
+
+        let reducer = RegionOverlayReducerV1::new(&layout, 5e-8, &HashSet::new()).unwrap();
+        let other_identity = identity(&layout, 1e-6);
+        assert!(matches!(
+            reducer.finish(&other_identity, no_genes()),
+            Err(RegionContractError::ReducerIdentityMismatch)
+        ));
+    }
+
+    #[test]
+    fn finish_normalizes_genes_and_produces_a_valid_manifest_pair() {
+        let layout = RegionLayoutV1::new("1", 100, 1, 100, 50, 64, 1).unwrap();
+        let identity = identity(&layout, 5e-8);
+        let mut reducer = RegionOverlayReducerV1::new(&layout, 5e-8, &HashSet::new()).unwrap();
+        reducer.push(&point(1, 0.5, 0.301, None, 1)).unwrap();
+        let overlay = reducer
+            .finish(
+                &identity,
+                GeneAnnotationsV1 {
+                    state: GeneAnnotationStateV1::Available,
+                    features: vec![
+                        GeneFeatureV1 {
+                            id: "b".into(),
+                            symbol: None,
+                            contig: "chr1".into(),
+                            start: 90,
+                            end: 120,
+                            strand: GeneStrandV1::Minus,
+                        },
+                        GeneFeatureV1 {
+                            id: "a".into(),
+                            symbol: Some("A".into()),
+                            contig: "chr1".into(),
+                            start: 1,
+                            end: 10,
+                            strand: GeneStrandV1::Plus,
+                        },
+                    ],
+                    message: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(overlay.gene_annotations.features[0].id, "a");
+        assert_eq!(overlay.gene_annotations.features[0].start, 1);
+        assert_eq!(overlay.gene_annotations.features[1].end, 100);
+
+        let manifest = AssociationRegionRenderManifestV1 {
+            schema_version: ASSOCIATION_REGION_SCHEMA_VERSION_V1.into(),
+            dataset_id: identity.dataset_id.clone(),
+            title: "Incremental region".into(),
+            assembly: identity.assembly.clone(),
+            coordinate_convention: COORDINATE_CONVENTION_V1.into(),
+            source_fingerprint: identity.source_fingerprint.clone(),
+            layout: layout.clone(),
+            layout_hash: identity.layout_hash().into(),
+            background_id: identity.background_id.clone(),
+            raster_hash: identity.raster_hash().into(),
+            render_hash: identity.render_hash().into(),
+            overlay_hash: overlay.overlay_hash.clone(),
+            significance_threshold: identity.significance_threshold(),
+            counts: AssociationRegionCountsV1 {
+                source_point_count: overlay.aggregation.input_point_count,
+                rasterized_point_count: overlay.aggregation.rasterized_point_count,
+                significant_point_count: overlay.aggregation.protected_significant_count,
+                coding_point_count: overlay.aggregation.protected_coding_count,
+                selected_point_count: overlay.aggregation.protected_selected_count,
+                overlay_point_count: overlay.aggregation.overlay_point_count,
+            },
+            aggregation: overlay.aggregation.clone(),
+            resources: AssociationRegionResourcesV1 {
+                raster: ResourceDescriptorV1 {
+                    url: "region.png".into(),
+                    media_type: "image/png".into(),
+                    byte_size: None,
+                    checksum: None,
+                    expires_at: None,
+                },
+                overlay: ResourceDescriptorV1 {
+                    url: "region.json".into(),
+                    media_type: "application/json".into(),
+                    byte_size: None,
+                    checksum: None,
+                    expires_at: None,
+                },
+            },
+        };
+        overlay.validate_against(&manifest).unwrap();
+    }
+
+    #[test]
+    fn million_row_incremental_reduction_keeps_only_bounded_state() {
+        let layout = RegionLayoutV1::new("1", 1_000_000, 1, 1_000_000, 4_050, 64, 1).unwrap();
+        let identity = identity(&layout, 5e-8);
+        let mut reducer = RegionOverlayReducerV1::new(&layout, 5e-8, &HashSet::new()).unwrap();
+        for ordinal in 0..1_000_000_u64 {
+            reducer
+                .push(&point(ordinal as i64 + 1, 0.5, 0.301, None, ordinal))
+                .unwrap();
+        }
+        assert!(reducer.protected.is_empty());
+        assert!(
+            reducer.ordinary_buckets.len()
+                <= REGION_X_STRATA_V1 as usize * REGION_Y_STRATA_V1 as usize
+        );
+        let overlay = reducer.finish(&identity, no_genes()).unwrap();
+        assert_eq!(overlay.aggregation.input_point_count, 1_000_000);
+        assert!(overlay.points.len() <= MAX_REGION_OVERLAY_POINTS);
+        overlay.validate().unwrap();
+    }
+
+    #[test]
     fn overlay_aggregate_text_is_hard_bounded() {
         let layout = RegionLayoutV1::new("1", 300, 1, 300, 50, 64, 1).unwrap();
         let mut selected = HashSet::new();
@@ -1482,15 +1777,28 @@ mod tests {
     #[test]
     fn protected_overflow_is_typed_instead_of_truncated() {
         let layout = RegionLayoutV1::new("1", 2_000, 1, 2_000, 50, 64, 1).unwrap();
-        let points = (0..=MAX_REGION_OVERLAY_POINTS)
-            .map(|index| point(index as i64 + 1, 0.0, 400.0, None, index as u64));
+        let points: Vec<_> = (0..=MAX_REGION_OVERLAY_POINTS)
+            .map(|index| point(index as i64 + 1, 0.0, 400.0, None, index as u64))
+            .collect();
         assert!(matches!(
             reduce_region_overlay(
                 &identity(&layout, 5e-8),
-                points,
+                points.clone(),
                 &HashSet::new(),
                 no_genes()
             ),
+            Err(RegionContractError::ProtectedOverlayLimit {
+                count: 1001,
+                maximum: 1000
+            })
+        ));
+
+        let mut reducer = RegionOverlayReducerV1::new(&layout, 5e-8, &HashSet::new()).unwrap();
+        for point in points.into_iter().take(MAX_REGION_OVERLAY_POINTS) {
+            reducer.push(&point).unwrap();
+        }
+        assert!(matches!(
+            reducer.push(&point(1_001, 0.0, 400.0, None, 1_000)),
             Err(RegionContractError::ProtectedOverlayLimit {
                 count: 1001,
                 maximum: 1000

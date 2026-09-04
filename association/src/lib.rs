@@ -55,7 +55,7 @@ pub use region::{
     AssociationRegionOverlayV1, AssociationRegionRenderManifestV1, AssociationRegionResourcesV1,
     GeneAnnotationStateV1, GeneAnnotationsV1, GeneFeatureV1, GeneReferenceError,
     GeneReferenceProvider, GeneRegionRequestV1, GeneStrandV1, RegionAggregationDisclosureV1,
-    RegionContractError, RegionLayoutV1, RegionRenderIdentityV1,
+    RegionContractError, RegionLayoutV1, RegionOverlayReducerV1, RegionRenderIdentityV1,
     ASSOCIATION_REGION_SCHEMA_VERSION_V1, CODING_CONSEQUENCE_V1, LOCUS_RENDERER_VERSION_V1,
     LOCUS_STYLE_VERSION_V1, MAX_GENE_FEATURES, MAX_GENE_TEXT_BYTES, MAX_REGION_DPR,
     MAX_REGION_HEIGHT, MAX_REGION_IDENTITY_TEXT_BYTES, MAX_REGION_OVERLAY_POINTS,
