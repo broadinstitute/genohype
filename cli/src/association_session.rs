@@ -285,6 +285,8 @@ pub(crate) struct AssociationSessionRegistry {
     after_rename_hook: Arc<std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>>,
     #[cfg(test)]
     before_active_transition_hook: Arc<std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>>,
+    #[cfg(test)]
+    before_warm_validation_hook: Arc<std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>>,
 }
 impl AssociationSessionRegistry {
     pub(crate) fn open_default() -> Result<Self, AssociationSessionError> {
@@ -328,6 +330,8 @@ impl AssociationSessionRegistry {
             after_rename_hook: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             before_active_transition_hook: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            before_warm_validation_hook: Arc::new(std::sync::Mutex::new(None)),
         };
         registry.initialize_registry()?;
         Ok(registry)
@@ -359,11 +363,36 @@ impl AssociationSessionRegistry {
         }
     }
 
+    #[cfg(test)]
+    fn set_before_warm_validation_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.before_warm_validation_hook.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn run_before_warm_validation_hook(&self) {
+        let hook = self.before_warm_validation_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    fn lock_broad_cache_shared(&self) -> Result<Arc<File>, AssociationSessionError> {
+        let lock = open_private_lock(&self.cache_clear_lock)?;
+        FileExt::lock_shared(&lock).map_err(private_io)?;
+        Ok(Arc::new(lock))
+    }
+
     pub(crate) fn lookup_valid(
         &self,
         lookup: &SessionLookup,
         now: SystemTime,
     ) -> Result<Option<CompletedAssociationSession>, AssociationSessionError> {
+        // Broad cache clear removes the registry and generations as one tree, so
+        // its persistent outside-tree lock must precede every warm lookup read.
+        // The same shared ownership is retained by the returned session.
+        let global_lock = self.lock_broad_cache_shared()?;
+        #[cfg(test)]
+        self.run_before_warm_validation_hook();
         let now = system_seconds(now)?;
         let Some(row) = self.registry_row(&lookup.request_key)? else {
             return Ok(None);
@@ -379,6 +408,7 @@ impl AssociationSessionRegistry {
             Some(&row.marker_checksum),
             Some(&lookup.request),
             false,
+            Some(global_lock),
             None,
         ) {
             Ok(session) => {
@@ -408,8 +438,7 @@ impl AssociationSessionRegistry {
         &self,
         lookup: SessionLookup,
     ) -> Result<BuildClaim, AssociationSessionError> {
-        let global_lock = open_private_lock(&self.cache_clear_lock)?;
-        FileExt::lock_shared(&global_lock).map_err(private_io)?;
+        let global_lock = self.lock_broad_cache_shared()?;
         let claim_path = self
             .root
             .join("claims")
@@ -700,8 +729,16 @@ impl AssociationSessionRegistry {
         expected_marker_checksum: Option<&str>,
         expected_request: Option<&NormalizedSessionRequestV1>,
         ephemeral: bool,
+        held_global_lock: Option<Arc<File>>,
         held_generation_locks: Option<GenerationLocks>,
     ) -> Result<CompletedAssociationSession, AssociationSessionError> {
+        // Keep one common acquisition order: global -> handoff -> active. Warm
+        // lookup passes the global ownership acquired before its registry read;
+        // publication passes the ownership acquired by its build claim.
+        let global_lock = match held_global_lock {
+            Some(lock) => lock,
+            None => self.lock_broad_cache_shared()?,
+        };
         let id = DatasetIdV1::new(dataset_id.to_string())
             .map_err(|_| AssociationSessionError::CorruptSession)?;
         let directory = self.root.join("sessions").join(dataset_id);
@@ -779,8 +816,6 @@ impl AssociationSessionRegistry {
             expected_request,
         )?;
 
-        let global_lock = open_private_lock(&self.cache_clear_lock)?;
-        FileExt::lock_shared(&global_lock).map_err(private_io)?;
         Ok(CompletedAssociationSession {
             inner: Arc::new(CompletedInner {
                 dataset_id: id,
@@ -838,7 +873,7 @@ pub(crate) struct BuildClaim {
     request_lock: Option<File>,
     handoff_lock: Option<File>,
     active_lock: Option<File>,
-    global_lock: Option<File>,
+    global_lock: Option<Arc<File>>,
 }
 impl BuildClaim {
     pub(crate) fn dataset_id(&self) -> &DatasetIdV1 {
@@ -1013,6 +1048,7 @@ impl BuildClaim {
             Some(&marker_checksum),
             Some(&self.lookup.request),
             completion.ephemeral,
+            self.global_lock.clone(),
             Some(locks_for_session),
         )?;
         check_cancel(cancellation)?;
@@ -1076,9 +1112,9 @@ impl BuildClaim {
         if let Some(file) = self.request_lock.take() {
             let _ = FileExt::unlock(&file);
         }
-        if let Some(file) = self.global_lock.take() {
-            let _ = FileExt::unlock(&file);
-        }
+        // Shared broad-cache ownership may also be retained by a completed
+        // session. Dropping this Arc releases the flock only after its last owner.
+        self.global_lock.take();
     }
 }
 impl Drop for BuildClaim {
@@ -1130,7 +1166,7 @@ struct CompletedInner {
     marker: AssociationSessionCompletionV1,
     handoff_lock: Option<File>,
     active_lock: Option<File>,
-    global_lock: Option<File>,
+    global_lock: Option<Arc<File>>,
     ephemeral: bool,
 }
 impl Drop for CompletedInner {
@@ -2098,6 +2134,56 @@ mod tests {
     }
 
     #[test]
+    fn warm_open_excludes_broad_cache_clear_during_validation_and_return() {
+        use std::sync::mpsc;
+
+        let temp = TempDir::new().unwrap();
+        let (registry, lookup, claim, manifest) = prepare_claim(temp.path());
+        let session = claim
+            .publish(
+                SessionCompletion {
+                    source_fingerprint: manifest.source_fingerprint,
+                    created_at: UNIX_EPOCH + Duration::from_secs(1),
+                    expires_at: Some(SystemTime::now() + Duration::from_secs(60)),
+                    ephemeral: false,
+                },
+                &NeverCancel,
+            )
+            .unwrap();
+        let directory = session.inner.directory.clone();
+        drop(session);
+
+        let clear_registry = registry.clone();
+        let clear_root = temp.path().to_path_buf();
+        let (clear_tx, clear_rx) = mpsc::channel();
+        registry.set_before_warm_validation_hook(move || {
+            std::thread::spawn(move || {
+                // Model MetadataCache::clear exactly: retain its exclusive guard
+                // across removal of the whole cache tree if acquisition succeeds.
+                let clear_guard = clear_registry.try_claim_broad_cache_clear().unwrap();
+                let claimed = clear_guard.is_some();
+                if claimed {
+                    fs::remove_dir_all(&clear_root).unwrap();
+                }
+                clear_tx.send(claimed).unwrap();
+            })
+            .join()
+            .unwrap();
+        });
+
+        let warm = registry
+            .lookup_valid(&lookup, SystemTime::now())
+            .unwrap()
+            .unwrap();
+        assert!(!clear_rx.recv().unwrap());
+        assert!(warm.database_path().exists());
+        assert!(directory.exists());
+        assert!(registry.try_claim_broad_cache_clear().unwrap().is_none());
+        drop(warm);
+        assert!(registry.try_claim_broad_cache_clear().unwrap().is_some());
+    }
+
+    #[test]
     fn failed_rebuild_preserves_old_generation_and_corruption_is_rejected() {
         let temp = TempDir::new().unwrap();
         let (registry, lookup, claim, manifest) = prepare_claim(temp.path());
@@ -2251,7 +2337,7 @@ mod tests {
         marker.raster_width += 1;
         fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
         assert!(registry
-            .validate_generation(id.as_str(), None, None, None, false, None)
+            .validate_generation(id.as_str(), None, None, None, false, None, None)
             .is_err());
 
         let temp = TempDir::new().unwrap();
@@ -2281,7 +2367,7 @@ mod tests {
         marker.database = artifact(&database_path, &NeverCancel).unwrap();
         fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
         assert!(registry
-            .validate_generation(id.as_str(), None, None, None, false, None)
+            .validate_generation(id.as_str(), None, None, None, false, None, None)
             .is_err());
     }
 
