@@ -6,6 +6,7 @@ use crate::manhattan::legacy_manifest::{
 };
 use genohype_association::{
     compare_association_points, AssociationPointV1, TopK, WarningCode, DEFAULT_TOP_K,
+    MAX_POINT_FIELD_BYTES,
 };
 use genohype_core::codec::EncodedValue;
 use genohype_core::{HailError, Result};
@@ -874,14 +875,20 @@ mod tests {
     fn producer_refuses_receipts_above_the_ingestion_byte_limit() {
         let mut accumulator =
             ManhattanPartitionReductionAccumulatorV1::new(0, ManhattanSource::Exome, 5e-8).unwrap();
-        accumulator
-            .observe_source_row(&EncodedValue::Int32(1))
-            .unwrap();
-        let mut oversized_point = point(0, 1e-9);
-        oversized_point.ref_allele = Some("A".repeat(MANHATTAN_PARTITION_REDUCTION_MAX_BYTES_V1));
-        accumulator
-            .observe_valid_point(oversized_point, vec![], true, true)
-            .unwrap();
+        // Exercise the receipt-level aggregate bound using individually valid,
+        // Phase 4-bounded points rather than one now-invalid oversized field.
+        for ordinal in 0..MANHATTAN_PARTITION_TOP_HITS_MAX_V1 as u64 {
+            accumulator
+                .observe_source_row(&EncodedValue::Int32(1))
+                .unwrap();
+            let mut large_point = point(ordinal, (ordinal + 1) as f64 * 1e-12);
+            large_point.ref_allele = Some("A".repeat(MAX_POINT_FIELD_BYTES));
+            large_point.alt_allele = Some("C".repeat(MAX_POINT_FIELD_BYTES));
+            large_point.gene_symbol = Some("G".repeat(MAX_POINT_FIELD_BYTES));
+            accumulator
+                .observe_valid_point(large_point, vec![], true, true)
+                .unwrap();
+        }
         let png = tiny_skia::Pixmap::new(1, 1).unwrap().encode_png().unwrap();
         let receipt = accumulator
             .finish_with_finalized_raster("part-00000.png".into(), &png)
