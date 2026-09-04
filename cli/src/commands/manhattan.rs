@@ -1,5 +1,6 @@
 //! Manhattan plot generation commands.
 
+use crate::association_server::{serve_viewer, ViewerArtifacts, ViewerOptions};
 use crate::cli::{LociArgs, LocusArgs, ManhattanArgs, ManhattanBatchArgs};
 use crate::commands::utils::progress_style_spinner;
 use crate::manhattan::batch::{
@@ -31,6 +32,47 @@ use std::thread;
 
 pub fn run_manhattan(args: ManhattanArgs) -> Result<()> {
     use crate::manhattan::annotate::Annotator;
+
+    let viewer_options = args.view.then_some(ViewerOptions {
+        port: args.port.unwrap_or(0),
+        open: !args.no_open,
+    });
+    if args.view
+        && (args.from_shards.is_some()
+            || args.exome.is_some()
+            || args.genome.is_some()
+            || args.scan_only
+            || args.aggregate_only)
+    {
+        return Err(HailError::InvalidFormat(
+            "--view currently supports only legacy local --table Manhattan output".into(),
+        ));
+    }
+    if args.view && args.table.is_none() {
+        return Err(HailError::InvalidFormat(
+            "--view requires a legacy --table input that produces one canonical raster and manifest"
+                .into(),
+        ));
+    }
+    if args.view
+        && (args.partitioning.worker_id != 0
+            || args.partitioning.total_workers != 1
+            || args.progress_json)
+    {
+        return Err(HailError::InvalidFormat(
+            "--view is a local foreground action and cannot run in distributed worker mode".into(),
+        ));
+    }
+    if args.view
+        && args
+            .output
+            .as_deref()
+            .is_some_and(genohype_core::io::is_cloud_path)
+    {
+        return Err(HailError::InvalidFormat(
+            "--view requires a local output prefix".into(),
+        ));
+    }
 
     // Check if aggregating from distributed shards
     if let Some(shards_path) = &args.from_shards {
@@ -449,10 +491,16 @@ pub fn run_manhattan(args: ManhattanArgs) -> Result<()> {
     println!(
         "{} {} + {} + {}",
         "Saved:".green().bold(),
-        png_path.bright_white(),
+        png_path.as_str().bright_white(),
         json_path.bright_white(),
-        manifest_path.bright_white()
+        manifest_path.as_str().bright_white()
     );
+
+    if let Some(options) = viewer_options {
+        // These are the exact paths returned by this successful generation. The viewer
+        // never rescans the source or reconstructs artifact names.
+        serve_viewer(ViewerArtifacts::new(manifest_path, png_path), options)?;
+    }
 
     Ok(())
 }

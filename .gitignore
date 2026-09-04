@@ -28,9 +28,12 @@ target/
 frontend/node_modules/
 frontend/dist/
 cli/static/dist/
+cli/static/association-viewer/dist/
 node_modules/
 ui/node_modules/
 ui/packages/*/node_modules/
+ui/test-results/
+ui/playwright-report/
 ui/packages/*/dist/
 
 # Manhattan output files

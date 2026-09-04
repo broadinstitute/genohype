@@ -6,6 +6,7 @@
 //! - summary: Scan full dataset to calculate row counts and field statistics (slow)
 //! - export: Export data to other formats (Parquet, ClickHouse, BigQuery)
 
+mod association_server;
 mod benchmark;
 mod cli;
 mod clickhouse;

@@ -5,6 +5,9 @@ use clap::Args;
 use super::shared::PartitioningArgs;
 
 #[derive(Args, Debug)]
+#[command(
+    after_help = "Example:\n  genohype manhattan --table data/test/association/single-variant.ht --y-field Pvalue --output /tmp/genohype-association-demo --view"
+)]
 pub struct ManhattanArgs {
     // -- Data Inputs --
     /// Path to Exome results Hail Table
@@ -85,6 +88,21 @@ pub struct ManhattanArgs {
     /// Run only the highly-parallel scan phase (outputs partial PNGs and sig.parquet)
     #[arg(long, conflicts_with = "aggregate_only")]
     pub scan_only: bool,
+
+    /// Serve the generated canonical Manhattan artifacts in a local browser viewer
+    #[arg(
+        long,
+        conflicts_with_all = ["scan_only", "aggregate_only", "from_shards", "exome", "genome"]
+    )]
+    pub view: bool,
+
+    /// Do not open a browser automatically when using --view
+    #[arg(long, requires = "view")]
+    pub no_open: bool,
+
+    /// Viewer port; omitted means 0 (OS-selected)
+    #[arg(long, value_name = "PORT", requires = "view")]
+    pub port: Option<u16>,
 
     /// Run only the memory-intensive aggregate phase (composites PNGs, generates locus plots)
     #[arg(long, conflicts_with = "scan_only")]
@@ -340,4 +358,77 @@ pub struct LocusArgs {
     /// Max Y-axis value (-log10 p)
     #[arg(long, default_value = "30.0")]
     pub y_max: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::{Cli, Commands};
+    use clap::{CommandFactory, Parser};
+
+    fn parse(args: &[&str]) -> Result<ManhattanArgs, clap::Error> {
+        let cli = Cli::try_parse_from(args)?;
+        match cli.command {
+            Commands::Manhattan(args) => Ok(args),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn viewer_flags_parse_with_ephemeral_port_default() {
+        let args = parse(&["genohype", "manhattan", "--table", "fixture.ht", "--view"]).unwrap();
+        assert!(args.view);
+        assert!(!args.no_open);
+        assert_eq!(args.port, None);
+
+        let args = parse(&[
+            "genohype",
+            "manhattan",
+            "--table",
+            "fixture.ht",
+            "--view",
+            "--no-open",
+            "--port",
+            "43210",
+        ])
+        .unwrap();
+        assert!(args.no_open);
+        assert_eq!(args.port, Some(43210));
+    }
+
+    #[test]
+    fn viewer_dependent_and_incompatible_flags_are_rejected() {
+        assert!(parse(&["genohype", "manhattan", "--no-open"]).is_err());
+        assert!(parse(&["genohype", "manhattan", "--port", "0"]).is_err());
+        assert!(parse(&["genohype", "manhattan", "--view", "--port", "65536"]).is_err());
+        assert!(parse(&[
+            "genohype",
+            "manhattan",
+            "--table",
+            "fixture.ht",
+            "--view",
+            "--scan-only"
+        ])
+        .is_err());
+        assert!(parse(&["genohype", "manhattan", "--exome", "fixture.ht", "--view"]).is_err());
+    }
+
+    #[test]
+    fn ordinary_manhattan_parsing_is_unchanged_and_help_has_checkpoint_example() {
+        let args = parse(&["genohype", "manhattan", "--table", "fixture.ht"]).unwrap();
+        assert!(!args.view);
+        assert!(!args.no_open);
+        assert_eq!(args.port, None);
+
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("Generate Manhattan plots"));
+        let manhattan = Cli::command()
+            .find_subcommand("manhattan")
+            .unwrap()
+            .clone()
+            .render_long_help()
+            .to_string();
+        assert!(manhattan.contains("data/test/association/single-variant.ht"));
+        assert!(manhattan.contains("--view"));
+    }
 }

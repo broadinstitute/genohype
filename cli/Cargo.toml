@@ -43,7 +43,7 @@ genohype-association = { path = "../association" }
 genohype-pool = { path = "../pool" }
 
 # Re-export/use core dependencies needed by CLI
-tokio = { version = "1.35", features = ["rt-multi-thread", "sync", "macros"] }
+tokio = { version = "1.35", features = ["rt-multi-thread", "sync", "macros", "net", "signal"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
@@ -110,6 +110,7 @@ tower-http = { version = "0.5", features = ["cors", "fs"] }
 # Embed static files for the dashboard SPA at compile time
 rust-embed = "8"
 mime_guess = "2"
+webbrowser = "1"
 
 # Additional HTTP server features (server feature)
 axum-extra = { version = "0.9", features = ["query"], optional = true }
@@ -147,3 +148,4 @@ required-features = ["server"]
 tempfile = "3.8"
 tower = { version = "0.5", features = ["util"] }
 criterion = "0.5"
+libc = "0.2"

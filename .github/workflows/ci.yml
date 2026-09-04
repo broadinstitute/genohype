@@ -29,9 +29,17 @@ jobs:
         with:
           node-version: 20
           cache: npm
-          cache-dependency-path: frontend/pool-dashboard/package-lock.json
+          cache-dependency-path: |
+            frontend/pool-dashboard/package-lock.json
+            ui/package-lock.json
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: Install association viewer browser test dependencies
+        working-directory: ui
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
 
       - name: Verify clean checkout
         run: ./scripts/verify.sh

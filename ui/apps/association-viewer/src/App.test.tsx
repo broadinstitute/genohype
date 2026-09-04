@@ -20,13 +20,26 @@ function response(body: unknown, status = 200): Response {
 describe('association viewer app', () => {
   it('constructs token-base-safe relative manifest and raster URLs', async () => {
     expect(associationManifestUrl().href).toBe('https://example.test/token/api/manifest');
-    const fetchMock = vi.fn().mockResolvedValue(response(fixture()));
+    const manifest = fixture();
+    manifest.resources.raster.url = 'raster';
+    const fetchMock = vi.fn().mockResolvedValue(response(manifest));
     vi.stubGlobal('fetch', fetchMock);
     const state = await loadAssociationViewer(associationManifestUrl());
     expect(fetchMock).toHaveBeenCalledWith(
       new URL('https://example.test/token/api/manifest'),
       expect.objectContaining({ headers: { Accept: 'application/json' } }),
     );
+    expect(state).toMatchObject({
+      kind: 'ready',
+      rasterUrl: 'https://example.test/token/api/raster',
+    });
+  });
+
+  it('preserves ordinary manifest-relative resource resolution', async () => {
+    const manifest = fixture();
+    const fetchMock = vi.fn().mockResolvedValue(response(manifest));
+    vi.stubGlobal('fetch', fetchMock);
+    const state = await loadAssociationViewer(associationManifestUrl());
     expect(state).toMatchObject({
       kind: 'ready',
       rasterUrl: 'https://example.test/token/api/height-genome.png',

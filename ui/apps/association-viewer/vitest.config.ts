@@ -7,6 +7,7 @@ export default defineConfig({
     environment: 'jsdom',
     environmentOptions: { jsdom: { url: 'https://example.test/token/index.html' } },
     setupFiles: ['./src/test/setup.ts'],
+    exclude: ['e2e/**'],
     restoreMocks: true,
   },
 });

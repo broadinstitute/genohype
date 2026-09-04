@@ -86,7 +86,9 @@ jobs:
         with:
           node-version: 20
           cache: npm
-          cache-dependency-path: frontend/pool-dashboard/package-lock.json
+          cache-dependency-path: |
+            frontend/pool-dashboard/package-lock.json
+            ui/package-lock.json
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -94,6 +96,9 @@ jobs:
 
       - name: Build embedded pool dashboard
         run: ./scripts/build-dashboard.sh
+
+      - name: Build embedded association viewer
+        run: ./scripts/build-association-viewer.sh
 
       - name: Install Zig build tools
         if: matrix.use_zig
@@ -183,6 +188,16 @@ jobs:
               exit 1
             fi
           fi
+
+      - name: Verify embedded association viewer
+        env:
+          TARGET: ${{ matrix.target }}
+          USE_ROSETTA: ${{ matrix.use_rosetta }}
+        run: |
+          if [[ "$USE_ROSETTA" == "true" ]]; then
+            export GENOHYPE_BINARY_RUNNER="arch -x86_64"
+          fi
+          ./scripts/test-association-viewer-package.sh "target/$TARGET/release/genohype"
 
       - name: Stage binary
         env:

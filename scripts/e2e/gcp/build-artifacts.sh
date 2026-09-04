@@ -32,8 +32,9 @@ mkdir -p "$OUTPUT_DIR" "$FIXTURE_DIR"
 rm -rf "$STAGE"
 mkdir -p "$STAGE/main" "$STAGE/worker"
 
-printf '%s\n' '--- build dashboard and main Linux CLI ---'
+printf '%s\n' '--- build embedded UIs and main Linux CLI ---'
 "$REPO_ROOT/scripts/build-dashboard.sh"
+"$REPO_ROOT/scripts/build-association-viewer.sh"
 (
   cd "$REPO_ROOT"
   ulimit -n 16384 2>/dev/null || ulimit -n 8192 2>/dev/null || true

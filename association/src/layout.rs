@@ -264,7 +264,23 @@ impl GenomeLayoutV1 {
             self.height,
             self.contig_gap,
         )?;
-        if *self != expected {
+        // serde_json's default float parser may round a canonical coordinate by one ULP
+        // when reading the manifest back. Compare within a tiny, width-scaled tolerance
+        // while still rejecting any geometrically meaningful change.
+        let tolerance = f64::EPSILON * f64::from(self.width).max(1.0) * 8.0;
+        let canonical = self.contigs.len() == expected.contigs.len()
+            && self
+                .contigs
+                .iter()
+                .zip(&expected.contigs)
+                .all(|(actual, expected)| {
+                    actual.name == expected.name
+                        && actual.length == expected.length
+                        && actual.color == expected.color
+                        && (actual.x_start - expected.x_start).abs() <= tolerance
+                        && (actual.x_end - expected.x_end).abs() <= tolerance
+                });
+        if !canonical {
             return Err(LayoutError::NonCanonicalGeometry);
         }
         Ok(())
@@ -440,6 +456,15 @@ mod tests {
         let mut alias = base.clone();
         alias.contigs[0].name = "chr1".into();
         assert_eq!(alias.validate(), Err(LayoutError::NonCanonicalGeometry));
+    }
+
+    #[test]
+    fn full_genome_layout_survives_json_round_trip() {
+        let layout =
+            GenomeLayoutV1::new(canonical_contig_lengths(Assembly::Grch38), 3000, 800, 4).unwrap();
+        let encoded = serde_json::to_vec(&layout).unwrap();
+        let decoded: GenomeLayoutV1 = serde_json::from_slice(&encoded).unwrap();
+        assert!(decoded.validate().is_ok());
     }
 
     #[test]
