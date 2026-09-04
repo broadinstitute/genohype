@@ -67,6 +67,9 @@ fn schema_rejects_invalid_domain_values_before_cross_language_consumption() {
         ("/top_hits/0/allele_frequency", json!(1.1)),
         ("/resources/raster/url", json!("api/%2e%2e/secret")),
         ("/resources/raster/media_type", json!("")),
+        ("/title", json!("x".repeat(513))),
+        ("/warnings/0", json!("x".repeat(1_025))),
+        ("/top_hits/0/gene_symbol", json!("x".repeat(4_097))),
     ] {
         let mut candidate = fixture.clone();
         *candidate.pointer_mut(pointer).unwrap() = invalid;

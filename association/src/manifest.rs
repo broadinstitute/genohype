@@ -9,6 +9,9 @@ use std::fmt;
 
 pub const SCHEMA_VERSION_V1: &str = "1.0";
 pub const COORDINATE_CONVENTION_V1: &str = "1-based-inclusive";
+pub const MAX_MANIFEST_WARNING_BYTES: usize = 1_024;
+pub const MAX_MANIFEST_WARNINGS: usize = 100;
+pub const MAX_MANIFEST_TEXT_BYTES: usize = 1_048_576;
 
 /// Visualization kinds defined by schema major version 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -21,7 +24,7 @@ pub enum PlotKindV1 {
 /// One named p-value threshold shown on a visualization.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AssociationThresholdV1 {
-    #[schemars(length(min = 1))]
+    #[schemars(length(min = 1, max = 128))]
     pub name: String,
     #[schemars(range(min = 0.0, max = 1.0))]
     pub pvalue: f64,
@@ -30,16 +33,18 @@ pub struct AssociationThresholdV1 {
 /// Browser-fetchable artifact or API route. URLs must be relative and credential-free.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ResourceDescriptorV1 {
-    #[schemars(regex(pattern = "^[^/\\\\?:#@%][^\\\\?:#@%]*$"))]
+    #[schemars(length(max = 2048), regex(pattern = "^[^/\\\\?:#@%][^\\\\?:#@%]*$"))]
     pub url: String,
-    #[schemars(length(min = 1))]
+    #[schemars(length(min = 1, max = 255))]
     pub media_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(range(max = 9007199254740991_u64))]
     pub byte_size: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 256))]
     pub checksum: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 64))]
     pub expires_at: Option<String>,
 }
 
@@ -62,6 +67,19 @@ impl ResourceDescriptorV1 {
         }
         if self.media_type.trim().is_empty() {
             return Err(ManifestError::MissingMediaType);
+        }
+        if self.url.len() > 2_048
+            || self.media_type.len() > 255
+            || self
+                .checksum
+                .as_ref()
+                .is_some_and(|value| value.len() > 256)
+            || self
+                .expires_at
+                .as_ref()
+                .is_some_and(|value| value.len() > 64)
+        {
+            return Err(ManifestError::TextPayloadTooLarge);
         }
         if self
             .byte_size
@@ -93,16 +111,25 @@ pub struct AssociationVisualizationManifestV1 {
     #[serde(deserialize_with = "deserialize_v1_schema_version")]
     #[schemars(regex(pattern = "^1\\.[0-9]+$"))]
     pub schema_version: String,
+    #[schemars(length(min = 1, max = 128))]
     pub plot_id: String,
     pub kind: PlotKindV1,
+    #[schemars(length(min = 1, max = 512))]
     pub title: String,
+    #[schemars(length(min = 1, max = 64))]
     pub assembly: String,
+    #[schemars(length(max = 64))]
     pub coordinate_convention: String,
+    #[schemars(length(min = 1, max = 128))]
     pub source_fingerprint: String,
+    #[schemars(length(min = 1, max = 128))]
     pub genohype_version: String,
+    #[schemars(length(min = 1, max = 64))]
     pub created_at: String,
     pub layout: GenomeLayoutV1,
+    #[schemars(length(min = 1, max = 128))]
     pub layout_hash: String,
+    #[schemars(length(max = 100))]
     pub thresholds: Vec<AssociationThresholdV1>,
     #[schemars(range(max = 9007199254740991_u64))]
     pub row_count: u64,
@@ -116,6 +143,7 @@ pub struct AssociationVisualizationManifestV1 {
     pub significant_hit_count: u64,
     #[schemars(length(max = 1_000))]
     pub top_hits: Vec<AssociationPointV1>,
+    #[schemars(length(max = 100), inner(length(max = 1024)))]
     pub warnings: Vec<String>,
     pub resources: AssociationVisualizationResourcesV1,
 }
@@ -131,6 +159,32 @@ impl AssociationVisualizationManifestV1 {
             || self.created_at.trim().is_empty()
         {
             return Err(ManifestError::MissingRequiredMetadata);
+        }
+        let fixed_fields = [
+            (&self.plot_id, 128_usize),
+            (&self.title, 512),
+            (&self.assembly, 64),
+            (&self.coordinate_convention, 64),
+            (&self.source_fingerprint, 128),
+            (&self.genohype_version, 128),
+            (&self.created_at, 64),
+            (&self.layout_hash, 128),
+        ];
+        if fixed_fields
+            .iter()
+            .any(|(value, maximum)| value.len() > *maximum)
+            || self.thresholds.len() > 100
+            || self
+                .thresholds
+                .iter()
+                .any(|threshold| threshold.name.len() > 128)
+            || self.warnings.len() > MAX_MANIFEST_WARNINGS
+            || self
+                .warnings
+                .iter()
+                .any(|warning| warning.len() > MAX_MANIFEST_WARNING_BYTES)
+        {
+            return Err(ManifestError::TextPayloadTooLarge);
         }
         if self.coordinate_convention != COORDINATE_CONVENTION_V1 {
             return Err(ManifestError::UnsupportedCoordinateConvention(
@@ -162,7 +216,51 @@ impl AssociationVisualizationManifestV1 {
         if self.top_hits.len() as u64 > self.valid_row_count {
             return Err(ManifestError::InconsistentCounts);
         }
+        let mut text_bytes = fixed_fields
+            .iter()
+            .map(|(value, _)| value.len())
+            .sum::<usize>();
+        text_bytes = text_bytes.saturating_add(
+            self.thresholds
+                .iter()
+                .map(|value| value.name.len())
+                .sum::<usize>(),
+        );
+        text_bytes =
+            text_bytes.saturating_add(self.warnings.iter().map(String::len).sum::<usize>());
+        text_bytes = text_bytes.saturating_add(
+            self.layout
+                .contigs
+                .iter()
+                .map(|value| value.name.len() + value.color.len())
+                .sum::<usize>(),
+        );
+        for resource in std::iter::once(&self.resources.raster)
+            .chain(self.resources.region_api.iter())
+            .chain(self.resources.table_api.iter())
+        {
+            text_bytes = text_bytes.saturating_add(
+                resource.url.len()
+                    + resource.media_type.len()
+                    + resource.checksum.as_ref().map_or(0, String::len)
+                    + resource.expires_at.as_ref().map_or(0, String::len),
+            );
+        }
         for point in &self.top_hits {
+            text_bytes = text_bytes.saturating_add(
+                [
+                    Some(point.contig.as_str()),
+                    point.ref_allele.as_deref(),
+                    point.alt_allele.as_deref(),
+                    point.gene_symbol.as_deref(),
+                    point.consequence.as_deref(),
+                    point.series.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .map(str::len)
+                .sum::<usize>(),
+            );
             let (normalized, _) = point
                 .clone()
                 .normalize()
@@ -177,6 +275,9 @@ impl AssociationVisualizationManifestV1 {
             .all(|pair| compare_association_points(&pair[0], &pair[1]).is_le())
         {
             return Err(ManifestError::UnsortedTopHits);
+        }
+        if text_bytes > MAX_MANIFEST_TEXT_BYTES {
+            return Err(ManifestError::TextPayloadTooLarge);
         }
         self.layout
             .validate()
@@ -255,6 +356,7 @@ pub enum ManifestError {
     BrowserUnsafeInteger(&'static str),
     UnsafeResourceUrl(String),
     MissingMediaType,
+    TextPayloadTooLarge,
 }
 
 impl fmt::Display for ManifestError {
@@ -294,6 +396,9 @@ impl fmt::Display for ManifestError {
                 write!(f, "resource URL must be safe and relative: {url}")
             }
             Self::MissingMediaType => write!(f, "resource media type cannot be empty"),
+            Self::TextPayloadTooLarge => {
+                write!(f, "manifest text exceeds bounded V1 payload limits")
+            }
         }
     }
 }
@@ -345,6 +450,22 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("unsupported association manifest schema major version 2"));
+    }
+
+    #[test]
+    fn browser_facing_manifest_text_is_bounded_by_utf8_bytes() {
+        let mut manifest: AssociationVisualizationManifestV1 = serde_json::from_str(include_str!(
+            "../tests/fixtures/association-visualization-v1.json"
+        ))
+        .unwrap();
+        assert!(manifest.validate().is_ok());
+
+        manifest.title = "é".repeat(300);
+        assert_eq!(manifest.validate(), Err(ManifestError::TextPayloadTooLarge));
+
+        manifest.title = "bounded".into();
+        manifest.warnings = vec!["x".repeat(MAX_MANIFEST_WARNING_BYTES + 1)];
+        assert_eq!(manifest.validate(), Err(ManifestError::TextPayloadTooLarge));
     }
 
     #[test]

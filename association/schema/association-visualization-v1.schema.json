@@ -5,16 +5,23 @@
   "type": "object",
   "properties": {
     "assembly": {
-      "type": "string"
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 1
     },
     "coordinate_convention": {
-      "type": "string"
+      "type": "string",
+      "maxLength": 64
     },
     "created_at": {
-      "type": "string"
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 1
     },
     "genohype_version": {
-      "type": "string"
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1
     },
     "kind": {
       "$ref": "#/$defs/PlotKindV1"
@@ -23,10 +30,14 @@
       "$ref": "#/$defs/GenomeLayoutV1"
     },
     "layout_hash": {
-      "type": "string"
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1
     },
     "plot_id": {
-      "type": "string"
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1
     },
     "rendered_point_count": {
       "type": "integer",
@@ -60,16 +71,21 @@
       "minimum": 0
     },
     "source_fingerprint": {
-      "type": "string"
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1
     },
     "thresholds": {
       "type": "array",
       "items": {
         "$ref": "#/$defs/AssociationThresholdV1"
-      }
+      },
+      "maxItems": 100
     },
     "title": {
-      "type": "string"
+      "type": "string",
+      "maxLength": 512,
+      "minLength": 1
     },
     "top_hits": {
       "type": "array",
@@ -87,8 +103,10 @@
     "warnings": {
       "type": "array",
       "items": {
-        "type": "string"
-      }
+        "type": "string",
+        "maxLength": 1024
+      },
+      "maxItems": 100
     }
   },
   "required": [
@@ -139,7 +157,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "maxLength": 4096
         },
         "beta": {
           "type": [
@@ -152,17 +171,20 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "maxLength": 4096
         },
         "contig": {
           "type": "string",
+          "maxLength": 4096,
           "minLength": 1
         },
         "gene_symbol": {
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "maxLength": 4096
         },
         "neg_log10_p": {
           "type": "number",
@@ -185,13 +207,15 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "maxLength": 4096
         },
         "series": {
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "maxLength": 4096
         },
         "source_ordinal": {
           "type": "integer",
@@ -221,6 +245,7 @@
       "properties": {
         "name": {
           "type": "string",
+          "maxLength": 128,
           "minLength": 1
         },
         "pvalue": {
@@ -283,6 +308,7 @@
         },
         "name": {
           "type": "string",
+          "maxLength": 4096,
           "minLength": 1
         },
         "x_end": {
@@ -369,20 +395,24 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "maxLength": 256
         },
         "expires_at": {
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "maxLength": 64
         },
         "media_type": {
           "type": "string",
+          "maxLength": 255,
           "minLength": 1
         },
         "url": {
           "type": "string",
+          "maxLength": 2048,
           "pattern": "^[^/\\\\?:#@%][^\\\\?:#@%]*$"
         }
       },

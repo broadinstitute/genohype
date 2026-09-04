@@ -1784,10 +1784,12 @@ version = "0.1.0"
 dependencies = [
  "jsonschema",
  "proptest",
+ "rusqlite",
  "schemars",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "tiny-skia",
 ]
 

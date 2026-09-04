@@ -1,0 +1,203 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AssociationPageV1",
+  "description": "Versioned bounded envelope shared by table and inclusive-region APIs.",
+  "type": "object",
+  "properties": {
+    "dataset_id": {
+      "$ref": "#/$defs/DatasetIdV1"
+    },
+    "direction": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AssociationSortDirectionV1"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "limit": {
+      "type": "integer",
+      "format": "uint32",
+      "maximum": 1000,
+      "minimum": 1
+    },
+    "offset": {
+      "type": "integer",
+      "format": "uint64",
+      "maximum": 9007199254740991,
+      "minimum": 0
+    },
+    "points": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AssociationPointV1"
+      },
+      "maxItems": 1000
+    },
+    "schema_version": {
+      "type": "string",
+      "pattern": "^1\\.[0-9]+$"
+    },
+    "search": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 256
+    },
+    "sort": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AssociationTableSortV1"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "total": {
+      "type": "integer",
+      "format": "uint64",
+      "maximum": 9007199254740991,
+      "minimum": 0
+    }
+  },
+  "required": [
+    "schema_version",
+    "dataset_id",
+    "points",
+    "offset",
+    "limit",
+    "total"
+  ],
+  "$defs": {
+    "AssociationPointV1": {
+      "description": "Canonical normalized single-variant association row.",
+      "type": "object",
+      "properties": {
+        "allele_count": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "minimum": 0.0
+        },
+        "allele_frequency": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "maximum": 1.0,
+          "minimum": 0.0
+        },
+        "alt_allele": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 4096
+        },
+        "beta": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "consequence": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 4096
+        },
+        "contig": {
+          "type": "string",
+          "maxLength": 4096,
+          "minLength": 1
+        },
+        "gene_symbol": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 4096
+        },
+        "neg_log10_p": {
+          "type": "number",
+          "format": "double",
+          "minimum": 0.0
+        },
+        "position": {
+          "type": "integer",
+          "format": "int64",
+          "maximum": 9007199254740991,
+          "minimum": 1
+        },
+        "pvalue": {
+          "type": "number",
+          "format": "double",
+          "maximum": 1.0,
+          "minimum": 0.0
+        },
+        "ref_allele": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 4096
+        },
+        "series": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 4096
+        },
+        "source_ordinal": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0
+        },
+        "standard_error": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        }
+      },
+      "required": [
+        "contig",
+        "position",
+        "pvalue",
+        "neg_log10_p",
+        "source_ordinal"
+      ]
+    },
+    "AssociationSortDirectionV1": {
+      "type": "string",
+      "enum": [
+        "ascending",
+        "descending"
+      ]
+    },
+    "AssociationTableSortV1": {
+      "type": "string",
+      "enum": [
+        "pvalue",
+        "locus"
+      ]
+    },
+    "DatasetIdV1": {
+      "description": "Browser-safe opaque dataset identifier. V1 uses canonical lowercase UUID-v4 text.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    }
+  }
+}

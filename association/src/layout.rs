@@ -150,7 +150,7 @@ pub fn canonical_contig_cmp(left: &str, right: &str) -> Ordering {
 /// One contig's raw-coordinate and pixel extent in a Manhattan layout.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ContigLayoutV1 {
-    #[schemars(length(min = 1))]
+    #[schemars(length(min = 1, max = 4096))]
     pub name: String,
     #[schemars(range(min = 1, max = 9007199254740991_u64))]
     pub length: u64,
@@ -195,6 +195,9 @@ impl GenomeLayoutV1 {
         for (name, length) in contigs {
             let original = name.into();
             let name = canonical_contig(&original).ok_or(LayoutError::InvalidContig)?;
+            if name.len() > 4_096 {
+                return Err(LayoutError::InvalidContig);
+            }
             if length == 0 {
                 return Err(LayoutError::ZeroContigLength(name));
             }

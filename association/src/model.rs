@@ -7,6 +7,11 @@ use crate::layout::canonical_contig;
 use crate::scale::MAX_NEG_LOG_P;
 use crate::JSON_SAFE_INTEGER_MAX;
 
+/// Maximum UTF-8 bytes accepted for any one browser-facing point text field.
+pub const MAX_POINT_FIELD_BYTES: usize = 4_096;
+/// Maximum combined UTF-8 bytes accepted across one point's text fields.
+pub const MAX_POINT_TEXT_BYTES: usize = 16_384;
+
 /// Stable warning codes emitted during association normalization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -37,6 +42,7 @@ pub struct NormalizedPValue {
 /// Why a p-value pair cannot be represented by the canonical contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PValueError {
+    MissingSignificance,
     InvalidPvalue,
     InvalidNegLog10P,
 }
@@ -44,6 +50,9 @@ pub enum PValueError {
 impl fmt::Display for PValueError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::MissingSignificance => {
+                write!(f, "pvalue or neg_log10_p must be supplied")
+            }
             Self::InvalidPvalue => write!(f, "pvalue must be finite and in the range 0..=1"),
             Self::InvalidNegLog10P => {
                 write!(f, "neg_log10_p must be finite and non-negative")
@@ -65,20 +74,39 @@ pub fn normalize_pvalue(
     pvalue: f64,
     supplied_neg_log10_p: Option<f64>,
 ) -> Result<NormalizedPValue, PValueError> {
-    if !pvalue.is_finite() || !(0.0..=1.0).contains(&pvalue) {
+    normalize_significance(Some(pvalue), supplied_neg_log10_p)
+}
+
+/// Canonically normalize raw p-value, negative-log p-value, or both.
+///
+/// When only `neg_log10_p` is available, the raw value is derived. Very large
+/// supplied significances may underflow to zero; the supplied significance is
+/// retained for ordering and a stable underflow warning is emitted.
+pub fn normalize_significance(
+    pvalue: Option<f64>,
+    supplied_neg_log10_p: Option<f64>,
+) -> Result<NormalizedPValue, PValueError> {
+    if pvalue.is_none() && supplied_neg_log10_p.is_none() {
+        return Err(PValueError::MissingSignificance);
+    }
+    if pvalue.is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value)) {
         return Err(PValueError::InvalidPvalue);
     }
     if supplied_neg_log10_p.is_some_and(|value| !value.is_finite() || value < 0.0) {
         return Err(PValueError::InvalidNegLog10P);
     }
 
-    let mut warnings = Vec::new();
-    let significance = if pvalue == 0.0 {
-        warnings.push(WarningCode::PvalueUnderflow);
-        supplied_neg_log10_p.unwrap_or(MAX_NEG_LOG_P)
-    } else {
-        supplied_neg_log10_p.unwrap_or_else(|| -pvalue.log10())
+    let significance = match (pvalue, supplied_neg_log10_p) {
+        (_, Some(significance)) => significance,
+        (Some(0.0), None) => MAX_NEG_LOG_P,
+        (Some(pvalue), None) => -pvalue.log10(),
+        (None, None) => unreachable!("the missing pair was rejected above"),
     };
+    let pvalue = pvalue.unwrap_or_else(|| 10_f64.powf(-significance));
+    let mut warnings = Vec::new();
+    if pvalue == 0.0 {
+        warnings.push(WarningCode::PvalueUnderflow);
+    }
     if significance > MAX_NEG_LOG_P {
         warnings.push(WarningCode::NegLog10PDisplayCapped);
     }
@@ -93,11 +121,13 @@ pub fn normalize_pvalue(
 /// Canonical normalized single-variant association row.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AssociationPointV1 {
-    #[schemars(length(min = 1))]
+    #[schemars(length(min = 1, max = 4096))]
     pub contig: String,
     #[schemars(range(min = 1, max = 9007199254740991_u64))]
     pub position: i64,
+    #[schemars(length(max = 4096))]
     pub ref_allele: Option<String>,
+    #[schemars(length(max = 4096))]
     pub alt_allele: Option<String>,
     #[schemars(range(min = 0.0, max = 1.0))]
     pub pvalue: f64,
@@ -109,8 +139,11 @@ pub struct AssociationPointV1 {
     pub allele_frequency: Option<f64>,
     #[schemars(range(min = 0.0))]
     pub allele_count: Option<f64>,
+    #[schemars(length(max = 4096))]
     pub gene_symbol: Option<String>,
+    #[schemars(length(max = 4096))]
     pub consequence: Option<String>,
+    #[schemars(length(max = 4096))]
     pub series: Option<String>,
     #[schemars(range(max = 9007199254740991_u64))]
     pub source_ordinal: u64,
@@ -129,6 +162,7 @@ impl AssociationPointV1 {
             return Err(ValidationError::BrowserUnsafeInteger("source_ordinal"));
         }
         let contig = canonical_contig(&self.contig).ok_or(ValidationError::InvalidContig)?;
+        validate_point_text(&self)?;
         let normalized = normalize_pvalue(self.pvalue, Some(self.neg_log10_p))?;
         validate_optional_finite(self.beta)?;
         validate_optional_finite(self.standard_error)?;
@@ -150,6 +184,30 @@ impl AssociationPointV1 {
     }
 }
 
+fn validate_point_text(point: &AssociationPointV1) -> Result<(), ValidationError> {
+    let values = [
+        Some(point.contig.as_str()),
+        point.ref_allele.as_deref(),
+        point.alt_allele.as_deref(),
+        point.gene_symbol.as_deref(),
+        point.consequence.as_deref(),
+        point.series.as_deref(),
+    ];
+    let mut total = 0_usize;
+    for value in values.into_iter().flatten() {
+        if value.len() > MAX_POINT_FIELD_BYTES {
+            return Err(ValidationError::TextFieldTooLong);
+        }
+        total = total
+            .checked_add(value.len())
+            .ok_or(ValidationError::PointTextTooLarge)?;
+    }
+    if total > MAX_POINT_TEXT_BYTES {
+        return Err(ValidationError::PointTextTooLarge);
+    }
+    Ok(())
+}
+
 fn validate_optional_finite(value: Option<f64>) -> Result<(), ValidationError> {
     if value.is_some_and(|number| !number.is_finite()) {
         Err(ValidationError::NonFiniteOptionalStatistic)
@@ -165,6 +223,8 @@ pub enum ValidationError {
     InvalidAlleleFrequency,
     InvalidAlleleCount,
     NonFiniteOptionalStatistic,
+    TextFieldTooLong,
+    PointTextTooLarge,
     BrowserUnsafeInteger(&'static str),
     InvalidPvalue(PValueError),
 }
@@ -183,6 +243,14 @@ impl fmt::Display for ValidationError {
             Self::InvalidAlleleFrequency => write!(f, "allele_frequency must be in 0..=1"),
             Self::InvalidAlleleCount => write!(f, "allele_count must be non-negative"),
             Self::NonFiniteOptionalStatistic => write!(f, "optional statistics must be finite"),
+            Self::TextFieldTooLong => write!(
+                f,
+                "association point text fields cannot exceed {MAX_POINT_FIELD_BYTES} UTF-8 bytes"
+            ),
+            Self::PointTextTooLarge => write!(
+                f,
+                "association point text cannot exceed {MAX_POINT_TEXT_BYTES} UTF-8 bytes"
+            ),
             Self::BrowserUnsafeInteger(field) => {
                 write!(f, "{field} exceeds the browser-safe integer maximum")
             }
@@ -273,6 +341,34 @@ mod tests {
     }
 
     #[test]
+    fn raw_log_or_both_use_one_canonical_rule() {
+        let raw = normalize_significance(Some(1e-8), None).unwrap();
+        assert_eq!((raw.pvalue, raw.neg_log10_p), (1e-8, 8.0));
+
+        let log_only = normalize_significance(None, Some(8.0)).unwrap();
+        assert!((log_only.pvalue - 1e-8).abs() < 1e-20);
+        assert_eq!(log_only.neg_log10_p, 8.0);
+
+        let both = normalize_significance(Some(1e-8), Some(9.0)).unwrap();
+        assert_eq!((both.pvalue, both.neg_log10_p), (1e-8, 9.0));
+
+        let underflow = normalize_significance(None, Some(400.0)).unwrap();
+        assert_eq!(underflow.pvalue, 0.0);
+        assert_eq!(underflow.neg_log10_p, 400.0);
+        assert_eq!(
+            underflow.warnings,
+            vec![
+                WarningCode::PvalueUnderflow,
+                WarningCode::NegLog10PDisplayCapped
+            ]
+        );
+        assert_eq!(
+            normalize_significance(None, None),
+            Err(PValueError::MissingSignificance)
+        );
+    }
+
+    #[test]
     fn pvalue_invalid_values_are_rejected() {
         for pvalue in [
             -1.0,
@@ -318,6 +414,34 @@ mod tests {
         assert_eq!(
             invalid.normalize().unwrap_err(),
             ValidationError::InvalidAlleleFrequency
+        );
+    }
+
+    #[test]
+    fn point_text_is_bounded_per_field_and_in_aggregate_by_utf8_bytes() {
+        let mut oversized = point();
+        oversized.gene_symbol = Some("x".repeat(MAX_POINT_FIELD_BYTES + 1));
+        assert_eq!(
+            oversized.normalize().unwrap_err(),
+            ValidationError::TextFieldTooLong
+        );
+
+        let mut aggregate = point();
+        aggregate.contig = "A".repeat(MAX_POINT_FIELD_BYTES);
+        aggregate.ref_allele = Some("C".repeat(MAX_POINT_FIELD_BYTES));
+        aggregate.alt_allele = Some("G".repeat(MAX_POINT_FIELD_BYTES));
+        aggregate.gene_symbol = Some("T".repeat(MAX_POINT_FIELD_BYTES));
+        aggregate.series = Some("z".into());
+        assert_eq!(
+            aggregate.normalize().unwrap_err(),
+            ValidationError::PointTextTooLarge
+        );
+
+        let mut utf8 = point();
+        utf8.gene_symbol = Some("é".repeat(MAX_POINT_FIELD_BYTES / 2 + 1));
+        assert_eq!(
+            utf8.normalize().unwrap_err(),
+            ValidationError::TextFieldTooLong
         );
     }
 
