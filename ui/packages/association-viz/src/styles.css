@@ -11,6 +11,7 @@
 }
 
 .association-manhattan,
+.association-locus,
 .association-table-section {
   box-sizing: border-box;
   width: 100%;
@@ -38,6 +39,53 @@
   pointer-events: none;
   filter: drop-shadow(0 0 4px color-mix(in srgb, var(--association-selected) 55%, transparent));
 }
+
+.association-locus-raster { max-width: 100%; }
+.association-locus-overlay { overflow: hidden; }
+.association-locus-point {
+  fill: #59636f;
+  stroke: #fff;
+  stroke-width: 1;
+  cursor: pointer;
+  vector-effect: non-scaling-stroke;
+}
+.association-locus-point.is-ordinary { fill: #78838f; }
+.association-locus-point.is-significant { fill: var(--association-hit); }
+.association-locus-point.is-coding { stroke: #15171b; stroke-width: 2; }
+.association-locus-point.is-selected,
+.association-locus-point.is-hovered { fill: var(--association-selected); stroke-width: 2; }
+.association-locus-point:focus { outline: none; stroke: #111; stroke-width: 2.5; }
+.association-locus-point.is-absent-representative { fill: var(--association-surface); stroke: var(--association-selected); stroke-width: 2.5; }
+.association-locus-selection {
+  fill: rgba(61, 47, 145, 0.22);
+  fill: color-mix(in srgb, var(--association-selected) 22%, transparent);
+  stroke: var(--association-selected);
+  stroke-width: 2;
+  pointer-events: none;
+  vector-effect: non-scaling-stroke;
+}
+.association-locus-selection.is-absent-representative { fill: none; stroke-dasharray: 3 2; }
+.association-locus-details { min-width: 0; }
+.association-locus-range { margin-top: 5px; color: var(--association-muted); font-size: 11px; }
+
+.association-gene-track { box-sizing: border-box; width: 100%; margin-top: 7px; color: var(--association-muted); }
+.association-gene-track svg { display: block; width: 100%; overflow: hidden; }
+.association-gene-track-title,
+.association-gene-label { fill: currentColor; font-size: 10px; }
+.association-gene-label { font-weight: 600; }
+.association-gene-span { stroke: var(--association-accent); stroke-width: 3; vector-effect: non-scaling-stroke; }
+.association-gene-direction { fill: var(--association-accent); }
+.association-gene-state {
+  display: flex;
+  min-height: 38px;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+  border-top: 1px solid var(--association-border);
+  color: var(--association-muted);
+  font-size: 12px;
+}
+.association-gene-state.is-error { color: #b42332; }
 
 .association-loading,
 .association-error {

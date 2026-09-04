@@ -2,8 +2,12 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
+  AssociationLocusViewer,
+  GeneTrack,
   parseAssociationRegionOverlay,
   parseAssociationRegionRenderManifest,
+  validateRegionRasterDimensions,
+  xForRegionPosition,
   validateAssociationRegionPair,
   type AssociationRegionCountsV1,
   type AssociationRegionOverlayPointV1,
@@ -36,13 +40,17 @@ type PublicRegionContracts = [
 
 describe('package isolation contract', () => {
   it('exports the complete region contract and parser surface from package root', () => {
-    const parsers: readonly unknown[] = [
+    const publicValues: readonly unknown[] = [
+      AssociationLocusViewer,
+      GeneTrack,
       parseAssociationRegionOverlay,
       parseAssociationRegionRenderManifest,
       validateAssociationRegionPair,
+      validateRegionRasterDimensions,
+      xForRegionPosition,
     ];
     const compileOnly: PublicRegionContracts | undefined = undefined;
-    expect(parsers.every((value) => typeof value === 'function')).toBe(true);
+    expect(publicValues.every((value) => typeof value === 'function')).toBe(true);
     expect(compileOnly).toBeUndefined();
   });
 

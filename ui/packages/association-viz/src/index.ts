@@ -70,3 +70,16 @@ export {
 } from './manhattan/useHitDetection.js';
 export { YAxis, generateYAxisTicks, type YAxisProps } from './manhattan/YAxis.js';
 export { ChromosomeLabels, type ChromosomeLabelsProps } from './manhattan/ChromosomeLabels.js';
+export {
+  AssociationLocusViewer,
+  type AssociationLocusViewerProps,
+} from './detail/AssociationLocusViewer.js';
+export { GeneTrack, type GeneTrackProps } from './detail/GeneTrack.js';
+export {
+  positionAbsentSelectedPoint,
+  positionRegionOverlayPoint,
+  validateRegionRasterDimensions,
+  xForRegionPosition,
+  yForRegionNegLog10P,
+  type LocusDisplayPoint,
+} from './detail/layout.js';
