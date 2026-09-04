@@ -282,6 +282,8 @@ pub(crate) struct AssociationSessionRegistry {
     cache_clear_lock: Arc<PathBuf>,
     #[cfg(test)]
     after_rename_hook: Arc<std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>>,
+    #[cfg(test)]
+    before_active_transition_hook: Arc<std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>>,
 }
 impl AssociationSessionRegistry {
     pub(crate) fn open_default() -> Result<Self, AssociationSessionError> {
@@ -323,6 +325,8 @@ impl AssociationSessionRegistry {
             cache_clear_lock: Arc::new(cache_clear_lock),
             #[cfg(test)]
             after_rename_hook: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            before_active_transition_hook: Arc::new(std::sync::Mutex::new(None)),
         };
         registry.initialize_registry()?;
         Ok(registry)
@@ -336,6 +340,19 @@ impl AssociationSessionRegistry {
     #[cfg(test)]
     fn run_after_rename_hook(&self) {
         let hook = self.after_rename_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    fn set_before_active_transition_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.before_active_transition_hook.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn run_before_active_transition_hook(&self) {
+        let hook = self.before_active_transition_hook.lock().unwrap().take();
         if let Some(hook) = hook {
             hook();
         }
@@ -359,6 +376,7 @@ impl AssociationSessionRegistry {
             &row.dataset_id,
             Some(&row.session_key),
             Some(&row.marker_checksum),
+            Some(&lookup.request),
             false,
             None,
         ) {
@@ -676,6 +694,7 @@ impl AssociationSessionRegistry {
         dataset_id: &str,
         expected_session_key: Option<&str>,
         expected_marker_checksum: Option<&str>,
+        expected_request: Option<&NormalizedSessionRequestV1>,
         ephemeral: bool,
         held_active_lock: Option<File>,
     ) -> Result<CompletedAssociationSession, AssociationSessionError> {
@@ -719,7 +738,8 @@ impl AssociationSessionRegistry {
             .map_err(|_| AssociationSessionError::CorruptSession)?;
         let table_url = format!("datasets/{id}/table");
         let region_url = format!("datasets/{id}/region");
-        if manifest.plot_id != id.as_str()
+        if expected_request.is_some_and(|request| !manifest_matches_request(&manifest, request))
+            || manifest.plot_id != id.as_str()
             || manifest.source_fingerprint != marker.source_fingerprint
             || manifest.created_at != marker.created_at
             || manifest.layout.width != marker.raster_width
@@ -742,7 +762,12 @@ impl AssociationSessionRegistry {
         {
             return Err(AssociationSessionError::CorruptSession);
         }
-        validate_database(&directory.join(DATABASE_NAME), &marker, &manifest)?;
+        validate_database(
+            &directory.join(DATABASE_NAME),
+            &marker,
+            &manifest,
+            expected_request,
+        )?;
 
         let active_lock = match held_active_lock {
             Some(lock) => lock,
@@ -902,11 +927,19 @@ impl BuildClaim {
         }
         let manifest_path = staging.join(MANIFEST_NAME);
         let manifest = artifact(&manifest_path, cancellation)?;
-        let manifest_created_at = serde_json::from_slice::<AssociationVisualizationManifestV1>(
+        let completed_manifest = serde_json::from_slice::<AssociationVisualizationManifestV1>(
             &read_bounded(&manifest_path, MANIFEST_MAX_BYTES)?,
         )
-        .map_err(|_| AssociationSessionError::InvalidCompletion)?
-        .created_at;
+        .map_err(|_| AssociationSessionError::InvalidCompletion)?;
+        completed_manifest
+            .validate()
+            .map_err(|_| AssociationSessionError::InvalidCompletion)?;
+        if completed_manifest.source_fingerprint != source_fingerprint
+            || !manifest_matches_request(&completed_manifest, &self.lookup.request)
+        {
+            return Err(AssociationSessionError::InvalidCompletion);
+        }
+        let manifest_created_at = completed_manifest.created_at.clone();
         let marker = AssociationSessionCompletionV1 {
             schema_version: SCHEMA_VERSION_V1.into(),
             dataset_id: self.dataset_id.clone(),
@@ -962,24 +995,36 @@ impl BuildClaim {
             self.dataset_id.as_str(),
             Some(&marker.session_key),
             Some(&marker_checksum),
+            Some(&self.lookup.request),
             completion.ephemeral,
             Some(active_for_session),
         )?;
         check_cancel(cancellation)?;
 
-        // Downgrade before the final pointer commit. The session clone keeps the
-        // shared active protection continuously; cleanup cannot acquire exclusive.
-        let active = self
-            .active_lock
-            .as_ref()
-            .ok_or(AssociationSessionError::ClaimConsumed)?;
-        FileExt::lock_shared(active).map_err(private_io)?;
         if !completion.ephemeral {
-            // Irreversible success point: no cancellation probe or other fallible
-            // operation is allowed after this exact registry commit boundary.
+            // Publish while the original exclusive active lock is still held. Only
+            // a registered, non-orphan generation may enter flock's non-atomic
+            // exclusive-to-shared conversion window.
             self.registry
                 .publish_registry(&self.lookup, &marker, &marker_checksum)?;
+            #[cfg(test)]
+            self.registry.run_before_active_transition_hook();
+            let active = self
+                .active_lock
+                .as_ref()
+                .ok_or(AssociationSessionError::ClaimConsumed)?;
+            // If a platform refuses the downgrade, retaining exclusive ownership
+            // is safe; publication has already succeeded and must not be reported
+            // as failed after its durable commit boundary.
+            let _ = FileExt::lock_shared(active);
+        } else {
+            // Ephemeral generations are intentionally never registered, so their
+            // completed handle retains exclusive ownership until final-handle drop.
+            #[cfg(test)]
+            self.registry.run_before_active_transition_hook();
         }
+        // Irreversible success point: no cancellation probe or fallible operation
+        // follows registry publication (or completed ephemeral validation).
         self.generation_path.take();
         self.active_lock.take();
         self.release_locks();
@@ -1085,10 +1130,33 @@ pub(crate) struct BroadCacheClearGuard {
     _file: File,
 }
 
+fn manifest_matches_request(
+    manifest: &AssociationVisualizationManifestV1,
+    request: &NormalizedSessionRequestV1,
+) -> bool {
+    manifest.schema_version == request.association_schema_version
+        && manifest.assembly == request.assembly
+        && manifest.thresholds == request.thresholds
+        && manifest
+            .thresholds
+            .iter()
+            .filter(|threshold| {
+                threshold.pvalue.to_bits() == request.significance_threshold.to_bits()
+            })
+            .count()
+            == 1
+        && manifest.layout.width == request.width
+        && manifest.layout.height == request.height
+        && manifest.layout_hash == request.layout_hash
+        && manifest.genohype_version == request.renderer_version
+        && manifest.top_hits.len() as u64 == (request.top_hits as u64).min(manifest.valid_row_count)
+}
+
 fn validate_database(
     path: &Path,
     marker: &AssociationSessionCompletionV1,
     manifest: &AssociationVisualizationManifestV1,
+    expected_request: Option<&NormalizedSessionRequestV1>,
 ) -> Result<(), AssociationSessionError> {
     validate_self_contained_database(path)?;
     let store = SqliteAssociationStore::open_read_only(path)
@@ -1122,12 +1190,24 @@ fn validate_database(
             |row| row.get(0),
         )
         .map_err(private_db)?;
+    let significant_hit_count = expected_request
+        .map(|request| {
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM association_points WHERE dataset_id=?1 AND pvalue < ?2",
+                    params![marker.dataset_id.as_str(), request.significance_threshold],
+                    |row| row.get::<_, u64>(0),
+                )
+                .map_err(private_db)
+        })
+        .transpose()?;
     if fingerprint != marker.source_fingerprint
         || created_at != marker.created_at
         || status != "complete"
         || dataset_count != 1
         || count != manifest.valid_row_count
         || top_hit_count != manifest.top_hits.len() as u64
+        || significant_hit_count.is_some_and(|count| count != manifest.significant_hit_count)
     {
         return Err(AssociationSessionError::CorruptSession);
     }
@@ -1373,18 +1453,43 @@ fn validate_png_dimensions(
 ) -> Result<(), AssociationSessionError> {
     if bytes.len() as u64 > MAX_ENCODED_RASTER_BYTES
         || validate_raster_dimensions(width, height).is_err()
+    {
+        return Err(AssociationSessionError::CorruptSession);
+    }
+    // Inspect only the fixed-size signature/IHDR prefix before invoking a decoder
+    // that allocates from encoded dimensions.
+    let (encoded_width, encoded_height) =
+        png_ihdr_dimensions(bytes).ok_or(AssociationSessionError::CorruptSession)?;
+    if validate_raster_dimensions(encoded_width, encoded_height).is_err()
+        || encoded_width != width
+        || encoded_height != height
         || !valid_png_chunk_crcs(bytes)
     {
         return Err(AssociationSessionError::CorruptSession);
     }
-    // Full decode validates image structure, truncation, and DEFLATE data; the
-    // explicit chunk walk above also enforces every PNG CRC.
+    // The bounded IHDR now makes decoder allocation safe. Full decode validates
+    // image structure, truncation, and DEFLATE data; the explicit chunk walk
+    // above enforces every PNG CRC.
     let pixmap = tiny_skia::Pixmap::decode_png(bytes)
         .map_err(|_| AssociationSessionError::CorruptSession)?;
     if pixmap.width() != width || pixmap.height() != height {
         return Err(AssociationSessionError::CorruptSession);
     }
     Ok(())
+}
+
+fn png_ihdr_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    let prefix = bytes.get(..33)?;
+    if &prefix[..8] != b"\x89PNG\r\n\x1a\n"
+        || u32::from_be_bytes(prefix[8..12].try_into().ok()?) != 13
+        || &prefix[12..16] != b"IHDR"
+    {
+        return None;
+    }
+    Some((
+        u32::from_be_bytes(prefix[16..20].try_into().ok()?),
+        u32::from_be_bytes(prefix[20..24].try_into().ok()?),
+    ))
 }
 
 fn valid_png_chunk_crcs(bytes: &[u8]) -> bool {
@@ -2078,7 +2183,7 @@ mod tests {
         marker.raster_width += 1;
         fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
         assert!(registry
-            .validate_generation(id.as_str(), None, None, false, None)
+            .validate_generation(id.as_str(), None, None, None, false, None)
             .is_err());
 
         let temp = TempDir::new().unwrap();
@@ -2108,7 +2213,7 @@ mod tests {
         marker.database = artifact(&database_path, &NeverCancel).unwrap();
         fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
         assert!(registry
-            .validate_generation(id.as_str(), None, None, false, None)
+            .validate_generation(id.as_str(), None, None, None, false, None)
             .is_err());
     }
 
@@ -2130,13 +2235,152 @@ mod tests {
             baseline_key,
             changed.with_source(observation).session_key().unwrap()
         );
+
+        let temp = TempDir::new().unwrap();
+        let (_registry, lookup, claim, mut manifest) = prepare_claim(temp.path());
+        let mut request = lookup.request.clone();
+        let suggestive = AssociationThresholdV1 {
+            name: "suggestive".into(),
+            pvalue: 1e-5,
+        };
+        request.thresholds.push(suggestive.clone());
+        manifest.thresholds.push(suggestive);
+        assert!(manifest_matches_request(&manifest, &request));
+        manifest.thresholds.swap(0, 1);
+        assert!(!manifest_matches_request(&manifest, &request));
+        claim.abandon().unwrap();
     }
 
     #[test]
-    fn png_validation_decodes_crc_and_enforces_shared_bounds() {
+    fn publication_and_warm_reuse_bind_request_to_manifest_thresholds() {
+        let temp = TempDir::new().unwrap();
+        let (registry, lookup, claim, mut manifest) = prepare_claim(temp.path());
+        manifest.thresholds[0].pvalue = 1e-6;
+        fs::write(
+            claim.staging_path.as_ref().unwrap().join(MANIFEST_NAME),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            claim.publish(
+                SessionCompletion {
+                    source_fingerprint: manifest.source_fingerprint,
+                    created_at: UNIX_EPOCH + Duration::from_secs(1),
+                    expires_at: None,
+                    ephemeral: false,
+                },
+                &NeverCancel,
+            ),
+            Err(AssociationSessionError::InvalidCompletion)
+        ));
+        assert!(registry
+            .registry_row(lookup.request_key())
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            fs::read_dir(temp.path().join("sessions")).unwrap().count(),
+            0
+        );
+
+        let temp = TempDir::new().unwrap();
+        let (registry, lookup, claim, manifest) = prepare_claim(temp.path());
+        let session = claim
+            .publish(
+                SessionCompletion {
+                    source_fingerprint: manifest.source_fingerprint,
+                    created_at: UNIX_EPOCH + Duration::from_secs(1),
+                    expires_at: None,
+                    ephemeral: false,
+                },
+                &NeverCancel,
+            )
+            .unwrap();
+        let directory = session.inner.directory.clone();
+        drop(session);
+        let manifest_path = directory.join(MANIFEST_NAME);
+        let mut mismatched: AssociationVisualizationManifestV1 =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        mismatched.thresholds[0].pvalue = 1e-6;
+        let manifest_bytes = serde_json::to_vec_pretty(&mismatched).unwrap();
+        fs::write(&manifest_path, &manifest_bytes).unwrap();
+        let marker_path = directory.join(COMPLETE_NAME);
+        let mut marker: AssociationSessionCompletionV1 =
+            serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
+        marker.manifest = CompletedArtifactV1 {
+            byte_size: manifest_bytes.len() as u64,
+            checksum: checksum(&manifest_bytes),
+        };
+        let marker_bytes = serde_json::to_vec_pretty(&marker).unwrap();
+        fs::write(&marker_path, &marker_bytes).unwrap();
+        registry
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE association_sessions SET marker_checksum=?1 WHERE request_key=?2",
+                params![checksum(&marker_bytes), lookup.request_key()],
+            )
+            .unwrap();
+        assert!(registry
+            .lookup_valid(&lookup, SystemTime::now())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn strict_significance_count_is_reconciled_from_the_database() {
+        let temp = TempDir::new().unwrap();
+        let (_registry, _lookup, claim, mut manifest) = prepare_claim(temp.path());
+        let threshold = 5e-8_f64;
+        let neg_log = -threshold.log10();
+        Connection::open(claim.database_path())
+            .unwrap()
+            .execute(
+                "UPDATE association_points SET pvalue=?1,neg_log10_p=?2",
+                params![threshold, neg_log],
+            )
+            .unwrap();
+        manifest.top_hits[0].pvalue = threshold;
+        manifest.top_hits[0].neg_log10_p = neg_log;
+        // Equality is not significant: the contract is strictly pvalue < threshold.
+        manifest.significant_hit_count = 1;
+        fs::write(
+            claim.staging_path.as_ref().unwrap().join(MANIFEST_NAME),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(claim
+            .publish(
+                SessionCompletion {
+                    source_fingerprint: manifest.source_fingerprint,
+                    created_at: UNIX_EPOCH + Duration::from_secs(1),
+                    expires_at: None,
+                    ephemeral: false,
+                },
+                &NeverCancel,
+            )
+            .is_err());
+        assert_eq!(
+            fs::read_dir(temp.path().join("sessions")).unwrap().count(),
+            0
+        );
+    }
+
+    #[test]
+    fn png_validation_bounds_encoded_ihdr_before_full_decode() {
         let pixmap = tiny_skia::Pixmap::new(8, 8).unwrap();
         let valid = pixmap.encode_png().unwrap();
         assert!(validate_png_dimensions(&valid, 8, 8).is_ok());
+
+        let mut oversized_ihdr = valid.clone();
+        oversized_ihdr[16..20]
+            .copy_from_slice(&(genohype_association::MAX_RASTER_DIMENSION + 1).to_be_bytes());
+        let ihdr_crc = png_crc32(&oversized_ihdr[12..29]);
+        oversized_ihdr[29..33].copy_from_slice(&ihdr_crc.to_be_bytes());
+        assert!(oversized_ihdr.len() < 1_024);
+        assert_eq!(
+            validate_png_dimensions(&oversized_ihdr, 8, 8),
+            Err(AssociationSessionError::CorruptSession)
+        );
 
         let mut bad_crc = valid;
         let last = bad_crc.len() - 1;
@@ -2180,6 +2424,87 @@ mod tests {
         let summary = registry.cleanup(CleanupPolicy::default()).unwrap();
         assert_eq!(summary.staging_removed, 1);
         assert!(!crashed.exists());
+    }
+
+    #[test]
+    fn cleanup_cannot_take_renamed_generation_during_publication_transition() {
+        use std::sync::mpsc;
+
+        let temp = TempDir::new().unwrap();
+        let (registry, _lookup, claim, manifest) = prepare_claim(temp.path());
+        let (cleanup_tx, cleanup_rx) = mpsc::channel();
+        let cleanup_registry = registry.clone();
+        registry.set_before_active_transition_hook(move || {
+            cleanup_tx
+                .send(
+                    cleanup_registry
+                        .cleanup(CleanupPolicy {
+                            now: UNIX_EPOCH + Duration::from_secs(3),
+                            remove_expired: true,
+                            remove_orphans: true,
+                            remove_staging: false,
+                        })
+                        .unwrap(),
+                )
+                .unwrap();
+        });
+        let session = claim
+            .publish(
+                SessionCompletion {
+                    source_fingerprint: manifest.source_fingerprint,
+                    created_at: UNIX_EPOCH + Duration::from_secs(1),
+                    expires_at: Some(UNIX_EPOCH + Duration::from_secs(2)),
+                    ephemeral: false,
+                },
+                &NeverCancel,
+            )
+            .unwrap();
+        assert_eq!(cleanup_rx.recv().unwrap().retained_locked, 1);
+        assert_eq!(
+            registry
+                .cleanup(CleanupPolicy {
+                    now: UNIX_EPOCH + Duration::from_secs(3),
+                    remove_expired: true,
+                    remove_orphans: true,
+                    remove_staging: false,
+                })
+                .unwrap()
+                .retained_locked,
+            1
+        );
+        assert!(session.database_path().exists());
+
+        let temp = TempDir::new().unwrap();
+        let (registry, _lookup, claim, manifest) = prepare_claim(temp.path());
+        let (cleanup_tx, cleanup_rx) = mpsc::channel();
+        let cleanup_registry = registry.clone();
+        registry.set_before_active_transition_hook(move || {
+            cleanup_tx
+                .send(cleanup_registry.cleanup(CleanupPolicy::default()).unwrap())
+                .unwrap();
+        });
+        let session = claim
+            .publish(
+                SessionCompletion {
+                    source_fingerprint: manifest.source_fingerprint,
+                    created_at: UNIX_EPOCH + Duration::from_secs(1),
+                    expires_at: None,
+                    ephemeral: true,
+                },
+                &NeverCancel,
+            )
+            .unwrap();
+        assert_eq!(cleanup_rx.recv().unwrap().retained_locked, 1);
+        assert_eq!(
+            registry
+                .cleanup(CleanupPolicy::default())
+                .unwrap()
+                .retained_locked,
+            1
+        );
+        let directory = session.inner.directory.clone();
+        drop(session);
+        assert!(!directory.exists());
     }
 
     #[test]
