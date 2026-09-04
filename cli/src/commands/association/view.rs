@@ -23,6 +23,7 @@ use genohype_association::{
 use genohype_core::io::{inventory_hail_table_path, InventoryOptions, SourceSnapshot};
 use genohype_core::query::QueryEngine;
 use std::fs::File;
+use std::future::Future;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -152,30 +153,44 @@ async fn acquire_with_cancellation(
 ) -> Result<AcquiredAssociationView> {
     let port = prepared.args.port.unwrap_or(0);
     let open = !prepared.args.no_open;
-    let mut task = tokio::task::spawn_blocking({
+    let task = tokio::task::spawn_blocking({
         let cancellation = cancellation.clone();
         move || acquire_or_build(prepared, registry, cancellation, port, open)
     });
+    await_acquisition_or_signal(task, tokio::signal::ctrl_c(), cancellation).await
+}
 
+async fn await_acquisition_or_signal<T, S>(
+    mut task: tokio::task::JoinHandle<Result<T>>,
+    signal: S,
+    cancellation: BuildCancellation,
+) -> Result<T>
+where
+    S: Future<Output = std::io::Result<()>>,
+{
+    tokio::pin!(signal);
     tokio::select! {
-        result = &mut task => join_acquisition(result),
-        signal = tokio::signal::ctrl_c() => {
+        // Give an observed signal deterministic precedence at the boundary. If
+        // publication already committed, awaiting the worker below still returns
+        // its successful completed-session handle rather than reporting a false
+        // cancellation for a registered generation.
+        biased;
+        signal = &mut signal => {
             signal.map_err(HailError::Io)?;
             cancellation.cancel();
             // The blocking worker owns the claim and source. Await it so Drop can
-            // roll back SQLite and remove staging before this process reports failure.
-            let _ = task.await.map_err(join_error)?;
-            Err(HailError::InvalidFormat(
-                "association view build was cancelled; no viewer was started".into(),
-            ))
+            // roll back SQLite and remove staging before this process returns.
+            match task.await.map_err(join_error)? {
+                Ok(acquired) => Ok(acquired),
+                Err(_) => Err(cancelled_build()),
+            }
         }
+        result = &mut task => result.map_err(join_error)?,
     }
 }
 
-fn join_acquisition(
-    result: std::result::Result<Result<AcquiredAssociationView>, tokio::task::JoinError>,
-) -> Result<AcquiredAssociationView> {
-    result.map_err(join_error)?
+fn cancelled_build() -> HailError {
+    HailError::InvalidFormat("association view build was cancelled; no viewer was started".into())
 }
 
 fn join_error(error: tokio::task::JoinError) -> HailError {
@@ -213,10 +228,19 @@ fn acquire_or_build(
             let inventory =
                 inventory_hail_table_path(&prepared.args.source, &InventoryOptions::default())?;
             cancellation.check().map_err(invalid)?;
+            // Local inventory canonicalizes its root (for example /var ->
+            // /private/var on macOS), and its object URIs are rooted there. Open
+            // the engine at that same canonical authority so every read resolves
+            // to an identity present in the snapshot.
+            let inventory_root = inventory.root.clone();
             let snapshot = SourceSnapshot::new(inventory.manifest, &inventory.digest_sha256)?;
+            // SourceSnapshot keeps the inventory authority in its canonical bare
+            // form. Session observations use the checksum wire form required by
+            // every other registry digest.
+            let stable_observation = format!("sha256:{}", snapshot.digest_sha256());
             let lookup = SessionLookup::observe_stable(
                 "hail-inventory-v1",
-                snapshot.digest_sha256(),
+                &stable_observation,
                 prepared.request.clone(),
             )
             .map_err(invalid)?;
@@ -247,7 +271,7 @@ fn acquire_or_build(
                 }
             }
             cancellation.check().map_err(invalid)?;
-            let engine = QueryEngine::open_path_with_snapshot(&prepared.args.source, snapshot)?;
+            let engine = QueryEngine::open_path_with_snapshot(&inventory_root, snapshot)?;
             let mut source = HailAssociationSource::from_engine(
                 engine,
                 prepared.mapping.clone(),
@@ -654,6 +678,38 @@ mod tests {
         assert_eq!(prepared.request.point_radius, POINT_RADIUS);
         assert_eq!(prepared.request.point_alpha, POINT_ALPHA);
         assert_eq!(prepared.request.background, SessionBackgroundV1::White);
+    }
+
+    #[tokio::test]
+    async fn published_worker_success_wins_a_simultaneous_signal() {
+        let cancellation = BuildCancellation::default();
+        let task = tokio::spawn(async { Ok::<_, HailError>(17_u8) });
+        tokio::task::yield_now().await;
+
+        let value = await_acquisition_or_signal(task, async { Ok(()) }, cancellation.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(value, 17);
+        assert!(cancellation.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn signal_still_cancels_an_incomplete_worker() {
+        let cancellation = BuildCancellation::default();
+        let worker_cancellation = cancellation.clone();
+        let task = tokio::spawn(async move {
+            while !worker_cancellation.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+            Err::<(), _>(invalid("worker observed cancellation"))
+        });
+
+        let error = await_acquisition_or_signal(task, async { Ok(()) }, cancellation)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("build was cancelled"));
     }
 
     #[test]

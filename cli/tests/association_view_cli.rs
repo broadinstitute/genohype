@@ -13,6 +13,23 @@ fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../data/test/association/single-variant.ht")
 }
 
+fn tsv_fixture_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../data/test/association/single-variant.tsv")
+}
+
+fn copy_tree(source: &Path, destination: &Path) {
+    fs::create_dir_all(destination).unwrap();
+    for entry in fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let target = destination.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
 struct ChildGuard(Child);
 
 impl Drop for ChildGuard {
@@ -258,13 +275,24 @@ fn write_association_source(path: &Path) {
     .unwrap();
 }
 
-fn association_command(home: &Path, source: &Path, extra: &[&str]) -> Command {
+fn isolated_genohype_command(home: &Path) -> Command {
     fs::create_dir_all(home.join("Library/Caches")).unwrap();
     fs::create_dir_all(home.join("xdg-cache")).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_genohype"));
     command
         .env("HOME", home)
-        .env("XDG_CACHE_HOME", home.join("xdg-cache"))
+        .env("XDG_CACHE_HOME", home.join("xdg-cache"));
+    command
+}
+
+fn association_command_with_mapping(
+    home: &Path,
+    source: &Path,
+    mapping: &str,
+    extra: &[&str],
+) -> Command {
+    let mut command = isolated_genohype_command(home);
+    command
         .args([
             "association",
             "view",
@@ -272,7 +300,7 @@ fn association_command(home: &Path, source: &Path, extra: &[&str]) -> Command {
             "--build",
             "GRCh38",
             "--map",
-            "contig=CHR,position=POS,pvalue=P,gene=GENE",
+            mapping,
             "--top-hits",
             "2",
             "--width",
@@ -289,12 +317,62 @@ fn association_command(home: &Path, source: &Path, extra: &[&str]) -> Command {
     command
 }
 
+fn association_command(home: &Path, source: &Path, extra: &[&str]) -> Command {
+    association_command_with_mapping(
+        home,
+        source,
+        "contig=CHR,position=POS,pvalue=P,gene=GENE",
+        extra,
+    )
+}
+
+fn inspect_emitted_view_command(home: &Path, source: &Path) -> Command {
+    let mut inspect = isolated_genohype_command(home);
+    let output = inspect
+        .args([
+            "association",
+            "inspect",
+            source.to_str().unwrap(),
+            "--build",
+            "GRCh38",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let emitted = stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("genohype association view "))
+        .expect("inspect-emitted view command");
+    let words = emitted.split_ascii_whitespace().collect::<Vec<_>>();
+    assert_eq!(words.first().copied(), Some("genohype"));
+
+    let mut command = isolated_genohype_command(home);
+    command
+        .args(&words[1..])
+        // Only process-lifecycle controls are added; every source, mapping, and
+        // build option is exactly the command emitted by inspect.
+        .args(["--no-open", "--port", "0"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
 fn start_association_viewer(
     home: &Path,
     source: &Path,
     extra: &[&str],
 ) -> RunningAssociationViewer {
-    let mut child = association_command(home, source, extra).spawn().unwrap();
+    start_association_command(association_command(home, source, extra))
+}
+
+fn start_association_command(mut command: Command) -> RunningAssociationViewer {
+    let mut child = command.spawn().unwrap();
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
     let (line_tx, line_rx) = mpsc::channel();
@@ -362,23 +440,6 @@ async fn association_view_cold_warm_rebuild_apis_cleanup_and_ephemeral_are_deter
     let home = temp.path().join("home");
     let source = temp.path().join("private-source.tsv");
     write_association_source(&source);
-
-    let inspect = Command::new(env!("CARGO_BIN_EXE_genohype"))
-        .args([
-            "association",
-            "inspect",
-            source.to_str().unwrap(),
-            "--build",
-            "GRCh38",
-        ])
-        .output()
-        .unwrap();
-    assert!(inspect.status.success());
-    let inspect_stdout = String::from_utf8(inspect.stdout).unwrap();
-    assert!(inspect_stdout.contains("genohype association view"));
-    assert!(inspect_stdout.contains("--map contig=CHR"));
-    assert!(inspect_stdout.contains("--map position=POS"));
-    assert!(inspect_stdout.contains("--map pvalue=P"));
 
     let cold = start_association_viewer(&home, &source, &[]);
     let cold_output = cold.output_text();
@@ -477,6 +538,105 @@ async fn association_view_cold_warm_rebuild_apis_cleanup_and_ephemeral_are_deter
 }
 
 #[test]
+fn inspect_emitted_command_builds_and_reuses_the_checked_in_mixed_tsv() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let source = tsv_fixture_path();
+
+    let cold = start_association_command(inspect_emitted_view_command(&home, &source));
+    assert!(cold
+        .output_text()
+        .contains("Association session: cold build"));
+    assert!(cold
+        .output_text()
+        .contains("Rows: seen=12 valid=10 rejected=2"));
+    let first_id = dataset_id(&cold);
+    assert!(cold.stop().success());
+
+    let warm = start_association_command(inspect_emitted_view_command(&home, &source));
+    assert!(warm
+        .output_text()
+        .contains("Association session: warm reuse"));
+    assert_eq!(dataset_id(&warm), first_id);
+    assert!(warm.stop().success());
+}
+
+#[test]
+fn hail_view_cold_scan_and_warm_reuse_share_one_inventory_snapshot() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let source = temp.path().join("single-variant.ht");
+    assert!(!fixture_path().join("_SUCCESS").exists());
+    copy_tree(&fixture_path(), &source);
+    // Production Hail inventories require a completion marker. Keep that test-only
+    // requirement in the temporary copy rather than changing the tracked fixture.
+    fs::write(source.join("_SUCCESS"), b"").unwrap();
+    let mapping = "contig=locus.contig,position=locus.position,pvalue=Pvalue,neg_log10_p=Pvalue_log10,beta=BETA,se=SE";
+
+    let cold = start_association_command(association_command_with_mapping(
+        &home,
+        &source,
+        mapping,
+        &[],
+    ));
+    assert!(cold
+        .output_text()
+        .contains("Association session: cold build"));
+    assert!(cold
+        .output_text()
+        .contains("Rows: seen=12 valid=10 rejected=2"));
+    let first_id = dataset_id(&cold);
+    assert!(cold.stop().success());
+
+    let warm = start_association_command(association_command_with_mapping(
+        &home,
+        &source,
+        mapping,
+        &[],
+    ));
+    assert!(warm
+        .output_text()
+        .contains("Association session: warm reuse"));
+    assert_eq!(dataset_id(&warm), first_id);
+    assert!(warm.stop().success());
+}
+
+#[tokio::test]
+async fn vcf_info_float_publishes_and_serves() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let source = temp.path().join("minimal.vcf");
+    fs::write(
+        &source,
+        "##fileformat=VCFv4.2\n##INFO=<ID=P,Number=A,Type=Float,Description=\"P-value\">\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n1\t20\t.\tA\tG\t.\tPASS\tP=1e-9\n",
+    )
+    .unwrap();
+
+    let viewer = start_association_command(association_command_with_mapping(
+        &home,
+        &source,
+        "contig=CHROM,position=POS,ref=REF,alt=ALT,pvalue=info.P",
+        &[],
+    ));
+    assert!(viewer
+        .output_text()
+        .contains("Association session: cold build"));
+    assert!(viewer
+        .output_text()
+        .contains("Rows: seen=1 valid=1 rejected=0"));
+    let manifest: AssociationVisualizationManifestV1 =
+        reqwest::get(viewer.url.join("api/manifest").unwrap())
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(manifest.top_hits.len(), 1);
+    assert!((manifest.top_hits[0].pvalue - 1e-9).abs() < 1e-15);
+    assert!(viewer.stop().success());
+}
+
+#[test]
 fn association_view_sigint_during_build_is_non_success_and_cleans_staging() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
@@ -499,7 +659,29 @@ fn association_view_sigint_during_build_is_non_success_and_cleans_staging() {
         startup.push_str(&line);
     }
     assert!(startup.contains("private local plaintext"));
-    std::thread::sleep(Duration::from_millis(50));
+    let cache_root = startup
+        .lines()
+        .find_map(|line| line.strip_prefix("Association cache root: "))
+        .map(PathBuf::from)
+        .unwrap();
+    let staging = cache_root.join("staging");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "build exited before SIGINT"
+        );
+        let has_staging = match fs::read_dir(&staging) {
+            Ok(mut entries) => entries.next().is_some(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => panic!("cannot inspect staging: {error}"),
+        };
+        if has_staging {
+            break;
+        }
+        assert!(Instant::now() < deadline, "build never created staging");
+        std::thread::sleep(Duration::from_millis(5));
+    }
     assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
     let status = child.wait().unwrap();
     assert!(!status.success());
@@ -516,11 +698,6 @@ fn association_view_sigint_during_build_is_non_success_and_cleans_staging() {
         stderr.contains("cancelled") || remainder.contains("cancelled"),
         "stdout={startup}{remainder}; stderr={stderr}"
     );
-    let cache_root = startup
-        .lines()
-        .find_map(|line| line.strip_prefix("Association cache root: "))
-        .map(PathBuf::from)
-        .unwrap();
     assert_eq!(fs::read_dir(cache_root.join("staging")).unwrap().count(), 0);
     assert_eq!(
         fs::read_dir(cache_root.join("sessions")).unwrap().count(),
