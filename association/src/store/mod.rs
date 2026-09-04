@@ -13,7 +13,6 @@ pub const MAX_INSERT_BATCH_SIZE: usize = 1_000;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssociationBuildV1 {
     pub dataset_id: DatasetIdV1,
-    pub source_fingerprint: String,
     pub created_at: String,
 }
 
@@ -31,7 +30,12 @@ pub trait AssociationStore {
         dataset_id: &DatasetIdV1,
         points: &[AssociationPointV1],
     ) -> Result<(), AssociationStoreError>;
-    fn complete_build(&mut self, dataset_id: &DatasetIdV1) -> Result<(), AssociationStoreError>;
+    /// Atomically installs the source identity finalized at EOF and marks the dataset complete.
+    fn complete_build(
+        &mut self,
+        dataset_id: &DatasetIdV1,
+        source_fingerprint: &str,
+    ) -> Result<(), AssociationStoreError>;
     fn abort_build(&mut self, dataset_id: &DatasetIdV1) -> Result<(), AssociationStoreError>;
     fn is_complete(&self, dataset_id: &DatasetIdV1) -> Result<bool, AssociationStoreError>;
     fn top_hits(

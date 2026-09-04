@@ -88,6 +88,33 @@ impl TopK {
         Ok(warnings)
     }
 
+    /// Consider an already-canonical point by reference.
+    ///
+    /// This seam is for sources that satisfy `AssociationSource`'s normalized-point
+    /// contract. It clones only when the point enters or replaces the bounded heap.
+    pub fn insert_normalized(&mut self, point: &AssociationPointV1) -> Result<(), TopKError> {
+        self.observed = self
+            .observed
+            .checked_add(1)
+            .ok_or(TopKError::ObservationCountOverflow)?;
+        if self.limit == 0 {
+            return Ok(());
+        }
+        if self.heap.len() < self.limit {
+            self.heap.push(HeapEntry(point.clone()));
+            return Ok(());
+        }
+        let should_replace = self
+            .heap
+            .peek()
+            .is_some_and(|worst| compare_association_points(point, &worst.0) == Ordering::Less);
+        if should_replace {
+            self.heap.pop();
+            self.heap.push(HeapEntry(point.clone()));
+        }
+        Ok(())
+    }
+
     /// Merge another reduction with the same limit without retaining source rows.
     ///
     /// Keeping each shard's best K points is sufficient to recover the global
@@ -234,6 +261,25 @@ mod tests {
         assert_eq!(points.len(), 10);
         assert_eq!(points[0].source_ordinal, 99_999);
         assert_eq!(points[9].source_ordinal, 99_990);
+    }
+
+    #[test]
+    fn borrowed_normalized_insertion_tracks_all_observations() {
+        let mut reducer = TopK::new(2).unwrap();
+        for ordinal in 0..10 {
+            let point = point("1", ordinal + 1, ordinal as f64, ordinal as u64);
+            reducer.insert_normalized(&point).unwrap();
+        }
+        assert_eq!(reducer.observed(), 10);
+        assert_eq!(reducer.len(), 2);
+        assert_eq!(
+            reducer
+                .into_sorted_vec()
+                .into_iter()
+                .map(|point| point.source_ordinal)
+                .collect::<Vec<_>>(),
+            vec![9, 8]
+        );
     }
 
     #[test]

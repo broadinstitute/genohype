@@ -12,6 +12,31 @@ use std::fmt;
 pub const STORE_SCHEMA_VERSION_V1: u32 = 1;
 pub const MAX_MAPPING_FIELD_BYTES: usize = 256;
 
+/// Typed effective raster background included in the private session identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionBackgroundV1 {
+    White,
+    Transparent,
+    Color(String),
+}
+impl SessionBackgroundV1 {
+    pub fn validate(&self) -> Result<(), SessionError> {
+        if let Self::Color(value) = self {
+            let valid = value.strip_prefix('#').is_some_and(|hex| {
+                hex.len() == 6
+                    && hex
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'A'..=b'F'))
+            });
+            if !valid {
+                return Err(SessionError::InvalidSessionInput);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Canonical source-field mapping. Assembly is session metadata, not a row field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct NormalizedFieldMappingV1 {
@@ -104,6 +129,10 @@ pub struct SessionKeyInputsV1 {
     pub height: u32,
     #[schemars(length(min = 1, max = 128))]
     pub layout_hash: String,
+    #[schemars(range(min = 0.0, max = 100.0))]
+    pub point_radius: f32,
+    pub point_alpha: u8,
+    pub background: SessionBackgroundV1,
     #[schemars(length(min = 1, max = 128))]
     pub renderer_version: String,
 }
@@ -127,6 +156,10 @@ impl SessionKeyInputsV1 {
         if self.top_hits > MAX_TOP_K
             || self.layout_hash.is_empty()
             || self.layout_hash.len() > 128
+            || !self.point_radius.is_finite()
+            || self.point_radius <= 0.0
+            || self.point_radius > 100.0
+            || self.background.validate().is_err()
             || self.renderer_version.is_empty()
             || self.renderer_version.len() > 128
         {
@@ -374,6 +407,23 @@ mod tests {
         assert_eq!(inputs.session_key().unwrap(), inputs.session_key().unwrap());
     }
 
+    #[test]
+    fn page_and_render_inputs_invalidate_session_identity() {
+        let baseline = session_inputs().session_key().unwrap();
+        let mut changed = session_inputs();
+        changed.point_radius = 3.0;
+        assert_ne!(baseline, changed.session_key().unwrap());
+        let mut changed = session_inputs();
+        changed.point_alpha = 177;
+        assert_ne!(baseline, changed.session_key().unwrap());
+        let mut changed = session_inputs();
+        changed.background = SessionBackgroundV1::Color("#FFFFFF".into());
+        assert_ne!(baseline, changed.session_key().unwrap());
+        let mut invalid = session_inputs();
+        invalid.background = SessionBackgroundV1::Color("#ffffff".into());
+        assert_eq!(invalid.validate(), Err(SessionError::InvalidSessionInput));
+    }
+
     fn session_inputs() -> SessionKeyInputsV1 {
         SessionKeyInputsV1 {
             association_schema_version: "1.0".into(),
@@ -386,6 +436,9 @@ mod tests {
             width: 3000,
             height: 800,
             layout_hash: "layout".into(),
+            point_radius: 2.5,
+            point_alpha: 178,
+            background: SessionBackgroundV1::White,
             renderer_version: "test".into(),
         }
     }

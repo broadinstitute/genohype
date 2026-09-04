@@ -20,8 +20,10 @@ pub mod store;
 pub const JSON_SAFE_INTEGER_MAX: u64 = 9_007_199_254_740_991;
 
 pub use build::{
-    AssociationBuildCancellation, AssociationBuildOptionsV1, AssociationBuildOutcomeV1,
-    AssociationBuildProgressV1, BuildContractError, NeverCancel,
+    build_association_session, AssociationBuildCancellation, AssociationBuildConfig,
+    AssociationBuildError, AssociationBuildOptionsV1, AssociationBuildOutcomeV1,
+    AssociationBuildProduct, AssociationBuildProgressV1, BuildCancellation, BuildContractError,
+    NeverCancel,
 };
 pub use layout::{
     canonical_assembly, canonical_contig, canonical_contig_cmp, canonical_contig_lengths, Assembly,
@@ -48,7 +50,7 @@ pub use render::{AssociationRasterizer, Background, RenderError};
 pub use scale::{YScale, LINEAR_FRACTION, LOG_THRESHOLD, MAX_NEG_LOG_P};
 pub use session::{
     AssociationSessionCompletionV1, CompletedArtifactV1, DatasetIdV1, NormalizedFieldMappingV1,
-    SessionError, SessionKeyInputsV1, STORE_SCHEMA_VERSION_V1,
+    SessionBackgroundV1, SessionError, SessionKeyInputsV1, STORE_SCHEMA_VERSION_V1,
 };
 pub use source::{
     AssociationSource, AssociationSourceError, AssociationSourceFieldV1, AssociationSourceItem,

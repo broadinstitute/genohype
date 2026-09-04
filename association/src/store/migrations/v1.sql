@@ -2,9 +2,13 @@ BEGIN IMMEDIATE;
 
 CREATE TABLE IF NOT EXISTS association_datasets (
   dataset_id TEXT PRIMARY KEY CHECK(length(CAST(dataset_id AS BLOB)) = 36),
-  source_fingerprint TEXT NOT NULL CHECK(length(CAST(source_fingerprint AS BLOB)) BETWEEN 1 AND 128),
+  source_fingerprint TEXT CHECK(
+    source_fingerprint IS NULL
+      OR length(CAST(source_fingerprint AS BLOB)) BETWEEN 71 AND 71
+  ),
   created_at TEXT NOT NULL CHECK(length(CAST(created_at AS BLOB)) BETWEEN 1 AND 64),
-  status TEXT NOT NULL CHECK(status IN ('building', 'complete'))
+  status TEXT NOT NULL CHECK(status IN ('building', 'complete')),
+  CHECK(status = 'building' OR source_fingerprint IS NOT NULL)
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS association_points (

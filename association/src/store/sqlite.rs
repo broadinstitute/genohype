@@ -31,6 +31,12 @@ impl SqliteAssociationStore {
         )
         .map_err(backend)?;
         configure(&connection)?;
+        connection
+            .pragma_update(None, "journal_mode", "DELETE")
+            .map_err(backend)?;
+        connection
+            .pragma_update(None, "synchronous", "FULL")
+            .map_err(backend)?;
         let version: u32 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(backend)?;
@@ -99,16 +105,12 @@ impl SqliteAssociationStore {
 impl AssociationStore for SqliteAssociationStore {
     fn begin_build(&mut self, build: &AssociationBuildV1) -> Result<(), AssociationStoreError> {
         self.writable()?;
-        if build.source_fingerprint.is_empty()
-            || build.source_fingerprint.len() > 128
-            || build.created_at.is_empty()
-            || build.created_at.len() > 64
-        {
+        if build.created_at.is_empty() || build.created_at.len() > 64 {
             return Err(AssociationStoreError::InvalidRequest(
                 "build metadata cannot be empty".into(),
             ));
         }
-        self.connection.execute("INSERT INTO association_datasets(dataset_id,source_fingerprint,created_at,status) VALUES(?1,?2,?3,'building')", params![build.dataset_id.as_str(),build.source_fingerprint,build.created_at]).map_err(backend)?;
+        self.connection.execute("INSERT INTO association_datasets(dataset_id,source_fingerprint,created_at,status) VALUES(?1,NULL,?2,'building')", params![build.dataset_id.as_str(),build.created_at]).map_err(backend)?;
         Ok(())
     }
 
@@ -230,10 +232,25 @@ impl AssociationStore for SqliteAssociationStore {
         transaction.commit().map_err(backend)
     }
 
-    fn complete_build(&mut self, dataset_id: &DatasetIdV1) -> Result<(), AssociationStoreError> {
+    fn complete_build(
+        &mut self,
+        dataset_id: &DatasetIdV1,
+        source_fingerprint: &str,
+    ) -> Result<(), AssociationStoreError> {
         self.writable()?;
         self.require_building(dataset_id)?;
-        let changed=self.connection.execute("UPDATE association_datasets SET status='complete' WHERE dataset_id=?1 AND status='building'",[dataset_id.as_str()]).map_err(backend)?;
+        if !valid_sha256(source_fingerprint) {
+            return Err(AssociationStoreError::InvalidRequest(
+                "source fingerprint must be canonical lowercase sha256 text".into(),
+            ));
+        }
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE association_datasets SET source_fingerprint=?2,status='complete' WHERE dataset_id=?1 AND status='building'",
+                params![dataset_id.as_str(), source_fingerprint],
+            )
+            .map_err(backend)?;
         if changed == 1 {
             Ok(())
         } else {
@@ -291,7 +308,7 @@ impl AssociationStore for SqliteAssociationStore {
             .filter(|value| !value.is_empty())
             .map(escape_like);
         let filter = if escaped.is_some() {
-            " AND (contig LIKE ?2 ESCAPE '\\' COLLATE NOCASE OR ref LIKE ?2 ESCAPE '\\' COLLATE NOCASE OR alt LIKE ?2 ESCAPE '\\' COLLATE NOCASE OR gene LIKE ?2 ESCAPE '\\' COLLATE NOCASE OR consequence LIKE ?2 ESCAPE '\\' COLLATE NOCASE OR series LIKE ?2 ESCAPE '\\' COLLATE NOCASE)"
+            " AND (contig LIKE ?2 ESCAPE '\\' COLLATE NOCASE OR CAST(position AS TEXT) LIKE ?2 ESCAPE '\\' OR ref LIKE ?2 ESCAPE '\\' COLLATE NOCASE OR alt LIKE ?2 ESCAPE '\\' COLLATE NOCASE OR gene LIKE ?2 ESCAPE '\\' COLLATE NOCASE OR consequence LIKE ?2 ESCAPE '\\' COLLATE NOCASE OR series LIKE ?2 ESCAPE '\\' COLLATE NOCASE)"
         } else {
             ""
         };
@@ -372,6 +389,15 @@ impl AssociationStore for SqliteAssociationStore {
             .map_err(|e| AssociationStoreError::Backend(e.to_string()))?;
         Ok(page)
     }
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    })
 }
 
 fn configure(connection: &Connection) -> Result<(), AssociationStoreError> {
@@ -549,7 +575,7 @@ fn table_order(
 ) -> &'static str {
     match (sort, direction) {
         (AssociationTableSortV1::Pvalue, AssociationSortDirectionV1::Ascending) => "pvalue ASC, neg_log10_p DESC, contig_rank ASC, contig ASC, position ASC, ref IS NOT NULL ASC, ref ASC, alt IS NOT NULL ASC, alt ASC, source_ordinal ASC",
-        (AssociationTableSortV1::Pvalue, AssociationSortDirectionV1::Descending) => "pvalue DESC, neg_log10_p ASC, contig_rank ASC, contig ASC, position ASC, ref IS NOT NULL ASC, ref ASC, alt IS NOT NULL ASC, alt ASC, source_ordinal ASC",
+        (AssociationTableSortV1::Pvalue, AssociationSortDirectionV1::Descending) => "pvalue DESC, neg_log10_p ASC, contig_rank DESC, contig DESC, position DESC, ref IS NOT NULL DESC, ref DESC, alt IS NOT NULL DESC, alt DESC, source_ordinal DESC",
         (AssociationTableSortV1::Locus, AssociationSortDirectionV1::Ascending) => "contig_rank ASC, contig ASC, position ASC, ref IS NOT NULL ASC, ref ASC, alt IS NOT NULL ASC, alt ASC, source_ordinal ASC",
         (AssociationTableSortV1::Locus, AssociationSortDirectionV1::Descending) => "contig_rank DESC, contig DESC, position DESC, ref IS NOT NULL DESC, ref DESC, alt IS NOT NULL DESC, alt DESC, source_ordinal DESC",
     }

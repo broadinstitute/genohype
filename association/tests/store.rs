@@ -10,6 +10,10 @@ fn id() -> DatasetIdV1 {
     DatasetIdV1::new("123e4567-e89b-42d3-a456-426614174000").unwrap()
 }
 
+fn fingerprint() -> String {
+    format!("sha256:{}", "a".repeat(64))
+}
+
 fn point(
     ordinal: u64,
     contig: &str,
@@ -94,7 +98,7 @@ fn migration_has_required_version_tables_indexes_and_constraints() {
     connection.execute("PRAGMA foreign_keys=ON", []).unwrap();
     connection
         .execute(
-            "INSERT INTO association_datasets VALUES('123e4567-e89b-42d3-a456-426614174000','f','now','building')",
+            "INSERT INTO association_datasets VALUES('123e4567-e89b-42d3-a456-426614174000',NULL,'now','building')",
             [],
         )
         .unwrap();
@@ -155,7 +159,6 @@ fn lifecycle_batches_top_hits_pages_search_regions_and_read_only_reopen() {
     store
         .begin_build(&AssociationBuildV1 {
             dataset_id: dataset_id.clone(),
-            source_fingerprint: "sha256:test".into(),
             created_at: "2026-09-04T00:00:00Z".into(),
         })
         .unwrap();
@@ -166,6 +169,16 @@ fn lifecycle_batches_top_hits_pages_search_regions_and_read_only_reopen() {
         )),
         Err(AssociationStoreError::InvalidBuildState)
     ));
+    let observer = Connection::open(&path).unwrap();
+    let pending: Option<String> = observer
+        .query_row(
+            "SELECT source_fingerprint FROM association_datasets WHERE dataset_id=?1",
+            [dataset_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pending, None, "fingerprint must remain pending before EOF");
+    drop(observer);
 
     let mut points = vec![
         point(0, "1", 10, 1e-3, 3.0),
@@ -191,8 +204,25 @@ fn lifecycle_batches_top_hits_pages_search_regions_and_read_only_reopen() {
 
     let top = vec![points[2].clone(), points[1].clone(), points[3].clone()];
     store.replace_top_hits(&dataset_id, &top).unwrap();
-    store.complete_build(&dataset_id).unwrap();
+    assert!(matches!(
+        store.complete_build(&dataset_id, "not-a-fingerprint"),
+        Err(AssociationStoreError::InvalidRequest(_))
+    ));
+    assert!(!store.is_complete(&dataset_id).unwrap());
+    store.complete_build(&dataset_id, &fingerprint()).unwrap();
     assert!(store.is_complete(&dataset_id).unwrap());
+    let observer = Connection::open(&path).unwrap();
+    assert_eq!(
+        observer
+            .query_row(
+                "SELECT source_fingerprint FROM association_datasets WHERE dataset_id=?1 AND status='complete'",
+                [dataset_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        fingerprint()
+    );
+    drop(observer);
     assert_eq!(store.top_hits(&dataset_id, 2).unwrap(), top[..2]);
 
     let p_page = store
@@ -211,6 +241,22 @@ fn lifecycle_batches_top_hits_pages_search_regions_and_read_only_reopen() {
         vec![2, 1, 3, 0, 4]
     );
     assert!(!p_page.points.iter().any(|point| point.source_ordinal == 99));
+
+    let descending = store
+        .table_page(&request(
+            AssociationTableSortV1::Pvalue,
+            AssociationSortDirectionV1::Descending,
+        ))
+        .unwrap();
+    assert_eq!(
+        descending
+            .points
+            .iter()
+            .map(|point| point.source_ordinal)
+            .collect::<Vec<_>>(),
+        vec![4, 0, 3, 1, 2],
+        "descending p-value order must reverse every deterministic tie key"
+    );
 
     let mut paged_request = request(
         AssociationTableSortV1::Pvalue,
@@ -254,7 +300,7 @@ fn lifecycle_batches_top_hits_pages_search_regions_and_read_only_reopen() {
     let search_page = store.table_page(&escaped_search).unwrap();
     assert_eq!(search_page.total, 1);
     assert_eq!(search_page.points[0].source_ordinal, 0);
-    for (search, expected_ordinal) in [("_", 3), (r"\", 4)] {
+    for (search, expected_ordinal) in [("_", 3), (r"\", 4), ("30", 3)] {
         escaped_search.search = Some(search.into());
         let page = store.table_page(&escaped_search).unwrap();
         assert_eq!(page.total, 1);
@@ -299,7 +345,6 @@ fn batches_and_query_inputs_are_hard_bounded() {
     store
         .begin_build(&AssociationBuildV1 {
             dataset_id: dataset_id.clone(),
-            source_fingerprint: "x".into(),
             created_at: "now".into(),
         })
         .unwrap();

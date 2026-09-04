@@ -29,6 +29,7 @@ pub use genohype_core::export;
 #[cfg(feature = "genomic")]
 pub use genohype_core::genomic;
 
+pub mod association_session;
 pub mod benchmark;
 
 // Re-export core types for convenience
