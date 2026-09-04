@@ -1,6 +1,6 @@
 use axum::body::Bytes;
 use genohype_association::{
-    canonical_contig, AssociationRasterizer, AssociationRegionCountsV1, AssociationRegionOverlayV1,
+    canonical_contig, AssociationRasterizer, AssociationRegionCountsV1,
     AssociationRegionRenderManifestV1, AssociationRegionResourcesV1,
     AssociationRegionScanRequestV1, AssociationStore, AssociationStoreError,
     AssociationVisualizationManifestV1, AssociationVisualizationResourcesV1, Background,
@@ -12,12 +12,22 @@ use genohype_association::{
 };
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::mem::size_of;
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::{Mutex, Notify};
+use std::time::{Duration, Instant};
+use tokio::sync::{watch, Mutex, OwnedSemaphorePermit, Semaphore};
+
+use crate::association_session::CompletedAssociationSession;
 
 const DEFAULT_CACHE_ENTRIES: usize = 32;
 const DEFAULT_CACHE_BYTES: usize = 256 * 1024 * 1024;
+// Two maximum-size locus pixmaps are at most about 128 MiB before encoding.
+const DEFAULT_MAX_FLIGHTS: usize = 2;
+const DEFAULT_FETCH_LEASE: Duration = Duration::from_secs(15);
+const CACHE_MAP_OVERHEAD: usize = 256;
 const BACKGROUND_ID: &str = "white";
 const POINT_RADIUS: f32 = 2.5;
 const POINT_ALPHA: u8 = 178;
@@ -31,75 +41,109 @@ struct RegionWorkKey {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum CacheKey {
-    RegionRaster(String),
-    RegionOverlay(String),
+    Region(String),
     Chromosome(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum FlightKey {
-    RegionRaster(String),
-    RegionWork(RegionWorkKey),
+    Region(RegionWorkKey),
     Chromosome(String),
 }
 
-#[derive(Clone)]
-pub(crate) struct RegionRasterProduct {
-    pub(crate) bytes: Bytes,
-    pub(crate) checksum: String,
-}
-
-#[derive(Clone)]
-pub(crate) struct RegionOverlayProduct {
-    pub(crate) overlay: AssociationRegionOverlayV1,
-    pub(crate) bytes: Bytes,
-    pub(crate) resource_id: String,
+#[derive(Debug, Clone)]
+pub(crate) struct RegionBundle {
+    pub(crate) manifest: Bytes,
+    pub(crate) raster: Bytes,
+    pub(crate) overlay: Bytes,
+    pub(crate) raster_id: String,
+    pub(crate) overlay_id: String,
     work_key: RegionWorkKey,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct ChromosomeProduct {
     pub(crate) raster: Bytes,
-    pub(crate) manifest: AssociationVisualizationManifestV1,
+    pub(crate) manifest: Bytes,
 }
 
 #[derive(Clone)]
 enum CachedValue {
-    RegionRaster(Arc<RegionRasterProduct>),
-    RegionOverlay(Arc<RegionOverlayProduct>),
+    Region(Arc<RegionBundle>),
     Chromosome(Arc<ChromosomeProduct>),
 }
 
-impl CachedValue {
-    fn byte_weight(&self) -> usize {
-        match self {
-            Self::RegionRaster(value) => value.bytes.len(),
-            Self::RegionOverlay(value) => value.bytes.len(),
-            Self::Chromosome(value) => value.raster.len(),
-        }
-    }
+#[derive(Clone)]
+enum FlightOutcome {
+    Region(Result<Arc<RegionBundle>, DetailError>),
+    Chromosome(Result<Arc<ChromosomeProduct>, DetailError>),
+}
+
+#[derive(Clone)]
+enum FlightState {
+    Pending,
+    Complete(FlightOutcome),
+}
+
+struct FetchLease {
+    expires_at: Instant,
+    raster_pending: bool,
+    overlay_pending: bool,
 }
 
 struct CacheEntry {
     value: CachedValue,
     last_used: u64,
+    byte_weight: usize,
+    lease: Option<FetchLease>,
 }
 
 struct CacheState {
     entries: HashMap<CacheKey, CacheEntry>,
-    flights: HashMap<FlightKey, Arc<Notify>>,
+    flights: HashMap<FlightKey, watch::Receiver<FlightState>>,
     total_bytes: usize,
     clock: u64,
 }
 
+type Now = Arc<dyn Fn() -> Instant + Send + Sync>;
+
 pub(crate) struct DetailCache {
     state: Mutex<CacheState>,
+    admission: Arc<Semaphore>,
     max_entries: usize,
     max_bytes: usize,
+    fetch_lease: Duration,
+    now: Now,
+}
+
+enum FlightAdmission {
+    Ready(FlightOutcome),
+    Joined(watch::Receiver<FlightState>),
+    Started {
+        receiver: watch::Receiver<FlightState>,
+        sender: watch::Sender<FlightState>,
+        permit: OwnedSemaphorePermit,
+    },
 }
 
 impl DetailCache {
     pub(crate) fn new(max_entries: usize, max_bytes: usize) -> Self {
+        Self::configured(
+            max_entries,
+            max_bytes,
+            DEFAULT_MAX_FLIGHTS,
+            DEFAULT_FETCH_LEASE,
+            Arc::new(Instant::now),
+        )
+    }
+
+    fn configured(
+        max_entries: usize,
+        max_bytes: usize,
+        max_flights: usize,
+        fetch_lease: Duration,
+        now: Now,
+    ) -> Self {
         Self {
             state: Mutex::new(CacheState {
                 entries: HashMap::new(),
@@ -107,8 +151,11 @@ impl DetailCache {
                 total_bytes: 0,
                 clock: 0,
             }),
+            admission: Arc::new(Semaphore::new(max_flights)),
             max_entries,
             max_bytes,
+            fetch_lease,
+            now,
         }
     }
 
@@ -116,102 +163,385 @@ impl DetailCache {
         Self::new(DEFAULT_CACHE_ENTRIES, DEFAULT_CACHE_BYTES)
     }
 
-    async fn get(&self, key: &CacheKey) -> Option<CachedValue> {
+    async fn chromosome(&self, key: &CacheKey) -> Option<Arc<ChromosomeProduct>> {
         let mut state = self.state.lock().await;
         state.clock = state.clock.wrapping_add(1);
         let clock = state.clock;
         let entry = state.entries.get_mut(key)?;
         entry.last_used = clock;
-        Some(entry.value.clone())
+        match &entry.value {
+            CachedValue::Chromosome(value) => Some(value.clone()),
+            _ => None,
+        }
     }
 
-    async fn matching_overlay(
-        &self,
-        work_key: &RegionWorkKey,
-    ) -> Option<Arc<RegionOverlayProduct>> {
+    async fn region_for_manifest(&self, work_key: &RegionWorkKey) -> Option<Arc<RegionBundle>> {
         let mut state = self.state.lock().await;
         let found = state
             .entries
             .iter()
             .find_map(|(key, entry)| match &entry.value {
-                CachedValue::RegionOverlay(value) if &value.work_key == work_key => {
+                CachedValue::Region(value) if &value.work_key == work_key => {
                     Some((key.clone(), value.clone()))
                 }
                 _ => None,
             });
         let (key, value) = found?;
-        state.clock = state.clock.wrapping_add(1);
-        let clock = state.clock;
-        if let Some(entry) = state.entries.get_mut(&key) {
-            entry.last_used = clock;
-        }
+        Self::advertise_locked(&mut state, &key, (self.now)(), self.fetch_lease);
         Some(value)
     }
 
-    async fn begin_flight(&self, key: FlightKey) -> Result<(), Arc<Notify>> {
+    async fn begin_flight(&self, key: FlightKey) -> Result<FlightAdmission, DetailError> {
         let mut state = self.state.lock().await;
-        if let Some(notify) = state.flights.get(&key) {
-            return Err(notify.clone());
+        // Repeat the cache lookup while establishing/joining a flight under the
+        // same lock. This closes the lookup-to-subscribe race without forcing
+        // callers to hold a mutex while they wait.
+        let ready = match &key {
+            FlightKey::Chromosome(id) => {
+                let cache_key = CacheKey::Chromosome(id.clone());
+                let value = state
+                    .entries
+                    .get(&cache_key)
+                    .and_then(|entry| match &entry.value {
+                        CachedValue::Chromosome(value) => Some(value.clone()),
+                        _ => None,
+                    });
+                if value.is_some() {
+                    state.clock = state.clock.wrapping_add(1);
+                    let clock = state.clock;
+                    if let Some(entry) = state.entries.get_mut(&cache_key) {
+                        entry.last_used = clock;
+                    }
+                }
+                value.map(|value| FlightOutcome::Chromosome(Ok(value)))
+            }
+            FlightKey::Region(work_key) => {
+                let found =
+                    state
+                        .entries
+                        .iter()
+                        .find_map(|(cache_key, entry)| match &entry.value {
+                            CachedValue::Region(value) if &value.work_key == work_key => {
+                                Some((cache_key.clone(), value.clone()))
+                            }
+                            _ => None,
+                        });
+                found.map(|(cache_key, value)| {
+                    Self::advertise_locked(&mut state, &cache_key, (self.now)(), self.fetch_lease);
+                    FlightOutcome::Region(Ok(value))
+                })
+            }
+        };
+        if let Some(ready) = ready {
+            return Ok(FlightAdmission::Ready(ready));
         }
-        state.flights.insert(key, Arc::new(Notify::new()));
-        Ok(())
+        if let Some(receiver) = state.flights.get(&key) {
+            return Ok(FlightAdmission::Joined(receiver.clone()));
+        }
+        Self::expire_leases(&mut state, (self.now)());
+        let only_leased_entries =
+            !state.entries.is_empty() && state.entries.values().all(|entry| entry.lease.is_some());
+        if only_leased_entries
+            && (state.entries.len() >= self.max_entries || state.total_bytes >= self.max_bytes)
+        {
+            // Do not start work that cannot occupy the cache without breaking
+            // resources already advertised by successful manifests.
+            return Err(DetailError::Busy);
+        }
+        // Admission is intentionally non-queuing: this also bounds the flight map.
+        let permit = self
+            .admission
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| DetailError::Busy)?;
+        let (sender, receiver) = watch::channel(FlightState::Pending);
+        state.flights.insert(key, receiver.clone());
+        Ok(FlightAdmission::Started {
+            receiver,
+            sender,
+            permit,
+        })
     }
 
-    async fn finish_flight(&self, key: &FlightKey) {
-        let notify = self.state.lock().await.flights.remove(key);
-        if let Some(notify) = notify {
-            notify.notify_waiters();
+    async fn finish_flight(
+        &self,
+        key: &FlightKey,
+        sender: watch::Sender<FlightState>,
+        outcome: FlightOutcome,
+        permit: OwnedSemaphorePermit,
+    ) {
+        let mut state = self.state.lock().await;
+        // watch::Sender retains the latest value, so a waiter cannot miss this
+        // transition even when completion occurs before its first poll.
+        sender.send_replace(FlightState::Complete(outcome));
+        state.flights.remove(key);
+        // Release admission while still holding the state lock. No caller can
+        // observe a removed flight before its capacity is reusable, and no new
+        // record can transiently push the map above the permit bound.
+        drop(permit);
+    }
+
+    async fn publish_chromosome(
+        &self,
+        key: CacheKey,
+        result: Result<Arc<ChromosomeProduct>, DetailError>,
+    ) -> Result<Arc<ChromosomeProduct>, DetailError> {
+        let value = result?;
+        let weight = chromosome_weight(&key, &value)?;
+        self.insert(key, CachedValue::Chromosome(value.clone()), weight, false)
+            .await?;
+        Ok(value)
+    }
+
+    async fn publish_region(
+        &self,
+        value: Result<Arc<RegionBundle>, DetailError>,
+    ) -> Result<Arc<RegionBundle>, DetailError> {
+        let value = value?;
+        let key = CacheKey::Region(value.overlay_id.clone());
+        let weight = region_weight(&key, &value)?;
+        self.insert(key, CachedValue::Region(value.clone()), weight, true)
+            .await?;
+        Ok(value)
+    }
+
+    async fn advertise_region(
+        &self,
+        value: Arc<RegionBundle>,
+    ) -> Result<Arc<RegionBundle>, DetailError> {
+        let key = CacheKey::Region(value.overlay_id.clone());
+        let mut state = self.state.lock().await;
+        let now = (self.now)();
+        if state.entries.contains_key(&key) {
+            Self::advertise_locked(&mut state, &key, now, self.fetch_lease);
+            return Ok(value);
+        }
+        drop(state);
+        let weight = region_weight(&key, &value)?;
+        self.insert(
+            key.clone(),
+            CachedValue::Region(value.clone()),
+            weight,
+            true,
+        )
+        .await?;
+        Ok(value)
+    }
+
+    fn advertise_locked(
+        state: &mut CacheState,
+        key: &CacheKey,
+        now: Instant,
+        lease_duration: Duration,
+    ) {
+        state.clock = state.clock.wrapping_add(1);
+        let clock = state.clock;
+        if let Some(entry) = state.entries.get_mut(key) {
+            entry.last_used = clock;
+            if matches!(entry.value, CachedValue::Region(_)) {
+                entry.lease = Some(FetchLease {
+                    expires_at: now + lease_duration,
+                    raster_pending: true,
+                    overlay_pending: true,
+                });
+            }
         }
     }
 
-    async fn insert(&self, key: CacheKey, value: CachedValue) {
-        let weight = value.byte_weight();
+    async fn insert(
+        &self,
+        key: CacheKey,
+        value: CachedValue,
+        weight: usize,
+        lease: bool,
+    ) -> Result<(), DetailError> {
+        if self.max_entries == 0 || weight > self.max_bytes {
+            return Err(DetailError::TooLarge);
+        }
         let mut state = self.state.lock().await;
+        let now = (self.now)();
+        Self::expire_leases(&mut state, now);
+
+        let old_weight = state.entries.get(&key).map_or(0, |entry| entry.byte_weight);
+        let base_entries = state.entries.len() - usize::from(old_weight != 0);
+        let base_bytes = state
+            .total_bytes
+            .checked_sub(old_weight)
+            .ok_or(DetailError::Internal)?;
+        let mut projected_entries = base_entries.checked_add(1).ok_or(DetailError::TooLarge)?;
+        let mut projected_bytes = base_bytes
+            .checked_add(weight)
+            .ok_or(DetailError::TooLarge)?;
+
+        let mut candidates: Vec<_> = state
+            .entries
+            .iter()
+            .filter(|(candidate, entry)| **candidate != key && entry.lease.is_none())
+            .map(|(candidate, entry)| (candidate.clone(), entry.last_used, entry.byte_weight))
+            .collect();
+        candidates.sort_by_key(|(_, last_used, _)| *last_used);
+        let mut victims = Vec::new();
+        for (candidate, _, candidate_weight) in candidates {
+            if projected_entries <= self.max_entries && projected_bytes <= self.max_bytes {
+                break;
+            }
+            projected_entries -= 1;
+            projected_bytes = projected_bytes
+                .checked_sub(candidate_weight)
+                .ok_or(DetailError::Internal)?;
+            victims.push(candidate);
+        }
+        if projected_entries > self.max_entries || projected_bytes > self.max_bytes {
+            return Err(DetailError::Busy);
+        }
+
+        for victim in victims {
+            if let Some(removed) = state.entries.remove(&victim) {
+                state.total_bytes = state
+                    .total_bytes
+                    .checked_sub(removed.byte_weight)
+                    .ok_or(DetailError::Internal)?;
+            }
+        }
         if let Some(previous) = state.entries.remove(&key) {
             state.total_bytes = state
                 .total_bytes
-                .saturating_sub(previous.value.byte_weight());
+                .checked_sub(previous.byte_weight)
+                .ok_or(DetailError::Internal)?;
         }
         state.clock = state.clock.wrapping_add(1);
         let clock = state.clock;
+        state.total_bytes = state
+            .total_bytes
+            .checked_add(weight)
+            .ok_or(DetailError::TooLarge)?;
         state.entries.insert(
             key,
             CacheEntry {
                 value,
                 last_used: clock,
+                byte_weight: weight,
+                lease: lease.then(|| FetchLease {
+                    expires_at: now + self.fetch_lease,
+                    raster_pending: true,
+                    overlay_pending: true,
+                }),
             },
         );
-        state.total_bytes = state.total_bytes.saturating_add(weight);
-        while state.entries.len() > self.max_entries || state.total_bytes > self.max_bytes {
-            let Some(oldest) = state
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(key, _)| key.clone())
-            else {
-                break;
-            };
-            if let Some(removed) = state.entries.remove(&oldest) {
-                state.total_bytes = state
-                    .total_bytes
-                    .saturating_sub(removed.value.byte_weight());
+        Ok(())
+    }
+
+    fn expire_leases(state: &mut CacheState, now: Instant) {
+        for entry in state.entries.values_mut() {
+            if entry
+                .lease
+                .as_ref()
+                .is_some_and(|lease| lease.expires_at <= now)
+            {
+                entry.lease = None;
             }
         }
     }
 
-    pub(crate) async fn region_raster(&self, id: &str) -> Option<Arc<RegionRasterProduct>> {
-        match self.get(&CacheKey::RegionRaster(id.to_string())).await? {
-            CachedValue::RegionRaster(value) => Some(value),
-            _ => None,
+    pub(crate) async fn region_raster(&self, id: &str) -> Option<Bytes> {
+        let mut state = self.state.lock().await;
+        Self::expire_leases(&mut state, (self.now)());
+        let keys: Vec<_> = state
+            .entries
+            .iter()
+            .filter_map(|(key, entry)| match &entry.value {
+                CachedValue::Region(value) if value.raster_id == id => Some(key.clone()),
+                _ => None,
+            })
+            .collect();
+        let first = keys.first()?.clone();
+        state.clock = state.clock.wrapping_add(1);
+        let clock = state.clock;
+        let bytes = match &state.entries.get(&first)?.value {
+            CachedValue::Region(value) => value.raster.clone(),
+            _ => return None,
+        };
+        for key in keys {
+            if let Some(entry) = state.entries.get_mut(&key) {
+                entry.last_used = clock;
+                if let Some(lease) = entry.lease.as_mut() {
+                    lease.raster_pending = false;
+                    if !lease.overlay_pending {
+                        entry.lease = None;
+                    }
+                }
+            }
         }
+        Some(bytes)
     }
 
-    pub(crate) async fn region_overlay(&self, id: &str) -> Option<Arc<RegionOverlayProduct>> {
-        match self.get(&CacheKey::RegionOverlay(id.to_string())).await? {
-            CachedValue::RegionOverlay(value) => Some(value),
-            _ => None,
+    pub(crate) async fn region_overlay(&self, render_id: &str, overlay_id: &str) -> Option<Bytes> {
+        let key = CacheKey::Region(overlay_id.to_string());
+        let mut state = self.state.lock().await;
+        Self::expire_leases(&mut state, (self.now)());
+        state.clock = state.clock.wrapping_add(1);
+        let clock = state.clock;
+        let entry = state.entries.get_mut(&key)?;
+        let bytes = match &entry.value {
+            CachedValue::Region(value) if value.raster_id == render_id => value.overlay.clone(),
+            _ => return None,
+        };
+        entry.last_used = clock;
+        if let Some(lease) = entry.lease.as_mut() {
+            lease.overlay_pending = false;
+            if !lease.raster_pending {
+                entry.lease = None;
+            }
         }
+        Some(bytes)
     }
+
+    #[cfg(test)]
+    pub(crate) async fn stats(&self) -> (usize, usize, usize) {
+        let state = self.state.lock().await;
+        (state.entries.len(), state.total_bytes, state.flights.len())
+    }
+}
+
+fn checked_weight(parts: impl IntoIterator<Item = usize>) -> Result<usize, DetailError> {
+    parts
+        .into_iter()
+        .try_fold(CACHE_MAP_OVERHEAD, |total, part| total.checked_add(part))
+        .ok_or(DetailError::TooLarge)
+}
+
+fn chromosome_weight(key: &CacheKey, value: &ChromosomeProduct) -> Result<usize, DetailError> {
+    let key_bytes = match key {
+        CacheKey::Chromosome(id) => id.capacity(),
+        CacheKey::Region(_) => return Err(DetailError::Internal),
+    };
+    checked_weight([
+        size_of::<CacheEntry>(),
+        size_of::<CacheKey>(),
+        size_of::<ChromosomeProduct>(),
+        key_bytes,
+        value.manifest.len(),
+        value.raster.len(),
+    ])
+}
+
+fn region_weight(key: &CacheKey, value: &RegionBundle) -> Result<usize, DetailError> {
+    let map_key_bytes = match key {
+        CacheKey::Region(id) => id.capacity(),
+        CacheKey::Chromosome(_) => return Err(DetailError::Internal),
+    };
+    checked_weight([
+        size_of::<CacheEntry>(),
+        size_of::<CacheKey>(),
+        size_of::<RegionBundle>(),
+        map_key_bytes,
+        value.raster_id.capacity(),
+        value.overlay_id.capacity(),
+        value.work_key.render_hash.capacity(),
+        value.manifest.len(),
+        value.raster.len(),
+        value.overlay.len(),
+    ])
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,7 +549,67 @@ pub(crate) enum DetailError {
     NotFound,
     BadRequest,
     TooDense,
+    TooLarge,
+    Busy,
     Internal,
+}
+
+#[cfg(test)]
+pub(crate) struct BuildProbe {
+    pub(crate) starts: AtomicUsize,
+    pub(crate) active: AtomicUsize,
+    pub(crate) peak: AtomicUsize,
+    delay: Duration,
+    failures: AtomicUsize,
+    panics: AtomicUsize,
+}
+
+#[cfg(test)]
+impl BuildProbe {
+    pub(crate) fn new(delay: Duration, failures: usize, panics: usize) -> Arc<Self> {
+        Arc::new(Self {
+            starts: AtomicUsize::new(0),
+            active: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            delay,
+            failures: AtomicUsize::new(failures),
+            panics: AtomicUsize::new(panics),
+        })
+    }
+
+    fn enter(self: &Arc<Self>) -> Result<BuildProbeGuard, DetailError> {
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(active, Ordering::SeqCst);
+        let guard = BuildProbeGuard(self.clone());
+        std::thread::sleep(self.delay);
+        if consume_one(&self.panics) {
+            panic!("injected detached detail build panic");
+        }
+        if consume_one(&self.failures) {
+            return Err(DetailError::Internal);
+        }
+        Ok(guard)
+    }
+}
+
+#[cfg(test)]
+fn consume_one(value: &AtomicUsize) -> bool {
+    value
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            current.checked_sub(1)
+        })
+        .is_ok()
+}
+
+#[cfg(test)]
+struct BuildProbeGuard(Arc<BuildProbe>);
+
+#[cfg(test)]
+impl Drop for BuildProbeGuard {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 pub(crate) struct DetailService {
@@ -228,6 +618,10 @@ pub(crate) struct DetailService {
     root: Arc<AssociationVisualizationManifestV1>,
     gene_provider: Option<Arc<dyn GeneReferenceProvider>>,
     pub(crate) cache: Arc<DetailCache>,
+    // Detached producers must retain the completed generation and its locks.
+    session: Option<CompletedAssociationSession>,
+    #[cfg(test)]
+    build_probe: Option<Arc<BuildProbe>>,
 }
 
 impl Clone for DetailService {
@@ -238,6 +632,9 @@ impl Clone for DetailService {
             root: self.root.clone(),
             gene_provider: self.gene_provider.clone(),
             cache: self.cache.clone(),
+            session: self.session.clone(),
+            #[cfg(test)]
+            build_probe: self.build_probe.clone(),
         }
     }
 }
@@ -254,7 +651,15 @@ impl DetailService {
             root: Arc::new(root),
             gene_provider: None,
             cache: Arc::new(DetailCache::default_bounded()),
+            session: None,
+            #[cfg(test)]
+            build_probe: None,
         }
+    }
+
+    pub(crate) fn with_session(mut self, session: CompletedAssociationSession) -> Self {
+        self.session = Some(session);
+        self
     }
 
     #[cfg(test)]
@@ -264,8 +669,27 @@ impl DetailService {
     }
 
     #[cfg(test)]
+    pub(crate) fn with_build_probe(mut self, probe: Arc<BuildProbe>) -> Self {
+        self.build_probe = Some(probe);
+        self
+    }
+
+    #[cfg(test)]
     pub(crate) fn with_cache_limits(mut self, entries: usize, bytes: usize) -> Self {
         self.cache = Arc::new(DetailCache::new(entries, bytes));
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_cache_config(
+        mut self,
+        entries: usize,
+        bytes: usize,
+        flights: usize,
+        lease: Duration,
+        now: Now,
+    ) -> Self {
+        self.cache = Arc::new(DetailCache::configured(entries, bytes, flights, lease, now));
         self
     }
 
@@ -307,26 +731,41 @@ impl DetailService {
             .ok_or(DetailError::NotFound)?;
         let cache_id = chromosome_cache_id(&self.root, contig);
         let cache_key = CacheKey::Chromosome(cache_id.clone());
-        loop {
-            if let Some(CachedValue::Chromosome(value)) = self.cache.get(&cache_key).await {
-                return Ok(value);
-            }
-            let flight = FlightKey::Chromosome(cache_id.clone());
-            match self.cache.begin_flight(flight.clone()).await {
-                Ok(()) => {
-                    let result = self
-                        .build_chromosome(contig.to_string(), contig_length)
+        if let Some(value) = self.cache.chromosome(&cache_key).await {
+            return Ok(value);
+        }
+        let flight_key = FlightKey::Chromosome(cache_id);
+        let owned_contig = contig.to_string();
+        let receiver = match self.cache.begin_flight(flight_key.clone()).await? {
+            FlightAdmission::Ready(FlightOutcome::Chromosome(result)) => return result,
+            FlightAdmission::Ready(_) => return Err(DetailError::Internal),
+            FlightAdmission::Joined(receiver) => receiver,
+            FlightAdmission::Started {
+                receiver,
+                sender,
+                permit,
+            } => {
+                let service = self.clone();
+                let cache_key = cache_key.clone();
+                tokio::spawn(async move {
+                    let result = service.build_chromosome(owned_contig, contig_length).await;
+                    let result = service.cache.publish_chromosome(cache_key, result).await;
+                    service
+                        .cache
+                        .finish_flight(
+                            &flight_key,
+                            sender,
+                            FlightOutcome::Chromosome(result),
+                            permit,
+                        )
                         .await;
-                    if let Ok(value) = &result {
-                        self.cache
-                            .insert(cache_key.clone(), CachedValue::Chromosome(value.clone()))
-                            .await;
-                    }
-                    self.cache.finish_flight(&flight).await;
-                    return result;
-                }
-                Err(notify) => notify.notified().await,
+                });
+                receiver
             }
+        };
+        match wait_for_flight(receiver).await? {
+            FlightOutcome::Chromosome(result) => result,
+            _ => Err(DetailError::Internal),
         }
     }
 
@@ -339,7 +778,14 @@ impl DetailService {
         let dataset_id = self.dataset_id.clone();
         let root = self.root.clone();
         let threshold = self.threshold();
+        #[cfg(test)]
+        let probe = self.build_probe.clone();
         run_blocking(move || {
+            #[cfg(test)]
+            let _probe_guard = match probe {
+                Some(probe) => Some(probe.enter()?),
+                None => None,
+            };
             let layout = GenomeLayoutV1::new(
                 [(contig.clone(), contig_length as u64)],
                 root.layout.width,
@@ -354,8 +800,6 @@ impl DetailService {
                     .render_threshold(&layout, line.pvalue, THRESHOLD_COLOR)
                     .map_err(|_| DetailError::Internal)?;
             }
-            // The completed root contains exactly min(configured K, dataset rows)
-            // hits, which is also a sufficient bound for every chromosome.
             let mut top_hits = TopK::new(root.top_hits.len()).map_err(|_| DetailError::Internal)?;
             let mut significant = 0_u64;
             let request = AssociationRegionScanRequestV1 {
@@ -412,9 +856,10 @@ impl DetailService {
                 },
             };
             manifest.validate().map_err(|_| DetailError::Internal)?;
+            let manifest = serde_json::to_vec(&manifest).map_err(|_| DetailError::Internal)?;
             Ok(Arc::new(ChromosomeProduct {
-                raster: Bytes::from(png),
-                manifest,
+                raster: exact_bytes(png),
+                manifest: exact_bytes(manifest),
             }))
         })
         .await
@@ -423,7 +868,7 @@ impl DetailService {
     pub(crate) async fn region(
         &self,
         request: RegionRequest,
-    ) -> Result<RegionResponse, DetailError> {
+    ) -> Result<Arc<RegionBundle>, DetailError> {
         let contig_length = self
             .canonical_contig_length(&request.contig)
             .ok_or(DetailError::NotFound)?;
@@ -459,169 +904,77 @@ impl DetailService {
             selected_ordinal: request.selected_ordinal,
         };
 
-        loop {
-            let raster = match self
-                .cache
-                .get(&CacheKey::RegionRaster(raster_id.clone()))
-                .await
-            {
-                Some(CachedValue::RegionRaster(value)) => Some(value),
-                _ => None,
-            };
-            let overlay = self.cache.matching_overlay(&work_key).await;
-            if let (Some(raster), Some(overlay)) = (raster, overlay) {
-                return self.region_response(&identity, raster_id, raster, overlay);
-            }
-            let work_flight = FlightKey::RegionWork(work_key.clone());
-            match self.cache.begin_flight(work_flight.clone()).await {
-                Ok(()) => {
-                    let result = self
-                        .build_region_work(identity.clone(), raster_id.clone(), work_key.clone())
-                        .await;
-                    self.cache.finish_flight(&work_flight).await;
-                    return result;
-                }
-                Err(notify) => notify.notified().await,
-            }
+        if let Some(value) = self.cache.region_for_manifest(&work_key).await {
+            return Ok(value);
         }
-    }
-
-    async fn build_region_work(
-        &self,
-        identity: RegionRenderIdentityV1,
-        raster_id: String,
-        work_key: RegionWorkKey,
-    ) -> Result<RegionResponse, DetailError> {
-        let existing_raster = match self
-            .cache
-            .get(&CacheKey::RegionRaster(raster_id.clone()))
-            .await
-        {
-            Some(CachedValue::RegionRaster(value)) => Some(value),
-            _ => None,
-        };
-        let existing_overlay = self.cache.matching_overlay(&work_key).await;
-
-        let mut owns_raster_flight = false;
-        let raster = if let Some(raster) = existing_raster {
-            Some(raster)
-        } else {
-            loop {
-                let flight = FlightKey::RegionRaster(raster_id.clone());
-                match self.cache.begin_flight(flight).await {
-                    Ok(()) => {
-                        owns_raster_flight = true;
-                        break None;
-                    }
-                    Err(notify) => {
-                        notify.notified().await;
-                        if let Some(CachedValue::RegionRaster(value)) = self
-                            .cache
-                            .get(&CacheKey::RegionRaster(raster_id.clone()))
-                            .await
-                        {
-                            break Some(value);
-                        }
-                    }
-                }
+        let flight_key = FlightKey::Region(work_key.clone());
+        let receiver = match self.cache.begin_flight(flight_key.clone()).await? {
+            FlightAdmission::Ready(FlightOutcome::Region(result)) => {
+                return self.cache.advertise_region(result?).await;
             }
-        };
-
-        let build_raster = raster.is_none();
-        let build_overlay = existing_overlay.is_none();
-        let built = if build_raster || build_overlay {
-            self.build_region(
-                identity.clone(),
-                work_key.clone(),
-                build_raster,
-                build_overlay,
-            )
-            .await
-        } else {
-            unreachable!("region work was requested with both products present")
-        };
-
-        // Publish a successful raster before waking requests for a different
-        // exact overlay that share this effective raster identity.
-        if owns_raster_flight {
-            if let Ok(value) = &built {
-                if let Some(raster) = &value.raster {
-                    self.cache
-                        .insert(
-                            CacheKey::RegionRaster(raster_id.clone()),
-                            CachedValue::RegionRaster(raster.clone()),
-                        )
+            FlightAdmission::Ready(_) => return Err(DetailError::Internal),
+            FlightAdmission::Joined(receiver) => receiver,
+            FlightAdmission::Started {
+                receiver,
+                sender,
+                permit,
+            } => {
+                let service = self.clone();
+                tokio::spawn(async move {
+                    let result = service.build_region(identity, raster_id, work_key).await;
+                    let result = service.cache.publish_region(result).await;
+                    service
+                        .cache
+                        .finish_flight(&flight_key, sender, FlightOutcome::Region(result), permit)
                         .await;
-                }
+                });
+                receiver
             }
-            self.cache
-                .finish_flight(&FlightKey::RegionRaster(raster_id.clone()))
-                .await;
-        }
-        let built = built?;
-        let raster = if let Some(value) = raster {
-            value
-        } else {
-            built.raster.ok_or(DetailError::Internal)?
         };
-        let overlay = if let Some(value) = existing_overlay {
-            value
-        } else {
-            let value = built.overlay.ok_or(DetailError::Internal)?;
-            self.cache
-                .insert(
-                    CacheKey::RegionOverlay(value.resource_id.clone()),
-                    CachedValue::RegionOverlay(value.clone()),
-                )
-                .await;
-            value
+        let value = match wait_for_flight(receiver).await? {
+            FlightOutcome::Region(result) => result?,
+            _ => return Err(DetailError::Internal),
         };
-        self.region_response(&identity, raster_id, raster, overlay)
+        // Every successful manifest response refreshes or restores its atomic
+        // bundle before advertising query-free resource URLs.
+        self.cache.advertise_region(value).await
     }
 
     async fn build_region(
         &self,
         identity: RegionRenderIdentityV1,
+        raster_id: String,
         work_key: RegionWorkKey,
-        build_raster: bool,
-        build_overlay: bool,
-    ) -> Result<BuiltRegion, DetailError> {
+    ) -> Result<Arc<RegionBundle>, DetailError> {
         let path = self.database_path.as_ref().clone();
         let dataset_id = self.dataset_id.clone();
         let provider = self.gene_provider.clone();
         let assembly = self.root.assembly.clone();
+        let title = self.root.title.clone();
+        let source_fingerprint = self.root.source_fingerprint.clone();
+        #[cfg(test)]
+        let probe = self.build_probe.clone();
         run_blocking(move || {
+            #[cfg(test)]
+            let _probe_guard = match probe {
+                Some(probe) => Some(probe.enter()?),
+                None => None,
+            };
             let selected = work_key
                 .selected_ordinal
                 .into_iter()
                 .collect::<HashSet<_>>();
-            let gene_annotations = if build_overlay {
-                load_genes(provider.as_deref(), &assembly, identity.layout())
-            } else {
-                unavailable_genes()
-            };
-            let mut reducer = if build_overlay {
-                Some(
-                    RegionOverlayReducerV1::new(
-                        identity.layout(),
-                        identity.significance_threshold(),
-                        &selected,
-                    )
-                    .map_err(contract_detail_error)?,
-                )
-            } else {
-                None
-            };
-            let mut raster = if build_raster {
-                Some(
-                    LocusRasterizer::from_layout(identity.layout(), Background::White)
-                        .map_err(|_| DetailError::Internal)?,
-                )
-            } else {
-                None
-            };
+            let gene_annotations = load_genes(provider.as_deref(), &assembly, identity.layout());
+            let mut reducer = RegionOverlayReducerV1::new(
+                identity.layout(),
+                identity.significance_threshold(),
+                &selected,
+            )
+            .map_err(contract_detail_error)?;
+            let mut raster = LocusRasterizer::from_layout(identity.layout(), Background::White)
+                .map_err(|_| DetailError::Internal)?;
             let scan_request = AssociationRegionScanRequestV1 {
-                dataset_id,
+                dataset_id: dataset_id.clone(),
                 contig: identity.layout().contig.clone(),
                 start: identity.layout().effective_start,
                 end: identity.layout().effective_end,
@@ -629,18 +982,14 @@ impl DetailService {
             let store = SqliteAssociationStore::open_read_only(path).map_err(store_detail_error)?;
             let mut contract_error = None;
             let scan = store.scan_region(&scan_request, &mut |point| {
-                if let Some(raster) = raster.as_mut() {
-                    raster
-                        .render_point(identity.layout(), point)
-                        .map_err(|_| AssociationStoreError::Sink("render failed".into()))?;
-                }
-                if let Some(reducer) = reducer.as_mut() {
-                    if let Err(error) = reducer.push(point) {
-                        contract_error = Some(error);
-                        return Err(AssociationStoreError::Sink(
-                            "overlay reduction failed".into(),
-                        ));
-                    }
+                raster
+                    .render_point(identity.layout(), point)
+                    .map_err(|_| AssociationStoreError::Sink("render failed".into()))?;
+                if let Err(error) = reducer.push(point) {
+                    contract_error = Some(error);
+                    return Err(AssociationStoreError::Sink(
+                        "overlay reduction failed".into(),
+                    ));
                 }
                 Ok(())
             });
@@ -649,112 +998,89 @@ impl DetailService {
             }
             scan.map_err(store_detail_error)?;
 
-            let raster = if let Some(mut raster) = raster {
-                raster
-                    .render_threshold(identity.layout(), identity.significance_threshold())
-                    .map_err(|_| DetailError::Internal)?;
-                let bytes = raster.png_bytes().map_err(|_| DetailError::Internal)?;
-                Some(Arc::new(RegionRasterProduct {
-                    checksum: checksum(&bytes),
-                    bytes: Bytes::from(bytes),
-                }))
-            } else {
-                None
+            raster
+                .render_threshold(identity.layout(), identity.significance_threshold())
+                .map_err(|_| DetailError::Internal)?;
+            let raster_bytes = raster.png_bytes().map_err(|_| DetailError::Internal)?;
+            let raster_checksum = checksum(&raster_bytes);
+            let overlay = reducer
+                .finish(&identity, gene_annotations)
+                .map_err(contract_detail_error)?;
+            overlay.validate().map_err(contract_detail_error)?;
+            let overlay_bytes = serde_json::to_vec(&overlay).map_err(|_| DetailError::Internal)?;
+            let overlay_id = overlay_resource_id(identity.render_hash(), &overlay.overlay_hash);
+            let counts = AssociationRegionCountsV1 {
+                source_point_count: overlay.aggregation.input_point_count,
+                rasterized_point_count: overlay.aggregation.rasterized_point_count,
+                significant_point_count: overlay.aggregation.protected_significant_count,
+                coding_point_count: overlay.aggregation.protected_coding_count,
+                selected_point_count: overlay.aggregation.protected_selected_count,
+                overlay_point_count: overlay.aggregation.overlay_point_count,
             };
-            let overlay = if let Some(reducer) = reducer {
-                let overlay = reducer
-                    .finish(&identity, gene_annotations)
-                    .map_err(contract_detail_error)?;
-                overlay.validate().map_err(contract_detail_error)?;
-                let bytes = serde_json::to_vec(&overlay).map_err(|_| DetailError::Internal)?;
-                let resource_id =
-                    overlay_resource_id(identity.render_hash(), &overlay.overlay_hash);
-                Some(Arc::new(RegionOverlayProduct {
-                    overlay,
-                    bytes: Bytes::from(bytes),
-                    resource_id,
-                    work_key,
-                }))
-            } else {
-                None
+            let manifest = AssociationRegionRenderManifestV1 {
+                schema_version: genohype_association::ASSOCIATION_REGION_SCHEMA_VERSION_V1.into(),
+                dataset_id,
+                title,
+                assembly,
+                coordinate_convention: COORDINATE_CONVENTION_V1.into(),
+                source_fingerprint,
+                layout: identity.layout().clone(),
+                layout_hash: identity.layout_hash().into(),
+                background_id: BACKGROUND_ID.into(),
+                raster_hash: identity.raster_hash().into(),
+                render_hash: identity.render_hash().into(),
+                overlay_hash: overlay.overlay_hash.clone(),
+                significance_threshold: identity.significance_threshold(),
+                counts,
+                aggregation: overlay.aggregation.clone(),
+                resources: AssociationRegionResourcesV1 {
+                    raster: ResourceDescriptorV1 {
+                        url: format!("renders/{raster_id}/raster"),
+                        media_type: "image/png".into(),
+                        byte_size: Some(raster_bytes.len() as u64),
+                        checksum: Some(raster_checksum),
+                        expires_at: None,
+                    },
+                    overlay: ResourceDescriptorV1 {
+                        url: format!("renders/{raster_id}/overlays/{overlay_id}"),
+                        media_type: "application/json".into(),
+                        byte_size: Some(overlay_bytes.len() as u64),
+                        checksum: Some(checksum(&overlay_bytes)),
+                        expires_at: None,
+                    },
+                },
             };
-            Ok(BuiltRegion { raster, overlay })
+            manifest.validate().map_err(contract_detail_error)?;
+            overlay
+                .validate_against(&manifest)
+                .map_err(contract_detail_error)?;
+            let manifest = serde_json::to_vec(&manifest).map_err(|_| DetailError::Internal)?;
+            Ok(Arc::new(RegionBundle {
+                manifest: exact_bytes(manifest),
+                raster: exact_bytes(raster_bytes),
+                overlay: exact_bytes(overlay_bytes),
+                raster_id,
+                overlay_id,
+                work_key,
+            }))
         })
         .await
     }
+}
 
-    fn region_response(
-        &self,
-        identity: &RegionRenderIdentityV1,
-        raster_id: String,
-        raster: Arc<RegionRasterProduct>,
-        overlay: Arc<RegionOverlayProduct>,
-    ) -> Result<RegionResponse, DetailError> {
-        let counts = AssociationRegionCountsV1 {
-            source_point_count: overlay.overlay.aggregation.input_point_count,
-            rasterized_point_count: overlay.overlay.aggregation.rasterized_point_count,
-            significant_point_count: overlay.overlay.aggregation.protected_significant_count,
-            coding_point_count: overlay.overlay.aggregation.protected_coding_count,
-            selected_point_count: overlay.overlay.aggregation.protected_selected_count,
-            overlay_point_count: overlay.overlay.aggregation.overlay_point_count,
-        };
-        let manifest = AssociationRegionRenderManifestV1 {
-            schema_version: genohype_association::ASSOCIATION_REGION_SCHEMA_VERSION_V1.into(),
-            dataset_id: self.dataset_id.clone(),
-            title: self.root.title.clone(),
-            assembly: self.root.assembly.clone(),
-            coordinate_convention: COORDINATE_CONVENTION_V1.into(),
-            source_fingerprint: self.root.source_fingerprint.clone(),
-            layout: identity.layout().clone(),
-            layout_hash: identity.layout_hash().into(),
-            background_id: BACKGROUND_ID.into(),
-            raster_hash: identity.raster_hash().into(),
-            render_hash: identity.render_hash().into(),
-            overlay_hash: overlay.overlay.overlay_hash.clone(),
-            significance_threshold: identity.significance_threshold(),
-            counts,
-            aggregation: overlay.overlay.aggregation.clone(),
-            resources: AssociationRegionResourcesV1 {
-                raster: ResourceDescriptorV1 {
-                    url: format!("renders/{raster_id}/raster"),
-                    media_type: "image/png".into(),
-                    byte_size: Some(raster.bytes.len() as u64),
-                    checksum: Some(raster.checksum.clone()),
-                    expires_at: None,
-                },
-                overlay: ResourceDescriptorV1 {
-                    url: format!("renders/{raster_id}/overlays/{}", overlay.resource_id),
-                    media_type: "application/json".into(),
-                    byte_size: Some(overlay.bytes.len() as u64),
-                    checksum: Some(checksum(&overlay.bytes)),
-                    expires_at: None,
-                },
-            },
-        };
-        manifest.validate().map_err(contract_detail_error)?;
-        overlay
-            .overlay
-            .validate_against(&manifest)
-            .map_err(contract_detail_error)?;
-        Ok(RegionResponse {
-            manifest,
-            _raster: raster,
-            _overlay: overlay,
-        })
+async fn wait_for_flight(
+    mut receiver: watch::Receiver<FlightState>,
+) -> Result<FlightOutcome, DetailError> {
+    loop {
+        let state = receiver.borrow().clone();
+        if let FlightState::Complete(outcome) = state {
+            return Ok(outcome);
+        }
+        receiver
+            .changed()
+            .await
+            .map_err(|_| DetailError::Internal)?;
     }
-}
-
-struct BuiltRegion {
-    raster: Option<Arc<RegionRasterProduct>>,
-    overlay: Option<Arc<RegionOverlayProduct>>,
-}
-
-pub(crate) struct RegionResponse {
-    pub(crate) manifest: AssociationRegionRenderManifestV1,
-    // Retain both cache products through manifest serialization even if a
-    // concurrent request causes immediate LRU pressure.
-    pub(crate) _raster: Arc<RegionRasterProduct>,
-    pub(crate) _overlay: Arc<RegionOverlayProduct>,
 }
 
 pub(crate) struct RegionRequest {
@@ -855,6 +1181,10 @@ fn checksum(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
+fn exact_bytes(bytes: Vec<u8>) -> Bytes {
+    Bytes::from(bytes.into_boxed_slice())
+}
+
 fn store_detail_error(error: AssociationStoreError) -> DetailError {
     match error {
         AssociationStoreError::DatasetNotFound => DetailError::NotFound,
@@ -879,4 +1209,116 @@ where
     tokio::task::spawn_blocking(operation)
         .await
         .map_err(|_| DetailError::Internal)?
+}
+
+#[cfg(test)]
+mod detail_tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    fn bundle(id: char, bytes: usize) -> Arc<RegionBundle> {
+        let id = id.to_string().repeat(64);
+        Arc::new(RegionBundle {
+            manifest: Bytes::from(vec![1; bytes]),
+            raster: Bytes::from(vec![2; bytes]),
+            overlay: Bytes::from(vec![3; bytes]),
+            raster_id: id.clone(),
+            overlay_id: id.clone(),
+            work_key: RegionWorkKey {
+                render_hash: id,
+                selected_ordinal: None,
+            },
+        })
+    }
+
+    #[tokio::test]
+    async fn durable_completion_precedes_wait_registration() {
+        let cache = DetailCache::new(1, 1024 * 1024);
+        let key = FlightKey::Chromosome("x".into());
+        let FlightAdmission::Started {
+            receiver,
+            sender,
+            permit,
+        } = cache.begin_flight(key.clone()).await.unwrap()
+        else {
+            panic!("expected owner")
+        };
+        let product = Arc::new(ChromosomeProduct {
+            raster: Bytes::from_static(b"r"),
+            manifest: Bytes::from_static(b"m"),
+        });
+        cache
+            .finish_flight(
+                &key,
+                sender,
+                FlightOutcome::Chromosome(Ok(product.clone())),
+                permit,
+            )
+            .await;
+        let outcome = tokio::time::timeout(Duration::from_millis(50), wait_for_flight(receiver))
+            .await
+            .expect("durable completion was missed")
+            .unwrap();
+        assert!(matches!(outcome, FlightOutcome::Chromosome(Ok(_))));
+        assert_eq!(cache.stats().await.2, 0);
+    }
+
+    #[tokio::test]
+    async fn atomic_bundle_lease_releases_after_both_fetches_and_expires() {
+        let origin = Instant::now();
+        let now = Arc::new(StdMutex::new(origin));
+        let clock: Now = {
+            let now = now.clone();
+            Arc::new(move || *now.lock().unwrap())
+        };
+        let cache = DetailCache::configured(1, 1024 * 1024, 1, Duration::from_secs(5), clock);
+        let first = bundle('a', 16);
+        cache.publish_region(Ok(first.clone())).await.unwrap();
+        assert!(cache
+            .region_overlay(&"f".repeat(64), &first.overlay_id)
+            .await
+            .is_none());
+        assert!(matches!(
+            cache.publish_region(Ok(bundle('b', 16))).await,
+            Err(DetailError::Busy)
+        ));
+        assert!(cache
+            .region_overlay(&first.raster_id, &first.overlay_id)
+            .await
+            .is_some());
+        assert!(matches!(
+            cache.publish_region(Ok(bundle('b', 16))).await,
+            Err(DetailError::Busy)
+        ));
+        assert!(cache.region_raster(&first.raster_id).await.is_some());
+        cache.publish_region(Ok(bundle('b', 16))).await.unwrap();
+
+        let second = bundle('c', 16);
+        assert!(matches!(
+            cache.publish_region(Ok(second)).await,
+            Err(DetailError::Busy)
+        ));
+        *now.lock().unwrap() = origin + Duration::from_secs(6);
+        cache.publish_region(Ok(bundle('c', 16))).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn weights_are_conservative_and_oversized_products_are_rejected() {
+        let value = bundle('d', 100);
+        let key = CacheKey::Region(value.overlay_id.clone());
+        let weight = region_weight(&key, &value).unwrap();
+        assert!(weight > value.manifest.len() + value.raster.len() + value.overlay.len());
+        let cache = DetailCache::configured(
+            1,
+            weight - 1,
+            1,
+            Duration::from_secs(1),
+            Arc::new(Instant::now),
+        );
+        assert!(matches!(
+            cache.publish_region(Ok(value)).await,
+            Err(DetailError::TooLarge)
+        ));
+        assert_eq!(cache.stats().await, (0, 0, 0));
+    }
 }

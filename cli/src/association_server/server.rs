@@ -1,4 +1,6 @@
 use super::assets::{viewer_asset, viewer_index};
+#[cfg(test)]
+use super::detail::BuildProbe;
 use super::detail::{valid_resource_id, DetailError, DetailService, RegionRequest};
 use super::security::security_headers;
 use crate::association_session::CompletedAssociationSession;
@@ -71,11 +73,10 @@ impl DatasetService {
         let dataset_id = session.dataset_id().clone();
         let database_path = session.database_path();
         Self {
-            detail: Some(DetailService::new(
-                dataset_id.clone(),
-                database_path.clone(),
-                root,
-            )),
+            detail: Some(
+                DetailService::new(dataset_id.clone(), database_path.clone(), root)
+                    .with_session(session.clone()),
+            ),
             dataset_id,
             database_path: Arc::new(database_path),
             _session: Some(session),
@@ -152,6 +153,32 @@ impl DatasetService {
         self.detail = self
             .detail
             .map(|detail| detail.with_cache_limits(entries, bytes));
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_build_probe(mut self, probe: Arc<BuildProbe>) -> Self {
+        self.detail = self.detail.map(|detail| detail.with_build_probe(probe));
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_cache_config(
+        mut self,
+        entries: usize,
+        bytes: usize,
+        flights: usize,
+        lease: std::time::Duration,
+    ) -> Self {
+        self.detail = self.detail.map(|detail| {
+            detail.with_cache_config(
+                entries,
+                bytes,
+                flights,
+                lease,
+                Arc::new(std::time::Instant::now),
+            )
+        });
         self
     }
 }
@@ -475,7 +502,12 @@ async fn chromosome_manifest_response(
         return not_found().await;
     };
     match detail.chromosome(&contig).await {
-        Ok(product) => json_response(&product.manifest),
+        Ok(product) => response(
+            StatusCode::OK,
+            "application/json",
+            NO_STORE,
+            product.manifest.clone(),
+        ),
         Err(error) => detail_error_response(error).await,
     }
 }
@@ -523,7 +555,12 @@ async fn region_manifest_response(
         selected_ordinal: query.selected,
     };
     match detail.region(request).await {
-        Ok(product) => json_response(&product.manifest),
+        Ok(product) => response(
+            StatusCode::OK,
+            "application/json",
+            NO_STORE,
+            product.manifest.clone(),
+        ),
         Err(error) => detail_error_response(error).await,
     }
 }
@@ -543,7 +580,7 @@ async fn region_raster_response(
         return not_found().await;
     }
     match detail.cache.region_raster(&render_id).await {
-        Some(product) => response(StatusCode::OK, "image/png", NO_STORE, product.bytes.clone()),
+        Some(bytes) => response(StatusCode::OK, "image/png", NO_STORE, bytes),
         None => not_found().await,
     }
 }
@@ -562,23 +599,10 @@ async fn region_overlay_response(
     if !valid_resource_id(&render_id) || !valid_resource_id(&overlay_id) {
         return not_found().await;
     }
-    let Some(overlay) = detail.cache.region_overlay(&overlay_id).await else {
-        return not_found().await;
-    };
-    let expected_render = overlay
-        .overlay
-        .raster_hash
-        .strip_prefix("sha256:")
-        .unwrap_or_default();
-    if expected_render != render_id {
-        return not_found().await;
+    match detail.cache.region_overlay(&render_id, &overlay_id).await {
+        Some(bytes) => response(StatusCode::OK, "application/json", NO_STORE, bytes),
+        None => not_found().await,
     }
-    response(
-        StatusCode::OK,
-        "application/json",
-        NO_STORE,
-        overlay.bytes.clone(),
-    )
 }
 
 fn json_response<T: serde::Serialize>(value: &T) -> Response {
@@ -597,6 +621,18 @@ async fn detail_error_response(error: DetailError) -> Response {
             "text/plain; charset=utf-8",
             NO_STORE,
             b"region is too dense; narrow the interval\n".to_vec(),
+        ),
+        DetailError::TooLarge => response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "text/plain; charset=utf-8",
+            NO_STORE,
+            b"detail product exceeds service limits\n".to_vec(),
+        ),
+        DetailError::Busy => response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "text/plain; charset=utf-8",
+            NO_STORE,
+            b"service busy\n".to_vec(),
         ),
         DetailError::Internal => internal_error(),
     }

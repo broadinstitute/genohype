@@ -1,3 +1,4 @@
+use super::detail::{BuildProbe, DetailError, DetailService, RegionRequest};
 use super::server::{self, DatasetService, ServerState};
 use super::*;
 use crate::association_session::{
@@ -123,6 +124,29 @@ fn detail_router(token: &str, database_path: PathBuf) -> axum::Router {
         ServerState::new(token.into(), serde_json::to_vec(&manifest).unwrap(), raster)
             .with_dataset(dataset),
     )
+}
+
+fn detail_request(threshold: Option<f64>) -> RegionRequest {
+    RegionRequest {
+        contig: "1".into(),
+        start: 10,
+        end: 20,
+        width: 50,
+        height: 64,
+        dpr: 1,
+        threshold,
+        selected_ordinal: None,
+    }
+}
+
+async fn wait_for_starts(probe: &BuildProbe, expected: usize) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while probe.starts.load(Ordering::SeqCst) < expected {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detail producer did not start");
 }
 
 struct CountingGeneProvider {
@@ -870,7 +894,7 @@ async fn detail_cache_is_single_flight_off_runtime_and_safely_evicts() {
     let dataset =
         DatasetService::for_test_with_manifest(dataset_id(), database.clone(), manifest.clone())
             .with_gene_provider(provider.clone())
-            .with_cache_limits(2, 1024 * 1024);
+            .with_cache_limits(1, 1024 * 1024);
     let app = server::build_router(
         ServerState::new(
             "correct-token".into(),
@@ -928,15 +952,15 @@ async fn detail_cache_is_single_flight_off_runtime_and_safely_evicts() {
         genohype_association::GeneAnnotationStateV1::Available
     );
 
-    // A different raster/overlay pair exceeds the two-entry limit and evicts
-    // the first pair as one generic opaque-resource miss.
+    // A competing pair cannot displace the first manifest's leased atomic
+    // bundle when all capacity is occupied.
     let second = router_response(
         app.clone(),
         Method::GET,
         &format!("{request}&threshold=0.02"),
     )
     .await;
-    assert_eq!(second.status(), StatusCode::OK);
+    assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
     let stale_raster = format!(
         "/correct-token/api/datasets/{id}/region/{}",
         first_manifest.resources.raster.url
@@ -945,12 +969,16 @@ async fn detail_cache_is_single_flight_off_runtime_and_safely_evicts() {
         router_response(app.clone(), Method::GET, &stale_raster)
             .await
             .status(),
-        StatusCode::NOT_FOUND
+        StatusCode::OK
     );
 
-    let rebuilt = router_response(app, Method::GET, &request).await;
-    assert_eq!(rebuilt.status(), StatusCode::OK);
-    assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+    let cached = router_response(app, Method::GET, &request).await;
+    assert_eq!(cached.status(), StatusCode::OK);
+    assert_eq!(
+        provider.calls.load(Ordering::SeqCst),
+        1,
+        "leased-capacity rejection must happen before starting work"
+    );
 
     let (manifest, raster) = detail_manifest();
     let failing = Arc::new(CountingGeneProvider {
@@ -999,6 +1027,209 @@ async fn detail_cache_is_single_flight_off_runtime_and_safely_evicts() {
         overlay.gene_annotations.message.as_deref(),
         Some("gene annotations could not be loaded")
     );
+}
+
+#[tokio::test]
+async fn detached_detail_flights_survive_owner_abort_and_retry_after_error_or_panic() {
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("private-associations.sqlite3");
+    write_dataset(&database);
+    let (manifest, _) = detail_manifest();
+
+    let probe = BuildProbe::new(Duration::from_millis(75), 0, 0);
+    let service = DetailService::new(dataset_id(), database.clone(), manifest.clone())
+        .with_build_probe(probe.clone());
+    let owner_service = service.clone();
+    let owner = tokio::spawn(async move { owner_service.region(detail_request(None)).await });
+    wait_for_starts(&probe, 1).await;
+    owner.abort();
+    let result = tokio::time::timeout(Duration::from_secs(2), service.region(detail_request(None)))
+        .await
+        .expect("aborted region owner poisoned its flight")
+        .unwrap();
+    assert!(!result.manifest.is_empty());
+    assert_eq!(probe.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(service.cache.stats().await.2, 0);
+
+    let chromosome_probe = BuildProbe::new(Duration::from_millis(75), 0, 0);
+    let chromosome_service = DetailService::new(dataset_id(), database.clone(), manifest.clone())
+        .with_build_probe(chromosome_probe.clone());
+    let owner_service = chromosome_service.clone();
+    let owner = tokio::spawn(async move { owner_service.chromosome("1").await });
+    wait_for_starts(&chromosome_probe, 1).await;
+    owner.abort();
+    tokio::time::timeout(Duration::from_secs(2), chromosome_service.chromosome("1"))
+        .await
+        .expect("aborted chromosome owner poisoned its flight")
+        .unwrap();
+    assert_eq!(chromosome_probe.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(chromosome_service.cache.stats().await.2, 0);
+
+    // Panics in spawn_blocking become a shared Internal result; errors and
+    // panics are removed rather than retained as cache products, so retry works.
+    let retry_probe = BuildProbe::new(Duration::from_millis(75), 1, 1);
+    let retry_service =
+        DetailService::new(dataset_id(), database, manifest).with_build_probe(retry_probe.clone());
+    let panic_service = retry_service.clone();
+    let panic_owner = tokio::spawn(async move { panic_service.region(detail_request(None)).await });
+    wait_for_starts(&retry_probe, 1).await;
+    assert_eq!(
+        retry_service
+            .region(detail_request(None))
+            .await
+            .unwrap_err(),
+        DetailError::Internal
+    );
+    assert_eq!(
+        panic_owner.await.unwrap().unwrap_err(),
+        DetailError::Internal
+    );
+    assert_eq!(retry_probe.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        retry_service
+            .region(detail_request(None))
+            .await
+            .unwrap_err(),
+        DetailError::Internal
+    );
+    let recovered = tokio::time::timeout(
+        Duration::from_secs(2),
+        retry_service.region(detail_request(None)),
+    )
+    .await
+    .expect("retry deadlocked after detached failures")
+    .unwrap();
+    assert!(!recovered.manifest.is_empty());
+    assert_eq!(retry_probe.starts.load(Ordering::SeqCst), 3);
+    assert_eq!(retry_probe.active.load(Ordering::SeqCst), 0);
+    assert_eq!(retry_service.cache.stats().await.2, 0);
+}
+
+#[tokio::test]
+async fn distinct_maximal_detail_builds_have_bounded_admission_and_flights() {
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("private-associations.sqlite3");
+    write_dataset(&database);
+    let (manifest, _) = detail_manifest();
+    let probe = BuildProbe::new(Duration::from_millis(100), 2, 0);
+    let service = DetailService::new(dataset_id(), database, manifest)
+        .with_build_probe(probe.clone())
+        .with_cache_config(
+            8,
+            256 * 1024 * 1024,
+            2,
+            Duration::from_secs(15),
+            Arc::new(std::time::Instant::now),
+        );
+    let maximal = |threshold| RegionRequest {
+        contig: "1".into(),
+        start: 1,
+        end: 100,
+        width: 4_050,
+        height: 2_048,
+        dpr: 1,
+        threshold: Some(threshold),
+        selected_ordinal: None,
+    };
+    let first_service = service.clone();
+    let first = tokio::spawn(async move { first_service.region(maximal(0.01)).await });
+    let second_service = service.clone();
+    let second = tokio::spawn(async move { second_service.region(maximal(0.02)).await });
+    wait_for_starts(&probe, 2).await;
+    assert_eq!(service.cache.stats().await.2, 2);
+    assert_eq!(
+        service.region(maximal(0.03)).await.unwrap_err(),
+        DetailError::Busy
+    );
+    assert_eq!(probe.starts.load(Ordering::SeqCst), 2);
+
+    // An identical caller joins an admitted flight instead of consuming a
+    // third permit or flight record.
+    let joined_service = service.clone();
+    let joined = tokio::spawn(async move { joined_service.region(maximal(0.01)).await });
+    assert_eq!(first.await.unwrap().unwrap_err(), DetailError::Internal);
+    assert_eq!(second.await.unwrap().unwrap_err(), DetailError::Internal);
+    assert_eq!(joined.await.unwrap().unwrap_err(), DetailError::Internal);
+    assert_eq!(probe.peak.load(Ordering::SeqCst), 2);
+    assert_eq!(probe.active.load(Ordering::SeqCst), 0);
+    assert_eq!(service.cache.stats().await.2, 0);
+}
+
+#[tokio::test]
+async fn saturated_detail_route_returns_generic_service_unavailable() {
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("private-associations.sqlite3");
+    write_dataset(&database);
+    let (manifest, raster) = detail_manifest();
+    let probe = BuildProbe::new(Duration::from_millis(100), 1, 0);
+    let dataset = DatasetService::for_test_with_manifest(dataset_id(), database, manifest.clone())
+        .with_build_probe(probe.clone())
+        .with_cache_config(4, 1024 * 1024, 1, Duration::from_secs(15));
+    let app = server::build_router(
+        ServerState::new(
+            "correct-token".into(),
+            serde_json::to_vec(&manifest).unwrap(),
+            raster,
+        )
+        .with_dataset(dataset),
+    );
+    let base = format!(
+        "/correct-token/api/datasets/{}/region/manifest?contig=1&start=10&end=20&width=50&height=64&dpr=1",
+        dataset_id()
+    );
+    let owner_app = app.clone();
+    let owner_path = format!("{base}&threshold=0.01");
+    let owner =
+        tokio::spawn(async move { router_response(owner_app, Method::GET, &owner_path).await });
+    wait_for_starts(&probe, 1).await;
+    let busy = router_response(app, Method::GET, &format!("{base}&threshold=0.02")).await;
+    assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(busy.headers()[header::CACHE_CONTROL], "no-store");
+    assert_security_headers(&busy);
+    assert_eq!(
+        to_bytes(busy.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"service busy\n"
+    );
+    assert_eq!(
+        owner.await.unwrap().status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(probe.starts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn detached_producer_retains_ephemeral_session_until_it_finishes() {
+    let (_temp, session, generation) = completed_ephemeral_session();
+    let database = session.database_path();
+    let (manifest, _) = detail_manifest();
+    let probe = BuildProbe::new(Duration::from_millis(100), 0, 0);
+    let service = DetailService::new(dataset_id(), database, manifest)
+        .with_session(session)
+        .with_build_probe(probe.clone());
+    let cache = service.cache.clone();
+    let owner_service = service.clone();
+    let owner = tokio::spawn(async move { owner_service.region(detail_request(None)).await });
+    wait_for_starts(&probe, 1).await;
+    owner.abort();
+    drop(service);
+    assert!(
+        generation.exists(),
+        "detached producer dropped session early"
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while cache.stats().await.2 != 0 {
+            tokio::task::yield_now().await;
+        }
+        while generation.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("producer did not release the ephemeral session");
+    assert_eq!(probe.active.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
