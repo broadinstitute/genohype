@@ -19,7 +19,6 @@ use crate::manhattan::pipeline::{
     aggregate_shards_and_render, run_integrated_pipeline, PipelineConfig,
 };
 use crate::manhattan::render::ManhattanRenderer;
-use crossbeam_channel::bounded;
 use genohype_association::{canonical_contig, canonical_contig_lengths, Assembly, GenomeLayoutV1};
 use genohype_core::query::QueryEngine;
 use genohype_core::{HailError, Result};
@@ -27,8 +26,156 @@ use indicatif::ProgressBar;
 use owo_colors::OwoColorize;
 use rayon::prelude::*;
 use std::fs;
+use std::ops::Range;
 use std::path::Path;
-use std::thread;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// Keep local raster memory bounded independently of partition count. At the default
+// 3000x800 dimensions, 12 transparent shards consume about 110 MiB.
+const MAX_LOCAL_RASTER_SHARDS: usize = 16;
+const LOCAL_RASTER_SHARD_BUDGET_BYTES: u64 = 192 * 1024 * 1024;
+
+struct LegacyRasterShard {
+    index: usize,
+    renderer: ManhattanRenderer,
+    significant_hits: Vec<SignificantHit>,
+    partition_summaries: Vec<LegacyPartitionSummary>,
+}
+
+impl LegacyRasterShard {
+    fn new(index: usize, width: u32, height: u32) -> Self {
+        Self {
+            index,
+            renderer: ManhattanRenderer::new_transparent(width, height),
+            significant_hits: Vec::new(),
+            partition_summaries: Vec::new(),
+        }
+    }
+}
+
+fn local_raster_shard_count(num_partitions: usize, width: u32, height: u32) -> usize {
+    if num_partitions == 0 {
+        return 0;
+    }
+    let bytes_per_raster = u64::from(width)
+        .saturating_mul(u64::from(height))
+        .saturating_mul(4)
+        .max(1);
+    let memory_limited = (LOCAL_RASTER_SHARD_BUDGET_BYTES / bytes_per_raster).max(1) as usize;
+    rayon::current_num_threads()
+        .min(MAX_LOCAL_RASTER_SHARDS)
+        .min(memory_limited)
+        .min(num_partitions)
+        .max(1)
+}
+
+/// Split partition order into non-empty contiguous ranges. Rendering each range in source
+/// order and compositing ranges in this order makes overlapping point colors deterministic.
+fn contiguous_partition_ranges(num_partitions: usize, shard_count: usize) -> Vec<Range<usize>> {
+    if num_partitions == 0 || shard_count == 0 {
+        return Vec::new();
+    }
+    let shard_count = shard_count.min(num_partitions);
+    let base = num_partitions / shard_count;
+    let remainder = num_partitions % shard_count;
+    let mut start = 0;
+    (0..shard_count)
+        .map(|index| {
+            let length = base + usize::from(index < remainder);
+            let range = start..start + length;
+            start += length;
+            range
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_legacy_partition(
+    engine: &QueryEngine,
+    partition_index: usize,
+    row_limit: Option<usize>,
+    y_field: &str,
+    threshold: f64,
+    width: u32,
+    height: u32,
+    layout: &GenomeLayoutV1,
+    renderer: &mut ManhattanRenderer,
+    significant_hits: &mut Vec<SignificantHit>,
+) -> Result<LegacyPartitionSummary> {
+    let iter = engine.scan_partition_iter(partition_index, &[])?;
+    let mut summary = LegacyPartitionSummary::new(partition_index)?;
+
+    for (row_index, row_result) in iter.enumerate() {
+        if row_limit.is_some_and(|limit| row_index >= limit) {
+            break;
+        }
+        let row = row_result?;
+        summary.observe_source_row(&row)?;
+        let ordinal = source_ordinal(partition_index, row_index)?;
+
+        match extract_association_point(&row, y_field, ordinal) {
+            Ok((point, warnings)) => {
+                let x = layout.x_for(&point.contig, point.position);
+                let rendered = x.is_some();
+                let significant = point.pvalue < threshold;
+
+                if let Some(x) = x {
+                    let y = layout.y_scale.y_for(point.neg_log10_p);
+                    let color = layout.color_for(&point.contig).ok_or_else(|| {
+                        HailError::InvalidFormat(format!(
+                            "canonical Manhattan layout has no color for {:?}",
+                            point.contig
+                        ))
+                    })?;
+                    renderer.render_point(x, y, color, 0.5);
+                    if significant {
+                        significant_hits.push(SignificantHit {
+                            variant_id: format!("{}:{}", point.contig, point.position),
+                            pvalue: point.pvalue,
+                            x_px: x,
+                            y_px: y,
+                            x_normalized: x / width as f32,
+                            y_normalized: y / height as f32,
+                            annotations: serde_json::Value::Null,
+                        });
+                    }
+                }
+
+                summary.observe_valid_point(point, warnings, rendered, significant)?;
+            }
+            Err(_) => summary.observe_skipped_row()?,
+        }
+    }
+
+    Ok(summary)
+}
+
+#[cfg(test)]
+mod legacy_raster_tests {
+    use super::*;
+
+    #[test]
+    fn contiguous_shard_plan_is_balanced_complete_and_ordered() {
+        let ranges = contiguous_partition_ranges(10, 3);
+        assert_eq!(ranges, [0..4, 4..7, 7..10]);
+        assert!(ranges.windows(2).all(|pair| pair[0].end == pair[1].start));
+        assert_eq!(
+            ranges.into_iter().flatten().collect::<Vec<_>>(),
+            (0..10).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn shard_plan_never_creates_empty_or_partition_count_sized_excess() {
+        assert!(contiguous_partition_ranges(0, 8).is_empty());
+        assert_eq!(contiguous_partition_ranges(3, 8), [0..1, 1..2, 2..3]);
+        assert_eq!(
+            local_raster_shard_count(1_849, 3_000, 800),
+            rayon::current_num_threads().min(MAX_LOCAL_RASTER_SHARDS)
+        );
+        assert_eq!(local_raster_shard_count(1, u32::MAX, u32::MAX), 1);
+    }
+}
 
 pub fn run_manhattan(args: ManhattanArgs) -> Result<()> {
     use crate::manhattan::annotate::Annotator;
@@ -254,174 +401,90 @@ pub fn run_manhattan(args: ManhattanArgs) -> Result<()> {
     })?;
     renderer.render_threshold_line(threshold_y, args.width);
 
-    let mut significant_hits: Vec<SignificantHit> = Vec::new();
-
-    // 4. Scan and render with bounded batches. Partition summaries carry exact counts,
-    // deterministic source identity, warnings, and O(K=100) top hits.
-    println!("{}", "Scanning rows (parallel)...".dimmed());
+    // 4. Scan into a bounded number of transparent in-memory rasters. Each shard owns a
+    // contiguous partition range and renders rows in source order. Rayon parallelizes the
+    // expensive tiny-skia circle fills without creating one raster per source partition.
+    println!("{}", "Scanning and rendering rows (parallel)...".dimmed());
     let pb = ProgressBar::new_spinner();
     pb.set_style(progress_style_spinner());
+    let reported_rows = AtomicU64::new(0);
 
-    struct RenderBatch {
-        points: Vec<(f32, f32, u8)>,
-        hits: Vec<SignificantHit>,
-    }
-
-    enum ScanEvent {
-        Render(RenderBatch),
-        Summary(LegacyPartitionSummary),
-    }
-
-    let (tx, rx) = bounded::<Result<ScanEvent>>(100);
-    let table_path_owned = table_path.to_string();
-    let y_field = args.y_field.clone();
-    let threshold = args.threshold;
-    let width = args.width;
-    let height = args.height;
-    let layout_clone = layout.clone();
-    let limit = args.limit;
-
-    let producer_handle = thread::spawn(move || {
-        let process_partition = |partition_index: usize, row_limit: Option<usize>| -> Result<u64> {
-            let worker_engine = QueryEngine::open_path(&table_path_owned)?;
-            let iter = worker_engine.scan_partition_iter(partition_index, &[])?;
-            let mut summary = LegacyPartitionSummary::new(partition_index)?;
-            let mut batch = RenderBatch {
-                points: Vec::with_capacity(2000),
-                hits: Vec::new(),
-            };
-
-            for (row_index, row_result) in iter.enumerate() {
-                if row_limit.is_some_and(|limit| row_index >= limit) {
-                    break;
-                }
-                let row = row_result?;
-                summary.observe_source_row(&row)?;
-                let ordinal = source_ordinal(partition_index, row_index)?;
-
-                match extract_association_point(&row, &y_field, ordinal) {
-                    Ok((point, warnings)) => {
-                        let x = layout_clone.x_for(&point.contig, point.position);
-                        let rendered = x.is_some();
-                        let significant = point.pvalue < threshold;
-
-                        if let Some(x) = x {
-                            let y = layout_clone.y_scale.y_for(point.neg_log10_p);
-                            let color_idx =
-                                if layout_clone.color_for(&point.contig) == Some("#404040") {
-                                    0
-                                } else {
-                                    1
-                                };
-                            batch.points.push((x, y, color_idx));
-                            if significant {
-                                batch.hits.push(SignificantHit {
-                                    variant_id: format!("{}:{}", point.contig, point.position),
-                                    pvalue: point.pvalue,
-                                    x_px: x,
-                                    y_px: y,
-                                    x_normalized: x / width as f32,
-                                    y_normalized: y / height as f32,
-                                    annotations: serde_json::Value::Null,
-                                });
-                            }
-                        }
-
-                        summary.observe_valid_point(point, warnings, rendered, significant)?;
-                    }
-                    Err(_) => summary.observe_skipped_row()?,
-                }
-
-                if batch.points.len() >= 2000 {
-                    tx.send(Ok(ScanEvent::Render(batch))).map_err(|_| {
-                        HailError::Io(std::io::Error::new(
-                            std::io::ErrorKind::BrokenPipe,
-                            "legacy Manhattan render receiver dropped",
-                        ))
-                    })?;
-                    batch = RenderBatch {
-                        points: Vec::with_capacity(2000),
-                        hits: Vec::new(),
-                    };
-                }
-            }
-
-            if !batch.points.is_empty() || !batch.hits.is_empty() {
-                tx.send(Ok(ScanEvent::Render(batch))).map_err(|_| {
-                    HailError::Io(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "legacy Manhattan render receiver dropped",
-                    ))
-                })?;
-            }
-            let scanned = summary.row_count;
-            tx.send(Ok(ScanEvent::Summary(summary))).map_err(|_| {
-                HailError::Io(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "legacy Manhattan summary receiver dropped",
-                ))
-            })?;
-            Ok(scanned)
-        };
-
-        let result: Result<()> = if let Some(limit) = limit {
-            // A test limit is a deterministic prefix of partition/row order.
+    let mut raster_shards = if let Some(limit) = args.limit {
+        // A test limit remains an exact deterministic prefix of partition/row order. Limits
+        // are primarily a test/debug facility, so use one shard rather than speculatively
+        // scanning later partitions before the prefix boundary is known.
+        let mut shards = Vec::new();
+        if limit > 0 && num_partitions > 0 {
+            let mut shard = LegacyRasterShard::new(0, args.width, args.height);
             let mut remaining = limit;
-            let mut result = Ok(());
             for partition_index in 0..num_partitions {
                 if remaining == 0 {
                     break;
                 }
-                match process_partition(partition_index, Some(remaining)) {
-                    Ok(scanned) => remaining = remaining.saturating_sub(scanned as usize),
-                    Err(error) => {
-                        result = Err(error);
-                        break;
-                    }
-                }
+                let summary = scan_legacy_partition(
+                    &engine,
+                    partition_index,
+                    Some(remaining),
+                    &args.y_field,
+                    args.threshold,
+                    args.width,
+                    args.height,
+                    &layout,
+                    &mut shard.renderer,
+                    &mut shard.significant_hits,
+                )?;
+                remaining = remaining.saturating_sub(summary.row_count as usize);
+                let scanned = reported_rows.fetch_add(summary.row_count, Ordering::Relaxed)
+                    + summary.row_count;
+                pb.set_message(format!("{scanned} rows scanned..."));
+                shard.partition_summaries.push(summary);
             }
-            result
-        } else {
-            (0..num_partitions)
-                .into_par_iter()
-                .try_for_each(|partition_index| {
-                    process_partition(partition_index, None).map(|_| ())
-                })
-        };
-
-        if let Err(error) = result {
-            let _ = tx.send(Err(error));
+            shards.push(shard);
         }
-    });
+        shards
+    } else {
+        let shard_count = local_raster_shard_count(num_partitions, args.width, args.height);
+        let ranges = contiguous_partition_ranges(num_partitions, shard_count);
+        pb.set_message(format!("using {} in-memory raster shards...", ranges.len()));
 
-    let colors = ["#404040", "#4682B4"];
-    let mut partition_summaries = Vec::new();
-    let mut scan_error = None;
-    let mut reported_rows = 0_u64;
-    for event in rx {
-        match event {
-            Ok(ScanEvent::Render(batch)) => {
-                for (x, y, color_idx) in batch.points {
-                    renderer.render_point(x, y, colors[color_idx as usize], 0.5);
+        ranges
+            .into_par_iter()
+            .enumerate()
+            .map(|(index, partitions)| -> Result<LegacyRasterShard> {
+                let mut shard = LegacyRasterShard::new(index, args.width, args.height);
+                for partition_index in partitions {
+                    let summary = scan_legacy_partition(
+                        &engine,
+                        partition_index,
+                        None,
+                        &args.y_field,
+                        args.threshold,
+                        args.width,
+                        args.height,
+                        &layout,
+                        &mut shard.renderer,
+                        &mut shard.significant_hits,
+                    )?;
+                    let scanned = reported_rows.fetch_add(summary.row_count, Ordering::Relaxed)
+                        + summary.row_count;
+                    pb.set_message(format!("{scanned} rows scanned..."));
+                    shard.partition_summaries.push(summary);
                 }
-                significant_hits.extend(batch.hits);
-            }
-            Ok(ScanEvent::Summary(summary)) => {
-                reported_rows = reported_rows.saturating_add(summary.row_count);
-                pb.set_message(format!("{} rows scanned...", reported_rows));
-                partition_summaries.push(summary);
-            }
-            Err(error) => scan_error = Some(error),
-        }
-    }
-    producer_handle.join().map_err(|_| {
-        HailError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "legacy Manhattan producer thread panicked",
-        ))
-    })?;
-    if let Some(error) = scan_error {
-        return Err(error);
+                Ok(shard)
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+
+    // Indexed Rayon collection is ordered, but sort explicitly so compositing order remains a
+    // visible invariant if the producer implementation changes. Sidecar hits follow the same
+    // deterministic partition/row order.
+    raster_shards.sort_by_key(|shard| shard.index);
+    let mut significant_hits = Vec::new();
+    let mut partition_summaries = Vec::with_capacity(num_partitions);
+    for shard in raster_shards {
+        renderer.composite(&shard.renderer)?;
+        significant_hits.extend(shard.significant_hits);
+        partition_summaries.extend(shard.partition_summaries);
     }
 
     let scan_summary = merge_partition_summaries(partition_summaries)?;

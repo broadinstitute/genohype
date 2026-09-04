@@ -182,6 +182,7 @@ fn integrated_multi_partition_identity_matches_legacy_and_is_deterministic() {
 
     let legacy_stem = temp.path().join("legacy");
     let legacy = Command::new(env!("CARGO_BIN_EXE_genohype"))
+        .env("RAYON_NUM_THREADS", "2")
         .args([
             "manhattan",
             "--table",
@@ -201,6 +202,47 @@ fn integrated_multi_partition_identity_matches_legacy_and_is_deterministic() {
         String::from_utf8_lossy(&legacy.stderr)
     );
     let legacy_manifest = read_manifest(format!("{}.manifest.json", legacy_stem.display()));
+    let legacy_png = fs::read(legacy_stem.with_extension("png")).unwrap();
+    let legacy_sidecar = fs::read(legacy_stem.with_extension("json")).unwrap();
+
+    // Two source partitions produce two concurrently rendered in-memory shards. Their explicit
+    // source-order merge must make both the raster bytes and sidecar hit order repeatable.
+    let repeated_stem = temp.path().join("legacy-repeated");
+    let repeated = Command::new(env!("CARGO_BIN_EXE_genohype"))
+        .env("RAYON_NUM_THREADS", "2")
+        .args([
+            "manhattan",
+            "--table",
+            fixture.to_str().unwrap(),
+            "--output",
+            repeated_stem.to_str().unwrap(),
+            "--width",
+            "800",
+            "--height",
+            "400",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        repeated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&repeated.stderr)
+    );
+    let repeated_manifest = read_manifest(format!("{}.manifest.json", repeated_stem.display()));
+    assert_eq!(repeated_manifest.row_count, legacy_manifest.row_count);
+    assert_eq!(repeated_manifest.top_hits, legacy_manifest.top_hits);
+    assert_eq!(
+        repeated_manifest.source_fingerprint,
+        legacy_manifest.source_fingerprint
+    );
+    assert_eq!(
+        fs::read(repeated_stem.with_extension("png")).unwrap(),
+        legacy_png
+    );
+    assert_eq!(
+        fs::read(repeated_stem.with_extension("json")).unwrap(),
+        legacy_sidecar
+    );
 
     let mut integrated_manifests = Vec::new();
     let mut integrated_rasters = Vec::new();
@@ -253,4 +295,70 @@ fn integrated_multi_partition_identity_matches_legacy_and_is_deterministic() {
         integrated_manifests[1].source_fingerprint
     );
     assert_eq!(integrated_rasters[0], integrated_rasters[1]);
+}
+
+#[test]
+fn legacy_limit_is_the_exact_partition_then_row_prefix() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = temp.path().join("two-partition.ht");
+    two_partition_fixture(&fixture);
+
+    let full_first_partition = temp.path().join("single");
+    let single = Command::new(env!("CARGO_BIN_EXE_genohype"))
+        .args([
+            "manhattan",
+            "--table",
+            fixture_path().to_str().unwrap(),
+            "--output",
+            full_first_partition.to_str().unwrap(),
+            "--width",
+            "800",
+            "--height",
+            "400",
+        ])
+        .output()
+        .unwrap();
+    assert!(single.status.success());
+
+    let limited_prefix = temp.path().join("limited");
+    let limited = Command::new(env!("CARGO_BIN_EXE_genohype"))
+        .env("RAYON_NUM_THREADS", "4")
+        .args([
+            "manhattan",
+            "--table",
+            fixture.to_str().unwrap(),
+            "--limit",
+            "12",
+            "--output",
+            limited_prefix.to_str().unwrap(),
+            "--width",
+            "800",
+            "--height",
+            "400",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        limited.status.success(),
+        "{}",
+        String::from_utf8_lossy(&limited.stderr)
+    );
+
+    let expected = read_manifest(format!("{}.manifest.json", full_first_partition.display()));
+    let actual = read_manifest(format!("{}.manifest.json", limited_prefix.display()));
+    assert_eq!(actual.row_count, 12);
+    assert_eq!(actual.valid_row_count, expected.valid_row_count);
+    assert_eq!(actual.skipped_row_count, expected.skipped_row_count);
+    assert_eq!(actual.rendered_point_count, expected.rendered_point_count);
+    assert_eq!(actual.significant_hit_count, expected.significant_hit_count);
+    assert_eq!(actual.top_hits, expected.top_hits);
+    assert_eq!(actual.source_fingerprint, expected.source_fingerprint);
+    assert_eq!(
+        fs::read(limited_prefix.with_extension("png")).unwrap(),
+        fs::read(full_first_partition.with_extension("png")).unwrap()
+    );
+    assert_eq!(
+        fs::read(limited_prefix.with_extension("json")).unwrap(),
+        fs::read(full_first_partition.with_extension("json")).unwrap()
+    );
 }
