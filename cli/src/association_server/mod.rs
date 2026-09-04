@@ -3,13 +3,17 @@ mod open;
 mod security;
 mod server;
 
-use genohype_association::AssociationVisualizationManifestV1;
+use crate::association_session::CompletedAssociationSession;
+use genohype_association::{
+    AssociationSessionCompletionV1, AssociationVisualizationManifestV1, MAX_ENCODED_RASTER_BYTES,
+};
 use genohype_core::{HailError, Result};
 use sha2::{Digest, Sha256};
-use std::fs;
-use std::io::{self, Write};
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 
+const MAX_COMPLETION_BYTES: usize = 64 * 1024;
 const MAX_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,7 +44,24 @@ struct PreparedArtifacts {
 }
 
 pub(crate) fn serve_viewer(artifacts: ViewerArtifacts, options: ViewerOptions) -> Result<()> {
-    let prepared = prepare_artifacts(&artifacts)?;
+    serve_prepared(prepare_artifacts(&artifacts)?, options, None)
+}
+
+/// Serves one already-completed indexed association session. The session handle is
+/// retained in Axum state until graceful shutdown, which also retains its lifecycle locks.
+pub(crate) fn serve_dataset_viewer(
+    session: CompletedAssociationSession,
+    options: ViewerOptions,
+) -> Result<()> {
+    let prepared = prepare_dataset_artifacts(&session)?;
+    serve_prepared(prepared, options, Some(session))
+}
+
+fn serve_prepared(
+    prepared: PreparedArtifacts,
+    options: ViewerOptions,
+    session: Option<CompletedAssociationSession>,
+) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -48,7 +69,12 @@ pub(crate) fn serve_viewer(artifacts: ViewerArtifacts, options: ViewerOptions) -
 
     runtime.block_on(async move {
         let token = server::generate_url_token();
-        let state = server::ServerState::new(token.clone(), prepared.manifest, prepared.raster);
+        let mut state = server::ServerState::new(token.clone(), prepared.manifest, prepared.raster);
+        if let Some(session) = session {
+            let dataset = server::DatasetService::from_session(session);
+            dataset.validate_complete().await.map_err(invalid_format)?;
+            state = state.with_dataset(dataset);
+        }
         let app = server::build_router(state);
         let listener = server::bind_loopback(options.port)
             .await
@@ -70,18 +96,96 @@ pub(crate) fn serve_viewer(artifacts: ViewerArtifacts, options: ViewerOptions) -
 }
 
 fn prepare_artifacts(artifacts: &ViewerArtifacts) -> Result<PreparedArtifacts> {
-    let manifest_bytes = fs::read(&artifacts.manifest_path)?;
-    if manifest_bytes.len() > MAX_MANIFEST_BYTES {
-        return Err(invalid_format(format!(
-            "association manifest exceeds {} bytes",
-            MAX_MANIFEST_BYTES
-        )));
+    let manifest_bytes = read_bounded(&artifacts.manifest_path, MAX_MANIFEST_BYTES, "manifest")?;
+    let raster = read_bounded(
+        &artifacts.raster_path,
+        MAX_ENCODED_RASTER_BYTES as usize,
+        "raster",
+    )?;
+    prepare_manifest_and_raster(manifest_bytes, raster, None)
+}
+
+fn prepare_dataset_artifacts(session: &CompletedAssociationSession) -> Result<PreparedArtifacts> {
+    let marker = session.completion();
+    marker.validate().map_err(invalid_format)?;
+    if &marker.dataset_id != session.dataset_id() {
+        return Err(invalid_format("completed association dataset ID mismatch"));
     }
-    let mut manifest: AssociationVisualizationManifestV1 =
+
+    let database_path = session.database_path();
+    let directory = database_path
+        .parent()
+        .ok_or_else(|| invalid_format("completed association session has no directory"))?;
+    let marker_bytes = read_bounded(
+        &directory.join("complete.json"),
+        MAX_COMPLETION_BYTES,
+        "completion marker",
+    )?;
+    let disk_marker: AssociationSessionCompletionV1 =
+        serde_json::from_slice(&marker_bytes).map_err(invalid_format)?;
+    disk_marker.validate().map_err(invalid_format)?;
+    if &disk_marker != marker {
+        return Err(invalid_format(
+            "completed association session marker changed before serving",
+        ));
+    }
+
+    validate_artifact_file(&database_path, &marker.database, "database")?;
+    let manifest_bytes = read_completed_artifact(
+        &session.manifest_path(),
+        &marker.manifest,
+        MAX_MANIFEST_BYTES,
+        "manifest",
+    )?;
+    let raster = read_completed_artifact(
+        &session.raster_path(),
+        &marker.raster,
+        MAX_ENCODED_RASTER_BYTES as usize,
+        "raster",
+    )?;
+
+    let table_url = format!("datasets/{}/table", session.dataset_id());
+    let region_url = format!("datasets/{}/region", session.dataset_id());
+    let prepared =
+        prepare_manifest_and_raster(manifest_bytes, raster, Some((&table_url, &region_url)))?;
+    let manifest: AssociationVisualizationManifestV1 =
+        serde_json::from_slice(&prepared.manifest).map_err(invalid_format)?;
+    if manifest.plot_id != session.dataset_id().as_str()
+        || manifest.source_fingerprint != marker.source_fingerprint
+        || manifest.created_at != marker.created_at
+        || manifest.layout.width != marker.raster_width
+        || manifest.layout.height != marker.raster_height
+        || manifest.resources.raster.byte_size != Some(marker.raster.byte_size)
+        || manifest.resources.raster.checksum.as_deref() != Some(&marker.raster.checksum)
+        || manifest
+            .resources
+            .table_api
+            .as_ref()
+            .map_or(true, |resource| resource.media_type != "application/json")
+        || manifest
+            .resources
+            .region_api
+            .as_ref()
+            .map_or(true, |resource| resource.media_type != "application/json")
+    {
+        return Err(invalid_format(
+            "completed association manifest does not match its completion marker",
+        ));
+    }
+    Ok(prepared)
+}
+
+fn prepare_manifest_and_raster(
+    manifest_bytes: Vec<u8>,
+    raster: Vec<u8>,
+    dataset_urls: Option<(&str, &str)>,
+) -> Result<PreparedArtifacts> {
+    let mut manifest_value: serde_json::Value =
         serde_json::from_slice(&manifest_bytes).map_err(invalid_format)?;
+    let manifest: AssociationVisualizationManifestV1 =
+        serde_json::from_value(manifest_value.clone()).map_err(invalid_format)?;
     manifest.validate().map_err(invalid_format)?;
 
-    let raster = fs::read(&artifacts.raster_path)?;
     let descriptor = &manifest.resources.raster;
     if descriptor.media_type != "image/png" {
         return Err(invalid_format(format!(
@@ -98,17 +202,7 @@ fn prepare_artifacts(artifacts: &ViewerArtifacts) -> Result<PreparedArtifacts> {
         ));
     }
     if let Some(expected) = &descriptor.checksum {
-        let Some(expected_digest) = expected.strip_prefix("sha256:") else {
-            return Err(invalid_format(format!(
-                "unsupported association raster checksum {expected:?}"
-            )));
-        };
-        let actual = format!("{:x}", Sha256::digest(&raster));
-        if !constant_time_eq(expected_digest.as_bytes(), actual.as_bytes()) {
-            return Err(invalid_format(
-                "association raster checksum does not match manifest",
-            ));
-        }
+        validate_checksum(&raster, expected, "raster")?;
     }
     let pixmap = tiny_skia::Pixmap::decode_png(&raster)
         .map_err(|error| invalid_format(format!("invalid association PNG: {error}")))?;
@@ -122,17 +216,137 @@ fn prepare_artifacts(artifacts: &ViewerArtifacts) -> Result<PreparedArtifacts> {
         )));
     }
 
-    // The on-disk canonical manifest is immutable. Only its in-memory transport copy
-    // is rebased to the token-relative allowlisted raster endpoint.
-    manifest.resources.raster.url = "raster".into();
-    manifest.validate().map_err(invalid_format)?;
-    let mut served_manifest = serde_json::to_vec_pretty(&manifest).map_err(invalid_format)?;
-    served_manifest.push(b'\n');
+    // Modify only the known URL leaves in the raw JSON tree. Deserializing a V1
+    // projection before and after this rebase enforces the typed contract without
+    // discarding compatible minor-version fields unknown to this binary.
+    set_manifest_url(&mut manifest_value, "/resources/raster/url", "raster")?;
+    if let Some((table_url, region_url)) = dataset_urls {
+        set_manifest_url(&mut manifest_value, "/resources/table_api/url", table_url)?;
+        set_manifest_url(&mut manifest_value, "/resources/region_api/url", region_url)?;
+    }
+    let served_projection: AssociationVisualizationManifestV1 =
+        serde_json::from_value(manifest_value.clone()).map_err(invalid_format)?;
+    served_projection.validate().map_err(invalid_format)?;
 
+    let mut served_manifest = serde_json::to_vec_pretty(&manifest_value).map_err(invalid_format)?;
+    served_manifest.push(b'\n');
     Ok(PreparedArtifacts {
         manifest: served_manifest,
         raster,
     })
+}
+
+fn set_manifest_url(manifest: &mut serde_json::Value, pointer: &str, url: &str) -> Result<()> {
+    let value = manifest
+        .pointer_mut(pointer)
+        .ok_or_else(|| invalid_format(format!("association manifest is missing {pointer}")))?;
+    if !value.is_string() {
+        return Err(invalid_format(format!(
+            "association manifest {pointer} must be a string"
+        )));
+    }
+    *value = serde_json::Value::String(url.to_string());
+    Ok(())
+}
+
+fn read_bounded(path: &Path, maximum: usize, name: &str) -> Result<Vec<u8>> {
+    let mut file = File::open(path)?;
+    if file.metadata()?.len() > maximum as u64 {
+        return Err(invalid_format(format!(
+            "association {name} exceeds {maximum} bytes"
+        )));
+    }
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(maximum as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > maximum {
+        return Err(invalid_format(format!(
+            "association {name} exceeds {maximum} bytes"
+        )));
+    }
+    Ok(bytes)
+}
+
+fn read_completed_artifact(
+    path: &Path,
+    expected: &genohype_association::CompletedArtifactV1,
+    maximum: usize,
+    name: &str,
+) -> Result<Vec<u8>> {
+    if expected.byte_size > maximum as u64 {
+        return Err(invalid_format(format!(
+            "completed association {name} exceeds {maximum} bytes"
+        )));
+    }
+    let bytes = read_bounded(path, maximum, name)?;
+    validate_artifact_bytes(&bytes, expected, name)?;
+    Ok(bytes)
+}
+
+fn validate_artifact_file(
+    path: &Path,
+    expected: &genohype_association::CompletedArtifactV1,
+    name: &str,
+) -> Result<()> {
+    let mut file = File::open(path)?;
+    if file.metadata()?.len() != expected.byte_size {
+        return Err(invalid_format(format!(
+            "completed association {name} byte size does not match marker"
+        )));
+    }
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    validate_digest(digest.finalize().as_slice(), &expected.checksum, name)
+}
+
+fn validate_artifact_bytes(
+    bytes: &[u8],
+    expected: &genohype_association::CompletedArtifactV1,
+    name: &str,
+) -> Result<()> {
+    if bytes.len() as u64 != expected.byte_size {
+        return Err(invalid_format(format!(
+            "completed association {name} byte size does not match marker"
+        )));
+    }
+    validate_checksum(bytes, &expected.checksum, name)
+}
+
+fn validate_checksum(bytes: &[u8], expected: &str, name: &str) -> Result<()> {
+    validate_digest(Sha256::digest(bytes).as_slice(), expected, name)
+}
+
+fn validate_digest(actual: &[u8], expected: &str, name: &str) -> Result<()> {
+    let Some(expected_digest) = expected.strip_prefix("sha256:") else {
+        return Err(invalid_format(format!(
+            "unsupported association {name} checksum"
+        )));
+    };
+    let actual = hex_lower(actual);
+    if !constant_time_eq(expected_digest.as_bytes(), actual.as_bytes()) {
+        return Err(invalid_format(format!(
+            "association {name} checksum does not match"
+        )));
+    }
+    Ok(())
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 fn announce_and_open<W1, W2, F>(

@@ -1,14 +1,16 @@
-use super::server::{self, ServerState};
+use super::server::{self, DatasetService, ServerState};
 use super::*;
 use axum::body::{to_bytes, Body};
-use axum::http::{header, Request, StatusCode};
+use axum::http::{header, Method, Request, StatusCode};
 use genohype_association::{
+    AssociationBuildV1, AssociationPageV1, AssociationPointV1, AssociationStore,
     AssociationThresholdV1, AssociationVisualizationManifestV1,
-    AssociationVisualizationResourcesV1, GenomeLayoutV1, PlotKindV1, ResourceDescriptorV1,
-    COORDINATE_CONVENTION_V1, SCHEMA_VERSION_V1,
+    AssociationVisualizationResourcesV1, DatasetIdV1, GenomeLayoutV1, PlotKindV1,
+    ResourceDescriptorV1, SqliteAssociationStore, COORDINATE_CONVENTION_V1, SCHEMA_VERSION_V1,
 };
 use sha2::{Digest, Sha256};
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tower::ServiceExt;
 
@@ -72,6 +74,80 @@ fn router(token: &str) -> axum::Router {
         serde_json::to_vec(&manifest).unwrap(),
         raster,
     ))
+}
+
+fn dataset_id() -> DatasetIdV1 {
+    DatasetIdV1::new("123e4567-e89b-42d3-a456-426614174000").unwrap()
+}
+
+fn dataset_router(token: &str, database_path: PathBuf) -> axum::Router {
+    let (mut manifest, raster) = artifact_bytes();
+    manifest.resources.raster.url = "raster".into();
+    let dataset = DatasetService::for_test(dataset_id(), database_path);
+    server::build_router(
+        ServerState::new(token.into(), serde_json::to_vec(&manifest).unwrap(), raster)
+            .with_dataset(dataset),
+    )
+}
+
+fn point(contig: &str, position: i64, pvalue: f64, gene: &str, ordinal: u64) -> AssociationPointV1 {
+    AssociationPointV1 {
+        contig: contig.into(),
+        position,
+        ref_allele: Some("A".into()),
+        alt_allele: Some("G".into()),
+        pvalue,
+        neg_log10_p: -pvalue.log10(),
+        beta: None,
+        standard_error: None,
+        allele_frequency: None,
+        allele_count: None,
+        gene_symbol: Some(gene.into()),
+        consequence: None,
+        series: None,
+        source_ordinal: ordinal,
+    }
+}
+
+fn write_dataset(path: &Path) {
+    let id = dataset_id();
+    let mut store = SqliteAssociationStore::create(path).unwrap();
+    store
+        .begin_build(&AssociationBuildV1 {
+            dataset_id: id.clone(),
+            created_at: "2026-09-03T00:00:00Z".into(),
+        })
+        .unwrap();
+    store
+        .insert_points(
+            &id,
+            &[
+                point("1", 10, 0.05, "GENE1", 0),
+                point("1", 20, 1e-8, "GENE2", 1),
+                point("2", 1, 0.01, "GENE1", 2),
+            ],
+        )
+        .unwrap();
+    store
+        .complete_build(&id, &format!("sha256:{}", "a".repeat(64)))
+        .unwrap();
+}
+
+async fn router_response(
+    router: axum::Router,
+    method: Method,
+    path: &str,
+) -> axum::response::Response {
+    router
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
 }
 
 async fn response(path: &str) -> axum::response::Response {
@@ -254,6 +330,270 @@ fn validates_manifest_raster_contract_before_serving() {
         .unwrap_err()
         .to_string()
         .contains("dimensions"));
+}
+
+#[test]
+fn manifest_rebase_preserves_unknown_compatible_v1_fields() {
+    let (mut manifest, raster) = artifact_bytes();
+    manifest.resources.table_api = Some(ResourceDescriptorV1 {
+        url: "datasets/old/table".into(),
+        media_type: "application/json".into(),
+        byte_size: None,
+        checksum: None,
+        expires_at: None,
+    });
+    manifest.resources.region_api = Some(ResourceDescriptorV1 {
+        url: "datasets/old/region".into(),
+        media_type: "application/json".into(),
+        byte_size: None,
+        checksum: None,
+        expires_at: None,
+    });
+    let mut value = serde_json::to_value(manifest).unwrap();
+    value["future_root"] = serde_json::json!({"kept": [1, 2, 3]});
+    value["resources"]["future_resource"] = serde_json::json!({"kind": "future"});
+    value["resources"]["raster"]["future_checksum_kind"] = serde_json::json!(7);
+    value["resources"]["table_api"]["future_table_field"] = serde_json::json!(true);
+    value["resources"]["region_api"]["future_region_field"] = serde_json::json!("kept");
+
+    let prepared = prepare_manifest_and_raster(
+        serde_json::to_vec(&value).unwrap(),
+        raster,
+        Some((
+            "datasets/123e4567-e89b-42d3-a456-426614174000/table",
+            "datasets/123e4567-e89b-42d3-a456-426614174000/region",
+        )),
+    )
+    .unwrap();
+    let served: serde_json::Value = serde_json::from_slice(&prepared.manifest).unwrap();
+    assert_eq!(served["future_root"], value["future_root"]);
+    assert_eq!(
+        served["resources"]["future_resource"],
+        value["resources"]["future_resource"]
+    );
+    assert_eq!(
+        served["resources"]["raster"]["future_checksum_kind"],
+        serde_json::json!(7)
+    );
+    assert_eq!(
+        served["resources"]["table_api"]["future_table_field"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        served["resources"]["region_api"]["future_region_field"],
+        serde_json::json!("kept")
+    );
+    assert_eq!(served["resources"]["raster"]["url"], "raster");
+    assert_eq!(
+        served["resources"]["table_api"]["url"],
+        "datasets/123e4567-e89b-42d3-a456-426614174000/table"
+    );
+    assert_eq!(
+        served["resources"]["region_api"]["url"],
+        "datasets/123e4567-e89b-42d3-a456-426614174000/region"
+    );
+    let projection: AssociationVisualizationManifestV1 = serde_json::from_value(served).unwrap();
+    projection.validate().unwrap();
+}
+
+#[tokio::test]
+async fn dataset_routes_page_sort_search_and_use_inclusive_regions() {
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("private-associations.sqlite3");
+    write_dataset(&database);
+    DatasetService::for_test(dataset_id(), database.clone())
+        .validate_complete()
+        .await
+        .unwrap();
+    let base = "/correct-token/api/datasets/123e4567-e89b-42d3-a456-426614174000";
+
+    let default = router_response(
+        dataset_router("correct-token", database.clone()),
+        Method::GET,
+        &format!("{base}/table"),
+    )
+    .await;
+    assert_eq!(default.status(), StatusCode::OK);
+    assert_eq!(default.headers()[header::CONTENT_TYPE], "application/json");
+    assert_eq!(default.headers()[header::CACHE_CONTROL], "no-store");
+    assert_security_headers(&default);
+    let default: AssociationPageV1 =
+        serde_json::from_slice(&to_bytes(default.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(default.offset, 0);
+    assert_eq!(default.limit, 100);
+    assert_eq!(default.total, 3);
+    assert_eq!(default.points[0].position, 20);
+    assert_eq!(default.points[1].contig, "2");
+    assert_eq!(default.points[2].position, 10);
+
+    let page = router_response(
+        dataset_router("correct-token", database.clone()),
+        Method::GET,
+        &format!("{base}/table?offset=1&limit=1&sort=locus&direction=descending"),
+    )
+    .await;
+    let page: AssociationPageV1 =
+        serde_json::from_slice(&to_bytes(page.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(page.total, 3);
+    assert_eq!(page.points.len(), 1);
+    assert_eq!(
+        (page.points[0].contig.as_str(), page.points[0].position),
+        ("1", 20)
+    );
+
+    let search = router_response(
+        dataset_router("correct-token", database.clone()),
+        Method::GET,
+        &format!("{base}/table?search=GENE2"),
+    )
+    .await;
+    let search: AssociationPageV1 =
+        serde_json::from_slice(&to_bytes(search.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(search.total, 1);
+    assert_eq!(search.points[0].gene_symbol.as_deref(), Some("GENE2"));
+
+    let region = router_response(
+        dataset_router("correct-token", database),
+        Method::GET,
+        &format!("{base}/region?contig=chr1&start=10&end=20"),
+    )
+    .await;
+    assert_eq!(region.status(), StatusCode::OK);
+    assert_eq!(region.headers()[header::CACHE_CONTROL], "no-store");
+    assert_security_headers(&region);
+    let region: AssociationPageV1 =
+        serde_json::from_slice(&to_bytes(region.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(region.offset, 0);
+    assert_eq!(region.limit, 100);
+    assert_eq!(region.total, 2);
+    assert_eq!(
+        region
+            .points
+            .iter()
+            .map(|point| point.position)
+            .collect::<Vec<_>>(),
+        vec![10, 20]
+    );
+
+    let region_page = router_response(
+        dataset_router(
+            "correct-token",
+            temp.path().join("private-associations.sqlite3"),
+        ),
+        Method::GET,
+        &format!("{base}/region?contig=1&start=10&end=20&offset=1&limit=1"),
+    )
+    .await;
+    let region_page: AssociationPageV1 =
+        serde_json::from_slice(&to_bytes(region_page.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(region_page.total, 2);
+    assert_eq!(region_page.points.len(), 1);
+    assert_eq!(region_page.points[0].position, 20);
+}
+
+#[tokio::test]
+async fn dataset_route_errors_are_generic_exact_and_hardened() {
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("do-not-leak-this.sqlite3");
+    write_dataset(&database);
+    let id = dataset_id().to_string();
+    let base = format!("/correct-token/api/datasets/{id}");
+
+    for path in [
+        format!("/wrong-token/api/datasets/{id}/table"),
+        "/correct-token/api/datasets/not-a-dataset/table".into(),
+        "/correct-token/api/datasets/123e4567-e89b-42d3-a456-426614174001/table".into(),
+        format!("{base}/table/"),
+        format!("{base}/unknown"),
+    ] {
+        let response = router_response(
+            dataset_router("correct-token", database.clone()),
+            Method::GET,
+            &path,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        assert_security_headers(&response);
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"not found\n"
+        );
+    }
+
+    let absent = router_response(
+        router("correct-token"),
+        Method::GET,
+        &format!("{base}/table"),
+    )
+    .await;
+    assert_eq!(absent.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        to_bytes(absent.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"not found\n"
+    );
+
+    for path in [
+        format!("{base}/table?limit=0"),
+        format!("{base}/table?limit=1001"),
+        format!("{base}/table?offset=9007199254740992"),
+        format!("{base}/table?sort=sql"),
+        format!("{base}/table?direction=sideways"),
+        format!("{base}/table?search={}", "x".repeat(257)),
+        format!("{base}/table?search=line%0Abreak"),
+        format!("{base}/table?unknown=1"),
+        format!("{base}/region?contig=1&start=0&end=1"),
+        format!("{base}/region?contig=1&start=2&end=1"),
+        format!("{base}/region?contig=%20&start=1&end=2"),
+        format!("{base}/region?contig=1&start=1"),
+        format!("{base}/region?contig=1&start=1&end=2&limit=1001"),
+    ] {
+        let response = router_response(
+            dataset_router("correct-token", database.clone()),
+            Method::GET,
+            &path,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_security_headers(&response);
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"bad request\n",
+            "{path}"
+        );
+    }
+
+    for route in ["table", "region"] {
+        let response = router_response(
+            dataset_router("correct-token", database.clone()),
+            Method::POST,
+            &format!("{base}/{route}"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_security_headers(&response);
+    }
+
+    let failing_router = dataset_router("correct-token", database.clone());
+    fs::remove_file(&database).unwrap();
+    let failure = router_response(failing_router, Method::GET, &format!("{base}/table")).await;
+    assert_eq!(failure.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(failure.headers()[header::CACHE_CONTROL], "no-store");
+    assert_security_headers(&failure);
+    let body = to_bytes(failure.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(body.as_ref(), b"internal server error\n");
+    assert!(!String::from_utf8_lossy(&body).contains("do-not-leak-this"));
 }
 
 #[test]
