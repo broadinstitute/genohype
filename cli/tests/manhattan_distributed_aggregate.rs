@@ -159,18 +159,27 @@ fn aggregate_rejects_missing_duplicate_and_corrupt_receipts() {
         let output = temp.path().join(format!("manhattans/meta/{case}"));
         scan(&output, ManhattanSource::Exome);
         let receipt = output.join("exome/part-00000-reduction.json");
+        let mut spec = aggregate_spec(&output, true, false);
         match case {
             "missing" => fs::remove_file(receipt).unwrap(),
             "duplicate" => {
-                fs::copy(receipt, output.join("exome/part-00001-reduction.json")).unwrap();
+                fs::copy(&receipt, output.join("exome/part-00001-reduction.json")).unwrap();
+                fs::copy(
+                    output.join("exome/part-00000.png"),
+                    output.join("exome/part-00001.png"),
+                )
+                .unwrap();
+                spec.exome_partitions = Some(2);
             }
             "corrupt" => fs::write(receipt, b"{not-json").unwrap(),
             _ => unreachable!(),
         }
-        let error = run_aggregation(&aggregate_spec(&output, true, false)).unwrap_err();
+        let error = run_aggregation(&spec).unwrap_err();
         assert!(
             error.to_string().contains("reduction receipt")
-                || error.to_string().contains("expected 1 Manhattan"),
+                || error.to_string().contains("expected 1 Manhattan")
+                || error.to_string().contains("declares partition")
+                || error.to_string().contains("No such file"),
             "{case}: {error}"
         );
         assert!(!temp
@@ -207,11 +216,110 @@ fn aggregation_requires_exact_raster_partition_inventory_and_bounded_receipts() 
         assert!(
             message.contains("partial PNG")
                 || message.contains("No part-*.png")
-                || message.contains("byte limit"),
+                || message.contains("byte limit")
+                || message.contains("No such file"),
             "{case}: {message}"
         );
         assert!(!output.join("plots/exome_manhattan.manifest.json").exists());
     }
+}
+
+#[test]
+fn aggregation_rejects_same_name_same_dimensions_raster_substitution_and_stale_bytes() {
+    for case in ["substitution", "stale-bytes"] {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join(format!("manhattans/meta/{case}"));
+        scan(&output, ManhattanSource::Exome);
+        let raster_path = output.join("exome/part-00000.png");
+        let mut replacement = tiny_skia::Pixmap::new(800, 400).unwrap();
+        let color = if case == "substitution" {
+            tiny_skia::Color::from_rgba8(255, 0, 0, 255)
+        } else {
+            tiny_skia::Color::from_rgba8(0, 0, 255, 255)
+        };
+        replacement.fill(color);
+        let replacement = replacement.encode_png().unwrap();
+        let decoded = tiny_skia::Pixmap::decode_png(&replacement).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (800, 400));
+        fs::write(&raster_path, replacement).unwrap();
+
+        let error = run_aggregation(&aggregate_spec(&output, true, false)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not match its reduction receipt"),
+            "{case}: {error}"
+        );
+        assert!(!output.join("plots/exome_manhattan.manifest.json").exists());
+    }
+}
+
+#[test]
+fn aggregation_rejects_unbound_receipts_and_noncanonical_warning_growth() {
+    for case in ["unbound", "bogus-warning"] {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join(format!("manhattans/meta/{case}"));
+        scan(&output, ManhattanSource::Exome);
+        let receipt_path = output.join("exome/part-00000-reduction.json");
+        let mut receipt: serde_json::Value =
+            serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+        match case {
+            "unbound" => {
+                receipt.as_object_mut().unwrap().remove("raster");
+            }
+            "bogus-warning" => {
+                receipt["warnings"] = serde_json::json!(["worker-00000-private-warning"]);
+            }
+            _ => unreachable!(),
+        }
+        fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+
+        let error = run_aggregation(&aggregate_spec(&output, true, false)).unwrap_err();
+        assert!(
+            error.to_string().contains("not bound") || error.to_string().contains("non-canonical"),
+            "{case}: {error}"
+        );
+        assert!(!output.join("plots/exome_manhattan.manifest.json").exists());
+    }
+}
+
+#[test]
+fn zero_hit_publication_replaces_stale_compatibility_artifacts_with_truthful_parquet() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("manhattans/meta/zero-hits");
+    scan(&output, ManhattanSource::Exome);
+    let receipt_path = output.join("exome/part-00000-reduction.json");
+    let mut receipt: serde_json::Value =
+        serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    receipt["significant_hit_count"] = serde_json::json!(0);
+    fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+    genohype_cli::manhattan::sig_writer::SigHitWriter::new(
+        output
+            .join("exome/part-00000-sig.parquet")
+            .to_str()
+            .unwrap(),
+    )
+    .unwrap()
+    .finish()
+    .unwrap();
+    let spec = aggregate_spec(&output, true, false);
+    process_manhattan_aggregate(&spec).unwrap();
+
+    let root: serde_json::Value =
+        serde_json::from_slice(&fs::read(output.join("manifest.json")).unwrap()).unwrap();
+    assert!(root["significant_hits"]["exome"].is_null());
+    let marker = temp
+        .path()
+        .join("manhattans/.completed_phenos/meta_zero-hits");
+    assert!(marker.is_file());
+
+    fs::write(
+        output.join("exome_significant.parquet"),
+        b"stale nonzero artifact",
+    )
+    .unwrap();
+    assert!(verify_and_checkpoint(&spec).is_err());
+    assert!(!marker.exists());
 }
 
 #[test]
@@ -227,6 +335,87 @@ fn failed_rerun_invalidates_prior_completion_marker_before_aggregation() {
     fs::remove_file(output.join("exome/part-00000-reduction.json")).unwrap();
     assert!(process_manhattan_aggregate(&spec).is_err());
     assert!(!marker.exists());
+}
+
+#[test]
+fn compatibility_significant_hits_are_exactly_verified_before_checkpoint() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("manhattans/meta/significant-integrity");
+    scan(&output, ManhattanSource::Exome);
+    scan(&output, ManhattanSource::Genome);
+    let spec = aggregate_spec(&output, true, false);
+    process_manhattan_aggregate(&spec).unwrap();
+
+    let marker = temp
+        .path()
+        .join("manhattans/.completed_phenos/meta_significant-integrity");
+    let root_path = output.join("manifest.json");
+    let canonical_path = output.join("plots/exome_manhattan.manifest.json");
+    let significant_path = output.join("exome_significant.parquet");
+    let original_root = fs::read(&root_path).unwrap();
+    let original_canonical = fs::read(&canonical_path).unwrap();
+    let original_significant = fs::read(&significant_path).unwrap();
+    let genome_content = fs::read(output.join("genome/part-00000-sig.parquet")).unwrap();
+
+    for case in [
+        "removed-entry",
+        "mismatched-count",
+        "wrong-path",
+        "corrupt",
+        "removed-artifact",
+        "wrong-top-hit",
+        "wrong-content-source",
+        "false-nonzero-entry",
+    ] {
+        fs::write(&root_path, &original_root).unwrap();
+        fs::write(&canonical_path, &original_canonical).unwrap();
+        fs::write(&significant_path, &original_significant).unwrap();
+        verify_and_checkpoint(&spec).unwrap();
+        assert!(marker.is_file());
+
+        match case {
+            "removed-entry" => {
+                let mut root: serde_json::Value = serde_json::from_slice(&original_root).unwrap();
+                root["significant_hits"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("exome");
+                fs::write(&root_path, serde_json::to_vec(&root).unwrap()).unwrap();
+            }
+            "mismatched-count" => {
+                let mut root: serde_json::Value = serde_json::from_slice(&original_root).unwrap();
+                root["significant_hits"]["exome"]["count"] = serde_json::json!(7);
+                fs::write(&root_path, serde_json::to_vec(&root).unwrap()).unwrap();
+            }
+            "wrong-path" => {
+                let decoy = output.join("readable-decoy.parquet");
+                fs::write(&decoy, &original_significant).unwrap();
+                let mut root: serde_json::Value = serde_json::from_slice(&original_root).unwrap();
+                root["significant_hits"]["exome"]["path"] =
+                    serde_json::json!(decoy.to_string_lossy());
+                fs::write(&root_path, serde_json::to_vec(&root).unwrap()).unwrap();
+            }
+            "corrupt" => fs::write(&significant_path, b"not parquet").unwrap(),
+            "removed-artifact" => fs::remove_file(&significant_path).unwrap(),
+            "wrong-top-hit" => {
+                let mut root: serde_json::Value = serde_json::from_slice(&original_root).unwrap();
+                root["significant_hits"]["exome"]["top_hit"]["id"] =
+                    serde_json::json!("chr22:1:A:T");
+                fs::write(&root_path, serde_json::to_vec(&root).unwrap()).unwrap();
+            }
+            "wrong-content-source" => fs::write(&significant_path, &genome_content).unwrap(),
+            "false-nonzero-entry" => {
+                let mut canonical: serde_json::Value =
+                    serde_json::from_slice(&original_canonical).unwrap();
+                canonical["significant_hit_count"] = serde_json::json!(0);
+                fs::write(&canonical_path, serde_json::to_vec(&canonical).unwrap()).unwrap();
+            }
+            _ => unreachable!(),
+        }
+
+        let error = verify_and_checkpoint(&spec).unwrap_err();
+        assert!(!marker.exists(), "{case} left a completion marker: {error}");
+    }
 }
 
 #[test]

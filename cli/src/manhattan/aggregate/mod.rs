@@ -14,7 +14,7 @@ pub mod utils;
 
 use crate::distributed::manhattan::{
     merge_partition_reduction_receipts_in_order, ManhattanPartitionReductionReceiptV1,
-    ManhattanReductionSourceV1,
+    ManhattanReductionSourceV1, MANHATTAN_PARTITION_REDUCTION_MAX_BYTES_V1,
 };
 use crate::distributed::message::ManhattanAggregateSpec;
 use crate::manhattan::config::{BackgroundStyle, PlotType};
@@ -36,7 +36,7 @@ use std::time::Instant;
 
 use io::{
     cleanup_chrom_intermediates, cleanup_intermediates, discover_chromosomes, has_partial_pngs,
-    list_files, write_locus_file,
+    write_locus_file,
 };
 use locus::{generate_loci_from_parquet, generate_locus_plots};
 use merge::{merge_and_combine_hits, merge_significant_hits};
@@ -197,6 +197,8 @@ pub fn run_aggregation(spec: &ManhattanAggregateSpec) -> Result<(usize, serde_js
             "exome",
             ManhattanReductionSourceV1::Exome,
             expected_partition_count(spec.exome_partitions, source_path, "exome")?,
+            spec.width,
+            spec.height,
         )?)
     } else {
         None
@@ -207,10 +209,25 @@ pub fn run_aggregation(spec: &ManhattanAggregateSpec) -> Result<(usize, serde_js
             "genome",
             ManhattanReductionSourceV1::Genome,
             expected_partition_count(spec.genome_partitions, source_path, "genome")?,
+            spec.width,
+            spec.height,
         )?)
     } else {
         None
     };
+
+    // Compatibility top-hit metadata comes from the same canonical bounded reduction
+    // as the source manifest. Parquet is still independently checked for the row.
+    let exome_canonical_top = exome_reduction
+        .as_ref()
+        .map(|reduction| compatibility_top_hit_from_reduction(reduction, "exome"))
+        .transpose()?
+        .flatten();
+    let genome_canonical_top = genome_reduction
+        .as_ref()
+        .map(|reduction| compatibility_top_hit_from_reduction(reduction, "genome"))
+        .transpose()?
+        .flatten();
 
     // Composite each whole-genome raster, then publish its canonical sibling manifest last.
     println!("  Compositing partial PNGs...");
@@ -490,21 +507,24 @@ pub fn run_aggregation(spec: &ManhattanAggregateSpec) -> Result<(usize, serde_js
         merge_and_combine_hits(output_base, has_exome, has_genome)?;
 
     // For backward compatibility, also generate per-source files
-    let (exome_sig_count, exome_top_hit) = if has_exome {
+    let (exome_sig_count, _exome_parquet_top_hit) = if has_exome {
         merge_significant_hits(output_base, "exome")?
     } else {
         (0, None)
     };
 
-    let (genome_sig_count, genome_top_hit) = if has_genome {
+    let (genome_sig_count, _genome_parquet_top_hit) = if has_genome {
         merge_significant_hits(output_base, "genome")?
     } else {
         (0, None)
     };
 
-    // Extract phenotype and ancestry from spec or path
-    let phenotype = extract_phenotype_name(output_base);
-    let ancestry = "meta".to_string(); // Default ancestry; could be extracted from spec if available
+    // Preserve the scan identity in the compatibility manifest and Parquet verifier.
+    let phenotype = spec
+        .phenotype_id
+        .clone()
+        .unwrap_or_else(|| extract_phenotype_name(output_base));
+    let ancestry = spec.ancestry.clone().unwrap_or_else(|| "meta".into());
 
     // Step 4: Compute locus regions (always) and generate plots (if enabled)
     // Locus data (loci.parquet, loci_variants.parquet) is always written.
@@ -599,7 +619,7 @@ pub fn run_aggregation(spec: &ManhattanAggregateSpec) -> Result<(usize, serde_js
                 Some(ManifestSigHits {
                     path: format!("{}/exome_significant.parquet", output_base),
                     count: exome_sig_count,
-                    top_hit: exome_top_hit,
+                    top_hit: exome_canonical_top,
                 })
             } else {
                 None
@@ -608,7 +628,7 @@ pub fn run_aggregation(spec: &ManhattanAggregateSpec) -> Result<(usize, serde_js
                 Some(ManifestSigHits {
                     path: format!("{}/genome_significant.parquet", output_base),
                     count: genome_sig_count,
-                    top_hit: genome_top_hit,
+                    top_hit: genome_canonical_top,
                 })
             } else {
                 None
@@ -662,6 +682,32 @@ pub fn run_aggregation(spec: &ManhattanAggregateSpec) -> Result<(usize, serde_js
     Ok(((exome_count + genome_count) as usize, summary))
 }
 
+fn compatibility_top_hit_from_reduction(
+    reduction: &LegacyScanSummary,
+    source: &str,
+) -> Result<Option<crate::manhattan::data::ManifestTopHit>> {
+    if reduction.significant_hit_count == 0 {
+        return Ok(None);
+    }
+    let point = reduction.top_hits.first().ok_or_else(|| {
+        crate::HailError::InvalidFormat(format!(
+            "distributed Manhattan {source} reduction has significant hits but no top hit"
+        ))
+    })?;
+    Ok(Some(crate::manhattan::data::ManifestTopHit {
+        id: format!(
+            "{}:{}:{}:{}",
+            crate::manhattan::reference::normalize_contig_name(&point.contig),
+            point.position,
+            point.ref_allele.as_deref().unwrap_or_default(),
+            point.alt_allele.as_deref().unwrap_or_default()
+        ),
+        pvalue: point.pvalue,
+        gene: None,
+        consequence: None,
+    }))
+}
+
 fn expected_partition_count(
     declared: Option<usize>,
     source_path: &str,
@@ -684,41 +730,67 @@ fn load_source_reduction(
     source_name: &str,
     source: ManhattanReductionSourceV1,
     expected_partition_count: usize,
+    expected_width: u32,
+    expected_height: u32,
 ) -> Result<LegacyScanSummary> {
     let source_dir = format!("{output_base}/{source_name}");
-    let paths = list_files(&source_dir, "-reduction.json")?;
-    if paths.len() != expected_partition_count {
-        return Err(crate::HailError::InvalidFormat(format!(
-            "expected {expected_partition_count} Manhattan partition reduction receipts, found {}",
-            paths.len()
-        )));
-    }
-    let receipts = paths.into_iter().enumerate().map(|(index, path)| {
-        let name = path.rsplit('/').next().unwrap_or_default();
-        if name != format!("part-{index:05}-reduction.json") {
-            return Err(crate::HailError::InvalidFormat(format!(
-                "unexpected Manhattan reduction receipt {name:?}"
-            )));
-        }
-        let size = if is_cloud_path(&path) {
-            genohype_core::io::get_file_size(&path)?
-        } else {
-            std::fs::metadata(&path)?.len()
-        };
-        const MAX_RECEIPT_BYTES: u64 = 1_048_576;
-        if size > MAX_RECEIPT_BYTES {
-            return Err(crate::HailError::InvalidFormat(format!(
-                "Manhattan reduction receipt exceeds {MAX_RECEIPT_BYTES} byte limit: {path}"
-            )));
-        }
-        let bytes = read_file_bytes(&path)?;
-        serde_json::from_slice::<ManhattanPartitionReductionReceiptV1>(&bytes).map_err(|error| {
+    // Synthesize the complete deterministic inventory instead of listing and sorting
+    // O(P) object names. Each iterator item is fully validated before its counts or
+    // top hits enter the bounded global reduction.
+    let receipts = (0..expected_partition_count).map(|index| {
+        let receipt_name = format!("part-{index:05}-reduction.json");
+        let receipt_path = format!("{source_dir}/{receipt_name}");
+        let maximum_receipt_bytes = MANHATTAN_PARTITION_REDUCTION_MAX_BYTES_V1 as u64;
+        let bytes = read_file_bytes_at_most(&receipt_path, maximum_receipt_bytes).map_err(|error| {
             crate::HailError::InvalidFormat(format!(
-                "invalid Manhattan reduction receipt {path}: {error}"
+                "failed to read Manhattan reduction receipt within {maximum_receipt_bytes} byte limit: {receipt_path}: {error}"
             ))
-        })
+        })?;
+        let receipt = serde_json::from_slice::<ManhattanPartitionReductionReceiptV1>(&bytes)
+            .map_err(|error| {
+                crate::HailError::InvalidFormat(format!(
+                    "invalid Manhattan reduction receipt {receipt_path}: {error}"
+                ))
+            })?;
+        if receipt.partition_index != index as u64 {
+            return Err(crate::HailError::InvalidFormat(format!(
+                "Manhattan reduction receipt {receipt_path} declares partition {}",
+                receipt.partition_index
+            )));
+        }
+        let raster_name = format!("part-{index:05}.png");
+        let raster_path = format!("{source_dir}/{raster_name}");
+        let raster = read_file_bytes(&raster_path)?;
+        receipt.verify_finalized_raster(&raster_name, expected_width, expected_height, &raster)?;
+        Ok(receipt)
     });
     merge_partition_reduction_receipts_in_order(source, expected_partition_count, receipts)
+}
+
+fn read_file_bytes_at_most(path: &str, maximum: u64) -> Result<Vec<u8>> {
+    if is_cloud_path(path) {
+        let size = genohype_core::io::get_file_size(path)?;
+        if size > maximum {
+            return Err(crate::HailError::InvalidFormat(format!(
+                "object exceeds {maximum} byte limit"
+            )));
+        }
+        let size = usize::try_from(size).map_err(|_| {
+            crate::HailError::InvalidFormat(format!("file is too large to verify: {path}"))
+        })?;
+        return genohype_core::io::range_read(path, 0, size);
+    }
+
+    use std::io::Read;
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take(maximum + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > maximum {
+        return Err(crate::HailError::InvalidFormat(format!(
+            "object exceeds {maximum} byte limit"
+        )));
+    }
+    Ok(bytes)
 }
 
 fn read_file_bytes(path: &str) -> Result<Vec<u8>> {

@@ -16,7 +16,7 @@ use super::io::{
 use crate::manhattan::data::ManifestTopHit;
 
 /// Candidate for top hit found during parallel scan.
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TopHitCandidate {
     pub contig: String,
     pub position: i32,
@@ -40,18 +40,22 @@ pub(crate) fn merge_significant_hits(
     let sig_dir = format!("{}/{}", output_base, source);
     let output_file = format!("{}/{}_significant.parquet", output_base, source);
 
-    // Collect all sig parquet files
+    // Collect all sig parquet files. A zero-hit source still replaces the
+    // deterministic compatibility artifact with a valid zero-row Parquet so a
+    // prior nonzero run cannot survive behind an absent root entry.
     let sig_files = if is_cloud_path(&sig_dir) {
         list_cloud_parquet_files(&sig_dir, "-sig.parquet")?
     } else {
         let path = Path::new(&sig_dir);
         if !path.exists() {
+            write_empty_significant_output(&output_file)?;
             return Ok((0, None));
         }
         list_local_parquet_files(&sig_dir, "-sig.parquet")?
     };
 
     if sig_files.is_empty() {
+        write_empty_significant_output(&output_file)?;
         return Ok((0, None));
     }
 
@@ -89,7 +93,9 @@ pub(crate) fn merge_significant_hits(
         if let Some(candidate) = top_candidate {
             global_top = Some(match global_top {
                 None => candidate,
-                Some(current) if candidate.pvalue < current.pvalue => candidate,
+                Some(current) if compare_top_hit_candidates(&candidate, &current).is_lt() => {
+                    candidate
+                }
                 Some(current) => current,
             });
         }
@@ -103,6 +109,7 @@ pub(crate) fn merge_significant_hits(
     );
 
     if all_batches.is_empty() {
+        write_empty_significant_output(&output_file)?;
         return Ok((0, None));
     }
 
@@ -110,6 +117,7 @@ pub(crate) fn merge_significant_hits(
     let total_count: u64 = all_batches.iter().map(|b| b.num_rows() as u64).sum();
 
     if total_count == 0 {
+        write_empty_significant_output(&output_file)?;
         return Ok((0, None));
     }
 
@@ -134,6 +142,11 @@ pub(crate) fn merge_significant_hits(
     });
 
     Ok((total_count, top_hit))
+}
+
+fn write_empty_significant_output(path: &str) -> Result<()> {
+    let schema = std::sync::Arc::new(crate::manhattan::sig_writer::sig_hit_schema());
+    write_parquet_batches(path, &schema, &[])
 }
 
 /// Merge and combine significant hits from both exome and genome into a single file.
@@ -218,7 +231,9 @@ pub(crate) fn merge_and_combine_hits(
         if let Some(candidate) = top_candidate {
             global_top = Some(match global_top {
                 None => candidate,
-                Some(current) if candidate.pvalue < current.pvalue => candidate,
+                Some(current) if compare_top_hit_candidates(&candidate, &current).is_lt() => {
+                    candidate
+                }
                 Some(current) => current,
             });
         }
@@ -313,20 +328,35 @@ pub(crate) fn find_top_hit_in_batches(batches: &[RecordBatch]) -> Option<TopHitC
             }
             let pvalue = pvalue_col.value(i);
 
-            let dominated = best.as_ref().map(|b| pvalue >= b.pvalue).unwrap_or(false);
-            if dominated {
-                continue;
-            }
-
-            best = Some(TopHitCandidate {
+            let candidate = TopHitCandidate {
                 contig: contig_col.value(i).to_string(),
                 position: position_col.value(i),
                 ref_allele: ref_col.value(i).to_string(),
                 alt_allele: alt_col.value(i).to_string(),
                 pvalue,
-            });
+            };
+            if best.as_ref().map_or(true, |current| {
+                compare_top_hit_candidates(&candidate, current).is_lt()
+            }) {
+                best = Some(candidate);
+            }
         }
     }
 
     best
+}
+
+/// Deterministic p-value/locus order for legacy consumers. Canonical manifest
+/// top-hit identity comes from the reduction receipt because this Parquet schema
+/// does not carry supplied `neg_log10_p` for zero-p-value tie-breaking.
+pub(crate) fn compare_top_hit_candidates(
+    left: &TopHitCandidate,
+    right: &TopHitCandidate,
+) -> std::cmp::Ordering {
+    left.pvalue
+        .total_cmp(&right.pvalue)
+        .then_with(|| genohype_association::canonical_contig_cmp(&left.contig, &right.contig))
+        .then_with(|| left.position.cmp(&right.position))
+        .then_with(|| left.ref_allele.cmp(&right.ref_allele))
+        .then_with(|| left.alt_allele.cmp(&right.alt_allele))
 }

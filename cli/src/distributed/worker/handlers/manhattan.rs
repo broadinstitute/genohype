@@ -349,7 +349,8 @@ pub fn process_manhattan_scan_v2(
             // Finalize Parquet before publishing the receipt. Any writer error aborts the
             // partition and leaves no successful reduction receipt behind.
             sig_writer.finish()?;
-            let receipt = reduction.finish()?;
+            let raster_basename = format!("part-{partition_id:05}.png");
+            let receipt = reduction.finish_with_finalized_raster(raster_basename, &png_data)?;
             let receipt_file = format!("{}/part-{:05}-reduction.json", output_base, partition_id);
             write_partition_reduction_receipt(&receipt_file, &receipt)?;
 
@@ -494,6 +495,240 @@ fn clear_completion_marker(spec: &ManhattanAggregateSpec) -> Result<()> {
     }
 }
 
+fn verify_compatibility_significant_hits(
+    output_base: &str,
+    source: &str,
+    entry: Option<&crate::manhattan::data::ManifestSigHits>,
+    canonical: &genohype_association::AssociationVisualizationManifestV1,
+    threshold: f64,
+    expected_phenotype: &str,
+    expected_ancestry: &str,
+) -> Result<()> {
+    use arrow::array::{Array, Float64Array, Int32Array, Int64Array, StringArray};
+
+    let expected_count = canonical.significant_hit_count;
+    let expected_path = format!("{output_base}/{source}_significant.parquet");
+    if expected_count == 0 {
+        if entry.is_some() {
+            return Err(crate::HailError::InvalidFormat(format!(
+                "compatibility significant-hit entry for {source} must be absent when the canonical count is zero"
+            )));
+        }
+        let batches = crate::manhattan::aggregate::io::read_parquet_file(&expected_path).map_err(
+            |error| {
+                crate::HailError::InvalidFormat(format!(
+                    "invalid zero-hit compatibility Parquet {expected_path}: {error}"
+                ))
+            },
+        )?;
+        let expected_schema = crate::manhattan::sig_writer::sig_hit_schema();
+        if batches
+            .iter()
+            .any(|batch| batch.schema().as_ref() != &expected_schema || batch.num_rows() != 0)
+        {
+            return Err(crate::HailError::InvalidFormat(format!(
+                "zero-hit compatibility Parquet for {source} is stale or invalid"
+            )));
+        }
+        return Ok(());
+    }
+
+    let entry = entry.ok_or_else(|| {
+        crate::HailError::InvalidFormat(format!(
+            "compatibility manifest is missing {source} significant hits for canonical count {expected_count}"
+        ))
+    })?;
+    let canonical_top = canonical.top_hits.first().ok_or_else(|| {
+        crate::HailError::InvalidFormat(format!(
+            "canonical {source} manifest has significant hits but no top hit"
+        ))
+    })?;
+    let canonical_id = format!(
+        "{}:{}:{}:{}",
+        crate::manhattan::reference::normalize_contig_name(&canonical_top.contig),
+        canonical_top.position,
+        canonical_top.ref_allele.as_deref().unwrap_or_default(),
+        canonical_top.alt_allele.as_deref().unwrap_or_default()
+    );
+    if canonical_top.pvalue >= threshold {
+        return Err(crate::HailError::InvalidFormat(format!(
+            "canonical {source} top hit is not significant at the aggregate threshold"
+        )));
+    }
+    if entry.path != expected_path || entry.count != expected_count {
+        return Err(crate::HailError::InvalidFormat(format!(
+            "compatibility {source} significant-hit path/count does not match the canonical manifest"
+        )));
+    }
+
+    let batches =
+        crate::manhattan::aggregate::io::read_parquet_file(&entry.path).map_err(|error| {
+            crate::HailError::InvalidFormat(format!(
+                "invalid compatibility significant-hit Parquet {}: {error}",
+                entry.path
+            ))
+        })?;
+    let expected_schema = crate::manhattan::sig_writer::sig_hit_schema();
+    let mut actual_count = 0_u64;
+    let mut canonical_top_present = false;
+    for batch in &batches {
+        if batch.schema().as_ref() != &expected_schema
+            || expected_schema
+                .fields()
+                .iter()
+                .enumerate()
+                .any(|(index, field)| !field.is_nullable() && batch.column(index).null_count() != 0)
+        {
+            return Err(crate::HailError::InvalidFormat(format!(
+                "compatibility {source} significant-hit Parquet has the wrong schema or nullability"
+            )));
+        }
+        actual_count = actual_count
+            .checked_add(batch.num_rows() as u64)
+            .ok_or_else(|| {
+                crate::HailError::InvalidFormat(
+                    "compatibility significant-hit row count overflowed".into(),
+                )
+            })?;
+        let phenotype_column = batch
+            .column_by_name("phenotype")
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| {
+                crate::HailError::InvalidFormat(
+                    "compatibility significant-hit phenotype column is invalid".into(),
+                )
+            })?;
+        let ancestry_column = batch
+            .column_by_name("ancestry")
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| {
+                crate::HailError::InvalidFormat(
+                    "compatibility significant-hit ancestry column is invalid".into(),
+                )
+            })?;
+        let source_column = batch
+            .column_by_name("sequencing_type")
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| {
+                crate::HailError::InvalidFormat(
+                    "compatibility significant-hit sequencing_type column is invalid".into(),
+                )
+            })?;
+        let pvalue_column = batch
+            .column_by_name("pvalue")
+            .and_then(|column| column.as_any().downcast_ref::<Float64Array>())
+            .ok_or_else(|| {
+                crate::HailError::InvalidFormat(
+                    "compatibility significant-hit pvalue column is invalid".into(),
+                )
+            })?;
+        let xpos_column = batch
+            .column_by_name("xpos")
+            .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+            .ok_or_else(|| {
+                crate::HailError::InvalidFormat(
+                    "compatibility significant-hit xpos column is invalid".into(),
+                )
+            })?;
+        let contig_column = batch
+            .column_by_name("contig")
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| {
+                crate::HailError::InvalidFormat(
+                    "compatibility significant-hit contig column is invalid".into(),
+                )
+            })?;
+        let position_column = batch
+            .column_by_name("position")
+            .and_then(|column| column.as_any().downcast_ref::<Int32Array>())
+            .ok_or_else(|| {
+                crate::HailError::InvalidFormat(
+                    "compatibility significant-hit position column is invalid".into(),
+                )
+            })?;
+        let ref_column = batch
+            .column_by_name("ref")
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| {
+                crate::HailError::InvalidFormat(
+                    "compatibility significant-hit ref column is invalid".into(),
+                )
+            })?;
+        let alt_column = batch
+            .column_by_name("alt")
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| {
+                crate::HailError::InvalidFormat(
+                    "compatibility significant-hit alt column is invalid".into(),
+                )
+            })?;
+        for row in 0..batch.num_rows() {
+            let contig = contig_column.value(row);
+            let position = position_column.value(row);
+            let canonical_contig = genohype_association::canonical_contig(contig);
+            if phenotype_column.value(row) != expected_phenotype
+                || ancestry_column.value(row) != expected_ancestry
+                || source_column.value(row) != source
+                || canonical_contig.is_none()
+                || crate::manhattan::reference::normalize_contig_name(
+                    canonical_contig.as_deref().unwrap_or_default(),
+                ) != contig
+                || position <= 0
+                || xpos_column.value(row)
+                    != crate::manhattan::reference::calculate_xpos(contig, position)
+                || pvalue_column.is_null(row)
+                || !pvalue_column.value(row).is_finite()
+                || pvalue_column.value(row) < 0.0
+                || pvalue_column.value(row) > 1.0
+                || pvalue_column.value(row) >= threshold
+            {
+                return Err(crate::HailError::InvalidFormat(format!(
+                    "compatibility {source} significant-hit Parquet contains inconsistent row content"
+                )));
+            }
+            let row_id = format!(
+                "{}:{}:{}:{}",
+                contig,
+                position,
+                ref_column.value(row),
+                alt_column.value(row)
+            );
+            if row_id == canonical_id
+                && pvalue_column.value(row).to_bits() == canonical_top.pvalue.to_bits()
+            {
+                canonical_top_present = true;
+            }
+        }
+    }
+    if actual_count != expected_count {
+        return Err(crate::HailError::InvalidFormat(format!(
+            "compatibility {source} significant-hit Parquet has {actual_count} rows, expected {expected_count}"
+        )));
+    }
+
+    if !canonical_top_present {
+        return Err(crate::HailError::InvalidFormat(format!(
+            "compatibility {source} significant-hit Parquet does not contain the canonical top hit"
+        )));
+    }
+    let compatibility_top = entry.top_hit.as_ref().ok_or_else(|| {
+        crate::HailError::InvalidFormat(format!(
+            "compatibility {source} significant-hit metadata has no top hit"
+        ))
+    })?;
+    if compatibility_top.id != canonical_id
+        || compatibility_top.pvalue.to_bits() != canonical_top.pvalue.to_bits()
+        || compatibility_top.gene.is_some()
+        || compatibility_top.consequence.is_some()
+    {
+        return Err(crate::HailError::InvalidFormat(format!(
+            "compatibility {source} top-hit metadata does not match its Parquet content"
+        )));
+    }
+
+    Ok(())
+}
+
 /// Process Manhattan aggregate phase (V2 pipeline).
 ///
 /// This is the Phase 2 worker task. It:
@@ -564,9 +799,20 @@ pub fn verify_and_checkpoint(spec: &ManhattanAggregateSpec) -> Result<()> {
     if root.inputs.exome_results != spec.exome_results
         || root.inputs.genome_results != spec.genome_results
         || root.inputs.gene_burden != spec.gene_burden
+        || spec
+            .phenotype_id
+            .as_ref()
+            .is_some_and(|phenotype| root.phenotype != *phenotype)
+        || spec
+            .ancestry
+            .as_ref()
+            .is_some_and(|ancestry| root.ancestry.as_ref() != Some(ancestry))
         || root.manhattans.exome.is_some() != spec.exome_results.is_some()
         || root.manhattans.genome.is_some() != spec.genome_results.is_some()
         || root.manhattans.gene.is_some() != spec.gene_burden.is_some()
+        || (spec.exome_results.is_none() && root.significant_hits.exome.is_some())
+        || (spec.genome_results.is_none() && root.significant_hits.genome.is_some())
+        || (spec.gene_burden.is_none() && root.significant_hits.gene.is_some())
     {
         return Err(crate::HailError::InvalidFormat(format!(
             "compatibility manifest source inventory mismatch: {root_manifest_path}"
@@ -684,6 +930,24 @@ pub fn verify_and_checkpoint(spec: &ManhattanAggregateSpec) -> Result<()> {
                 "canonical raster size or checksum mismatch: {raster_path}"
             )));
         }
+
+        let compatibility_significant_hits = match source {
+            "exome" => root.significant_hits.exome.as_ref(),
+            "genome" => root.significant_hits.genome.as_ref(),
+            _ => unreachable!(),
+        };
+        verify_compatibility_significant_hits(
+            output_base,
+            source,
+            compatibility_significant_hits,
+            &manifest,
+            spec.threshold,
+            spec.phenotype_id.as_deref().unwrap_or(&root.phenotype),
+            spec.ancestry
+                .as_deref()
+                .or(root.ancestry.as_deref())
+                .unwrap_or("meta"),
+        )?;
     }
 
     // Validate every remaining compatibility artifact referenced by the root.
@@ -727,31 +991,16 @@ pub fn verify_and_checkpoint(spec: &ManhattanAggregateSpec) -> Result<()> {
             }
         }
     }
-    for (source, hit, enabled) in [
-        (
-            "exome",
-            root.significant_hits.exome.as_ref(),
-            spec.exome_results.is_some(),
-        ),
-        (
-            "genome",
-            root.significant_hits.genome.as_ref(),
-            spec.genome_results.is_some(),
-        ),
-        (
-            "gene",
-            root.significant_hits.gene.as_ref(),
-            spec.gene_burden.is_some(),
-        ),
-    ] {
-        if let Some(hit) = hit {
-            if !enabled || hit.count == 0 {
-                return Err(crate::HailError::InvalidFormat(format!(
-                    "invalid compatibility significant-hit inventory for {source}"
-                )));
-            }
-            read_all(&hit.path)?;
+    // Variant significant-hit entries were checked exactly against their canonical
+    // manifests and Parquet content above. Preserve the existing gene compatibility
+    // behavior because Phase 1 does not publish a canonical gene manifest.
+    if let Some(hit) = root.significant_hits.gene.as_ref() {
+        if spec.gene_burden.is_none() || hit.count == 0 {
+            return Err(crate::HailError::InvalidFormat(
+                "invalid compatibility significant-hit inventory for gene".into(),
+            ));
         }
+        read_all(&hit.path)?;
     }
     for locus in &root.loci {
         if let Some(plot) = locus.plot.as_deref() {

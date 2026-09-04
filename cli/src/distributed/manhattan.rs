@@ -15,6 +15,8 @@ use std::collections::BTreeSet;
 
 pub const MANHATTAN_PARTITION_REDUCTION_SCHEMA_V1: &str = "1.0";
 pub const MANHATTAN_PARTITION_TOP_HITS_MAX_V1: usize = DEFAULT_TOP_K;
+pub const MANHATTAN_PARTITION_REDUCTION_MAX_BYTES_V1: usize = 1_048_576;
+const CANONICAL_WARNING_CODES_V1: [&str; 2] = ["neg_log10_p_display_capped", "pvalue_underflow"];
 
 /// Stable source identity stored in a partition reduction receipt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,11 +35,25 @@ impl From<ManhattanSource> for ManhattanReductionSourceV1 {
     }
 }
 
+/// Stable identity of the finalized whole-genome raster shard covered by a receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManhattanPartitionRasterArtifactV1 {
+    pub basename: String,
+    pub partition_index: u64,
+    pub source: ManhattanReductionSourceV1,
+    pub byte_size: u64,
+    pub checksum: String,
+    pub width: u32,
+    pub height: u32,
+}
+
 /// Bounded result of scanning one source partition.
 ///
 /// The best points are kept in canonical association order and are hard-bounded
 /// at 100. `source_digest` fingerprints every decoded row, including skipped
-/// rows, while excluding input and output paths.
+/// rows, while excluding input and output paths. `raster` binds canonical
+/// publication to the exact finalized whole-genome PNG shard. It remains
+/// optional on the wire solely so pre-binding receipts can be read for diagnostics.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ManhattanPartitionReductionReceiptV1 {
     pub schema_version: String,
@@ -51,6 +67,8 @@ pub struct ManhattanPartitionReductionReceiptV1 {
     pub top_hits: Vec<AssociationPointV1>,
     pub warnings: Vec<String>,
     pub source_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raster: Option<ManhattanPartitionRasterArtifactV1>,
 }
 
 #[derive(Deserialize)]
@@ -66,6 +84,8 @@ struct ManhattanPartitionReductionReceiptWireV1 {
     top_hits: Vec<AssociationPointV1>,
     warnings: Vec<String>,
     source_digest: String,
+    #[serde(default)]
+    raster: Option<ManhattanPartitionRasterArtifactV1>,
 }
 
 impl<'de> Deserialize<'de> for ManhattanPartitionReductionReceiptV1 {
@@ -86,6 +106,7 @@ impl<'de> Deserialize<'de> for ManhattanPartitionReductionReceiptV1 {
             top_hits: wire.top_hits,
             warnings: wire.warnings,
             source_digest: wire.source_digest,
+            raster: wire.raster,
         };
         receipt.validate().map_err(D::Error::custom)?;
         Ok(receipt)
@@ -148,25 +169,87 @@ impl ManhattanPartitionReductionReceiptV1 {
         if self.warnings.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err("warnings must be deduplicated and lexically ordered".into());
         }
-        let digest = self
-            .source_digest
-            .strip_prefix("sha256:")
-            .ok_or_else(|| "source_digest must use the sha256: prefix".to_string())?;
-        if digest.len() != 64
-            || !digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        if self
+            .warnings
+            .iter()
+            .any(|warning| !CANONICAL_WARNING_CODES_V1.contains(&warning.as_str()))
         {
-            return Err("source_digest must contain 64 lowercase hexadecimal digits".into());
+            return Err("warnings contain a non-canonical warning code".into());
+        }
+        validate_sha256(&self.source_digest, "source_digest")?;
+        if let Some(raster) = &self.raster {
+            let expected_basename = format!("part-{:05}.png", self.partition_index);
+            if raster.basename != expected_basename
+                || raster.basename.contains('/')
+                || raster.basename.contains('\\')
+                || raster.partition_index != self.partition_index
+                || raster.source != self.source
+                || raster.width == 0
+                || raster.height == 0
+            {
+                return Err("raster artifact identity does not match its receipt".into());
+            }
+            validate_sha256(&raster.checksum, "raster checksum")?;
+        }
+        Ok(())
+    }
+
+    /// Require the publication-only raster binding and verify it against the bytes
+    /// currently stored at the deterministic shard path.
+    pub(crate) fn verify_finalized_raster(
+        &self,
+        expected_basename: &str,
+        expected_width: u32,
+        expected_height: u32,
+        bytes: &[u8],
+    ) -> Result<()> {
+        self.validate().map_err(HailError::InvalidFormat)?;
+        let artifact = self.raster.as_ref().ok_or_else(|| {
+            HailError::InvalidFormat(format!(
+                "Manhattan partition {} reduction receipt is not bound to a raster shard",
+                self.partition_index
+            ))
+        })?;
+        let actual_size = u64::try_from(bytes.len())
+            .map_err(|_| HailError::InvalidFormat("raster shard is too large".into()))?;
+        let actual_checksum = format!("sha256:{:x}", Sha256::digest(bytes));
+        let pixmap = tiny_skia::Pixmap::decode_png(bytes).map_err(|error| {
+            HailError::InvalidFormat(format!(
+                "invalid Manhattan raster shard {expected_basename}: {error}"
+            ))
+        })?;
+        if artifact.basename != expected_basename
+            || artifact.width != expected_width
+            || artifact.height != expected_height
+            || artifact.byte_size != actual_size
+            || artifact.checksum != actual_checksum
+            || pixmap.width() != artifact.width
+            || pixmap.height() != artifact.height
+        {
+            return Err(HailError::InvalidFormat(format!(
+                "Manhattan partition {} raster shard does not match its reduction receipt",
+                self.partition_index
+            )));
         }
         Ok(())
     }
 
     pub(crate) fn to_json_bytes(&self) -> Result<Vec<u8>> {
         self.validate().map_err(HailError::InvalidFormat)?;
+        if self.raster.is_none() {
+            return Err(HailError::InvalidFormat(
+                "cannot publish an unbound Manhattan partition reduction receipt".into(),
+            ));
+        }
         let mut bytes = serde_json::to_vec_pretty(self)
             .map_err(|error| HailError::InvalidFormat(error.to_string()))?;
         bytes.push(b'\n');
+        if bytes.len() > MANHATTAN_PARTITION_REDUCTION_MAX_BYTES_V1 {
+            return Err(HailError::InvalidFormat(format!(
+                "Manhattan partition reduction receipt exceeds {} byte publication limit",
+                MANHATTAN_PARTITION_REDUCTION_MAX_BYTES_V1
+            )));
+        }
         Ok(bytes)
     }
 }
@@ -246,7 +329,38 @@ impl ManhattanPartitionReductionAccumulatorV1 {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn finish(self) -> Result<ManhattanPartitionReductionReceiptV1> {
+        self.finish_with_raster(None)
+    }
+
+    /// Finish a receipt only after the caller has finalized the exact PNG bytes.
+    pub(crate) fn finish_with_finalized_raster(
+        self,
+        basename: String,
+        png_bytes: &[u8],
+    ) -> Result<ManhattanPartitionReductionReceiptV1> {
+        let pixmap = tiny_skia::Pixmap::decode_png(png_bytes).map_err(|error| {
+            HailError::InvalidFormat(format!("cannot bind invalid Manhattan PNG: {error}"))
+        })?;
+        let raster = ManhattanPartitionRasterArtifactV1 {
+            basename,
+            partition_index: self.partition_index as u64,
+            source: self.source,
+            byte_size: u64::try_from(png_bytes.len()).map_err(|_| {
+                HailError::InvalidFormat("Manhattan PNG byte size exceeds u64".into())
+            })?,
+            checksum: format!("sha256:{:x}", Sha256::digest(png_bytes)),
+            width: pixmap.width(),
+            height: pixmap.height(),
+        };
+        self.finish_with_raster(Some(raster))
+    }
+
+    fn finish_with_raster(
+        self,
+        raster: Option<ManhattanPartitionRasterArtifactV1>,
+    ) -> Result<ManhattanPartitionReductionReceiptV1> {
         let receipt = ManhattanPartitionReductionReceiptV1 {
             schema_version: MANHATTAN_PARTITION_REDUCTION_SCHEMA_V1.into(),
             partition_index: self.partition_index as u64,
@@ -259,6 +373,7 @@ impl ManhattanPartitionReductionAccumulatorV1 {
             top_hits: self.top_hits.into_sorted_vec(),
             warnings: self.warnings.into_iter().collect(),
             source_digest: format!("sha256:{:x}", self.source_hasher.finalize()),
+            raster,
         };
         receipt.validate().map_err(HailError::InvalidFormat)?;
         Ok(receipt)
@@ -382,6 +497,22 @@ pub(crate) fn merge_partition_reduction_receipts(
         expected_partition_count,
         receipts.into_iter().map(Ok),
     )
+}
+
+fn validate_sha256(digest: &str, name: &str) -> std::result::Result<(), String> {
+    let hex = digest
+        .strip_prefix("sha256:")
+        .ok_or_else(|| format!("{name} must use the sha256: prefix"))?;
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!(
+            "{name} must contain 64 lowercase hexadecimal digits"
+        ));
+    }
+    Ok(())
 }
 
 fn parse_source_digest(digest: &str) -> Result<[u8; 32]> {
@@ -508,6 +639,7 @@ mod tests {
                 top_hits,
                 warnings: vec!["pvalue_underflow".into()],
                 source_digest: format!("sha256:{:064x}", partition_index + 1),
+                raster: None,
             }
         };
         let first = receipt(0, &[1e-6, 1e-12]);
@@ -558,6 +690,7 @@ mod tests {
             top_hits: vec![],
             warnings: vec![],
             source_digest: format!("sha256:{:064x}", partition_index + 1),
+            raster: None,
         };
         let zero = receipt(0, ManhattanReductionSourceV1::Exome);
         assert!(merge_partition_reduction_receipts(
@@ -620,6 +753,93 @@ mod tests {
                 .to_string()
                 .contains("exactly")
         );
+    }
+
+    #[test]
+    fn old_unbound_receipts_deserialize_for_diagnostics_but_cannot_publish() {
+        let accumulator =
+            ManhattanPartitionReductionAccumulatorV1::new(0, ManhattanSource::Exome).unwrap();
+        let receipt = accumulator.finish().unwrap();
+        let json = serde_json::to_string(&receipt).unwrap();
+        let decoded: ManhattanPartitionReductionReceiptV1 = serde_json::from_str(&json).unwrap();
+        assert!(decoded.raster.is_none());
+        assert!(decoded
+            .to_json_bytes()
+            .unwrap_err()
+            .to_string()
+            .contains("unbound"));
+        assert!(decoded
+            .verify_finalized_raster("part-00000.png", 1, 1, b"not a png")
+            .unwrap_err()
+            .to_string()
+            .contains("not bound"));
+    }
+
+    #[test]
+    fn producer_refuses_receipts_above_the_ingestion_byte_limit() {
+        let mut accumulator =
+            ManhattanPartitionReductionAccumulatorV1::new(0, ManhattanSource::Exome).unwrap();
+        accumulator
+            .observe_source_row(&EncodedValue::Int32(1))
+            .unwrap();
+        let mut oversized_point = point(0, 1e-9);
+        oversized_point.ref_allele = Some("A".repeat(MANHATTAN_PARTITION_REDUCTION_MAX_BYTES_V1));
+        accumulator
+            .observe_valid_point(oversized_point, vec![], true, true)
+            .unwrap();
+        let png = tiny_skia::Pixmap::new(1, 1).unwrap().encode_png().unwrap();
+        let receipt = accumulator
+            .finish_with_finalized_raster("part-00000.png".into(), &png)
+            .unwrap();
+        assert!(receipt
+            .to_json_bytes()
+            .unwrap_err()
+            .to_string()
+            .contains("publication limit"));
+    }
+
+    #[test]
+    fn receipt_validation_rejects_noncanonical_warning_vocabulary() {
+        let accumulator =
+            ManhattanPartitionReductionAccumulatorV1::new(0, ManhattanSource::Exome).unwrap();
+        let receipt = accumulator.finish().unwrap();
+        let mut value = serde_json::to_value(receipt).unwrap();
+        value["warnings"] = serde_json::json!(["partition-specific-warning-00000"]);
+        assert!(
+            serde_json::from_value::<ManhattanPartitionReductionReceiptV1>(value)
+                .unwrap_err()
+                .to_string()
+                .contains("non-canonical")
+        );
+    }
+
+    #[test]
+    fn high_partition_count_merge_keeps_only_bounded_global_state() {
+        const PARTITIONS: usize = 20_000;
+        let receipts = (0..PARTITIONS).map(|partition_index| {
+            Ok(ManhattanPartitionReductionReceiptV1 {
+                schema_version: MANHATTAN_PARTITION_REDUCTION_SCHEMA_V1.into(),
+                partition_index: partition_index as u64,
+                source: ManhattanReductionSourceV1::Genome,
+                row_count: 0,
+                valid_row_count: 0,
+                skipped_row_count: 0,
+                rendered_point_count: 0,
+                significant_hit_count: 0,
+                top_hits: vec![],
+                warnings: vec!["pvalue_underflow".into()],
+                source_digest: format!("sha256:{:064x}", partition_index + 1),
+                raster: None,
+            })
+        });
+        let merged = merge_partition_reduction_receipts_in_order(
+            ManhattanReductionSourceV1::Genome,
+            PARTITIONS,
+            receipts,
+        )
+        .unwrap();
+        assert!(merged.top_hits.is_empty());
+        assert_eq!(merged.warnings, ["pvalue_underflow"]);
     }
 
     #[test]

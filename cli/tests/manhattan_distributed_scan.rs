@@ -3,6 +3,7 @@ use genohype_cli::distributed::message::{ManhattanScanSpec, ManhattanSource};
 use genohype_cli::distributed::worker::handlers::manhattan::process_manhattan_scan_v2;
 use genohype_cli::manhattan::config::ResolvedStyle;
 use genohype_cli::manhattan::layout::{ChromosomeLayout, YScale};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -59,6 +60,17 @@ fn local_worker_scan_publishes_canonical_bounded_receipt_last() {
     assert_eq!(first.top_hits.len(), 10);
     assert_eq!(first.warnings, ["pvalue_underflow"]);
     assert!(first.top_hits.iter().all(|point| point.source_ordinal < 12));
+    let raster = first.raster.as_ref().expect("published receipt is bound");
+    let raster_bytes = fs::read(temp.path().join("first/exome/part-00000.png")).unwrap();
+    assert_eq!(raster.basename, "part-00000.png");
+    assert_eq!(raster.partition_index, 0);
+    assert_eq!(raster.width, 800);
+    assert_eq!(raster.height, 400);
+    assert_eq!(raster.byte_size, raster_bytes.len() as u64);
+    assert_eq!(
+        raster.checksum,
+        format!("sha256:{:x}", Sha256::digest(&raster_bytes))
+    );
 
     // Output location and a fresh worker engine cannot alter source identity or ordering.
     let second = scan(&temp.path().join("second"));

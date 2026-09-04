@@ -108,14 +108,6 @@ pub(crate) fn list_cloud_files(dir: &str, suffix: &str) -> Result<Vec<String>> {
     Ok(files)
 }
 
-pub(crate) fn list_files(dir: &str, suffix: &str) -> Result<Vec<String>> {
-    if is_cloud_path(dir) {
-        list_cloud_files(dir, suffix)
-    } else {
-        list_local_files(dir, suffix)
-    }
-}
-
 // Compatibility wrappers keep the established significant-hit merge call sites explicit.
 pub(crate) fn list_local_parquet_files(dir: &str, suffix: &str) -> Result<Vec<String>> {
     list_local_files(dir, suffix)
