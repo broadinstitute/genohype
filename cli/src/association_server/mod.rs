@@ -10,6 +10,7 @@ use genohype_association::{
 use genohype_core::{HailError, Result};
 use sha2::{Digest, Sha256};
 use std::fs::File;
+use std::future::{poll_fn, Future};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -81,6 +82,19 @@ fn serve_prepared(
             .map_err(HailError::Io)?;
         let url = server::viewer_url(listener.local_addr().map_err(HailError::Io)?, &token)
             .map_err(HailError::Io)?;
+
+        // Poll once before publishing the URL so Tokio installs its process-wide
+        // Ctrl-C listener. A client may signal immediately after observing the
+        // URL; leaving the first poll until serve_with_shutdown creates a window
+        // where that signal is lost and the viewer serves indefinitely.
+        let mut shutdown = Box::pin(server::shutdown_signal());
+        let interrupted =
+            poll_fn(|context| std::task::Poll::Ready(shutdown.as_mut().poll(context).is_ready()))
+                .await;
+        if interrupted {
+            return Ok(());
+        }
+
         announce_and_open(
             &url,
             options.open,
@@ -89,7 +103,7 @@ fn serve_prepared(
             open::open,
         )
         .map_err(HailError::Io)?;
-        server::serve_with_shutdown(listener, app, server::shutdown_signal())
+        server::serve_with_shutdown(listener, app, shutdown)
             .await
             .map_err(HailError::Io)
     })
