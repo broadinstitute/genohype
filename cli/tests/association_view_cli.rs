@@ -2,9 +2,10 @@
 
 use genohype_association::AssociationVisualizationManifestV1;
 use sha2::{Digest, Sha256};
-use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::fs;
+use std::io::{BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -218,4 +219,311 @@ fn ordinary_legacy_manhattan_remains_nonblocking() {
     );
     assert!(output.with_extension("png").is_file());
     assert!(PathBuf::from(format!("{}.manifest.json", output.display())).is_file());
+}
+
+struct RunningAssociationViewer {
+    child: ChildGuard,
+    url: url::Url,
+    lines: Vec<String>,
+    _stderr_rx: mpsc::Receiver<String>,
+    cache_root: PathBuf,
+}
+
+impl RunningAssociationViewer {
+    fn stop(mut self) -> ExitStatus {
+        assert_eq!(
+            unsafe { libc::kill(self.child.0.id() as i32, libc::SIGINT) },
+            0
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = self.child.0.try_wait().unwrap() {
+                return status;
+            }
+            assert!(Instant::now() < deadline, "association viewer did not stop");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn output_text(&self) -> String {
+        self.lines.join("\n")
+    }
+}
+
+fn write_association_source(path: &Path) {
+    fs::write(
+        path,
+        "CHR\tPOS\tP\tGENE\n1\t10\t0.5\tGENE1\n1\t20\t1e-9\tGENE2\n2\t30\tbad\tPRIVATE_REJECTED_VALUE\n",
+    )
+    .unwrap();
+}
+
+fn association_command(home: &Path, source: &Path, extra: &[&str]) -> Command {
+    fs::create_dir_all(home.join("Library/Caches")).unwrap();
+    fs::create_dir_all(home.join("xdg-cache")).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_genohype"));
+    command
+        .env("HOME", home)
+        .env("XDG_CACHE_HOME", home.join("xdg-cache"))
+        .args([
+            "association",
+            "view",
+            source.to_str().unwrap(),
+            "--build",
+            "GRCh38",
+            "--map",
+            "contig=CHR,position=POS,pvalue=P,gene=GENE",
+            "--top-hits",
+            "2",
+            "--width",
+            "320",
+            "--height",
+            "160",
+            "--no-open",
+            "--port",
+            "0",
+        ])
+        .args(extra)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
+fn start_association_viewer(
+    home: &Path,
+    source: &Path,
+    extra: &[&str],
+) -> RunningAssociationViewer {
+    let mut child = association_command(home, source, extra).spawn().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let (line_tx, line_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if line_tx.send(line.unwrap_or_default()).is_err() {
+                break;
+            }
+        }
+    });
+    let (stderr_tx, stderr_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            if stderr_tx.send(line.unwrap_or_default()).is_err() {
+                break;
+            }
+        }
+    });
+
+    let child = ChildGuard(child);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut lines = Vec::new();
+    let mut cache_root = None;
+    let url = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let line = line_rx.recv_timeout(remaining).unwrap_or_else(|_| {
+            let stderr: Vec<_> = stderr_rx.try_iter().collect();
+            panic!("timed out waiting for association viewer; stdout={lines:?}; stderr={stderr:?}")
+        });
+        if let Some(path) = line.strip_prefix("Association cache root: ") {
+            cache_root = Some(PathBuf::from(path));
+        }
+        let found = line
+            .strip_prefix("Viewer URL: ")
+            .map(|value| url::Url::parse(value).unwrap());
+        lines.push(line);
+        if let Some(url) = found {
+            break url;
+        }
+    };
+    RunningAssociationViewer {
+        child,
+        url,
+        lines,
+        _stderr_rx: stderr_rx,
+        cache_root: cache_root.expect("cache root announcement"),
+    }
+}
+
+fn dataset_id(viewer: &RunningAssociationViewer) -> String {
+    viewer
+        .lines
+        .iter()
+        .find_map(|line| line.split_once("dataset_id=").map(|(_, id)| id.to_string()))
+        .expect("dataset ID announcement")
+}
+
+fn completed_generation(cache_root: &Path, dataset_id: &str) -> PathBuf {
+    cache_root.join("sessions").join(dataset_id)
+}
+
+#[tokio::test]
+async fn association_view_cold_warm_rebuild_apis_cleanup_and_ephemeral_are_deterministic() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let source = temp.path().join("private-source.tsv");
+    write_association_source(&source);
+
+    let inspect = Command::new(env!("CARGO_BIN_EXE_genohype"))
+        .args([
+            "association",
+            "inspect",
+            source.to_str().unwrap(),
+            "--build",
+            "GRCh38",
+        ])
+        .output()
+        .unwrap();
+    assert!(inspect.status.success());
+    let inspect_stdout = String::from_utf8(inspect.stdout).unwrap();
+    assert!(inspect_stdout.contains("genohype association view"));
+    assert!(inspect_stdout.contains("--map contig=CHR"));
+    assert!(inspect_stdout.contains("--map position=POS"));
+    assert!(inspect_stdout.contains("--map pvalue=P"));
+
+    let cold = start_association_viewer(&home, &source, &[]);
+    let cold_output = cold.output_text();
+    assert!(cold_output.contains("private local plaintext"));
+    assert!(cold_output.contains("use --ephemeral"));
+    assert!(cold_output.contains("Association session: cold build"));
+    assert!(cold_output.contains("Rows: seen=3 valid=2 rejected=1"));
+    assert!(!cold_output.contains("PRIVATE_REJECTED_VALUE"));
+    let first_id = dataset_id(&cold);
+    let first_generation = completed_generation(&cold.cache_root, &first_id);
+    let first_marker = fs::read(first_generation.join("complete.json")).unwrap();
+
+    let manifest_response = reqwest::get(cold.url.join("api/manifest").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(manifest_response.status(), reqwest::StatusCode::OK);
+    let manifest_bytes = manifest_response.bytes().await.unwrap();
+    let manifest: AssociationVisualizationManifestV1 =
+        serde_json::from_slice(&manifest_bytes).unwrap();
+    assert_eq!(manifest.plot_id, first_id);
+    assert_eq!(manifest.title, "Association dataset");
+    assert_eq!(manifest.row_count, 3);
+    assert_eq!(manifest.valid_row_count, 2);
+    assert_eq!(manifest.skipped_row_count, 1);
+    let manifest_url = cold.url.join("api/manifest").unwrap();
+    let table_url = manifest_url
+        .join(&manifest.resources.table_api.as_ref().unwrap().url)
+        .unwrap();
+    let table_response = reqwest::get(table_url.clone()).await.unwrap();
+    assert_eq!(table_response.status(), reqwest::StatusCode::OK);
+    let table_bytes = table_response.bytes().await.unwrap();
+    let table: serde_json::Value = serde_json::from_slice(&table_bytes).unwrap();
+    assert_eq!(table["dataset_id"], first_id);
+    assert_eq!(table["total"], 2);
+    let region_url = manifest_url
+        .join(&manifest.resources.region_api.as_ref().unwrap().url)
+        .unwrap();
+    let mut region_url = region_url;
+    region_url.set_query(Some("contig=1&start=1&end=100&offset=0&limit=100"));
+    let region_response = reqwest::get(region_url).await.unwrap();
+    assert_eq!(region_response.status(), reqwest::StatusCode::OK);
+    let region_bytes = region_response.bytes().await.unwrap();
+    let region: serde_json::Value = serde_json::from_slice(&region_bytes).unwrap();
+    assert_eq!(region["total"], 2);
+    let wrong_id = "00000000-0000-4000-8000-000000000000";
+    let wrong = table_url.as_str().replace(&first_id, wrong_id);
+    assert_eq!(
+        reqwest::get(wrong).await.unwrap().status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+    for body in [&manifest_bytes[..], &table_bytes[..], &region_bytes[..]] {
+        let body = String::from_utf8_lossy(body);
+        assert!(!body.contains(source.to_str().unwrap()));
+        assert!(!body.contains(cold.cache_root.to_str().unwrap()));
+        assert!(!body.contains("PRIVATE_REJECTED_VALUE"));
+    }
+    assert!(cold.stop().success());
+
+    let warm = start_association_viewer(&home, &source, &[]);
+    assert!(warm
+        .output_text()
+        .contains("Association session: warm reuse"));
+    assert_eq!(dataset_id(&warm), first_id);
+    assert_eq!(
+        fs::read(first_generation.join("complete.json")).unwrap(),
+        first_marker
+    );
+    assert!(warm.stop().success());
+
+    let rebuilt = start_association_viewer(&home, &source, &["--rebuild"]);
+    assert!(rebuilt
+        .output_text()
+        .contains("Association session: cold build"));
+    let second_id = dataset_id(&rebuilt);
+    assert_ne!(second_id, first_id);
+    assert!(first_generation.join("complete.json").is_file());
+    assert!(completed_generation(&rebuilt.cache_root, &second_id)
+        .join("complete.json")
+        .is_file());
+    assert!(rebuilt.stop().success());
+
+    let cleaned = start_association_viewer(&home, &source, &["--cleanup-expired"]);
+    assert!(cleaned.output_text().contains("sessions_removed=1"));
+    assert_eq!(dataset_id(&cleaned), second_id);
+    assert!(!first_generation.exists());
+    let cache_root = cleaned.cache_root.clone();
+    assert!(cleaned.stop().success());
+
+    let ephemeral = start_association_viewer(&home, &source, &["--rebuild", "--ephemeral"]);
+    assert!(ephemeral.output_text().contains("Retention: --ephemeral"));
+    let ephemeral_generation = completed_generation(&ephemeral.cache_root, &dataset_id(&ephemeral));
+    assert!(ephemeral_generation.is_dir());
+    assert!(ephemeral.stop().success());
+    assert!(!ephemeral_generation.exists());
+    assert!(completed_generation(&cache_root, &second_id).is_dir());
+}
+
+#[test]
+fn association_view_sigint_during_build_is_non_success_and_cleans_staging() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let source = temp.path().join("large.tsv");
+    let mut contents = String::from("CHR\tPOS\tP\tGENE\n");
+    for ordinal in 0..200_000_u64 {
+        contents.push_str(&format!("1\t{}\t0.5\tGENE\n", ordinal + 1));
+    }
+    fs::write(&source, contents).unwrap();
+
+    let mut child = association_command(&home, &source, &["--rebuild"])
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut stdout = BufReader::new(stdout);
+    let mut startup = String::new();
+    for _ in 0..3 {
+        let mut line = String::new();
+        assert!(stdout.read_line(&mut line).unwrap() > 0);
+        startup.push_str(&line);
+    }
+    assert!(startup.contains("private local plaintext"));
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    let status = child.wait().unwrap();
+    assert!(!status.success());
+    let mut remainder = String::new();
+    stdout.read_to_string(&mut remainder).unwrap();
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(
+        stderr.contains("cancelled") || remainder.contains("cancelled"),
+        "stdout={startup}{remainder}; stderr={stderr}"
+    );
+    let cache_root = startup
+        .lines()
+        .find_map(|line| line.strip_prefix("Association cache root: "))
+        .map(PathBuf::from)
+        .unwrap();
+    assert_eq!(fs::read_dir(cache_root.join("staging")).unwrap().count(), 0);
+    assert_eq!(
+        fs::read_dir(cache_root.join("sessions")).unwrap().count(),
+        0
+    );
 }
