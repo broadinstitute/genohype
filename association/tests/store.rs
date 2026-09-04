@@ -1,7 +1,8 @@
 use genohype_association::{
-    AssociationBuildV1, AssociationPointV1, AssociationRegionRequestV1, AssociationSortDirectionV1,
-    AssociationStore, AssociationStoreError, AssociationTablePageRequestV1, AssociationTableSortV1,
-    DatasetIdV1, SqliteAssociationStore,
+    AssociationBuildV1, AssociationPointV1, AssociationRegionRequestV1,
+    AssociationRegionScanRequestV1, AssociationSortDirectionV1, AssociationStore,
+    AssociationStoreError, AssociationTablePageRequestV1, AssociationTableSortV1, DatasetIdV1,
+    SqliteAssociationStore, JSON_SAFE_INTEGER_MAX,
 };
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -334,6 +335,342 @@ fn lifecycle_batches_top_hits_pages_search_regions_and_read_only_reopen() {
         read_only.abort_build(&dataset_id),
         Err(AssociationStoreError::ReadOnly)
     ));
+}
+
+#[test]
+fn region_scan_is_inclusive_canonicalizes_aliases_and_orders_ties() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("associations.sqlite3");
+    let mut store = SqliteAssociationStore::create(&path).unwrap();
+    let dataset_id = id();
+    store
+        .begin_build(&AssociationBuildV1 {
+            dataset_id: dataset_id.clone(),
+            created_at: "2026-09-04T00:00:00Z".into(),
+        })
+        .unwrap();
+
+    let mut points = vec![
+        point(0, "1", 8, 0.5, -0.5_f64.log10()),
+        point(1, "1", 10, 0.5, -0.5_f64.log10()),
+        point(2, "1", 10, 0.5, -0.5_f64.log10()),
+        point(3, "1", 10, 0.5, -0.5_f64.log10()),
+        point(4, "1", 10, 0.5, -0.5_f64.log10()),
+        point(5, "1", 10, 0.5, -0.5_f64.log10()),
+        point(6, "1", 12, 0.5, -0.5_f64.log10()),
+        point(7, "1", 13, 0.5, -0.5_f64.log10()),
+    ];
+    points[1].ref_allele = Some("A".into());
+    points[1].alt_allele = Some("C".into());
+    points[2].ref_allele = Some("A".into());
+    points[2].alt_allele = Some("C".into());
+    points[3].ref_allele = None;
+    points[3].alt_allele = None;
+    points[4].ref_allele = None;
+    points[4].alt_allele = Some("T".into());
+    points[5].ref_allele = Some("A".into());
+    points[5].alt_allele = Some("G".into());
+    store.insert_points(&dataset_id, &points).unwrap();
+    store.complete_build(&dataset_id, &fingerprint()).unwrap();
+
+    let request = AssociationRegionScanRequestV1 {
+        dataset_id: dataset_id.clone(),
+        contig: " cHr01 ".into(),
+        start: 8,
+        end: 12,
+    };
+    let mut visited = Vec::new();
+    let summary = store
+        .scan_region(&request, &mut |point| {
+            visited.push((
+                point.position,
+                point.ref_allele.clone(),
+                point.alt_allele.clone(),
+                point.source_ordinal,
+            ));
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        visited,
+        vec![
+            (8, Some("A".into()), Some("C".into()), 0),
+            (10, None, None, 3),
+            (10, None, Some("T".into()), 4),
+            (10, Some("A".into()), Some("C".into()), 1),
+            (10, Some("A".into()), Some("C".into()), 2),
+            (10, Some("A".into()), Some("G".into()), 5),
+            (12, Some("A".into()), Some("C".into()), 6),
+        ]
+    );
+    assert_eq!(summary.dataset_id, dataset_id);
+    assert_eq!(summary.contig, "1");
+    assert_eq!((summary.start, summary.end), (8, 12));
+    assert_eq!(summary.point_count, 7);
+
+    drop(store);
+    let read_only = SqliteAssociationStore::open_read_only(&path).unwrap();
+    let mut read_only_count = 0_u64;
+    assert_eq!(
+        read_only
+            .scan_region(&request, &mut |_| {
+                read_only_count += 1;
+                Ok(())
+            })
+            .unwrap()
+            .point_count,
+        7
+    );
+    assert_eq!(read_only_count, 7);
+}
+
+#[test]
+fn region_scan_rejects_invalid_incomplete_and_wrong_dataset_requests() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("associations.sqlite3");
+    let mut store = SqliteAssociationStore::create(&path).unwrap();
+    let dataset_id = id();
+    store
+        .begin_build(&AssociationBuildV1 {
+            dataset_id: dataset_id.clone(),
+            created_at: "now".into(),
+        })
+        .unwrap();
+    let request = AssociationRegionScanRequestV1 {
+        dataset_id: dataset_id.clone(),
+        contig: "1".into(),
+        start: 1,
+        end: 1,
+    };
+    assert!(matches!(
+        store.scan_region(&request, &mut |_| Ok(())),
+        Err(AssociationStoreError::InvalidBuildState)
+    ));
+
+    store
+        .insert_points(&dataset_id, &[point(0, "1", 1, 0.5, -0.5_f64.log10())])
+        .unwrap();
+    store.complete_build(&dataset_id, &fingerprint()).unwrap();
+    let wrong_dataset = AssociationRegionScanRequestV1 {
+        dataset_id: DatasetIdV1::new("223e4567-e89b-42d3-a456-426614174000").unwrap(),
+        ..request.clone()
+    };
+    assert!(matches!(
+        store.scan_region(&wrong_dataset, &mut |_| Ok(())),
+        Err(AssociationStoreError::DatasetNotFound)
+    ));
+
+    for invalid in [
+        AssociationRegionScanRequestV1 {
+            start: 0,
+            ..request.clone()
+        },
+        AssociationRegionScanRequestV1 {
+            start: 2,
+            end: 1,
+            ..request.clone()
+        },
+        AssociationRegionScanRequestV1 {
+            end: JSON_SAFE_INTEGER_MAX as i64 + 1,
+            ..request.clone()
+        },
+        AssociationRegionScanRequestV1 {
+            contig: String::new(),
+            ..request.clone()
+        },
+        AssociationRegionScanRequestV1 {
+            contig: "x".repeat(4_097),
+            ..request.clone()
+        },
+    ] {
+        assert!(matches!(
+            store.scan_region(&invalid, &mut |_| Ok(())),
+            Err(AssociationStoreError::InvalidRequest(_))
+        ));
+    }
+}
+
+#[test]
+fn region_scan_stops_immediately_and_preserves_sink_failure() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("associations.sqlite3");
+    let mut store = SqliteAssociationStore::create(&path).unwrap();
+    let dataset_id = id();
+    store
+        .begin_build(&AssociationBuildV1 {
+            dataset_id: dataset_id.clone(),
+            created_at: "now".into(),
+        })
+        .unwrap();
+    let points = (0..5)
+        .map(|ordinal| point(ordinal, "1", ordinal as i64 + 1, 0.5, -0.5_f64.log10()))
+        .collect::<Vec<_>>();
+    store.insert_points(&dataset_id, &points).unwrap();
+    store.complete_build(&dataset_id, &fingerprint()).unwrap();
+
+    let mut visited = Vec::new();
+    let error = store
+        .scan_region(
+            &AssociationRegionScanRequestV1 {
+                dataset_id,
+                contig: "chr1".into(),
+                start: 1,
+                end: 5,
+            },
+            &mut |point| {
+                visited.push(point.source_ordinal);
+                if visited.len() == 2 {
+                    Err(AssociationStoreError::Sink(
+                        "injected reducer failure".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+    assert_eq!(
+        error,
+        AssociationStoreError::Sink("injected reducer failure".into())
+    );
+    assert_eq!(visited, vec![0, 1]);
+}
+
+#[test]
+fn region_scan_rejects_an_invalid_persisted_source_row_before_visiting_it() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("associations.sqlite3");
+    drop(SqliteAssociationStore::create(&path).unwrap());
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch("PRAGMA ignore_check_constraints=ON")
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO association_datasets(dataset_id,source_fingerprint,created_at,status) \
+             VALUES(?1,?2,'now','complete')",
+            rusqlite::params![id().as_str(), fingerprint()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO association_points( \
+               dataset_id,source_ordinal,contig,contig_rank,position,pvalue,neg_log10_p \
+             ) VALUES(?1,-1,'1',1,1,0.5,0.3010299956639812)",
+            [id().as_str()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = SqliteAssociationStore::open_read_only(&path).unwrap();
+    let mut visited = 0;
+    assert!(matches!(
+        store.scan_region(
+            &AssociationRegionScanRequestV1 {
+                dataset_id: id(),
+                contig: "1".into(),
+                start: 1,
+                end: 1,
+            },
+            &mut |_| {
+                visited += 1;
+                Ok(())
+            }
+        ),
+        Err(AssociationStoreError::InvalidPoint(_))
+    ));
+    assert_eq!(visited, 0);
+}
+
+#[test]
+fn region_scan_query_plan_uses_the_region_index() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("associations.sqlite3");
+    drop(SqliteAssociationStore::create(&path).unwrap());
+    let connection = Connection::open(&path).unwrap();
+    let mut statement = connection
+        .prepare(
+            "EXPLAIN QUERY PLAN \
+             SELECT source_ordinal, contig, position, ref, alt, pvalue, neg_log10_p, beta, se, af, ac, gene, consequence, series \
+             FROM association_points \
+             WHERE dataset_id=?1 AND contig=?2 AND position BETWEEN ?3 AND ?4 \
+             ORDER BY position, ref IS NOT NULL, ref, alt IS NOT NULL, alt, source_ordinal",
+        )
+        .unwrap();
+    let details = statement
+        .query_map(
+            rusqlite::params![id().as_str(), "1", 1_i64, 100_i64],
+            |row| row.get::<_, String>(3),
+        )
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(
+        details
+            .iter()
+            .any(|detail| detail.contains("USING INDEX association_region_idx")),
+        "query plan did not use association_region_idx: {details:?}"
+    );
+}
+
+#[test]
+fn million_row_region_scan_keeps_the_caller_sink_constant_space() {
+    const ROW_COUNT: u64 = 1_000_000;
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("associations.sqlite3");
+    drop(SqliteAssociationStore::create(&path).unwrap());
+    let mut connection = Connection::open(&path).unwrap();
+    connection.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+    let transaction = connection.transaction().unwrap();
+    transaction
+        .execute(
+            "INSERT INTO association_datasets(dataset_id,source_fingerprint,created_at,status) \
+             VALUES(?1,?2,'now','complete')",
+            rusqlite::params![id().as_str(), fingerprint()],
+        )
+        .unwrap();
+    transaction
+        .execute(
+            "WITH RECURSIVE source_rows(source_ordinal) AS ( \
+               VALUES(0) \
+               UNION ALL \
+               SELECT source_ordinal + 1 FROM source_rows WHERE source_ordinal + 1 < ?2 \
+             ) \
+             INSERT INTO association_points( \
+               dataset_id,source_ordinal,contig,contig_rank,position,pvalue,neg_log10_p \
+             ) \
+             SELECT ?1,source_ordinal,'1',1,source_ordinal + 1,0.5,0.3010299956639812 \
+             FROM source_rows",
+            rusqlite::params![id().as_str(), ROW_COUNT as i64],
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+    drop(connection);
+
+    let store = SqliteAssociationStore::open_read_only(&path).unwrap();
+    let mut visited = 0_u64;
+    let mut first = None;
+    let mut last = None;
+    let summary = store
+        .scan_region(
+            &AssociationRegionScanRequestV1 {
+                dataset_id: id(),
+                contig: "chr1".into(),
+                start: 1,
+                end: ROW_COUNT as i64,
+            },
+            &mut |point| {
+                visited += 1;
+                first.get_or_insert(point.position);
+                last = Some(point.position);
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(visited, ROW_COUNT);
+    assert_eq!(summary.point_count, ROW_COUNT);
+    assert_eq!(first, Some(1));
+    assert_eq!(last, Some(ROW_COUNT as i64));
 }
 
 #[test]

@@ -1,4 +1,7 @@
-use super::{AssociationBuildV1, AssociationStore, AssociationStoreError, MAX_INSERT_BATCH_SIZE};
+use super::{
+    AssociationBuildV1, AssociationRegionScanRequestV1, AssociationRegionScanSummaryV1,
+    AssociationStore, AssociationStoreError, MAX_INSERT_BATCH_SIZE,
+};
 use crate::layout::canonical_contig;
 use crate::model::AssociationPointV1;
 use crate::page::{
@@ -8,6 +11,7 @@ use crate::page::{
 };
 use crate::reduction::{compare_association_points, MAX_TOP_K};
 use crate::session::{DatasetIdV1, STORE_SCHEMA_VERSION_V1};
+use crate::JSON_SAFE_INTEGER_MAX;
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OpenFlags, OptionalExtension, Row};
 use std::path::Path;
@@ -388,6 +392,58 @@ impl AssociationStore for SqliteAssociationStore {
         page.validate()
             .map_err(|e| AssociationStoreError::Backend(e.to_string()))?;
         Ok(page)
+    }
+
+    fn scan_region(
+        &self,
+        request: &AssociationRegionScanRequestV1,
+        visitor: &mut dyn FnMut(&AssociationPointV1) -> Result<(), AssociationStoreError>,
+    ) -> Result<AssociationRegionScanSummaryV1, AssociationStoreError> {
+        let contig = request.validate()?;
+        self.require_complete(&request.dataset_id)?;
+        let sql = format!(
+            "SELECT {POINT_COLUMNS} FROM association_points \
+             WHERE dataset_id=?1 AND contig=?2 AND position BETWEEN ?3 AND ?4 \
+             ORDER BY position, ref IS NOT NULL, ref, alt IS NOT NULL, alt, source_ordinal"
+        );
+        let mut statement = self.connection.prepare(&sql).map_err(backend)?;
+        let mut rows = statement
+            .query(params![
+                request.dataset_id.as_str(),
+                contig,
+                request.start,
+                request.end
+            ])
+            .map_err(backend)?;
+        let mut point_count = 0_u64;
+        while let Some(row) = rows.next().map_err(backend)? {
+            let point = read_point(row).map_err(backend)?;
+            let (normalized, _) = point
+                .clone()
+                .normalize()
+                .map_err(|error| AssociationStoreError::InvalidPoint(error.to_string()))?;
+            if normalized != point {
+                return Err(AssociationStoreError::InvalidPoint(
+                    "stored point is not canonical".into(),
+                ));
+            }
+            point_count = point_count
+                .checked_add(1)
+                .filter(|count| *count <= JSON_SAFE_INTEGER_MAX)
+                .ok_or_else(|| {
+                    AssociationStoreError::Backend(
+                        "region point count exceeds the supported integer range".into(),
+                    )
+                })?;
+            visitor(&point)?;
+        }
+        Ok(AssociationRegionScanSummaryV1 {
+            dataset_id: request.dataset_id.clone(),
+            contig,
+            start: request.start,
+            end: request.end,
+            point_count,
+        })
     }
 }
 

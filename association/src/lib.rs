@@ -77,6 +77,6 @@ pub use source::{
     MAX_SOURCE_ERROR_CODE_BYTES, MAX_SOURCE_ERROR_MESSAGE_BYTES,
 };
 pub use store::{
-    AssociationBuildV1, AssociationStore, AssociationStoreError, SqliteAssociationStore,
-    MAX_INSERT_BATCH_SIZE,
+    AssociationBuildV1, AssociationRegionScanRequestV1, AssociationRegionScanSummaryV1,
+    AssociationStore, AssociationStoreError, SqliteAssociationStore, MAX_INSERT_BATCH_SIZE,
 };
