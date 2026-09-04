@@ -26,7 +26,10 @@
     }
   },
   "layout_hash": "sha256:58e894ece562c4722bf4385139b9d73d3a86fb1eddc41b42d265dcaff56c4d4f",
-  "render_hash": "sha256:35f568ed68feae4d126044e0d44a00fac919be8b6a8d4bd3293e639ad88aff13",
+  "background_id": "white",
+  "raster_hash": "sha256:993a151498ed6cfc895ae80d72a9dd3cacfc6bc8dc3e035f02a0a175889f5a4a",
+  "render_hash": "sha256:625f0f2ef10f2bd6bc369c81074e9fec4b2233d083587eb563d09a1f80469c7e",
+  "overlay_hash": "sha256:efdd113327cc7408da704d01ebf7fa4cef426a7a2f5175df4146f45f82456fc7",
   "significance_threshold": 5e-8,
   "counts": {
     "source_point_count": 3,

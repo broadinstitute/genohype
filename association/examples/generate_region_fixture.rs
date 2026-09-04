@@ -1,8 +1,9 @@
 use genohype_association::{
-    reduce_region_overlay, region_render_hash, AssociationPointV1, AssociationRegionCountsV1,
+    reduce_region_overlay, AssociationPointV1, AssociationRegionCountsV1,
     AssociationRegionRenderManifestV1, AssociationRegionResourcesV1, DatasetIdV1,
     GeneAnnotationStateV1, GeneAnnotationsV1, GeneFeatureV1, GeneStrandV1, RegionLayoutV1,
-    ResourceDescriptorV1, ASSOCIATION_REGION_SCHEMA_VERSION_V1, COORDINATE_CONVENTION_V1,
+    RegionRenderIdentityV1, ResourceDescriptorV1, ASSOCIATION_REGION_SCHEMA_VERSION_V1,
+    COORDINATE_CONVENTION_V1,
 };
 use std::collections::HashSet;
 
@@ -34,8 +35,16 @@ fn point(
 fn main() {
     let layout =
         RegionLayoutV1::new("chr4", 190_214_555, 68_000_111, 68_999_001, 777, 320, 2).unwrap();
-    let layout_hash = layout.layout_hash("GRCh38");
-    let render_hash = region_render_hash(&layout_hash, "sha256:fixture", 5e-8);
+    let dataset_id = DatasetIdV1::new("123e4567-e89b-42d3-a456-426614174000").unwrap();
+    let identity = RegionRenderIdentityV1::new(
+        dataset_id.clone(),
+        "sha256:fixture",
+        "GRCh38",
+        "white",
+        layout.clone(),
+        5e-8,
+    )
+    .unwrap();
     let points = vec![
         point(68_000_001, 0.0, 400.0, Some("stop_gained"), 7),
         point(68_500_000, 1e-12, 12.0, Some("intron_variant"), 8),
@@ -54,10 +63,7 @@ fn main() {
         }],
         message: None,
     };
-    let mut overlay = reduce_region_overlay(&layout, points, &selected, 5e-8, genes).unwrap();
-    overlay.layout_hash = layout_hash.clone();
-    overlay.render_hash = render_hash.clone();
-    overlay.validate().unwrap();
+    let overlay = reduce_region_overlay(&identity, points, &selected, genes).unwrap();
 
     let counts = AssociationRegionCountsV1 {
         source_point_count: overlay.aggregation.input_point_count,
@@ -76,14 +82,17 @@ fn main() {
     };
     let manifest = AssociationRegionRenderManifestV1 {
         schema_version: ASSOCIATION_REGION_SCHEMA_VERSION_V1.into(),
-        dataset_id: DatasetIdV1::new("123e4567-e89b-42d3-a456-426614174000").unwrap(),
+        dataset_id,
         title: "Height locus".into(),
         assembly: "GRCh38".into(),
         coordinate_convention: COORDINATE_CONVENTION_V1.into(),
         source_fingerprint: "sha256:fixture".into(),
         layout,
-        layout_hash,
-        render_hash,
+        layout_hash: identity.layout_hash().into(),
+        background_id: "white".into(),
+        raster_hash: identity.raster_hash().into(),
+        render_hash: identity.render_hash().into(),
+        overlay_hash: overlay.overlay_hash.clone(),
         significance_threshold: 5e-8,
         counts,
         aggregation: overlay.aggregation.clone(),
@@ -92,7 +101,7 @@ fn main() {
             overlay: resource("region/overlay/fixture.json", "application/json"),
         },
     };
-    manifest.validate().unwrap();
+    overlay.validate_against(&manifest).unwrap();
 
     match std::env::args().nth(1).as_deref() {
         Some("manifest") => println!("{}", serde_json::to_string_pretty(&manifest).unwrap()),

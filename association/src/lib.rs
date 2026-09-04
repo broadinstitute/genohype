@@ -50,16 +50,18 @@ pub use page::{
 pub use reduction::{compare_association_points, TopK, TopKError, DEFAULT_TOP_K, MAX_TOP_K};
 pub use region::{
     coding_consequence_v1, generate_region_overlay_schema, generate_region_render_manifest_schema,
-    normalize_gene_features, reduce_region_overlay, region_render_hash, AssociationRegionCountsV1,
-    AssociationRegionOverlayPointV1, AssociationRegionOverlayV1, AssociationRegionRenderManifestV1,
-    AssociationRegionResourcesV1, GeneAnnotationStateV1, GeneAnnotationsV1, GeneFeatureV1,
-    GeneReferenceError, GeneReferenceProvider, GeneRegionRequestV1, GeneStrandV1,
-    RegionAggregationDisclosureV1, RegionContractError, RegionLayoutV1,
+    normalize_gene_features, reduce_region_overlay, region_overlay_hash, region_raster_hash,
+    region_render_hash, AssociationRegionCountsV1, AssociationRegionOverlayPointV1,
+    AssociationRegionOverlayV1, AssociationRegionRenderManifestV1, AssociationRegionResourcesV1,
+    GeneAnnotationStateV1, GeneAnnotationsV1, GeneFeatureV1, GeneReferenceError,
+    GeneReferenceProvider, GeneRegionRequestV1, GeneStrandV1, RegionAggregationDisclosureV1,
+    RegionContractError, RegionLayoutV1, RegionRenderIdentityV1,
     ASSOCIATION_REGION_SCHEMA_VERSION_V1, CODING_CONSEQUENCE_V1, LOCUS_RENDERER_VERSION_V1,
-    MAX_GENE_FEATURES, MAX_GENE_TEXT_BYTES, MAX_REGION_DPR, MAX_REGION_HEIGHT,
-    MAX_REGION_OVERLAY_POINTS, MAX_REGION_OVERLAY_TEXT_BYTES, MAX_REGION_WIDTH, MIN_REGION_DPR,
-    MIN_REGION_HEIGHT, MIN_REGION_WIDTH, REGION_DENSE_RULE_V1, REGION_QUANTUM_BASES_V1,
-    REGION_WIDTH_QUANTUM_V1, REGION_X_STRATA_V1, REGION_Y_STRATA_V1,
+    LOCUS_STYLE_VERSION_V1, MAX_GENE_FEATURES, MAX_GENE_TEXT_BYTES, MAX_REGION_DPR,
+    MAX_REGION_HEIGHT, MAX_REGION_IDENTITY_TEXT_BYTES, MAX_REGION_OVERLAY_POINTS,
+    MAX_REGION_OVERLAY_TEXT_BYTES, MAX_REGION_WIDTH, MIN_REGION_DPR, MIN_REGION_HEIGHT,
+    MIN_REGION_WIDTH, REGION_DENSE_RULE_V1, REGION_QUANTUM_BASES_V1, REGION_WIDTH_QUANTUM_V1,
+    REGION_X_STRATA_V1, REGION_Y_STRATA_V1,
 };
 pub use render::{AssociationRasterizer, Background, LocusRasterizer, RenderError};
 pub use scale::{YScale, LINEAR_FRACTION, LOG_THRESHOLD, MAX_NEG_LOG_P};

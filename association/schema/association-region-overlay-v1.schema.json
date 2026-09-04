@@ -18,12 +18,24 @@
       "minLength": 71,
       "pattern": "^sha256:[0-9a-f]{64}$"
     },
+    "overlay_hash": {
+      "type": "string",
+      "maxLength": 71,
+      "minLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
     "points": {
       "type": "array",
       "items": {
         "$ref": "#/$defs/AssociationRegionOverlayPointV1"
       },
       "maxItems": 1000
+    },
+    "raster_hash": {
+      "type": "string",
+      "maxLength": 71,
+      "minLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$"
     },
     "render_hash": {
       "type": "string",
@@ -35,15 +47,30 @@
       "type": "string",
       "pattern": "^1\\.[0-9]+$"
     },
+    "selected_ordinals": {
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint64",
+        "maximum": 9007199254740991,
+        "minimum": 0
+      },
+      "maxItems": 1000
+    },
     "significance_threshold": {
       "type": "number",
-      "format": "double"
+      "format": "double",
+      "exclusiveMinimum": 0.0,
+      "maximum": 1.0
     }
   },
   "required": [
     "schema_version",
     "layout_hash",
+    "raster_hash",
     "render_hash",
+    "overlay_hash",
+    "selected_ordinals",
     "layout",
     "significance_threshold",
     "points",
@@ -431,13 +458,13 @@
         "requested_width": {
           "type": "integer",
           "format": "uint32",
-          "maximum": 4096,
+          "maximum": 4050,
           "minimum": 50
         },
         "width": {
           "type": "integer",
           "format": "uint32",
-          "maximum": 4100,
+          "maximum": 4050,
           "minimum": 50
         },
         "y_scale": {

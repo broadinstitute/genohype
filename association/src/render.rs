@@ -158,6 +158,9 @@ impl LocusRasterizer {
         layout: &RegionLayoutV1,
         background: Background,
     ) -> Result<Self, RenderError> {
+        layout
+            .validate()
+            .map_err(|_| RenderError::InvalidRegionLayout)?;
         validate_raster_dimensions(layout.physical_width, layout.physical_height).map_err(
             |_| RenderError::InvalidDimensions {
                 width: layout.physical_width,
@@ -324,6 +327,7 @@ fn parse_hex_color(value: &str, alpha: u8) -> Result<Color, RenderError> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RenderError {
     InvalidDimensions { width: u32, height: u32 },
+    InvalidRegionLayout,
     InvalidRadius,
     InvalidThreshold,
     InvalidColor(String),
@@ -337,6 +341,7 @@ impl fmt::Display for RenderError {
             Self::InvalidDimensions { width, height } => {
                 write!(f, "cannot allocate {width}x{height} raster")
             }
+            Self::InvalidRegionLayout => write!(f, "region layout is not canonical"),
             Self::InvalidRadius => write!(f, "point radius must be finite and positive"),
             Self::InvalidThreshold => write!(f, "threshold must be finite and in 0 < p <= 1"),
             Self::InvalidColor(color) => write!(f, "invalid six-digit RGB color {color:?}"),
@@ -440,6 +445,22 @@ mod tests {
             render(vec![lof.clone(), other.clone()]),
             render(vec![other, lof])
         );
+    }
+
+    #[test]
+    fn locus_constructor_rejects_noncanonical_layouts() {
+        let mut layout = RegionLayoutV1::new("1", 100, 1, 100, 100, 64, 1).unwrap();
+        layout.physical_width += 1;
+        assert!(matches!(
+            LocusRasterizer::from_layout(&layout, Background::White),
+            Err(RenderError::InvalidRegionLayout)
+        ));
+        let mut scale = RegionLayoutV1::new("1", 100, 1, 100, 100, 64, 1).unwrap();
+        scale.y_scale.max_neg_log_p = 349.0;
+        assert!(matches!(
+            LocusRasterizer::from_layout(&scale, Background::White),
+            Err(RenderError::InvalidRegionLayout)
+        ));
     }
 
     #[test]

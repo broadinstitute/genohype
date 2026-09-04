@@ -9,6 +9,20 @@ export function rawGoldenManifest(): unknown {
   ));
 }
 
+export function rawGoldenRegionManifest(): unknown {
+  return JSON.parse(readFileSync(
+    resolve(process.cwd(), '../../../association/tests/fixtures/association-region-render-v1.json'),
+    'utf8',
+  ));
+}
+
+export function rawGoldenRegionOverlay(): unknown {
+  return JSON.parse(readFileSync(
+    resolve(process.cwd(), '../../../association/tests/fixtures/association-region-overlay-v1.json'),
+    'utf8',
+  ));
+}
+
 export function goldenManifest(): AssociationVisualizationManifestV1 {
   return rawGoldenManifest() as AssociationVisualizationManifestV1;
 }

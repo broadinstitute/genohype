@@ -11,6 +11,11 @@
       "maxLength": 64,
       "minLength": 1
     },
+    "background_id": {
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 1
+    },
     "coordinate_convention": {
       "type": "string"
     },
@@ -24,6 +29,18 @@
       "$ref": "#/$defs/RegionLayoutV1"
     },
     "layout_hash": {
+      "type": "string",
+      "maxLength": 71,
+      "minLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "overlay_hash": {
+      "type": "string",
+      "maxLength": 71,
+      "minLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "raster_hash": {
       "type": "string",
       "maxLength": 71,
       "minLength": 71,
@@ -44,7 +61,9 @@
     },
     "significance_threshold": {
       "type": "number",
-      "format": "double"
+      "format": "double",
+      "exclusiveMinimum": 0.0,
+      "maximum": 1.0
     },
     "source_fingerprint": {
       "type": "string",
@@ -66,7 +85,10 @@
     "source_fingerprint",
     "layout",
     "layout_hash",
+    "background_id",
+    "raster_hash",
     "render_hash",
+    "overlay_hash",
     "significance_threshold",
     "counts",
     "aggregation",
@@ -299,13 +321,13 @@
         "requested_width": {
           "type": "integer",
           "format": "uint32",
-          "maximum": 4096,
+          "maximum": 4050,
           "minimum": 50
         },
         "width": {
           "type": "integer",
           "format": "uint32",
-          "maximum": 4100,
+          "maximum": 4050,
           "minimum": 50
         },
         "y_scale": {

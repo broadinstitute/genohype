@@ -3,8 +3,8 @@
  * Sources: association/schema/association-visualization-v1.schema.json, association/schema/association-page-v1.schema.json, association/schema/association-region-render-v1.schema.json, association/schema/association-region-overlay-v1.schema.json
  * association-visualization-v1.schema.json SHA-256: 718b10211efde93506441b17cda5ca94e6bbd926f0ff3666ab33aa71f17aa1dc
  * association-page-v1.schema.json SHA-256: 41fed34cee5fbd5678dc8ffb0b4a6af0a5304b32a49d1b38e23289ea20ce2a00
- * association-region-render-v1.schema.json SHA-256: 1598d1f64c650dcbd3d30d912fa001be3a29015ada9f25198fdbe52b5e374514
- * association-region-overlay-v1.schema.json SHA-256: 1e580cf8a133fb075b5296f91a9dc61568a7f5af1ffc323d3c0c6635384fa06b
+ * association-region-render-v1.schema.json SHA-256: 47519c8ad135fe6bfd894c2658839554b347692e441ebf78dd685b2961d8e846
+ * association-region-overlay-v1.schema.json SHA-256: 5f986857e4a09f5efaa275128a2e7facceafe5bbe0b7a1f40399394fe8f31adc
  * Regenerate with: npm run contracts:generate -w @genohype/association-viz
  */
 
@@ -201,11 +201,14 @@ export interface AssociationPageV1 {
 export interface AssociationRegionRenderManifestV1 {
   aggregation: RegionAggregationDisclosureV1;
   assembly: string;
+  background_id: string;
   coordinate_convention: string;
   counts: AssociationRegionCountsV1;
   dataset_id: DatasetIdV1;
   layout: RegionLayoutV1;
   layout_hash: string;
+  overlay_hash: string;
+  raster_hash: string;
   render_hash: string;
   resources: AssociationRegionResourcesV1;
   schema_version: string;
@@ -220,9 +223,12 @@ export interface AssociationRegionOverlayV1 {
   gene_annotations: GeneAnnotationsV1;
   layout: RegionLayoutV1;
   layout_hash: string;
+  overlay_hash: string;
   points: AssociationRegionOverlayPointV1[];
+  raster_hash: string;
   render_hash: string;
   schema_version: string;
+  selected_ordinals: number[];
   significance_threshold: number;
   [minorField: string]: unknown;
 }

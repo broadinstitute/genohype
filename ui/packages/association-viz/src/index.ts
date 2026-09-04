@@ -1,6 +1,11 @@
 export type {
   AssociationPageV1,
   AssociationPointV1,
+  AssociationRegionCountsV1,
+  AssociationRegionOverlayPointV1,
+  AssociationRegionOverlayV1,
+  AssociationRegionRenderManifestV1,
+  AssociationRegionResourcesV1,
   AssociationResourceName,
   AssociationSortDirectionV1,
   AssociationTableSortV1,
@@ -8,16 +13,26 @@ export type {
   AssociationVisualizationManifestV1,
   AssociationVisualizationResourcesV1,
   ContigLayoutV1,
+  DatasetIdV1,
+  GeneAnnotationStateV1,
+  GeneAnnotationsV1,
+  GeneFeatureV1,
+  GeneStrandV1,
   GenomeLayoutV1,
   PlotKindV1,
+  RegionAggregationDisclosureV1,
+  RegionLayoutV1,
   ResourceDescriptorV1,
   YScaleV1,
 } from './contracts/types.js';
 export {
   ManifestValidationError,
   parseAssociationPage,
+  parseAssociationRegionOverlay,
+  parseAssociationRegionRenderManifest,
   parseAssociationVisualizationManifest,
   resolveAssociationResourceUrl,
+  validateAssociationRegionPair,
   type ManifestValidationCode,
 } from './contracts/parse.js';
 export {

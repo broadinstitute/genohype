@@ -14,7 +14,7 @@ import {
 import '@genohype/association-viz/styles.css';
 ```
 
-Parse untrusted manifest JSON before rendering. Resolve each resource against the final fetched manifest URL. Parse table and region API responses with `parseAssociationPage`; it rejects unsupported major versions and unsafe or out-of-contract values while retaining compatible V1 minor fields. Selection is controlled with `selectedHitKey` (from `stableHitKey`) and the plot/table callbacks; locus and chromosome actions are callbacks, never navigation. The package renders only `manifest.top_hits` as SVG semantics over the dense raster.
+Parse untrusted manifest JSON before rendering. Resolve each resource against the final fetched manifest URL. Parse table and region API responses with `parseAssociationPage`; it rejects unsupported major versions and unsafe or out-of-contract values while retaining compatible V1 minor fields. Region render documents use `parseAssociationRegionRenderManifest` and `parseAssociationRegionOverlay`; call `validateAssociationRegionPair` before combining their raster and semantic layers. Selection is controlled with `selectedHitKey` (from `stableHitKey`) and the plot/table callbacks; locus and chromosome actions are callbacks, never navigation. The package renders only `manifest.top_hits` as SVG semantics over the dense raster.
 
 `AssociationHitTable` keeps its original local API (`hits`) and client-side search/sort. For a fetched page, use the discriminated controlled mode:
 
