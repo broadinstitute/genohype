@@ -1002,27 +1002,23 @@ impl BuildClaim {
         check_cancel(cancellation)?;
 
         if !completion.ephemeral {
-            // Publish while the original exclusive active lock is still held. Only
-            // a registered, non-orphan generation may enter flock's non-atomic
-            // exclusive-to-shared conversion window.
+            // Publish while the original exclusive active lock is still held.
             self.registry
                 .publish_registry(&self.lookup, &marker, &marker_checksum)?;
             #[cfg(test)]
             self.registry.run_before_active_transition_hook();
-            let active = self
-                .active_lock
-                .as_ref()
-                .ok_or(AssociationSessionError::ClaimConsumed)?;
-            // If a platform refuses the downgrade, retaining exclusive ownership
-            // is safe; publication has already succeeded and must not be reported
-            // as failed after its durable commit boundary.
-            let _ = FileExt::lock_shared(active);
         } else {
-            // Ephemeral generations are intentionally never registered, so their
-            // completed handle retains exclusive ownership until final-handle drop.
+            // Ephemeral generations are intentionally never registered.
             #[cfg(test)]
             self.registry.run_before_active_transition_hook();
         }
+        // Retain exclusive ownership in the returned handle. `flock` cannot
+        // atomically convert an exclusive lock to a shared lock, and even a
+        // registered generation can become cleanup-eligible before that conversion
+        // completes (for example when a long build outlives its retention). Keeping
+        // the existing lock mode closes that deletion window for both retained and
+        // ephemeral sessions. A later opener may acquire a shared lock after this
+        // active handle is released.
         // Irreversible success point: no cancellation probe or fallible operation
         // follows registry publication (or completed ephemeral validation).
         self.generation_path.take();
@@ -2432,21 +2428,21 @@ mod tests {
 
         let temp = TempDir::new().unwrap();
         let (registry, _lookup, claim, manifest) = prepare_claim(temp.path());
-        let (cleanup_tx, cleanup_rx) = mpsc::channel();
+        let (cleanup_thread_tx, cleanup_thread_rx) = mpsc::channel();
         let cleanup_registry = registry.clone();
         registry.set_before_active_transition_hook(move || {
-            cleanup_tx
-                .send(
-                    cleanup_registry
-                        .cleanup(CleanupPolicy {
-                            now: UNIX_EPOCH + Duration::from_secs(3),
-                            remove_expired: true,
-                            remove_orphans: true,
-                            remove_staging: false,
-                        })
-                        .unwrap(),
-                )
-                .unwrap();
+            let thread = std::thread::spawn(move || {
+                cleanup_registry
+                    .cleanup(CleanupPolicy {
+                        now: UNIX_EPOCH + Duration::from_secs(3),
+                        remove_expired: true,
+                        remove_orphans: true,
+                        remove_staging: false,
+                    })
+                    .unwrap()
+            });
+            cleanup_thread_tx.send(thread).unwrap();
+            std::thread::yield_now();
         });
         let session = claim
             .publish(
@@ -2459,7 +2455,8 @@ mod tests {
                 &NeverCancel,
             )
             .unwrap();
-        assert_eq!(cleanup_rx.recv().unwrap().retained_locked, 1);
+        let concurrent_cleanup = cleanup_thread_rx.recv().unwrap().join().unwrap();
+        assert_eq!(concurrent_cleanup.retained_locked, 1);
         assert_eq!(
             registry
                 .cleanup(CleanupPolicy {
