@@ -1,18 +1,21 @@
 use super::assets::{viewer_asset, viewer_index};
+use super::detail::{valid_resource_id, DetailError, DetailService, RegionRequest};
 use super::security::security_headers;
 use crate::association_session::CompletedAssociationSession;
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::QueryRejection;
-use axum::extract::{OriginalUri, Query, State};
+use axum::extract::{OriginalUri, Path, Query, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware;
 use axum::response::Response;
 use axum::routing::get;
 use axum::Router;
+#[cfg(test)]
+use genohype_association::GeneReferenceProvider;
 use genohype_association::{
     AssociationPageV1, AssociationRegionRequestV1, AssociationSortDirectionV1, AssociationStore,
-    AssociationStoreError, AssociationTablePageRequestV1, AssociationTableSortV1, DatasetIdV1,
-    SqliteAssociationStore, DEFAULT_PAGE_SIZE,
+    AssociationStoreError, AssociationTablePageRequestV1, AssociationTableSortV1,
+    AssociationVisualizationManifestV1, DatasetIdV1, SqliteAssociationStore, DEFAULT_PAGE_SIZE,
 };
 use serde::Deserialize;
 use std::future::Future;
@@ -54,16 +57,27 @@ impl ServerState {
 pub(crate) struct DatasetService {
     dataset_id: DatasetIdV1,
     database_path: Arc<PathBuf>,
+    detail: Option<DetailService>,
     // This is lifecycle state, not just metadata: retaining the final clone keeps
     // ephemeral session artifacts and their locks alive until server shutdown.
     _session: Option<CompletedAssociationSession>,
 }
 
 impl DatasetService {
-    pub(crate) fn from_session(session: CompletedAssociationSession) -> Self {
+    pub(crate) fn from_session(
+        session: CompletedAssociationSession,
+        root: AssociationVisualizationManifestV1,
+    ) -> Self {
+        let dataset_id = session.dataset_id().clone();
+        let database_path = session.database_path();
         Self {
-            dataset_id: session.dataset_id().clone(),
-            database_path: Arc::new(session.database_path()),
+            detail: Some(DetailService::new(
+                dataset_id.clone(),
+                database_path.clone(),
+                root,
+            )),
+            dataset_id,
+            database_path: Arc::new(database_path),
             _session: Some(session),
         }
     }
@@ -105,8 +119,40 @@ impl DatasetService {
         Self {
             dataset_id,
             database_path: Arc::new(database_path),
+            detail: None,
             _session: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_with_manifest(
+        dataset_id: DatasetIdV1,
+        database_path: PathBuf,
+        root: AssociationVisualizationManifestV1,
+    ) -> Self {
+        let detail = DetailService::new(dataset_id.clone(), database_path.clone(), root);
+        Self {
+            dataset_id,
+            database_path: Arc::new(database_path),
+            detail: Some(detail),
+            _session: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_gene_provider(mut self, provider: Arc<dyn GeneReferenceProvider>) -> Self {
+        self.detail = self
+            .detail
+            .map(|detail| detail.with_gene_provider(provider));
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_cache_limits(mut self, entries: usize, bytes: usize) -> Self {
+        self.detail = self
+            .detail
+            .map(|detail| detail.with_cache_limits(entries, bytes));
+        self
     }
 }
 
@@ -129,9 +175,13 @@ pub(crate) fn build_router(state: ServerState) -> Router {
     let assets = format!("/{}/assets/*path", state.token);
     let manifest = format!("/{}/api/manifest", state.token);
     let raster = format!("/{}/api/raster", state.token);
+    let chromosome_ui = format!("/{}/chromosome/:contig", state.token);
+    let locus_ui = format!("/{}/locus/:contig/:bounds", state.token);
 
     let mut router = Router::new()
         .route(&root, get(index))
+        .route(&chromosome_ui, get(chromosome_index))
+        .route(&locus_ui, get(locus_index))
         .route(&assets, get(asset))
         .route(&manifest, get(manifest_response))
         .route(&raster, get(raster_response));
@@ -141,9 +191,34 @@ pub(crate) fn build_router(state: ServerState) -> Router {
             "/{}/api/datasets/{}/region",
             state.token, dataset.dataset_id
         );
+        let chromosome_manifest = format!(
+            "/{}/api/datasets/{}/chromosomes/:contig/manifest",
+            state.token, dataset.dataset_id
+        );
+        let chromosome_raster = format!(
+            "/{}/api/datasets/{}/chromosomes/:contig/raster",
+            state.token, dataset.dataset_id
+        );
+        let region_manifest = format!(
+            "/{}/api/datasets/{}/region/manifest",
+            state.token, dataset.dataset_id
+        );
+        let region_raster = format!(
+            "/{}/api/datasets/{}/region/renders/:render_id/raster",
+            state.token, dataset.dataset_id
+        );
+        let region_overlay = format!(
+            "/{}/api/datasets/{}/region/renders/:render_id/overlays/:overlay_id",
+            state.token, dataset.dataset_id
+        );
         router = router
             .route(&table, get(table_response))
-            .route(&region, get(region_response));
+            .route(&region, get(region_response))
+            .route(&chromosome_manifest, get(chromosome_manifest_response))
+            .route(&chromosome_raster, get(chromosome_raster_response))
+            .route(&region_manifest, get(region_manifest_response))
+            .route(&region_raster, get(region_raster_response))
+            .route(&region_overlay, get(region_overlay_response));
     }
 
     router
@@ -193,6 +268,70 @@ async fn index() -> Response {
             NO_STORE,
             asset.bytes,
         ),
+        None => not_found().await,
+    }
+}
+
+async fn chromosome_index(
+    State(state): State<ServerState>,
+    Path(contig): Path<String>,
+) -> Response {
+    let Some(dataset) = state.dataset.as_ref() else {
+        return not_found().await;
+    };
+    if dataset
+        .detail
+        .as_ref()
+        .and_then(|detail| detail.canonical_contig_length(&contig))
+        .is_none()
+    {
+        return not_found().await;
+    }
+    index_for_token(&state.token).await
+}
+
+async fn locus_index(
+    State(state): State<ServerState>,
+    Path((contig, bounds)): Path<(String, String)>,
+) -> Response {
+    let Some(dataset) = state.dataset.as_ref() else {
+        return not_found().await;
+    };
+    let Some((start, end)) = parse_canonical_bounds(&bounds) else {
+        return not_found().await;
+    };
+    if !dataset
+        .detail
+        .as_ref()
+        .is_some_and(|detail| detail.validates_region(&contig, start, end))
+    {
+        return not_found().await;
+    }
+    index_for_token(&state.token).await
+}
+
+async fn index_for_token(token: &str) -> Response {
+    match viewer_index() {
+        Some(mut asset) => {
+            let Ok(html) = String::from_utf8(asset.bytes) else {
+                return internal_error();
+            };
+            let base = format!("<base href=\"/{}/\">", html_escape(token));
+            let Some(head) = html.find("<head>").map(|offset| offset + "<head>".len()) else {
+                return internal_error();
+            };
+            let mut injected = String::with_capacity(html.len() + base.len());
+            injected.push_str(&html[..head]);
+            injected.push_str(&base);
+            injected.push_str(&html[head..]);
+            asset.bytes = injected.into_bytes();
+            response(
+                StatusCode::OK,
+                "text/html; charset=utf-8",
+                NO_STORE,
+                asset.bytes,
+            )
+        }
         None => not_found().await,
     }
 }
@@ -253,6 +392,21 @@ struct RegionQueryV1 {
     limit: Option<u32>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegionManifestQueryV1 {
+    contig: String,
+    start: i64,
+    end: i64,
+    width: u32,
+    height: u32,
+    dpr: u8,
+    #[serde(default)]
+    threshold: Option<f64>,
+    #[serde(default)]
+    selected: Option<u64>,
+}
+
 async fn table_response(
     State(state): State<ServerState>,
     query: Result<Query<TableQueryV1>, QueryRejection>,
@@ -309,10 +463,142 @@ async fn region_response(
     }
 }
 
-fn json_response(page: &AssociationPageV1) -> Response {
-    match serde_json::to_vec(page) {
+async fn chromosome_manifest_response(
+    State(state): State<ServerState>,
+    Path(contig): Path<String>,
+    OriginalUri(uri): OriginalUri,
+) -> Response {
+    if uri.query().is_some() {
+        return bad_request();
+    }
+    let Some(detail) = state.dataset.and_then(|dataset| dataset.detail) else {
+        return not_found().await;
+    };
+    match detail.chromosome(&contig).await {
+        Ok(product) => json_response(&product.manifest),
+        Err(error) => detail_error_response(error).await,
+    }
+}
+
+async fn chromosome_raster_response(
+    State(state): State<ServerState>,
+    Path(contig): Path<String>,
+    OriginalUri(uri): OriginalUri,
+) -> Response {
+    if uri.query().is_some() {
+        return bad_request();
+    }
+    let Some(detail) = state.dataset.and_then(|dataset| dataset.detail) else {
+        return not_found().await;
+    };
+    match detail.chromosome(&contig).await {
+        Ok(product) => response(
+            StatusCode::OK,
+            "image/png",
+            NO_STORE,
+            product.raster.clone(),
+        ),
+        Err(error) => detail_error_response(error).await,
+    }
+}
+
+async fn region_manifest_response(
+    State(state): State<ServerState>,
+    query: Result<Query<RegionManifestQueryV1>, QueryRejection>,
+) -> Response {
+    let Some(detail) = state.dataset.and_then(|dataset| dataset.detail) else {
+        return not_found().await;
+    };
+    let Ok(Query(query)) = query else {
+        return bad_request();
+    };
+    let request = RegionRequest {
+        contig: query.contig,
+        start: query.start,
+        end: query.end,
+        width: query.width,
+        height: query.height,
+        dpr: query.dpr,
+        threshold: query.threshold,
+        selected_ordinal: query.selected,
+    };
+    match detail.region(request).await {
+        Ok(product) => json_response(&product.manifest),
+        Err(error) => detail_error_response(error).await,
+    }
+}
+
+async fn region_raster_response(
+    State(state): State<ServerState>,
+    Path(render_id): Path<String>,
+    OriginalUri(uri): OriginalUri,
+) -> Response {
+    if uri.query().is_some() {
+        return not_found().await;
+    }
+    let Some(detail) = state.dataset.and_then(|dataset| dataset.detail) else {
+        return not_found().await;
+    };
+    if !valid_resource_id(&render_id) {
+        return not_found().await;
+    }
+    match detail.cache.region_raster(&render_id).await {
+        Some(product) => response(StatusCode::OK, "image/png", NO_STORE, product.bytes.clone()),
+        None => not_found().await,
+    }
+}
+
+async fn region_overlay_response(
+    State(state): State<ServerState>,
+    Path((render_id, overlay_id)): Path<(String, String)>,
+    OriginalUri(uri): OriginalUri,
+) -> Response {
+    if uri.query().is_some() {
+        return not_found().await;
+    }
+    let Some(detail) = state.dataset.and_then(|dataset| dataset.detail) else {
+        return not_found().await;
+    };
+    if !valid_resource_id(&render_id) || !valid_resource_id(&overlay_id) {
+        return not_found().await;
+    }
+    let Some(overlay) = detail.cache.region_overlay(&overlay_id).await else {
+        return not_found().await;
+    };
+    let expected_render = overlay
+        .overlay
+        .raster_hash
+        .strip_prefix("sha256:")
+        .unwrap_or_default();
+    if expected_render != render_id {
+        return not_found().await;
+    }
+    response(
+        StatusCode::OK,
+        "application/json",
+        NO_STORE,
+        overlay.bytes.clone(),
+    )
+}
+
+fn json_response<T: serde::Serialize>(value: &T) -> Response {
+    match serde_json::to_vec(value) {
         Ok(bytes) => response(StatusCode::OK, "application/json", NO_STORE, bytes),
         Err(_) => internal_error(),
+    }
+}
+
+async fn detail_error_response(error: DetailError) -> Response {
+    match error {
+        DetailError::NotFound => not_found().await,
+        DetailError::BadRequest => bad_request(),
+        DetailError::TooDense => response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "text/plain; charset=utf-8",
+            NO_STORE,
+            b"region is too dense; narrow the interval\n".to_vec(),
+        ),
+        DetailError::Internal => internal_error(),
     }
 }
 
@@ -332,6 +618,25 @@ fn internal_error() -> Response {
         NO_STORE,
         b"internal server error\n".to_vec(),
     )
+}
+
+fn parse_canonical_bounds(value: &str) -> Option<(i64, i64)> {
+    let (start, end) = value.split_once('-')?;
+    let start = start.parse::<i64>().ok()?;
+    let end = end.parse::<i64>().ok()?;
+    if value != format!("{start}-{end}") {
+        return None;
+    }
+    Some((start, end))
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 async fn not_found() -> Response {

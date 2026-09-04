@@ -1,4 +1,5 @@
 mod assets;
+mod detail;
 mod open;
 mod security;
 mod server;
@@ -72,7 +73,11 @@ fn serve_prepared(
         let token = server::generate_url_token();
         let mut state = server::ServerState::new(token.clone(), prepared.manifest, prepared.raster);
         if let Some(session) = session {
-            let dataset = server::DatasetService::from_session(session);
+            // `prepare_dataset_artifacts` has already validated this typed V1
+            // projection against the immutable completion marker and raster.
+            let root_manifest: AssociationVisualizationManifestV1 =
+                serde_json::from_slice(&state.manifest).map_err(invalid_format)?;
+            let dataset = server::DatasetService::from_session(session, root_manifest);
             dataset.validate_complete().await.map_err(invalid_format)?;
             state = state.with_dataset(dataset);
         }

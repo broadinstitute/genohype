@@ -9,13 +9,16 @@ use axum::http::{header, Method, Request, StatusCode};
 use genohype_association::{
     AssociationBuildV1, AssociationPageV1, AssociationPointV1, AssociationRasterizer,
     AssociationStore, AssociationThresholdV1, AssociationVisualizationManifestV1,
-    AssociationVisualizationResourcesV1, Background, DatasetIdV1, GenomeLayoutV1, NeverCancel,
+    AssociationVisualizationResourcesV1, Background, DatasetIdV1, GeneFeatureV1,
+    GeneReferenceError, GeneReferenceProvider, GeneRegionRequestV1, GenomeLayoutV1, NeverCancel,
     NormalizedFieldMappingV1, PlotKindV1, ResourceDescriptorV1, SessionBackgroundV1,
     SqliteAssociationStore, COORDINATE_CONVENTION_V1, SCHEMA_VERSION_V1, STORE_SCHEMA_VERSION_V1,
 };
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 use tempfile::TempDir;
 use tower::ServiceExt;
@@ -94,6 +97,49 @@ fn dataset_router(token: &str, database_path: PathBuf) -> axum::Router {
         ServerState::new(token.into(), serde_json::to_vec(&manifest).unwrap(), raster)
             .with_dataset(dataset),
     )
+}
+
+fn detail_manifest() -> (AssociationVisualizationManifestV1, Vec<u8>) {
+    let (mut manifest, raster) = artifact_bytes();
+    manifest.plot_id = dataset_id().to_string();
+    manifest.row_count = 3;
+    manifest.valid_row_count = 3;
+    manifest.rendered_point_count = 3;
+    manifest.significant_hit_count = 1;
+    manifest.top_hits = vec![
+        point("1", 20, 1e-8, "GENE2", 1),
+        point("2", 1, 0.01, "GENE1", 2),
+        point("1", 10, 0.05, "GENE1", 0),
+    ];
+    manifest.resources.raster.url = "raster".into();
+    (manifest, raster)
+}
+
+fn detail_router(token: &str, database_path: PathBuf) -> axum::Router {
+    let (manifest, raster) = detail_manifest();
+    let dataset =
+        DatasetService::for_test_with_manifest(dataset_id(), database_path, manifest.clone());
+    server::build_router(
+        ServerState::new(token.into(), serde_json::to_vec(&manifest).unwrap(), raster)
+            .with_dataset(dataset),
+    )
+}
+
+struct CountingGeneProvider {
+    calls: AtomicUsize,
+    delay: Duration,
+    result: std::result::Result<Vec<GeneFeatureV1>, GeneReferenceError>,
+}
+
+impl GeneReferenceProvider for CountingGeneProvider {
+    fn genes_overlapping(
+        &self,
+        _request: &GeneRegionRequestV1,
+    ) -> std::result::Result<Vec<GeneFeatureV1>, GeneReferenceError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(self.delay);
+        self.result.clone()
+    }
 }
 
 fn point(contig: &str, position: i64, pvalue: f64, gene: &str, ordinal: u64) -> AssociationPointV1 {
@@ -650,6 +696,312 @@ async fn dataset_routes_page_sort_search_and_use_inclusive_regions() {
 }
 
 #[tokio::test]
+async fn detail_routes_render_validate_coalesce_and_serve_deep_links() {
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("private-associations.sqlite3");
+    write_dataset(&database);
+    let id = dataset_id();
+    let base = format!("/correct-token/api/datasets/{id}");
+    let app = detail_router("correct-token", database);
+
+    let chromosome = router_response(
+        app.clone(),
+        Method::GET,
+        &format!("{base}/chromosomes/1/manifest"),
+    )
+    .await;
+    assert_eq!(chromosome.status(), StatusCode::OK);
+    let chromosome: AssociationVisualizationManifestV1 =
+        serde_json::from_slice(&to_bytes(chromosome.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    chromosome.validate().unwrap();
+    assert_eq!(chromosome.valid_row_count, 2);
+    assert_eq!(chromosome.rendered_point_count, 2);
+    assert_eq!(chromosome.significant_hit_count, 1);
+    assert_eq!(chromosome.top_hits.len(), 2);
+    let chromosome_raster = router_response(
+        app.clone(),
+        Method::GET,
+        &format!("{base}/chromosomes/1/raster"),
+    )
+    .await;
+    assert_eq!(chromosome_raster.status(), StatusCode::OK);
+    assert_eq!(
+        chromosome_raster.headers()[header::CONTENT_TYPE],
+        "image/png"
+    );
+
+    let first = router_response(
+        app.clone(),
+        Method::GET,
+        &format!("{base}/region/manifest?contig=1&start=10&end=20&width=51&height=64&dpr=2&threshold=0.01&selected=0"),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let first: genohype_association::AssociationRegionRenderManifestV1 =
+        serde_json::from_slice(&to_bytes(first.into_body(), usize::MAX).await.unwrap()).unwrap();
+    first.validate().unwrap();
+    assert_eq!(
+        (first.layout.width, first.layout.physical_width),
+        (100, 200)
+    );
+    assert_eq!(first.counts.source_point_count, 2);
+    assert_eq!(first.counts.selected_point_count, 1);
+
+    let raster_path = format!("{base}/region/{}", first.resources.raster.url);
+    let raster = router_response(app.clone(), Method::GET, &raster_path).await;
+    assert_eq!(raster.status(), StatusCode::OK);
+    let png =
+        tiny_skia::Pixmap::decode_png(&to_bytes(raster.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!((png.width(), png.height()), (200, 128));
+
+    let overlay_path = format!("{base}/region/{}", first.resources.overlay.url);
+    let overlay = router_response(app.clone(), Method::GET, &overlay_path).await;
+    assert_eq!(overlay.status(), StatusCode::OK);
+    let overlay: genohype_association::AssociationRegionOverlayV1 =
+        serde_json::from_slice(&to_bytes(overlay.into_body(), usize::MAX).await.unwrap()).unwrap();
+    overlay.validate_against(&first).unwrap();
+    assert_eq!(
+        overlay.gene_annotations.state,
+        genohype_association::GeneAnnotationStateV1::Unavailable
+    );
+
+    let coalesced = router_response(
+        app.clone(),
+        Method::GET,
+        &format!("{base}/region/manifest?contig=1&start=11&end=19&width=99&height=64&dpr=2&threshold=0.01&selected=0"),
+    )
+    .await;
+    let coalesced: genohype_association::AssociationRegionRenderManifestV1 =
+        serde_json::from_slice(&to_bytes(coalesced.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(first.raster_hash, coalesced.raster_hash);
+    assert_eq!(first.resources.raster.url, coalesced.resources.raster.url);
+    assert_ne!(first.render_hash, coalesced.render_hash);
+    assert_ne!(first.resources.overlay.url, coalesced.resources.overlay.url);
+
+    for path in [
+        "/correct-token/chromosome/1",
+        "/correct-token/locus/1/10-20",
+    ] {
+        let response = router_response(app.clone(), Method::GET, path).await;
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let html = String::from_utf8(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(html.contains("<base href=\"/correct-token/\">"));
+    }
+    for path in [
+        "/correct-token/chromosome/chr1",
+        "/correct-token/chromosome/2",
+        "/correct-token/locus/1/010-20",
+        "/correct-token/locus/1/0-20",
+        "/correct-token/locus/1/10-101",
+    ] {
+        assert_eq!(
+            router_response(app.clone(), Method::GET, path)
+                .await
+                .status(),
+            StatusCode::NOT_FOUND,
+            "{path}"
+        );
+    }
+
+    let alias = router_response(
+        app.clone(),
+        Method::GET,
+        &format!("{base}/region/manifest?contig=chr1&start=10&end=20&width=50&height=64&dpr=1"),
+    )
+    .await;
+    assert_eq!(alias.status(), StatusCode::NOT_FOUND);
+    for query in [
+        "contig=1&start=0&end=20&width=50&height=64&dpr=1",
+        "contig=1&start=10&end=101&width=50&height=64&dpr=1",
+        "contig=1&start=10&end=20&width=49&height=64&dpr=1",
+        "contig=1&start=10&end=20&width=4051&height=64&dpr=1",
+        "contig=1&start=10&end=20&width=50&height=63&dpr=1",
+        "contig=1&start=10&end=20&width=50&height=64&dpr=0",
+        "contig=1&start=10&end=20&width=50&height=64&dpr=1&threshold=0",
+        "contig=1&start=10&end=20&width=50&height=64&dpr=1&selected=9007199254740992",
+        "contig=1&start=10&end=20&width=50&height=64&dpr=1&unknown=1",
+    ] {
+        let response = router_response(
+            app.clone(),
+            Method::GET,
+            &format!("{base}/region/manifest?{query}"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+    }
+    assert_eq!(
+        router_response(
+            app.clone(),
+            Method::GET,
+            &format!("{base}/chromosomes/1/manifest?unknown=1"),
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        router_response(app, Method::GET, &format!("{raster_path}?unknown=1"))
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn detail_cache_is_single_flight_off_runtime_and_safely_evicts() {
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("private-associations.sqlite3");
+    write_dataset(&database);
+    let (manifest, raster) = detail_manifest();
+    let provider = Arc::new(CountingGeneProvider {
+        calls: AtomicUsize::new(0),
+        delay: Duration::from_millis(75),
+        result: Ok(vec![]),
+    });
+    let dataset =
+        DatasetService::for_test_with_manifest(dataset_id(), database.clone(), manifest.clone())
+            .with_gene_provider(provider.clone())
+            .with_cache_limits(2, 1024 * 1024);
+    let app = server::build_router(
+        ServerState::new(
+            "correct-token".into(),
+            serde_json::to_vec(&manifest).unwrap(),
+            raster,
+        )
+        .with_dataset(dataset),
+    );
+    let id = dataset_id();
+    let request = format!(
+        "/correct-token/api/datasets/{id}/region/manifest?contig=1&start=10&end=20&width=50&height=64&dpr=1"
+    );
+
+    let requests: Vec<_> = (0..8)
+        .map(|_| {
+            let app = app.clone();
+            let request = request.clone();
+            tokio::spawn(async move { router_response(app, Method::GET, &request).await })
+        })
+        .collect();
+    tokio::time::timeout(
+        Duration::from_millis(30),
+        tokio::time::sleep(Duration::from_millis(5)),
+    )
+    .await
+    .expect("blocking provider stalled the Tokio runtime");
+    let mut first_manifest = None;
+    for task in requests {
+        let response = task.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let manifest: genohype_association::AssociationRegionRenderManifestV1 =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        first_manifest.get_or_insert(manifest);
+    }
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    let first_manifest = first_manifest.unwrap();
+    assert_eq!(
+        first_manifest.counts.source_point_count,
+        first_manifest.counts.rasterized_point_count
+    );
+    let first_overlay_path = format!(
+        "/correct-token/api/datasets/{id}/region/{}",
+        first_manifest.resources.overlay.url
+    );
+    let first_overlay = router_response(app.clone(), Method::GET, &first_overlay_path).await;
+    let first_overlay: genohype_association::AssociationRegionOverlayV1 = serde_json::from_slice(
+        &to_bytes(first_overlay.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        first_overlay.gene_annotations.state,
+        genohype_association::GeneAnnotationStateV1::Available
+    );
+
+    // A different raster/overlay pair exceeds the two-entry limit and evicts
+    // the first pair as one generic opaque-resource miss.
+    let second = router_response(
+        app.clone(),
+        Method::GET,
+        &format!("{request}&threshold=0.02"),
+    )
+    .await;
+    assert_eq!(second.status(), StatusCode::OK);
+    let stale_raster = format!(
+        "/correct-token/api/datasets/{id}/region/{}",
+        first_manifest.resources.raster.url
+    );
+    assert_eq!(
+        router_response(app.clone(), Method::GET, &stale_raster)
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+
+    let rebuilt = router_response(app, Method::GET, &request).await;
+    assert_eq!(rebuilt.status(), StatusCode::OK);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+
+    let (manifest, raster) = detail_manifest();
+    let failing = Arc::new(CountingGeneProvider {
+        calls: AtomicUsize::new(0),
+        delay: Duration::ZERO,
+        result: Err(GeneReferenceError::ProviderFailure),
+    });
+    let dataset = DatasetService::for_test_with_manifest(dataset_id(), database, manifest.clone())
+        .with_gene_provider(failing);
+    let failing_app = server::build_router(
+        ServerState::new(
+            "correct-token".into(),
+            serde_json::to_vec(&manifest).unwrap(),
+            raster,
+        )
+        .with_dataset(dataset),
+    );
+    let manifest_response = router_response(failing_app.clone(), Method::GET, &request).await;
+    let manifest: genohype_association::AssociationRegionRenderManifestV1 = serde_json::from_slice(
+        &to_bytes(manifest_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let overlay_response = router_response(
+        failing_app,
+        Method::GET,
+        &format!(
+            "/correct-token/api/datasets/{id}/region/{}",
+            manifest.resources.overlay.url
+        ),
+    )
+    .await;
+    let overlay: genohype_association::AssociationRegionOverlayV1 = serde_json::from_slice(
+        &to_bytes(overlay_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(overlay.points.len(), 2);
+    assert_eq!(
+        overlay.gene_annotations.state,
+        genohype_association::GeneAnnotationStateV1::Error
+    );
+    assert_eq!(
+        overlay.gene_annotations.message.as_deref(),
+        Some("gene annotations could not be loaded")
+    );
+}
+
+#[tokio::test]
 async fn dataset_route_errors_are_generic_exact_and_hardened() {
     let temp = tempfile::tempdir().unwrap();
     let database = temp.path().join("do-not-leak-this.sqlite3");
@@ -856,7 +1208,9 @@ async fn production_dataset_router_retains_ephemeral_session_until_shutdown_drop
     let (_temp, session, generation) = completed_ephemeral_session();
     let dataset_id = session.dataset_id().clone();
     let prepared = prepare_dataset_artifacts(&session).unwrap();
-    let dataset = DatasetService::from_session(session);
+    let root_manifest: AssociationVisualizationManifestV1 =
+        serde_json::from_slice(&prepared.manifest).unwrap();
+    let dataset = DatasetService::from_session(session, root_manifest);
     dataset.validate_complete().await.unwrap();
     let token = server::generate_url_token();
     let app = server::build_router(
@@ -878,6 +1232,15 @@ async fn production_dataset_router_retains_ephemeral_session_until_shutdown_drop
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let page: AssociationPageV1 = response.json().await.unwrap();
     assert_eq!(page.total, 1);
+    let detail_url = format!(
+        "http://{address}/{token}/api/datasets/{dataset_id}/region/manifest?contig=1&start=1&end=100&width=50&height=64&dpr=1"
+    );
+    let detail = reqwest::get(detail_url).await.unwrap();
+    assert_eq!(detail.status(), reqwest::StatusCode::OK);
+    let detail: genohype_association::AssociationRegionRenderManifestV1 =
+        detail.json().await.unwrap();
+    detail.validate().unwrap();
+    assert_eq!(detail.counts.source_point_count, 1);
     assert!(
         generation.exists(),
         "live server state dropped the generation"
