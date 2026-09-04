@@ -32,6 +32,7 @@ describe('association viewer app', () => {
     expect(state).toMatchObject({
       kind: 'ready',
       rasterUrl: 'https://example.test/token/api/raster',
+      tableApiUrl: new URL('https://example.test/token/api/api/height-genome/hits'),
     });
   });
 
@@ -44,6 +45,49 @@ describe('association viewer app', () => {
       kind: 'ready',
       rasterUrl: 'https://example.test/token/api/height-genome.png',
     });
+  });
+
+  it('resolves a table descriptor against the authoritative manifest response URL', async () => {
+    const manifest = fixture();
+    manifest.resources.table_api.url = 'datasets/opaque/table';
+    const manifestResponse = response(manifest);
+    Object.defineProperty(manifestResponse, 'url', {
+      configurable: true,
+      value: 'https://example.test/redirected-token/api/manifest',
+    });
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(manifestResponse));
+    const state = await loadAssociationViewer(new URL('https://example.test/original-token/api/manifest'));
+    expect(state).toMatchObject({
+      kind: 'ready',
+      tableApiUrl: new URL('https://example.test/redirected-token/api/datasets/opaque/table'),
+    });
+  });
+
+  it('keeps the exact inline table path and makes no page request when table_api is absent', async () => {
+    const manifest = fixture();
+    delete manifest.resources.table_api;
+    const fetchMock = vi.fn().mockResolvedValueOnce(response(manifest));
+    vi.stubGlobal('fetch', fetchMock);
+    render(<App />);
+    await waitFor(() => expect(document.querySelector('[data-state="ready"]')).toBeInTheDocument());
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(screen.getByText('2 of 2 hits')).toBeInTheDocument();
+  });
+
+  it('keeps the raster available and shows a path-safe inline fallback when the table API fails', async () => {
+    const manifest = fixture();
+    manifest.resources.table_api.url = 'datasets/opaque/table';
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response(manifest))
+      .mockResolvedValueOnce(response({ source_path: '/private/study.tsv' }));
+    vi.stubGlobal('fetch', fetchMock);
+    render(<App />);
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('Showing inline top hits instead');
+    expect(alert).not.toHaveTextContent('/private');
+    expect(document.querySelector('[data-state="ready"]')).toBeInTheDocument();
+    expect(screen.getByRole('img')).toBeInTheDocument();
+    expect(screen.getByText('2 of 2 hits')).toBeInTheDocument();
   });
 
   it('shows distinct loading and empty states', async () => {
@@ -97,6 +141,47 @@ describe('association viewer app', () => {
     await waitFor(() => expect(document.querySelector('[data-state="ready"]')).toBeInTheDocument());
     fireEvent.error(screen.getByRole('img'));
     await waitFor(() => expect(document.querySelector('[data-state="resource-error"]')).toBeInTheDocument());
+  });
+
+  it('pages server rows while preserving a selected top hit outside the current page', async () => {
+    vi.stubGlobal('ResizeObserver', class { observe() {} disconnect() {} unobserve() {} });
+    const manifest = fixture();
+    manifest.resources.table_api.url = 'datasets/opaque/table';
+    const [firstHit, secondHit] = manifest.top_hits;
+    const page = (point: Json, offset: number) => ({
+      schema_version: '1.0',
+      dataset_id: '2f1f76b8-d244-4d95-8219-ec8dbeb24d8b',
+      points: [point],
+      offset,
+      limit: 100,
+      total: 200,
+      sort: 'pvalue',
+      direction: 'ascending',
+      search: '',
+    });
+    const fetchMock = vi.fn(async (input: URL | RequestInfo) => {
+      if (fetchMock.mock.calls.length === 1) return response(manifest);
+      const url = new URL(String(input));
+      const offset = Number(url.searchParams.get('offset'));
+      return response(page(offset === 0 ? firstHit : secondHit, offset));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    render(<App />);
+    await waitFor(() => expect(screen.getAllByText('1–1 of 200 hits')).toHaveLength(2));
+    const image = screen.getByRole('img');
+    vi.spyOn(image, 'getBoundingClientRect').mockReturnValue({
+      x: 0, y: 0, top: 0, left: 0, right: 100, bottom: 50, width: 100, height: 50, toJSON: () => ({}),
+    });
+    fireEvent.load(image);
+    const firstRow = within(screen.getByRole('table')).getAllByRole('row')[1];
+    await userEvent.click(firstRow);
+    expect(firstRow).toHaveAttribute('aria-selected', 'true');
+    expect(document.querySelector('.association-hit-selection')).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Next' }));
+    await waitFor(() => expect(screen.getAllByText('101–101 of 200 hits')).toHaveLength(2));
+    expect(within(screen.getByRole('table')).getAllByRole('row')[1]).toHaveAttribute('aria-selected', 'false');
+    expect(document.querySelector('.association-hit-selection')).toBeInTheDocument();
   });
 
   it('synchronizes controlled table and plot selection', async () => {

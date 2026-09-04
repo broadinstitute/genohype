@@ -18,6 +18,18 @@ body { margin: 0; }
 .association-viewer-app > header p { margin: 5px 0 20px; color: #646b75; }
 .viewer-state { display: grid; align-content: center; justify-items: center; text-align: center; }
 .viewer-error { color: #982735; }
+.association-table-fallback {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 20px;
+  border: 1px solid #d7a3aa;
+  border-radius: 5px;
+  padding: 10px 12px;
+  background: #fff3f4;
+  color: #7e202d;
+}
 @media (prefers-color-scheme: dark) {
   html { background: #17191d; }
   .association-viewer-app, .viewer-state { border-color: #3b4049; background: #23262c; color: #f2f4f7; }
