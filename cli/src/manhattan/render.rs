@@ -95,6 +95,33 @@ impl ManhattanRenderer {
         }
     }
 
+    /// Alpha-composite a transparent renderer onto this renderer.
+    ///
+    /// Callers control overlay order; tiny-skia applies source-over blending, matching
+    /// the point draw operation used by this renderer.
+    pub(crate) fn composite(&mut self, overlay: &Self) -> Result<()> {
+        if self.pixmap.width() != overlay.pixmap.width()
+            || self.pixmap.height() != overlay.pixmap.height()
+        {
+            return Err(HailError::InvalidFormat(format!(
+                "cannot composite Manhattan rasters with dimensions {}x{} and {}x{}",
+                self.pixmap.width(),
+                self.pixmap.height(),
+                overlay.pixmap.width(),
+                overlay.pixmap.height()
+            )));
+        }
+        self.pixmap.draw_pixmap(
+            0,
+            0,
+            overlay.pixmap.as_ref(),
+            &tiny_skia::PixmapPaint::default(),
+            Transform::identity(),
+            None,
+        );
+        Ok(())
+    }
+
     /// Encode the rendered pixmap as a PNG byte vector.
     pub fn encode_png(&self) -> Result<Vec<u8>> {
         self.pixmap.encode_png().map_err(|e| {
@@ -114,4 +141,60 @@ pub fn hex_to_color(hex: &str, alpha: f32) -> Color {
     let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(0);
 
     Color::from_rgba8(r, g, b, (alpha * 255.0) as u8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transparent_shards_are_visually_equivalent_to_serial_source_over() {
+        let points = [
+            (12.0, 10.0, "#404040"),
+            (12.8, 10.4, "#404040"),
+            (13.2, 11.0, "#4682B4"),
+            (31.0, 18.0, "#4682B4"),
+            (31.4, 18.2, "#404040"),
+            (48.0, 7.0, "#4682B4"),
+        ];
+
+        let mut serial = ManhattanRenderer::new(64, 32);
+        serial.render_threshold_line(16.0, 64);
+        for (x, y, color) in points {
+            serial.render_point(x, y, color, 0.5);
+        }
+
+        let mut first = ManhattanRenderer::new_transparent(64, 32);
+        for (x, y, color) in &points[..3] {
+            first.render_point(*x, *y, color, 0.5);
+        }
+        let mut second = ManhattanRenderer::new_transparent(64, 32);
+        for (x, y, color) in &points[3..] {
+            second.render_point(*x, *y, color, 0.5);
+        }
+        let mut composited = ManhattanRenderer::new(64, 32);
+        composited.render_threshold_line(16.0, 64);
+        composited.composite(&first).unwrap();
+        composited.composite(&second).unwrap();
+
+        // Rendering into an 8-bit premultiplied transparent layer introduces only bounded
+        // quantization versus drawing directly on opaque white. Geometry, draw order, and
+        // source-over coverage are identical; no channel may differ by more than one level.
+        let max_delta = serial
+            .pixmap
+            .data()
+            .iter()
+            .zip(composited.pixmap.data())
+            .map(|(left, right)| left.abs_diff(*right))
+            .max()
+            .unwrap_or(0);
+        assert!(max_delta <= 1, "maximum channel delta was {max_delta}");
+    }
+
+    #[test]
+    fn composite_rejects_mismatched_dimensions() {
+        let mut canvas = ManhattanRenderer::new(10, 10);
+        let overlay = ManhattanRenderer::new_transparent(11, 10);
+        assert!(canvas.composite(&overlay).is_err());
+    }
 }
