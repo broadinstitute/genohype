@@ -393,6 +393,104 @@ fn store_failure_and_cancellation_rollback_partial_builds() {
 }
 
 #[test]
+fn cancellation_after_a_bulk_batch_rolls_back_all_rows() {
+    struct CancellingSource(FakeSource, BuildCancellation);
+    impl AssociationSource for CancellingSource {
+        fn metadata(&self) -> &AssociationSourceMetadataV1 {
+            self.0.metadata()
+        }
+        fn finalized_source_fingerprint(&self) -> Option<&str> {
+            self.0.finalized_source_fingerprint()
+        }
+        fn next_item(&mut self) -> Result<Option<AssociationSourceItem>, AssociationSourceError> {
+            let item = self.0.next_item();
+            if self.0.calls == 4 {
+                self.1.cancel();
+            }
+            item
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cancelled.db");
+    let mut store =
+        genohype_association::SqliteAssociationStore::create_for_bulk_build(&path).unwrap();
+    let cancellation = BuildCancellation::default();
+    let mut source = CancellingSource(FakeSource::new(canonical_items()), cancellation.clone());
+    assert!(matches!(
+        build_association_session(&mut source, &mut store, &config(2), &cancellation),
+        Err(genohype_association::AssociationBuildError::Cancelled)
+    ));
+    assert_eq!(source.0.calls, 4);
+    drop(store);
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM association_points", [], |r| r
+                .get::<_, u64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn bulk_sqlite_is_byte_identical_to_batched_build_and_fatal_source_rolls_back() {
+    use genohype_association::SqliteAssociationStore;
+    let dir = tempfile::tempdir().unwrap();
+    let mut batched = SqliteAssociationStore::create(dir.path().join("batched.db")).unwrap();
+    let mut bulk =
+        SqliteAssociationStore::create_for_bulk_build(dir.path().join("bulk.db")).unwrap();
+    let mut products = Vec::new();
+    for store in [&mut batched, &mut bulk] {
+        let mut source = FakeSource::new(canonical_items());
+        let product = build_association_session(
+            &mut source,
+            store,
+            &config(2),
+            &BuildCancellation::default(),
+        )
+        .unwrap();
+        assert_eq!(source.eof_count, 1);
+        assert_eq!(source.calls, 7);
+        assert!(store.is_complete(&id()).unwrap());
+        assert_eq!(store.top_hits(&id(), 3).unwrap(), product.top_hits);
+        products.push(product);
+    }
+    assert_eq!(products[0].manifest, products[1].manifest);
+    assert_eq!(products[0].png_bytes, products[1].png_bytes);
+    assert_eq!(products[0].progress, products[1].progress);
+    assert_eq!(
+        products[0].source_fingerprint,
+        products[1].source_fingerprint
+    );
+    assert_eq!(
+        products[0].rejection_diagnostics,
+        products[1].rejection_diagnostics
+    );
+
+    let path = dir.path().join("failed.db");
+    let mut bulk = SqliteAssociationStore::create_for_bulk_build(&path).unwrap();
+    let mut source = FakeSource::new(canonical_items());
+    source.fatal_after = Some(4); // after a flushed batch
+    assert!(build_association_session(
+        &mut source,
+        &mut bulk,
+        &config(2),
+        &BuildCancellation::default()
+    )
+    .is_err());
+    drop(bulk);
+    let reopened = SqliteAssociationStore::open_read_only(&path).unwrap();
+    assert!(!reopened.is_complete(&id()).unwrap());
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    let rows: u64 = connection
+        .query_row("SELECT COUNT(*) FROM association_points", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(rows, 0);
+}
+
+#[test]
 fn public_rejection_fields_cannot_bypass_builder_bounds() {
     let mut source = FakeSource::new(vec![AssociationSourceItem::Rejected(
         AssociationSourceRejectionV1 {

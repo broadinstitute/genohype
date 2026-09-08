@@ -55,6 +55,126 @@ fn request(
 }
 
 #[test]
+fn bulk_build_is_atomic_one_shot_and_keeps_failed_batches_atomic() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("bulk.db");
+    let mut store = SqliteAssociationStore::create_for_bulk_build(&path).unwrap();
+    let build = AssociationBuildV1 {
+        dataset_id: id(),
+        created_at: "now".into(),
+    };
+    store.begin_build(&build).unwrap();
+    let first = point(0, "1", 1, 0.1, 1.0);
+    let second = point(1, "1", 2, 0.01, 2.0);
+    store.insert_points(&id(), &[first.clone()]).unwrap();
+    assert!(store
+        .insert_points(&id(), &[second.clone(), first.clone()])
+        .is_err());
+    store.insert_points(&id(), &[second.clone()]).unwrap(); // failed batch left no partial insert
+    assert!(store.complete_build(&id(), "bad-fingerprint").is_err());
+    assert!(!store.is_complete(&id()).unwrap());
+    store
+        .replace_top_hits(&id(), &[second.clone(), first.clone()])
+        .unwrap();
+    store.complete_build(&id(), &fingerprint()).unwrap();
+    assert!(store.abort_build(&id()).is_err());
+    assert!(store.begin_build(&build).is_err());
+    drop(store);
+    let reopened = SqliteAssociationStore::open_read_only(&path).unwrap();
+    assert_eq!(reopened.top_hits(&id(), 100).unwrap(), [second, first]);
+    let connection = Connection::open(&path).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        "ok"
+    );
+    assert!(connection
+        .prepare("PRAGMA foreign_key_check")
+        .unwrap()
+        .query([])
+        .unwrap()
+        .next()
+        .unwrap()
+        .is_none());
+    drop(connection);
+    assert!(SqliteAssociationStore::create_for_bulk_build(&path).is_err());
+    assert!(reopened.is_complete(&id()).unwrap());
+    assert!(!path.with_extension("db-journal").exists());
+}
+
+#[test]
+fn failed_bulk_commit_rolls_back_instead_of_leaving_a_complete_handle() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("bulk.db");
+    let mut store = SqliteAssociationStore::create_for_bulk_build(&path).unwrap();
+    store
+        .begin_build(&AssociationBuildV1 {
+            dataset_id: id(),
+            created_at: "now".into(),
+        })
+        .unwrap();
+    store
+        .insert_points(&id(), &[point(0, "1", 1, 0.1, 1.0)])
+        .unwrap();
+    // Keep a shared reader lock: COMMIT cannot acquire its exclusive lock and
+    // must fail after the configured busy timeout. The unpublished row is invisible.
+    let reader = Connection::open(&path).unwrap();
+    reader.execute_batch("BEGIN").unwrap();
+    assert_eq!(
+        reader
+            .query_row("SELECT COUNT(*) FROM association_datasets", [], |r| r
+                .get::<_, u64>(0))
+            .unwrap(),
+        0
+    );
+    assert!(store.complete_build(&id(), &fingerprint()).is_err());
+    assert!(!store.is_complete(&id()).unwrap());
+    reader.execute_batch("ROLLBACK").unwrap();
+    drop(store);
+    assert!(!SqliteAssociationStore::open_read_only(&path)
+        .unwrap()
+        .is_complete(&id())
+        .unwrap());
+}
+
+#[test]
+fn unfinished_bulk_builds_roll_back_on_abort_and_connection_drop() {
+    for abort in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bulk.db");
+        let mut store = SqliteAssociationStore::create_for_bulk_build(&path).unwrap();
+        store
+            .begin_build(&AssociationBuildV1 {
+                dataset_id: id(),
+                created_at: "now".into(),
+            })
+            .unwrap();
+        store
+            .insert_points(&id(), &[point(0, "1", 1, 0.1, 1.0)])
+            .unwrap();
+        if abort {
+            store.abort_build(&id()).unwrap();
+        }
+        drop(store);
+        let connection = Connection::open(&path).unwrap();
+        for table in ["association_points", "association_datasets"] {
+            assert_eq!(
+                connection
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                        .get::<_, u64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+        assert!(!SqliteAssociationStore::open_read_only(&path)
+            .unwrap()
+            .is_complete(&id())
+            .unwrap());
+    }
+}
+
+#[test]
 fn migration_has_required_version_tables_indexes_and_constraints() {
     let directory = TempDir::new().unwrap();
     let path = directory.path().join("associations.sqlite3");

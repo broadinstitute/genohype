@@ -66,6 +66,8 @@ pub struct AssociationBuildProgressV1 {
     pub valid_rows: u64,
     pub rejected_rows: u64,
     pub rows_persisted: u64,
+    /// Atomically accepted insert batches. A bulk store makes these durable
+    /// together at `complete_build`, not at each batch boundary.
     pub batches_committed: u64,
 }
 

@@ -425,7 +425,10 @@ fn build_claim<S: AssociationSource>(
         region_resource: json_resource(format!("{route_base}/region")),
     };
 
-    let mut store = SqliteAssociationStore::create(claim.database_path()).map_err(invalid)?;
+    // The claim owns an empty unpublished database. Commit its bounded batches
+    // atomically at EOF rather than synchronizing every 1,000 inserted rows.
+    let mut store =
+        SqliteAssociationStore::create_for_bulk_build(claim.database_path()).map_err(invalid)?;
     let product =
         build_association_session(source, &mut store, &config, cancellation).map_err(invalid)?;
     // SQLite must be fully closed before lifecycle code hashes, syncs, validates,

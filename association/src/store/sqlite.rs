@@ -23,6 +23,8 @@ const JOINED_POINT_COLUMNS: &str = "p.source_ordinal, p.contig, p.position, p.re
 pub struct SqliteAssociationStore {
     connection: Connection,
     read_only: bool,
+    // Only an empty, unpublished store may hold this one-shot outer transaction.
+    bulk_build: bool,
 }
 
 impl SqliteAssociationStore {
@@ -51,7 +53,44 @@ impl SqliteAssociationStore {
         Ok(Self {
             connection,
             read_only: false,
+            bulk_build: false,
         })
+    }
+
+    /// Create an empty, exclusively owned staging store for one atomic bulk build.
+    ///
+    /// Batches remain bounded, validated and individually atomic (savepoints), but
+    /// are not durably committed until `complete_build`. FULL synchronization and
+    /// all V1 indexes/constraints are retained. SQLite spills dirty pages to disk;
+    /// its page-cache target is 8 MiB rather than retaining the dataset in RAM.
+    /// Drop, abort, or process failure rolls back the unpublished transaction.
+    /// Never use this constructor on a published/shared generation.
+    pub fn create_for_bulk_build(path: impl AsRef<Path>) -> Result<Self, AssociationStoreError> {
+        let mut store = Self::create(path)?;
+        store
+            .connection
+            .pragma_update(None, "cache_size", -8192)
+            .map_err(backend)?;
+        store
+            .connection
+            .pragma_update(None, "temp_store", "FILE")
+            .map_err(backend)?;
+        store
+            .connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(backend)?;
+        let datasets: u64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM association_datasets", [], |row| {
+                row.get(0)
+            })
+            .map_err(backend)?;
+        if datasets != 0 {
+            // Dropping the connection rolls back without touching existing data.
+            return Err(AssociationStoreError::InvalidBuildState);
+        }
+        store.bulk_build = true;
+        Ok(store)
     }
 
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, AssociationStoreError> {
@@ -70,6 +109,7 @@ impl SqliteAssociationStore {
         Ok(Self {
             connection,
             read_only: true,
+            bulk_build: false,
         })
     }
 
@@ -98,6 +138,9 @@ impl SqliteAssociationStore {
         }
     }
     fn require_complete(&self, id: &DatasetIdV1) -> Result<(), AssociationStoreError> {
+        if self.bulk_build && !self.connection.is_autocommit() {
+            return Err(AssociationStoreError::InvalidBuildState);
+        }
         match self.state(id)? {
             Some(state) if state == "complete" => Ok(()),
             Some(_) => Err(AssociationStoreError::InvalidBuildState),
@@ -109,6 +152,19 @@ impl SqliteAssociationStore {
 impl AssociationStore for SqliteAssociationStore {
     fn begin_build(&mut self, build: &AssociationBuildV1) -> Result<(), AssociationStoreError> {
         self.writable()?;
+        if self.bulk_build {
+            let empty: bool = self
+                .connection
+                .query_row(
+                    "SELECT NOT EXISTS(SELECT 1 FROM association_datasets)",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(backend)?;
+            if self.connection.is_autocommit() || !empty {
+                return Err(AssociationStoreError::InvalidBuildState);
+            }
+        }
         if build.created_at.is_empty() || build.created_at.len() > 64 {
             return Err(AssociationStoreError::InvalidRequest(
                 "build metadata cannot be empty".into(),
@@ -139,7 +195,9 @@ impl AssociationStore for SqliteAssociationStore {
                 ));
             }
         }
-        let transaction = self.connection.transaction().map_err(backend)?;
+        // Outermost savepoints commit exactly like the former batch transaction;
+        // inside a bulk build they provide batch rollback without a per-batch fsync.
+        let transaction = self.connection.savepoint().map_err(backend)?;
         {
             let mut statement=transaction.prepare("INSERT INTO association_points(dataset_id,source_ordinal,contig,contig_rank,position,ref,alt,pvalue,neg_log10_p,beta,se,af,ac,gene,consequence,series) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)").map_err(backend)?;
             for point in points {
@@ -212,7 +270,7 @@ impl AssociationStore for SqliteAssociationStore {
                 ));
             }
         }
-        let transaction = self.connection.transaction().map_err(backend)?;
+        let transaction = self.connection.savepoint().map_err(backend)?;
         transaction
             .execute(
                 "DELETE FROM top_hits WHERE dataset_id=?1",
@@ -256,6 +314,14 @@ impl AssociationStore for SqliteAssociationStore {
             )
             .map_err(backend)?;
         if changed == 1 {
+            if self.bulk_build {
+                if let Err(error) = self.connection.execute_batch("COMMIT") {
+                    // A failed commit must never expose a complete dataset through
+                    // this handle. Roll back the entire unpublished generation.
+                    let _ = self.connection.execute_batch("ROLLBACK");
+                    return Err(backend(error));
+                }
+            }
             Ok(())
         } else {
             Err(AssociationStoreError::InvalidBuildState)
@@ -264,6 +330,9 @@ impl AssociationStore for SqliteAssociationStore {
     fn abort_build(&mut self, dataset_id: &DatasetIdV1) -> Result<(), AssociationStoreError> {
         self.writable()?;
         self.require_building(dataset_id)?;
+        if self.bulk_build {
+            return self.connection.execute_batch("ROLLBACK").map_err(backend);
+        }
         self.connection
             .execute(
                 "DELETE FROM association_datasets WHERE dataset_id=?1",
@@ -273,7 +342,8 @@ impl AssociationStore for SqliteAssociationStore {
         Ok(())
     }
     fn is_complete(&self, dataset_id: &DatasetIdV1) -> Result<bool, AssociationStoreError> {
-        Ok(self.state(dataset_id)?.as_deref() == Some("complete"))
+        Ok((!self.bulk_build || self.connection.is_autocommit())
+            && self.state(dataset_id)?.as_deref() == Some("complete"))
     }
 
     fn top_hits(
